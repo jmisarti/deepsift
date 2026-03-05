@@ -1,0 +1,313 @@
+﻿{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>{{ person.first_name }} {{ person.last_name }}</h2>
+    <details class="compact">
+        <summary><strong>Update Name</strong></summary>
+        <form id="personNameForm" class="grid-form compact">
+            <label>First Name <input id="personFirstName" value="{{ person.first_name }}" required></label>
+            <label>Last Name <input id="personLastName" value="{{ person.last_name }}" required></label>
+        </form>
+    </details>
+    {% if property_context %}
+    <p><strong>Context:</strong> Relative of {{ property_context.owner_first }} {{ property_context.owner_last }} at <a href="{{ url_for('property_detail', property_id=property_context.id) }}">{{ property_context.street }}, {{ property_context.city }}, {{ property_context.state }} {{ property_context.postal_code }}</a></p>
+    {% endif %}
+    <label><strong>Status:</strong>
+        <select id="personStatusSelect">
+            {% for s in ['No Contact','Contact No Response','Follow Up','Outreach Attempted'] %}
+            <option value="{{ s }}" {% if person.outreach_status == s %}selected{% endif %}>{{ s }}</option>
+            {% endfor %}
+        </select>
+    </label>
+    <div class="profile-actions">
+        <button type="button" id="skipTraceBtn" {% if not default_property_id %}disabled{% endif %}>Run Skip Trace</button>
+    </div>
+    <div class="profile-grid">
+        <div><strong>Age:</strong> {{ person.age if person.age is not none else 'Unknown' }}</div>
+        <div><strong>Deceased:</strong> {{ 'Yes' if person.deceased else 'No' }}</div>
+        <div><strong>Birth Year:</strong> {{ person.birth_year or 'Unknown' }}</div>
+        <div><strong>Deceased Date:</strong> {{ person.deceased_date or 'Unknown' }}</div>
+        <div><strong>Bankruptcy:</strong> {{ 'Yes' if person.bankruptcy else 'No' }}</div>
+        <div><strong>Employer:</strong> {{ person.employer or 'Unknown' }}</div>
+    </div>
+</section>
+
+<section class="panel split">
+    <div>
+        <h3>Contact Information</h3>
+        {% set phone_rows = touchpoints | selectattr('channel_type', 'equalto', 'Phone') | list %}
+        {% set email_rows = touchpoints | selectattr('channel_type', 'equalto', 'Email') | list %}
+        <section class="contact-card">
+            <div class="contact-card-head">
+                <h4>Phone Numbers ({{ phone_rows|length }})</h4>
+                <details class="inline-add-details">
+                    <summary>Add New Phone</summary>
+                    <form id="addPhoneForm" class="grid-form compact"><label>Type<select name="channel_label"><option>Landline</option><option>Mobile</option><option>VoIP</option><option>Fax</option><option>Unknown</option></select></label><label>Number <input name="value" required></label></form>
+                </details>
+            </div>
+            <table class="crm-table contact-table"><thead><tr><th>Type</th><th>Number</th><th>Status</th><th></th></tr></thead><tbody id="phoneRows">{% for t in phone_rows %}<tr data-touchpoint-id="{{ t.id }}"><td><select class="touch-label" data-id="{{ t.id }}">{% for phone_type in ['Landline','Mobile','VoIP','Fax','Unknown'] %}<option value="{{ phone_type }}" {% if t.channel_label == phone_type %}selected{% endif %}>{{ phone_type }}</option>{% endfor %}</select></td><td>{{ t.value }}</td><td><select class="touch-status" data-id="{{ t.id }}">{% for s in ['Correct','Incorrect','DNC','DNT','No Answer','Dead','Undeliverable','Not in service','Unknown'] %}<option value="{{ s }}" {% if t.status == s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></td><td><button type="button" class="icon-btn delete-touch" data-id="{{ t.id }}">x</button></td></tr>{% endfor %}</tbody></table>
+        </section>
+
+        <section class="contact-card">
+            <div class="contact-card-head">
+                <h4>Emails ({{ email_rows|length }})</h4>
+                <details class="inline-add-details">
+                    <summary>Add New Email</summary>
+                    <form id="addEmailForm" class="grid-form compact"><label class="span2">Email Address <input name="value" required></label></form>
+                </details>
+            </div>
+            <table class="crm-table contact-table"><thead><tr><th>Email</th><th>Status</th><th></th></tr></thead><tbody id="emailRows">{% for t in email_rows %}<tr data-touchpoint-id="{{ t.id }}"><td>{{ t.value }}</td><td><select class="touch-status" data-id="{{ t.id }}">{% for s in ['Correct','Incorrect','DNC','DNT','No Answer','Dead','Undeliverable','Not in service','Unknown'] %}<option value="{{ s }}" {% if t.status == s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></td><td><button type="button" class="icon-btn delete-touch" data-id="{{ t.id }}">x</button></td></tr>{% endfor %}</tbody></table>
+        </section>
+    </div>
+
+    <div>
+        <section class="contact-card">
+            <div class="contact-card-head">
+                <h4>Addresses ({{ addresses|length }})</h4>
+                <details class="inline-add-details">
+                    <summary>Add New Address</summary>
+                    <form method="post" action="{{ url_for('add_person_address', person_id=person.id) }}" class="grid-form compact"><label>Label <input name="label" value="Related Address"></label><label>Street <input name="street" required></label><label>City <input name="city" required></label><label>State <input name="state" required></label><label>ZIP <input name="postal_code" required></label><button type="submit">Add Address</button></form>
+                </details>
+            </div>
+            <table class="crm-table contact-table"><thead><tr><th>Label</th><th>Address</th></tr></thead><tbody>{% for a in addresses %}<tr><td>{{ a.label }}</td><td>{{ a.street }}, {{ a.city }}, {{ a.state }} {{ a.postal_code }}</td></tr>{% endfor %}{% if not addresses %}<tr><td colspan="2">No addresses on file.</td></tr>{% endif %}</tbody></table>
+        </section>
+
+        <section class="contact-card">
+            <div class="contact-card-head">
+                <h4>Social Accounts ({{ socials|length }})</h4>
+                <details class="inline-add-details">
+                    <summary>Add New Social</summary>
+                    <form id="addSocialForm" class="grid-form compact"><label>Platform <input name="platform" value="LinkedIn"></label><label>Handle <input name="handle"></label><label>URL <input name="url"></label></form>
+                </details>
+            </div>
+            <table class="crm-table contact-table"><thead><tr><th>Platform</th><th>Handle</th><th>Status</th><th></th></tr></thead><tbody id="socialRows">{% for s in socials %}<tr data-social-id="{{ s.id }}"><td>{{ s.platform }}</td><td><a href="{{ social_url(s.platform, s.handle, s.url) }}" target="_blank">{{ s.handle or social_url(s.platform, s.handle, s.url) }}</a></td><td><select class="social-status" data-id="{{ s.id }}">{% for st in ['Unverified','Verified','Incorrect','Dead'] %}<option value="{{ st }}" {% if s.status == st %}selected{% endif %}>{{ st }}</option>{% endfor %}</select></td><td><button type="button" class="icon-btn delete-social" data-id="{{ s.id }}">x</button></td></tr>{% endfor %}</tbody></table>
+        </section>
+    </div>
+</section>
+
+<section class="panel">
+    <h3>Person Notes</h3>
+    <form id="personNoteForm" class="grid-form compact">
+        <label>Source <input id="personNoteSource" value="Manual"></label>
+        <label class="span2">Note <textarea id="personNoteBody" rows="3" placeholder="Add note..."></textarea></label>
+        <button type="submit">Add Note</button>
+    </form>
+    <div id="personNotesList">
+        {% for n in person_notes %}
+        <article class="note-card">
+            <div class="note-meta"><strong>{{ n.source }}</strong> <span>{{ n.created_at }}</span></div>
+            <p>{{ n.note_body }}</p>
+            {% if n.payload_json %}
+            <details>
+                <summary>View Payload</summary>
+                <pre>{{ n.payload_json }}</pre>
+            </details>
+            {% endif %}
+        </article>
+        {% endfor %}
+        {% if not person_notes %}
+        <p>No notes yet.</p>
+        {% endif %}
+    </div>
+</section>
+
+<section class="panel">
+    <h3>Communications</h3>
+    <section class="comm-card">
+        <div class="comm-tabs" id="personCommTabs">
+            <button type="button" class="comm-tab active" data-channel="ALL">All</button>
+            <button type="button" class="comm-tab" data-channel="SMS">SMS</button>
+            <button type="button" class="comm-tab" data-channel="EMAIL">Email</button>
+        </div>
+
+        <div class="comm-header">
+            <strong>Send to</strong>
+            <select id="personCommToNumber">
+                {% if person_phone_options %}
+                    {% for ph in person_phone_options %}
+                    <option value="{{ ph }}">{{ ph }}</option>
+                    {% endfor %}
+                {% else %}
+                    <option value="">No phone on file</option>
+                {% endif %}
+            </select>
+        </div>
+
+        <div id="personCommFeed" class="comm-feed">
+            {% for m in communications %}
+            <article class="msg-row {{ 'outbound' if m.direction|lower == 'outbound' else 'inbound' }}" data-channel="{{ m.channel|upper }}">
+                <div class="msg-meta">
+                    <span>{{ m.direction }}{% if m.direction|lower == 'outbound' and m.to_number %} to {{ m.to_number }}{% elif m.direction|lower == 'inbound' and m.from_number %} from {{ m.from_number }}{% endif %}</span>
+                    <span>{{ m.sent_at }}</span>
+                    <span class="msg-status">{{ m.status }}</span>
+                </div>
+                <div class="msg-bubble">{{ m.body }}</div>
+            </article>
+            {% endfor %}
+        </div>
+
+        <form id="personSmsComposer" class="comm-compose">
+            <textarea id="personSmsBody" placeholder="Jot something down..." rows="2"></textarea>
+            <div class="comm-actions">
+                <span id="personComposerMode">From {{ smrt_from_number }} (SMS mode)</span>
+                <button type="submit" id="personSmsSendBtn">Send</button>
+            </div>
+        </form>
+    </section>
+</section>
+
+<script>
+const personId = {{ person.id }};
+const personCommPropertyId = {{ default_property_id if default_property_id else 'null' }};
+let personCommChannel = 'ALL';
+const patchJson = (url, body) => fetch(url, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+const postJson = (url, body) => fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(r=>r.json().then(j=>({ok:r.ok,data:j})));
+const delReq = (url) => fetch(url, {method:'DELETE'});
+function flash(el){ el.classList.add('fade-highlight'); setTimeout(()=>el.classList.remove('fade-highlight'),900); }
+function esc(text){ return (text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function socialUrl(platform, handle, url) {
+  const rawUrl = (url || '').trim();
+  if (rawUrl) return /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
+  const p = (platform || '').toLowerCase();
+  const h = (handle || '').replace(/^@+/, '').trim();
+  if (!h) return '';
+  if (p.includes('linkedin')) return h.startsWith('in/') || h.startsWith('company/') ? `https://www.linkedin.com/${h}` : `https://www.linkedin.com/in/${h}`;
+  if (p === 'x' || p.includes('twitter')) return `https://x.com/${h}`;
+  if (p.includes('facebook')) return `https://www.facebook.com/${h}`;
+  if (p.includes('instagram')) return `https://www.instagram.com/${h}`;
+  if (p.includes('tiktok')) return `https://www.tiktok.com/@${h}`;
+  if (p.includes('youtube')) return `https://www.youtube.com/@${h}`;
+  return '';
+}
+
+function applyPersonCommFilter() {
+  document.querySelectorAll('#personCommFeed .msg-row').forEach((row) => {
+    const show = personCommChannel === 'ALL' || (row.dataset.channel || '') === personCommChannel;
+    row.style.display = show ? '' : 'none';
+  });
+}
+
+function setPersonCommChannel(channel) {
+  personCommChannel = channel;
+  document.querySelectorAll('#personCommTabs .comm-tab').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.channel === channel);
+  });
+  const mode = document.getElementById('personComposerMode');
+  const sendBtn = document.getElementById('personSmsSendBtn');
+  const toSelect = document.getElementById('personCommToNumber');
+  const isEmail = channel === 'EMAIL';
+  mode.textContent = isEmail ? 'Email coming next' : (personCommPropertyId ? 'From {{ smrt_from_number }} (SMS mode)' : 'Add from a property context to send');
+  sendBtn.disabled = isEmail || !personCommPropertyId || !toSelect.value;
+  toSelect.disabled = isEmail;
+  applyPersonCommFilter();
+}
+
+document.getElementById('personStatusSelect').addEventListener('change', async (e)=>{ const r=await patchJson(`/api/people/${personId}/status`, {status:e.target.value}); if(r.ok) flash(e.target); });
+function bindPersonNameSave(){ const form=document.getElementById('personNameForm'); const first=document.getElementById('personFirstName'); const last=document.getElementById('personLastName'); if(!form||!first||!last) return; let current=`${first.value.trim()}|${last.value.trim()}`; const save=async()=>{ const f=first.value.trim(); const l=last.value.trim(); if(!f||!l) return; const nxt=`${f}|${l}`; if(nxt===current) return; const r=await patchJson(`/api/people/${personId}/name`, {first_name:f,last_name:l}); if(r.ok){ current=nxt; const h2=document.querySelector('.panel h2'); if(h2) h2.textContent=`${f} ${l}`; flash(form);} }; form.addEventListener('submit',(e)=>{e.preventDefault(); save();}); [first,last].forEach((i)=>{ i.addEventListener('blur', save); i.addEventListener('keydown',(e)=>{ if(e.key==='Enter'){ e.preventDefault(); save(); }}); }); }
+bindPersonNameSave();
+
+document.getElementById('skipTraceBtn').addEventListener('click', async () => {
+  if (!personCommPropertyId) {
+    alert('No property context available for this person.');
+    return;
+  }
+  if (!window.confirm('Run skip trace for this person using the property address?')) return;
+  const firstName = (document.getElementById('personFirstName')?.value || '{{ person.first_name }}').trim();
+  const lastName = (document.getElementById('personLastName')?.value || '{{ person.last_name }}').trim();
+  const res = await postJson(`/api/properties/${personCommPropertyId}/people/${personId}/skip-trace`, {
+    first_name: firstName,
+    last_name: lastName
+  });
+  if (!res.ok) {
+    alert((res.data && res.data.error) ? res.data.error : 'Skip trace failed.');
+    return;
+  }
+  const s = res.data.summary || {};
+  alert(`Skip trace complete. Matches: ${s.matched_people || 0}, Phones +${s.phones_added || 0}, Emails +${s.emails_added || 0}, Addresses +${s.addresses_added || 0}, Relatives +${s.relatives_added || 0}.`);
+  window.location.reload();
+});
+
+document.addEventListener('change', async (e)=>{
+  if(e.target.classList.contains('touch-label')){ const id=e.target.dataset.id; const r=await patchJson(`/api/touchpoints/${id}/label`, {channel_label:e.target.value}); if(r.ok) flash(e.target.closest('tr')); }
+  if(e.target.classList.contains('touch-status')){ const id=e.target.dataset.id; const r=await patchJson(`/api/touchpoints/${id}/status`, {status:e.target.value}); if(r.ok) flash(e.target.closest('tr')); }
+  if(e.target.classList.contains('social-status')){ const id=e.target.dataset.id; const r=await patchJson(`/api/socials/${id}/status`, {status:e.target.value}); if(r.ok) flash(e.target.closest('tr')); }
+});
+
+document.addEventListener('click', async (e)=>{
+  if(e.target.classList.contains('delete-touch')){ if(!window.confirm('Delete this phone/email record? This cannot be undone.')) return; const id=e.target.dataset.id; const r=await delReq(`/api/touchpoints/${id}`); if(r.ok) e.target.closest('tr').remove(); }
+  if(e.target.classList.contains('delete-social')){ if(!window.confirm('Delete this social account? This cannot be undone.')) return; const id=e.target.dataset.id; const r=await delReq(`/api/socials/${id}`); if(r.ok) e.target.closest('tr').remove(); }
+});
+
+function bindEnter(formId, handler){ const form=document.getElementById(formId); form.addEventListener('submit',(e)=>{e.preventDefault(); handler(form);}); form.addEventListener('keydown',(e)=>{ if(e.key==='Enter'){ e.preventDefault(); form.requestSubmit(); }}); }
+
+bindEnter('addPhoneForm', async(form)=>{ const label=form.querySelector('[name=channel_label]').value; const value=form.querySelector('[name=value]').value.trim(); if(!value) return; const res=await postJson(`/api/people/${personId}/touchpoints`, {channel_type:'Phone',channel_label:label,value,status:'Unknown'}); if(!res.ok||!res.data.id) return; const tr=document.createElement('tr'); tr.innerHTML=`<td><select class="touch-label" data-id="${res.data.id}"><option ${label==='Landline'?'selected':''}>Landline</option><option ${label==='Mobile'?'selected':''}>Mobile</option><option ${label==='VoIP'?'selected':''}>VoIP</option><option ${label==='Fax'?'selected':''}>Fax</option><option ${label==='Unknown'?'selected':''}>Unknown</option></select></td><td>${value}</td><td><select class="touch-status" data-id="${res.data.id}"><option>Correct</option><option>Incorrect</option><option>DNC</option><option>DNT</option><option>No Answer</option><option>Dead</option><option>Undeliverable</option><option>Not in service</option><option selected>Unknown</option></select></td><td><button type="button" class="icon-btn delete-touch" data-id="${res.data.id}">x</button></td>`; tr.classList.add('fade-highlight'); document.getElementById('phoneRows').prepend(tr); form.reset(); });
+bindEnter('addEmailForm', async(form)=>{ const value=form.querySelector('[name=value]').value.trim(); if(!value) return; const res=await postJson(`/api/people/${personId}/touchpoints`, {channel_type:'Email',channel_label:'Email',value,status:'Unknown'}); if(!res.ok||!res.data.id) return; const tr=document.createElement('tr'); tr.innerHTML=`<td>${value}</td><td><select class="touch-status" data-id="${res.data.id}"><option>Correct</option><option>Incorrect</option><option>DNC</option><option>DNT</option><option>No Answer</option><option>Dead</option><option>Undeliverable</option><option>Not in service</option><option selected>Unknown</option></select></td><td><button type="button" class="icon-btn delete-touch" data-id="${res.data.id}">x</button></td>`; tr.classList.add('fade-highlight'); document.getElementById('emailRows').prepend(tr); form.reset(); });
+bindEnter('addSocialForm', async(form)=>{ const platform=form.querySelector('[name=platform]').value.trim(); const handle=form.querySelector('[name=handle]').value.trim(); const url=form.querySelector('[name=url]').value.trim(); if(!platform&&!handle&&!url) return; const res=await postJson(`/api/people/${personId}/socials`, {platform,handle,url,status:'Unverified'}); if(!res.ok||!res.data.id) return; const profileUrl=socialUrl(platform, handle, url); const tr=document.createElement('tr'); tr.innerHTML=`<td>${platform}</td><td><a href="${esc(profileUrl)}" target="_blank">${esc(handle || profileUrl)}</a></td><td><select class="social-status" data-id="${res.data.id}"><option selected>Unverified</option><option>Verified</option><option>Incorrect</option><option>Dead</option></select></td><td><button type="button" class="icon-btn delete-social" data-id="${res.data.id}">x</button></td>`; tr.classList.add('fade-highlight'); document.getElementById('socialRows').prepend(tr); form.reset(); });
+
+document.getElementById('personNoteForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const source = document.getElementById('personNoteSource').value.trim() || 'Manual';
+  const noteBody = document.getElementById('personNoteBody').value.trim();
+  if (!noteBody) return;
+  const res = await postJson(`/api/people/${personId}/notes`, { source, note_body: noteBody });
+  if (!res.ok || !res.data) return;
+  const n = res.data;
+  const card = document.createElement('article');
+  card.className = 'note-card fade-highlight';
+  card.innerHTML = `<div class="note-meta"><strong>${esc(n.source)}</strong> <span>${esc(n.created_at)}</span></div><p>${esc(n.note_body)}</p>`;
+  const list = document.getElementById('personNotesList');
+  if (list.querySelector('p') && list.querySelector('p').textContent === 'No notes yet.') list.innerHTML = '';
+  list.prepend(card);
+  document.getElementById('personNoteBody').value = '';
+});
+
+document.getElementById('personCommTabs').addEventListener('click', (e) => {
+  if (!e.target.classList.contains('comm-tab')) return;
+  setPersonCommChannel(e.target.dataset.channel);
+});
+
+document.getElementById('personSmsComposer').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (personCommChannel === 'EMAIL' || !personCommPropertyId) return;
+  const toNumber = document.getElementById('personCommToNumber').value.trim();
+  if (!toNumber) return;
+  const bodyInput = document.getElementById('personSmsBody');
+  const body = bodyInput.value.trim();
+  if (!body) return;
+  const res = await postJson(`/api/people/${personId}/communications`, {
+    property_id: personCommPropertyId,
+    channel: 'SMS',
+    direction: 'Outbound',
+    to_number: toNumber,
+    body
+  });
+  if (!res.ok || !res.data.id) {
+    if (res.data && res.data.error) alert(res.data.error);
+    return;
+  }
+  const m = res.data;
+  const row = document.createElement('article');
+  row.className = 'msg-row outbound fade-highlight';
+  row.dataset.channel = (m.channel || 'SMS').toUpperCase();
+  const toMeta = m.to_number ? ` to ${esc(m.to_number)}` : '';
+  row.innerHTML = `<div class="msg-meta"><span>${esc(m.direction)}${toMeta}</span><span>${esc(m.sent_at)}</span><span class="msg-status">${esc(m.status)}</span></div><div class="msg-bubble">${esc(m.body)}</div>`;
+  document.getElementById('personCommFeed').appendChild(row);
+  bodyInput.value = '';
+  applyPersonCommFilter();
+});
+
+document.getElementById('personSmsBody').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    document.getElementById('personSmsComposer').requestSubmit();
+  }
+});
+
+document.getElementById('personCommToNumber').addEventListener('change', () => {
+  if (personCommChannel === 'EMAIL') return;
+  document.getElementById('personSmsSendBtn').disabled = !document.getElementById('personCommToNumber').value || !personCommPropertyId;
+});
+
+setPersonCommChannel('ALL');
+</script>
+{% endblock %}

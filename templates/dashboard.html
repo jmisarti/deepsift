@@ -1,0 +1,75 @@
+﻿{% extends "base.html" %}
+{% block content %}
+<section class="cards">
+    <article><h3>Properties</h3><p>{{ counts.properties }}</p></article>
+    <article><h3>People</h3><p>{{ counts.people }}</p></article>
+    <article><h3>Touchpoints</h3><p>{{ counts.touchpoints }}</p></article>
+    <article><h3>Relationships</h3><p>{{ counts.relationships }}</p></article>
+</section>
+
+<section class="panel">
+    <h2>Property Pipeline</h2>
+    <form id="filterForm" method="get" class="grid-form compact">
+        <label>Status
+            <select id="statusFilter" name="status">
+                <option value="">All</option>
+                {% for s in ['Untouched','Interested','Not Interested','Sold','Listed','DNC','Opt Out','Follow Up'] %}
+                <option value="{{ s }}" {% if status_filter == s %}selected{% endif %}>{{ s }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>Search Address <input id="addressSearch" name="q" value="{{ q }}" placeholder="e.g. Main St, West Orange"></label>
+    </form>
+
+    <table>
+        <thead><tr><th>Property</th><th>Owner</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+            {% for p in properties %}
+            <tr>
+                <td>{{ p.street }}, {{ p.city }}, {{ p.state }} {{ p.postal_code }}</td>
+                <td>{{ p.owner_first }} {{ p.owner_last }}</td>
+                <td><span class="pill">{{ p.status }}</span></td>
+                <td><a href="{{ url_for('property_detail', property_id=p.id) }}">Open</a></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="panel">
+    <details>
+        <summary><strong>Add New Property Lead</strong></summary>
+        <form method="post" action="{{ url_for('create_property_route') }}" class="grid-form" style="margin-top:0.8rem;">
+            <label>Property Street <input name="property_street" required></label>
+            <label>City <input name="property_city" required></label>
+            <label>State <input name="property_state" required></label>
+            <label>ZIP <input name="property_zip" required></label>
+            <label>Status
+                <select name="property_status">
+                    <option selected>Untouched</option><option>Interested</option><option>Not Interested</option><option>Sold</option><option>Listed</option><option>DNC</option><option>Opt Out</option><option>Follow Up</option>
+                </select>
+            </label>
+            <label class="span2">Property Notes <textarea name="property_notes"></textarea></label>
+            <label>Owner First Name <input name="owner_first_name" required></label>
+            <label>Owner Last Name <input name="owner_last_name" required></label>
+            <label>Owner Phone <input name="owner_phone"></label>
+            <label>Owner Email <input name="owner_email"></label>
+            <label class="span2">Owner Notes <textarea name="owner_notes"></textarea></label>
+            <button type="submit">Create Lead</button>
+        </form>
+    </details>
+</section>
+
+<script>
+const filterForm = document.getElementById('filterForm');
+const statusFilter = document.getElementById('statusFilter');
+const addressSearch = document.getElementById('addressSearch');
+statusFilter.addEventListener('change', () => filterForm.requestSubmit());
+addressSearch.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        filterForm.requestSubmit();
+    }
+});
+</script>
+{% endblock %}

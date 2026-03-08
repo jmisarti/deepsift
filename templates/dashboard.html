@@ -27,7 +27,7 @@
             {% for p in properties %}
             <tr>
                 <td>{{ p.street }}, {{ p.city }}, {{ p.state }} {{ p.postal_code }}</td>
-                <td>{{ p.owner_first }} {{ p.owner_last }}</td>
+                <td>{{ p.owner_first }} {{ p.owner_middle or '' }} {{ p.owner_last }}</td>
                 <td><span class="pill">{{ p.status }}</span></td>
                 <td><a href="{{ url_for('property_detail', property_id=p.id) }}">Open</a></td>
             </tr>
@@ -51,6 +51,7 @@
             </label>
             <label class="span2">Property Notes <textarea name="property_notes"></textarea></label>
             <label>Owner First Name <input name="owner_first_name" required></label>
+            <label>Owner Middle <input name="owner_middle_name"></label>
             <label>Owner Last Name <input name="owner_last_name" required></label>
             <label>Owner Phone <input name="owner_phone"></label>
             <label>Owner Email <input name="owner_email"></label>

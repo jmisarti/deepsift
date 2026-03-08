@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Referral Property Detail</h2>
+    <p><a href="{{ url_for('referral_dashboard') }}">Back to Referral Queue</a></p>
+    {% if notice %}
+    <div class="notice-banner">{{ notice }}</div>
+    {% endif %}
+    <table>
+        <tbody>
+            <tr><th style="width:180px;">Address</th><td>{{ referral.full_address or "-" }}</td></tr>
+            <tr><th>Status</th><td><span class="pill">{{ referral.status or "-" }}</span></td></tr>
+            <tr><th>Referral Status</th><td>{{ referral.referral_status or 'Untouched' }}</td></tr>
+            <tr><th>Owners</th><td>{{ referral.owner_names or "-" }}</td></tr>
+            <tr><th>Phone(s)</th><td>{% if phones %}{% for p in phones %}{{ p.number|fmt_phone }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}-{% endif %}</td></tr>
+            <tr><th>Email(s)</th><td>{% if emails %}{{ emails|join(', ') }}{% else %}-{% endif %}</td></tr>
+            <tr><th>Winning Realtor</th><td>{% if winning_realtor %}{{ winning_realtor.first_name }} {{ winning_realtor.last_name }}{% if winning_realtor.brokerage %} ({{ winning_realtor.brokerage }}){% endif %}{% else %}-{% endif %}</td></tr>
+            <tr><th>Last Synced</th><td>{{ referral.last_synced_at }}</td></tr>
+        </tbody>
+    </table>
+</section>
+
+<section class="panel">
+    <h3>Referral Management</h3>
+    <form method="post" action="{{ url_for('referral_manage_detail', property_uuid=referral.property_uuid) }}" class="grid-form compact">
+        <label>Referral Status
+            <select name="referral_status">
+                {% for rs in referral_statuses %}
+                <option value="{{ rs }}" {% if referral.referral_status == rs %}selected{% endif %}>{{ rs }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>Winning Realtor
+            <select name="winning_realtor_id">
+                <option value="">None</option>
+                {% for r in realtors %}
+                <option value="{{ r.id }}" {% if referral.winning_realtor_id and referral.winning_realtor_id == r.id %}selected{% endif %}>{{ r.first_name }} {{ r.last_name }}{% if r.brokerage %} - {{ r.brokerage }}{% endif %}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label class="span2">Notes
+            <textarea name="referral_notes" rows="3" placeholder="Add notes...">{{ referral.referral_notes or '' }}</textarea>
+        </label>
+        <button type="submit">Save Referral Management</button>
+    </form>
+</section>
+
+<section class="panel">
+    <h3>Send To Realtors</h3>
+    <form method="get" class="grid-form compact">
+        <label>Target Market
+            <select name="market">
+                <option value="">All</option>
+                {% for county in nj_counties %}
+                <option value="{{ county }}" {% if market_filter == county %}selected{% endif %}>{{ county }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <button type="submit">Filter Realtors</button>
+    </form>
+    <form method="post" action="{{ url_for('referral_push_sms', property_uuid=referral.property_uuid) }}">
+        <input type="hidden" name="market" value="{{ market_filter }}">
+        <table>
+            <thead><tr><th></th><th>Name</th><th>Phone</th><th>Email</th><th>Brokerage</th><th>Target Markets</th></tr></thead>
+            <tbody>
+                {% for r in realtors %}
+                <tr>
+                    <td><input type="checkbox" name="realtor_ids" value="{{ r.id }}"></td>
+                    <td>{{ r.first_name }} {{ r.last_name }}</td>
+                    <td>{{ r.phone or '-' }}</td>
+                    <td>{{ r.email or '-' }}</td>
+                    <td>{{ r.brokerage or '-' }}</td>
+                    <td>{{ r.target_markets or '-' }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="6">No realtors found. <a href="{{ url_for('referral_realtors_page') }}">Add or upload realtors</a>.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <p class="inline-actions">
+            <button type="submit" name="send_mode" value="selected">Send To Selected Realtors</button>
+            <button type="submit" name="send_mode" value="filtered">Send To Filtered Realtors</button>
+        </p>
+    </form>
+    <p><small>Message format:</small></p>
+    <pre class="json-block">New Listing Lead
+Name: {Owner Name}
+Address: {Property Address, City, State}
+Phone: {Contact Phone}
+Email: {Contact Email}</pre>
+</section>
+
+<section class="panel">
+    <h3>Referral SMS Activity</h3>
+    <table>
+        <thead>
+            <tr><th>Date</th><th>Realtor</th><th>Phone</th><th>Status</th><th>Message</th></tr>
+        </thead>
+        <tbody>
+            {% for a in push_activity %}
+            <tr>
+                <td>{{ a.created_at }}</td>
+                <td>{{ a.first_name }} {{ a.last_name }}{% if a.brokerage %} ({{ a.brokerage }}){% endif %}</td>
+                <td>{{ a.to_number|fmt_phone if a.to_number else '-' }}</td>
+                <td>{{ a.status or '-' }}</td>
+                <td>{{ a.message_body }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5">No referral SMS activity yet.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="panel">
+    <details>
+        <summary><strong>Full Cached Payload</strong></summary>
+        <pre class="json-block">{{ payload_json_pretty }}</pre>
+    </details>
+</section>
+{% endblock %}

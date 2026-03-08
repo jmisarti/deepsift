@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Coming Soon</h2>
+    <p>Implementation summary for the full automation roadmap.</p>
+
+    <h3>1) County Data Automation</h3>
+    <p>Automate login + navigation on county probate sources, track the last processed sequence number, and run incremental pulls daily.</p>
+    <p>Store raw source rows, normalized records, and job logs so every import is auditable and resumable.</p>
+
+    <h3>2) Data Cleaning and Standardization</h3>
+    <p>Normalize owner names, addresses, phones, and emails before pushing to downstream systems.</p>
+    <p>Apply dedupe and merge rules so new records enrich existing people/properties instead of creating duplicates.</p>
+
+    <h3>3) Push to ReiSIFT and Pull Back</h3>
+    <p>Use ReiSIFT as campaign/list system of record while this app keeps local intelligence and communications context.</p>
+    <p>Use controlled sync and local cache refreshes to avoid unnecessary API load.</p>
+
+    <h3>4) Skip Tracing Pipeline</h3>
+    <p>Run property and person skip trace flows with explicit handling for middle initials and location hints.</p>
+    <p>Ingest relatives/associates, deduplicate, and preserve useful metadata in person notes with source/timestamp.</p>
+
+    <h3>5) Automated Outreach Engine</h3>
+    <p>Support SMS/email sequences with sending windows, retry rules, queue persistence, and stop-on-reply behavior.</p>
+    <p>Skip invalid channels automatically (landline, DNC, bounced, not in service, invalid email).</p>
+
+    <h3>6) Response Analysis and Escalation</h3>
+    <p>Analyze inbound responses for intent (positive, neutral, rejection, wrong person, do-not-contact) and adjust status automatically.</p>
+    <p>Escalate when touch thresholds are reached (owner -> relatives -> neighbors/associates) with clear tasking and notes.</p>
+
+    <h3>7) Appointment and Acquisitions Handoff</h3>
+    <p>Route qualified conversations to acquisitions with appointment windows, assigned rep, and handoff context.</p>
+    <p>Track appointment lifecycle and push final outcomes back into ReiSIFT status fields.</p>
+
+    <h3>8) Worker Queue and Reliability</h3>
+    <p>Use queue workers for scraping, skip tracing, SMS/email sends, webhook processing, and AI analysis.</p>
+    <p>Each worker task should be idempotent, retry-safe, and visible in an operations dashboard.</p>
+
+    <h3>Ownership and Worker Matrix</h3>
+    <p>Draft system ownership matrix for ReiSIFT and Deep Dive.</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Domain</th>
+                <th>Primary Owner</th>
+                <th>Sync Direction</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>List management, tags, campaign/disposition statuses</td>
+                <td>ReiSIFT</td>
+                <td>ReiSIFT -> Deep Dive</td>
+                <td>ReiSIFT remains system of record for marketing ops.</td>
+            </tr>
+            <tr>
+                <td>Referral queue and referral lifecycle</td>
+                <td>ReiSIFT + Deep Dive</td>
+                <td>Bi-directional</td>
+                <td>Deep Dive stores local cache and activity context; writes back refined outcomes.</td>
+            </tr>
+            <tr>
+                <td>Property + person relationship graph (owner, relatives, associates)</td>
+                <td>Deep Dive</td>
+                <td>Deep Dive -> ReiSIFT (selected outcomes)</td>
+                <td>Core deep prospecting intelligence should stay here.</td>
+            </tr>
+            <tr>
+                <td>Obituary parsing and confidence notes</td>
+                <td>Deep Dive</td>
+                <td>Local only (optional summary to ReiSIFT)</td>
+                <td>Model-level extraction and confidence tracking belong in app notes.</td>
+            </tr>
+            <tr>
+                <td>SMS/email conversation threading + alerts</td>
+                <td>Deep Dive</td>
+                <td>Local only (status summary outbound)</td>
+                <td>Deep Dive should own per-contact communications and automations.</td>
+            </tr>
+            <tr>
+                <td>Direct mail production</td>
+                <td>ReiSIFT / Mailhouse provider</td>
+                <td>Deep Dive -> provider; webhook -> Deep Dive</td>
+                <td>Use provider for fulfillment; store payload/proof/order status in notes.</td>
+            </tr>
+            <tr>
+                <td>Escalation rules (no response after X touches)</td>
+                <td>Deep Dive</td>
+                <td>Deep Dive -> ReiSIFT status updates</td>
+                <td>Escalate from owner to relatives/neighbors while preserving audit history.</td>
+            </tr>
+            <tr>
+                <td>Appointment handoff and human takeover state</td>
+                <td>Deep Dive</td>
+                <td>Deep Dive -> ReiSIFT (final outcome)</td>
+                <td>Track qualified responses and meeting handoff timestamps.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <details class="collapsed-section" style="margin-top: 1rem;">
+        <summary>Draft Notes and Open Questions</summary>
+        <div style="margin-top: 0.75rem;">
+            <p>1. Avoid rebuilding full ReiSIFT list/campaign/disposition features unless there is a hard workflow gap.</p>
+            <p>2. Keep AI analysis event-driven instead of always-on; trigger from inbound responses and queued tasks.</p>
+            <p>3. Add SLAs for worker retries so no lead is silently dropped when external APIs fail.</p>
+            <p>4. Define exact escalation thresholds by channel and cadence (for example: 6 touches with no response).</p>
+            <p>5. Add role-based controls for auto-send and appointment confirmation steps.</p>
+        </div>
+    </details>
+</section>
+{% endblock %}

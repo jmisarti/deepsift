@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Referral Realtors</h2>
+    <p>Upload or add realtors and categorize by NJ target markets.</p>
+    <p><a href="{{ url_for('referral_dashboard') }}">Back to Referral Queue</a></p>
+    {% if notice %}
+    <div class="notice-banner">{{ notice }}</div>
+    {% endif %}
+
+    <details open>
+        <summary><strong>Add New Realtor</strong></summary>
+        <form method="post" class="grid-form compact">
+            <label>First Name <input name="first_name" required></label>
+            <label>Last Name <input name="last_name" required></label>
+            <label>Email <input name="email"></label>
+            <label>Phone <input name="phone"></label>
+            <label>Brokerage <input name="brokerage"></label>
+            <fieldset class="span2 checkbox-grid">
+                <legend>Target Market (NJ Counties)</legend>
+                {% for county in nj_counties %}
+                <label><input type="checkbox" name="target_markets" value="{{ county }}"> {{ county }}</label>
+                {% endfor %}
+            </fieldset>
+            <button type="submit">Add Realtor</button>
+        </form>
+    </details>
+
+    <details>
+        <summary><strong>Upload Realtors CSV</strong></summary>
+        <p><a href="{{ url_for('referral_realtors_template') }}">Download Realtor CSV Template</a></p>
+        <form method="post" action="{{ url_for('referral_realtors_upload') }}" enctype="multipart/form-data" class="grid-form compact">
+            <label class="span2">CSV file
+                <input type="file" name="realtors_file" accept=".csv" required>
+            </label>
+            <fieldset class="span2 checkbox-grid">
+                <legend>Default Target Market(s)</legend>
+                {% for county in nj_counties %}
+                <label><input type="checkbox" name="target_markets" value="{{ county }}"> {{ county }}</label>
+                {% endfor %}
+            </fieldset>
+            <button type="submit">Upload CSV</button>
+        </form>
+    </details>
+</section>
+
+<section class="panel">
+    <h3>Realtor Table</h3>
+    <form method="get" class="grid-form compact">
+        <label>Name/Brokerage
+            <input name="q" value="{{ q }}" placeholder="partial name">
+        </label>
+        <label>Target Market
+            <select name="market">
+                <option value="">All</option>
+                {% for county in nj_counties %}
+                <option value="{{ county }}" {% if market == county %}selected{% endif %}>{{ county }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <button type="submit">Apply</button>
+    </form>
+    <table>
+        <thead>
+            <tr><th>Name</th><th>Email</th><th>Phone</th><th>Brokerage</th><th>Target Markets</th><th></th></tr>
+        </thead>
+        <tbody>
+            {% for r in realtors %}
+            <tr>
+                <td>{{ r.first_name }} {{ r.last_name }}</td>
+                <td>{{ r.email or '-' }}</td>
+                <td>{{ r.phone|fmt_phone if r.phone else '-' }}</td>
+                <td>{{ r.brokerage or '-' }}</td>
+                <td>{{ r.target_markets or '-' }}</td>
+                <td>
+                    <div class="inline-actions">
+                        <a href="#edit-realtor-{{ r.id }}">Edit</a>
+                        <form method="post" action="{{ url_for('referral_realtor_delete', realtor_id=r.id) }}" onsubmit="return confirm('Delete this realtor? This cannot be undone.');">
+                            <input type="hidden" name="_q" value="{{ q }}">
+                            <input type="hidden" name="_market" value="{{ market }}">
+                            <button type="submit" class="icon-btn" title="Delete realtor">x</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            <tr id="edit-realtor-{{ r.id }}">
+                <td colspan="6">
+                    <details>
+                        <summary><strong>Edit {{ r.first_name }} {{ r.last_name }}</strong></summary>
+                        <form method="post" action="{{ url_for('referral_realtor_update', realtor_id=r.id) }}" class="grid-form compact">
+                            <input type="hidden" name="_q" value="{{ q }}">
+                            <input type="hidden" name="_market" value="{{ market }}">
+                            <label>First Name <input name="first_name" value="{{ r.first_name }}" required></label>
+                            <label>Last Name <input name="last_name" value="{{ r.last_name }}" required></label>
+                            <label>Email <input name="email" value="{{ r.email or '' }}"></label>
+                            <label>Phone <input name="phone" value="{{ r.phone or '' }}"></label>
+                            <label>Brokerage <input name="brokerage" value="{{ r.brokerage or '' }}"></label>
+                            <label class="span2">Target Markets (comma-separated) <input name="target_markets" value="{{ r.target_markets or '' }}"></label>
+                            <button type="submit">Save</button>
+                        </form>
+                    </details>
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6">No realtors found.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

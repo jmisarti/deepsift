@@ -1,60 +1,69 @@
-﻿# Deep Prospect CRM (MVP)
+# Deep Prospect CRM
 
-Property-centric CRM for deep homeowner prospecting.
-
-## What it does
-- Tracks properties with owner and resident links.
-- Stores contact touchpoints (phone/email/etc) with status and notes.
-- Stores social accounts with status and notes.
-- Maps relationship graph (relative, associate, neighbor) as references.
-- Keeps property activity log.
-- Exposes JSON API for light integrations.
-- Includes lightweight public web lookup endpoint for prospecting context.
-- Imports obituary-based relatives/spouse signals into a property record.
-- Adds AI obituary extraction API using OpenAI with strict JSON schema.
+Property-centric CRM for deep homeowner prospecting, relationship mapping, SMS/email workflows, and ReiSift integrations.
 
 ## Stack
 - Python 3.13
 - Flask
-- SQLite (local file: `crm.db`)
+- SQLite (local default) or persistent volume path via `CRM_DB_PATH`
 
-## Run locally
-1. Create virtual environment (optional):
+## Local Run
+1. Create venv (optional):
    - `python -m venv .venv`
    - `.\.venv\Scripts\Activate.ps1`
-2. Install dependencies:
+2. Install deps:
    - `python -m pip install -r requirements.txt`
-3. Set AI env vars (for AI obituary import):
-   - `$env:OPENAI_API_KEY="<your_key>"`
-   - Optional: `$env:OPENAI_MODEL="gpt-4.1-mini"`
-4. Start app:
+3. Copy env template:
+   - `Copy-Item .env.example .env`
+4. Set needed keys in `.env` (OpenAI, SmrtPhone, SkipSherpa, ReiSift, etc.)
+5. Start:
    - `python app.py`
-5. Open:
+6. Open:
    - `http://127.0.0.1:5000`
 
-On first run, the app creates schema and seed data using the Jill Smith example.
+## Security Hardening Added
+- No hardcoded API key defaults in code.
+- Secret key from env (`FLASK_SECRET_KEY` / `SECRET_KEY`).
+- Secure session cookie options (`HTTPOnly`, `SameSite=Lax`, optional `Secure`).
+- Optional app login gate for all UI/API routes:
+  - `APP_AUTH_ENABLED=1`
+  - `APP_AUTH_USERNAME=...`
+  - `APP_AUTH_PASSWORD=...` (or `APP_AUTH_PASSWORD_HASH`)
 
-## Core routes
-- UI
-  - `/` dashboard
-  - `/property/<id>` property workspace
-  - `/person/<id>` person profile
-  - `POST /property/<id>/obituary-import`
-  - `POST /property/<id>/obituary-import-ai`
-- API
-  - `GET/POST /api/properties`
-  - `GET /api/properties/<id>`
-  - `POST /api/people/<id>/touchpoints`
-  - `GET /api/people/<id>/network`
-  - `GET /api/web-search?q=<query>`
-  - `POST /api/obituary/extract` with `{ "url": "..." }`
-  - `POST /api/obituary/ai-extract` with `{ "url": "...", "subject_name": "John Smith" }`
-  - `POST /api/properties/<id>/import-obituary` with `{ "url": "...", "subject_person_id": 1 }`
-  - `POST /api/properties/<id>/import-obituary-ai` with `{ "url": "...", "subject_person_id": 1 }`
-  - `GET /api/properties/<id>/prospecting-snapshot`
+Generate a password hash (optional):
+```powershell
+@'
+from werkzeug.security import generate_password_hash
+print(generate_password_hash("YourStrongPasswordHere"))
+'@ | python -
+```
+
+## Railway Deploy (Recommended)
+This repo includes:
+- `Procfile`
+- `railway.json` (healthcheck: `/healthz`)
+- Gunicorn in `requirements.txt`
+
+### Deploy Steps
+1. Push repo to GitHub.
+2. In Railway: New Project -> Deploy from GitHub repo.
+3. Add a persistent volume (for SQLite) and set:
+   - `CRM_DB_PATH=/data/crm.db`
+4. Set Railway Variables from `.env.example`.
+5. Important production vars:
+   - `FLASK_DEBUG=0`
+   - `SESSION_COOKIE_SECURE=1`
+   - `APP_AUTH_ENABLED=1`
+   - `APP_AUTH_USERNAME=...`
+   - `APP_AUTH_PASSWORD` or `APP_AUTH_PASSWORD_HASH`
+6. Point webhook providers to your Railway public URL endpoints.
+
+### Secrets Handling
+- Keep secrets only in Railway Variables (never commit to git).
+- `.env` is gitignored locally.
+- Rotate any previously exposed keys before production cutover.
 
 ## Notes
-- AI obituary extraction requires `OPENAI_API_KEY`.
-- Obituary extraction should be reviewed by an operator before outbound actions.
-- Web lookup uses DuckDuckGo instant-answer endpoint and returns snippet-level context only.
-- This is an MVP foundation designed to expand into stronger identity resolution and data-provider integrations.
+- If your app must run 24/7 and receive webhooks reliably, do not depend on local machine + tunnel.
+- Selenium/web scraping workers should run as separate workers and push results into this app via API.
+

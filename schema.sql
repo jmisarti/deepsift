@@ -3,6 +3,7 @@
 CREATE TABLE IF NOT EXISTS people (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     first_name TEXT NOT NULL,
+    middle_name TEXT,
     last_name TEXT NOT NULL,
     primary_phone TEXT,
     primary_email TEXT,
@@ -193,5 +194,188 @@ CREATE TABLE IF NOT EXISTS person_notes (
     payload_json TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(person_id) REFERENCES people(id)
+);
+
+CREATE TABLE IF NOT EXISTS reisift_referrals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_uuid TEXT NOT NULL UNIQUE,
+    status TEXT,
+    full_address TEXT,
+    owner_names TEXT,
+    payload_json TEXT,
+    referral_status TEXT NOT NULL DEFAULT 'Untouched',
+    winning_realtor_id INTEGER,
+    referral_notes TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    last_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS mail_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_id INTEGER NOT NULL,
+    person_id INTEGER,
+    mode TEXT NOT NULL,
+    template_id INTEGER NOT NULL,
+    external_order_id TEXT,
+    status TEXT,
+    cost REAL,
+    recipient_count INTEGER NOT NULL DEFAULT 0,
+    request_json TEXT,
+    response_json TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(property_id) REFERENCES properties(id),
+    FOREIGN KEY(person_id) REFERENCES people(id)
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS app_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    route TEXT,
+    status_code INTEGER,
+    error_message TEXT NOT NULL,
+    details TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS referral_realtors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    email TEXT,
+    phone TEXT,
+    brokerage TEXT,
+    target_markets TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS referral_push_activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_uuid TEXT NOT NULL,
+    realtor_id INTEGER NOT NULL,
+    to_number TEXT,
+    message_body TEXT NOT NULL,
+    status TEXT,
+    external_id TEXT,
+    response_json TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(realtor_id) REFERENCES referral_realtors(id)
+);
+
+CREATE TABLE IF NOT EXISTS sequence_campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'Active',
+    stop_on_reply INTEGER NOT NULL DEFAULT 1,
+    send_window_start TEXT NOT NULL DEFAULT '10:00',
+    send_window_end TEXT NOT NULL DEFAULT '16:30',
+    timezone TEXT NOT NULL DEFAULT 'America/New_York',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS sequence_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL,
+    step_order INTEGER NOT NULL,
+    delay_minutes INTEGER NOT NULL DEFAULT 0,
+    channel TEXT NOT NULL DEFAULT 'SMS',
+    subject_template TEXT,
+    body_template TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(campaign_id) REFERENCES sequence_campaigns(id)
+);
+
+CREATE TABLE IF NOT EXISTS sequence_enrollments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL,
+    property_id INTEGER NOT NULL,
+    person_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Active',
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    next_run_at TEXT,
+    last_step_order INTEGER NOT NULL DEFAULT 0,
+    completed_at TEXT,
+    stopped_reason TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(campaign_id) REFERENCES sequence_campaigns(id),
+    FOREIGN KEY(property_id) REFERENCES properties(id),
+    FOREIGN KEY(person_id) REFERENCES people(id)
+);
+
+CREATE TABLE IF NOT EXISTS sequence_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    enrollment_id INTEGER NOT NULL,
+    step_id INTEGER,
+    step_order INTEGER,
+    channel TEXT,
+    status TEXT NOT NULL DEFAULT 'Queued',
+    communication_id INTEGER,
+    error_text TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(enrollment_id) REFERENCES sequence_enrollments(id),
+    FOREIGN KEY(step_id) REFERENCES sequence_steps(id),
+    FOREIGN KEY(communication_id) REFERENCES communications(id)
+);
+
+CREATE TABLE IF NOT EXISTS obituary_expansion_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_id INTEGER NOT NULL,
+    root_subject_person_id INTEGER NOT NULL,
+    root_source_url TEXT NOT NULL,
+    max_depth INTEGER NOT NULL DEFAULT 1,
+    expand_deceased INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'Running',
+    summary_json TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    FOREIGN KEY(property_id) REFERENCES properties(id),
+    FOREIGN KEY(root_subject_person_id) REFERENCES people(id)
+);
+
+CREATE TABLE IF NOT EXISTS obituary_expansion_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    property_id INTEGER NOT NULL,
+    subject_person_id INTEGER NOT NULL,
+    related_person_id INTEGER,
+    depth INTEGER NOT NULL DEFAULT 1,
+    person_name TEXT,
+    relationship_type TEXT,
+    relative_status TEXT,
+    confidence REAL,
+    processing_status TEXT NOT NULL DEFAULT 'Imported',
+    source_url TEXT,
+    note TEXT,
+    details_json TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(run_id) REFERENCES obituary_expansion_runs(id),
+    FOREIGN KEY(property_id) REFERENCES properties(id),
+    FOREIGN KEY(subject_person_id) REFERENCES people(id),
+    FOREIGN KEY(related_person_id) REFERENCES people(id)
+);
+
+CREATE TABLE IF NOT EXISTS reisift_followups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_uuid TEXT NOT NULL UNIQUE,
+    status TEXT,
+    full_address TEXT,
+    owner_names TEXT,
+    added_at TEXT,
+    outbound_calls INTEGER NOT NULL DEFAULT 0,
+    outbound_sms INTEGER NOT NULL DEFAULT 0,
+    outbound_email INTEGER NOT NULL DEFAULT 0,
+    inbound_responses INTEGER NOT NULL DEFAULT 0,
+    events_json TEXT,
+    tasks_json TEXT,
+    payload_json TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    last_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

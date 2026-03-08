@@ -13,17 +13,32 @@
             <p>Property-centric prospecting and relationship mapping</p>
         </div>
         <nav>
-            <a href="{{ url_for('dashboard') }}">Dashboard</a>
+            <a class="module-link {% if not request.path.startswith('/referral') and not request.path.startswith('/settings') and not request.path.startswith('/sequences') and not request.path.startswith('/follow-ups') and not request.path.startswith('/coming-soon') %}active{% endif %}" href="{{ url_for('dashboard') }}">Deep Dive</a>
+            <a class="module-link {% if request.path.startswith('/referral') %}active{% endif %}" href="{{ url_for('referral_dashboard') }}">Referral</a>
+            <a class="module-link {% if request.path.startswith('/follow-ups') %}active{% endif %}" href="{{ url_for('follow_ups_page') }}">New Leads</a>
+            <div class="module-dropdown {% if request.path.startswith('/settings') or request.path.startswith('/sequences') or request.path.startswith('/coming-soon') %}active{% endif %}" id="settingsMenuWrap">
+                <button type="button" class="module-link module-dropdown-toggle" id="settingsMenuToggle">Settings</button>
+                <div class="module-dropdown-menu hidden" id="settingsMenuPanel">
+                    <a class="module-dropdown-item {% if request.path.startswith('/settings') %}active{% endif %}" href="{{ url_for('settings_page') }}">Global</a>
+                    <a class="module-dropdown-item {% if request.path.startswith('/sequences') %}active{% endif %}" href="{{ url_for('sequences_page') }}">Sequences</a>
+                    <a class="module-dropdown-item {% if request.path.startswith('/coming-soon') %}active{% endif %}" href="{{ url_for('coming_soon') }}">Coming Soon</a>
+                </div>
+            </div>
             <div class="top-notify" id="smsNotifyWrap">
                 <button type="button" id="smsNotifyToggle" class="top-notify-toggle">
-                    SMS
+                    Notifications
                     <span class="top-notify-count hidden" id="smsNotifyCount">0</span>
                 </button>
                 <div class="top-notify-panel hidden" id="smsNotifyPanel">
-                    <h4>Unread SMS</h4>
+                    <h4>Unread Notifications</h4>
                     <div class="top-notify-list" id="smsNotifyList"></div>
                 </div>
             </div>
+            {% if auth_enabled %}
+            <form method="post" action="{{ url_for('logout') }}" class="inline-logout-form">
+                <button type="submit" class="module-link module-link-button">Logout</button>
+            </form>
+            {% endif %}
         </nav>
     </header>
 
@@ -37,6 +52,9 @@
       const panel = document.getElementById('smsNotifyPanel');
       const count = document.getElementById('smsNotifyCount');
       const list = document.getElementById('smsNotifyList');
+      const settingsWrap = document.getElementById('settingsMenuWrap');
+      const settingsToggle = document.getElementById('settingsMenuToggle');
+      const settingsPanel = document.getElementById('settingsMenuPanel');
       if (!wrap || !toggle || !panel || !count || !list) return;
 
       function esc(text) {
@@ -49,32 +67,38 @@
       }
 
       function buildHref(item) {
+        if (item.link_person_id && item.link_property_id) return `/person/${item.link_person_id}?property_id=${item.link_property_id}`;
+        if (item.link_person_id) return `/person/${item.link_person_id}`;
+        if (item.person_id && item.property_id) return `/person/${item.person_id}?property_id=${item.property_id}`;
         if (item.property_id) return `/property/${item.property_id}`;
         if (item.person_id) return `/person/${item.person_id}`;
         return '#';
       }
 
       async function markRead(id) {
-        await fetch(`/api/notifications/sms-unread/${id}/read`, { method: 'POST' });
+        await fetch(`/api/notifications/unread/${id}/read`, { method: 'POST' });
       }
 
       function render(items) {
         setCount(items.length);
         if (!items.length) {
-          list.innerHTML = '<p class="top-notify-empty">No unread SMS</p>';
+          list.innerHTML = '<p class="top-notify-empty">No unread notifications</p>';
           return;
         }
         list.innerHTML = items.map((item) => {
           const href = buildHref(item);
           const from = esc(item.from_number || 'Unknown');
           const sentAt = esc(item.sent_at || '');
-          return `<article class="top-notify-item" data-id="${item.id}"><a class="top-notify-link" href="${href}" data-id="${item.id}">SMS received from ${from}</a><p>${sentAt}</p></article>`;
+          const channel = String(item.channel || '').toUpperCase();
+          const linked = item.link_person_name ? ` (${esc(item.link_person_name)})` : '';
+          const msg = channel === 'EMAIL' ? `Email reply from ${from}${linked}` : `SMS received from ${from}${linked}`;
+          return `<article class="top-notify-item" data-id="${item.id}"><a class="top-notify-link" href="${href}" data-id="${item.id}">${msg}</a><p>${sentAt}</p></article>`;
         }).join('');
       }
 
       async function refresh() {
         try {
-          const r = await fetch('/api/notifications/sms-unread');
+          const r = await fetch('/api/notifications/unread');
           if (!r.ok) return;
           const data = await r.json();
           render(data.items || []);
@@ -82,6 +106,9 @@
       }
 
       toggle.addEventListener('click', () => panel.classList.toggle('hidden'));
+      if (settingsWrap && settingsToggle && settingsPanel) {
+        settingsToggle.addEventListener('click', () => settingsPanel.classList.toggle('hidden'));
+      }
       list.addEventListener('click', async (e) => {
         const a = e.target.closest('.top-notify-link');
         if (!a) return;
@@ -92,7 +119,7 @@
         const item = a.closest('.top-notify-item');
         if (item) item.remove();
         const remaining = list.querySelectorAll('.top-notify-item').length;
-        if (!remaining) list.innerHTML = '<p class="top-notify-empty">No unread SMS</p>';
+        if (!remaining) list.innerHTML = '<p class="top-notify-empty">No unread notifications</p>';
         setCount(remaining);
         const href = a.getAttribute('href') || '#';
         if (href !== '#') window.location.href = href;
@@ -102,6 +129,7 @@
       setInterval(refresh, 5000);
       document.addEventListener('click', (e) => {
         if (!wrap.contains(e.target)) panel.classList.add('hidden');
+        if (settingsWrap && !settingsWrap.contains(e.target)) settingsPanel.classList.add('hidden');
       });
     })();
     </script>

@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Something went wrong</h2>
+    <p>An unexpected error occurred while processing your request.</p>
+    {% if message %}
+    <div class="error-banner">{{ message }}</div>
+    {% endif %}
+    <p><a href="{{ url_for('dashboard') }}">Return to dashboard</a></p>
+</section>
+{% endblock %}

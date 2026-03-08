@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Referral Queue (SIFT)</h2>
+    <p>Status filter: <strong>{{ status_slug }}</strong>. Showing {{ referrals|length }} cached rows.</p>
+    <div class="panel-actions">
+        <form method="post" action="{{ url_for('referral_refresh') }}">
+            <button type="submit">Refresh From REISift</button>
+        </form>
+        <p><a href="{{ url_for('referral_realtors_page') }}">Manage Realtors</a></p>
+    </div>
+    {% if notice %}
+    <div class="notice-banner">{{ notice }}</div>
+    {% endif %}
+    {% if error %}
+    <div class="error-banner">
+        Could not load Referral results from SIFT: {{ error }}
+    </div>
+    {% endif %}
+
+    <table>
+        <thead>
+            <tr>
+                <th>Address</th>
+                <th>Referral Status</th>
+                <th>Outreach</th>
+                <th>Status</th>
+                <th>Owners</th>
+                <th>UUID</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in referrals %}
+            <tr>
+                <td><a href="{{ url_for('referral_property_detail', property_uuid=row.property_uuid) }}">{{ row.full_address or "-" }}</a></td>
+                <td>
+                    <form method="post" action="{{ url_for('referral_update_status', property_uuid=row.property_uuid) }}">
+                        <select name="referral_status" onchange="this.form.submit()">
+                            {% for rs in referral_statuses %}
+                            <option value="{{ rs }}" {% if row.referral_status == rs %}selected{% endif %}>{{ rs }}</option>
+                            {% endfor %}
+                        </select>
+                    </form>
+                </td>
+                <td>{{ 'Sent' if row.push_count else 'Not Sent' }}</td>
+                <td><span class="pill">{{ row.status or "-" }}</span></td>
+                <td>{{ row.owner_names or "-" }}</td>
+                <td><code>{{ row.property_uuid }}</code></td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="6">No records found.</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

@@ -1,18 +1,29 @@
 ﻿{% extends "base.html" %}
 {% block content %}
 <section class="panel">
-    <h2>{{ prop.street }}, {{ prop.city }}, {{ prop.state }} {{ prop.postal_code }}</h2>
-    <label><strong>Status:</strong>
-        <select id="propertyStatusSelect" data-property-id="{{ prop.id }}">
-            {% for s in ['Untouched','Interested','Not Interested','Sold','Listed','DNC','Opt Out','Follow Up'] %}
-            <option value="{{ s }}" {% if prop.status == s %}selected{% endif %}>{{ s }}</option>
-            {% endfor %}
-        </select>
-    </label>
+    <div class="entity-topbar">
+        <h2 class="entity-title">{{ prop.street }}, {{ prop.city }}, {{ prop.state }} {{ prop.postal_code }}</h2>
+        <label class="entity-status"><strong>Status:</strong>
+            <select id="propertyStatusSelect" data-property-id="{{ prop.id }}">
+                {% for s in ['Untouched','Interested','Not Interested','Sold','Listed','DNC','Opt Out','Follow Up'] %}
+                <option value="{{ s }}" {% if prop.status == s %}selected{% endif %}>{{ s }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <details class="entity-integrations">
+            <summary><strong>Integrations</strong></summary>
+            <div class="entity-integrations-menu">
+                <button type="button" id="propertySkipTraceBtn">Skip Trace Property (Owners)</button>
+                <a href="{{ url_for('sequences_page') }}">Sequence Automation</a>
+            </div>
+        </details>
+    </div>
     <p>
         <strong>Owner:</strong>
-        <a href="{{ url_for('person_detail', person_id=owner.id, property_id=prop.id) }}" id="ownerLink">{{ prop.owner_first }} {{ prop.owner_last }}</a>
+        <a href="{{ url_for('person_detail', person_id=owner.id, property_id=prop.id) }}" id="ownerLink">{{ prop.owner_first }} {{ prop.owner_middle or '' }} {{ prop.owner_last }}</a>
     </p>
+    <p><strong>Last Sold Date:</strong> {{ prop.attom_last_sold_date or '-' }}</p>
+    <p><strong>Last Sale Price:</strong> {% if prop.attom_last_sold_price is not none %}${{ "{:,.0f}".format(prop.attom_last_sold_price) }}{% else %}-{% endif %}</p>
 </section>
 
 <section class="panel">
@@ -75,7 +86,7 @@
                             {% endfor %}
                         </select>
                     </td>
-                    <td>{{ t.value }}</td>
+                    <td>{{ t.value|fmt_phone }}</td>
                     <td>
                         <select class="touch-status" data-id="{{ t.id }}">
                             {% for s in ['Correct','Incorrect','DNC','DNT','No Answer','Dead','Undeliverable','Not in service','Unknown'] %}
@@ -157,14 +168,31 @@
 
     <div>
         <h3>Relationships</h3>
-        <table>
-            <thead><tr><th>Full Name</th><th>Relationship</th><th>Status</th></tr></thead>
+        <table class="crm-table">
+            <thead><tr><th>Order</th><th>Full Name</th><th>Relationship</th><th>Deceased</th><th>Status</th><th></th></tr></thead>
             <tbody>
                 {% for rel in owner_relationships %}
-                <tr>
-                    <td><a href="{{ url_for('person_detail', person_id=rel.person_id, property_id=prop.id) }}">{{ rel.first_name }} {{ rel.last_name }}</a></td>
-                    <td>{{ rel.relationship_type }}</td>
-                    <td>{{ rel.outreach_status }}</td>
+                <tr data-relationship-id="{{ rel.relationship_id }}" data-person-id="{{ rel.person_id }}" class="{% if rel.deceased %}deceased-row{% endif %}">
+                    <td>
+                        <div class="inline-order-controls">
+                            <button type="button" class="reorder-rel-btn" data-id="{{ rel.relationship_id }}" data-direction="up" title="Move up">↑</button>
+                            <button type="button" class="reorder-rel-btn" data-id="{{ rel.relationship_id }}" data-direction="down" title="Move down">↓</button>
+                        </div>
+                    </td>
+                    <td><a href="{{ url_for('person_detail', person_id=rel.person_id, property_id=prop.id) }}">{{ rel.first_name }} {{ rel.middle_name or '' }} {{ rel.last_name }}</a></td>
+                    <td>
+                        <input type="text" class="relationship-type-input" value="{{ rel.relationship_type }}" data-id="{{ rel.relationship_id }}">
+                    </td>
+                    <td>{{ 'Yes' if rel.deceased else 'No' }}</td>
+                    <td>
+                        {% set rel_status = 'Skip Traced' if rel.skip_traced else (rel.outreach_status or 'No Contact') %}
+                        <select class="relationship-status" data-person-id="{{ rel.person_id }}">
+                            {% for s in ['No Contact','Contact No Response','Follow Up','Outreach Attempted','In Touch','Not Skipped','Skipped','Skipped, No Info','Skip Traced'] %}
+                            <option value="{{ s }}" {% if rel_status == s %}selected{% endif %}>{{ s }}</option>
+                            {% endfor %}
+                        </select>
+                    </td>
+                    <td><button type="button" class="icon-btn delete-relationship" data-id="{{ rel.relationship_id }}">x</button></td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -177,7 +205,7 @@
                 <label>Last Name <input name="related_last_name" required></label>
                 <label>Relationship Type <input name="relationship_type" value="Relative"></label>
                 <label>Status
-                    <select name="related_status"><option>No Contact</option><option>Contact No Response</option><option>Follow Up</option><option>Outreach Attempted</option></select>
+                    <select name="related_status"><option>No Contact</option><option>Contact No Response</option><option>Follow Up</option><option>Outreach Attempted</option><option>In Touch</option><option>Not Skipped</option><option>Skipped</option><option>Skipped, No Info</option><option>Skip Traced</option></select>
                 </label>
                 <label>Phone <input name="related_phone"></label>
                 <label>Email <input name="related_email"></label>
@@ -203,23 +231,24 @@
         </div>
 
         <div class="comm-header">
-            <strong>Send to</strong>
+            <strong id="commToLabel">Send to (Phone)</strong>
             <select id="commToNumber">
                 {% if owner_phone_options %}
                     {% for ph in owner_phone_options %}
-                    <option value="{{ ph }}">{{ ph }}</option>
+                    <option value="{{ ph }}">{{ ph|fmt_phone }}</option>
                     {% endfor %}
                 {% else %}
                     <option value="">No phone on file</option>
                 {% endif %}
             </select>
         </div>
+        <input type="text" id="commEmailSubject" placeholder="Email subject" value="Question re: {{ prop.street }}" class="comm-subject hidden">
 
         <div id="commFeed" class="comm-feed">
             {% for m in communications %}
             <article class="msg-row {{ 'outbound' if m.direction|lower == 'outbound' else 'inbound' }}" data-channel="{{ m.channel|upper }}">
                 <div class="msg-meta">
-                    <span>{{ m.direction }}{% if m.direction|lower == 'outbound' and m.to_number %} to {{ m.to_number }}{% elif m.direction|lower == 'inbound' and m.from_number %} from {{ m.from_number }}{% endif %}</span>
+                    <span>{{ m.direction }}{% if m.direction|lower == 'outbound' and m.to_number %} to {% if (m.channel or '')|upper == 'EMAIL' %}{{ m.to_number }}{% else %}{{ m.to_number|fmt_phone }}{% endif %}{% elif m.direction|lower == 'inbound' and m.from_number %} from {% if (m.channel or '')|upper == 'EMAIL' %}{{ m.from_number }}{% else %}{{ m.from_number|fmt_phone }}{% endif %}{% endif %}</span>
                     <span>{{ m.sent_at }}</span>
                     <span class="msg-status">{{ m.status }}</span>
                 </div>
@@ -241,21 +270,55 @@
     </div>
 </section>
 
-<section class="panel">
-    <h3>General Notes</h3>
-    <textarea id="propertyNotes" rows="5">{{ prop.notes or '' }}</textarea>
-</section>
-
 <section class="panel"><details><summary><strong>Activity Log</strong></summary><table><thead><tr><th>Date</th><th>Person ID</th><th>Type</th><th>Outcome</th><th>Note</th></tr></thead><tbody>{% for a in activities %}<tr><td>{{ a.created_at }}</td><td>{{ a.person_id }}</td><td>{{ a.activity_type }}</td><td>{{ a.outcome }}</td><td>{{ a.note }}</td></tr>{% endfor %}</tbody></table></details></section>
 
-<section class="panel"><details><summary><strong>Obituary Import</strong></summary><div class="split"><div><form id="obitAiImportForm" method="post" action="{{ url_for('import_obituary_ai_route', property_id=prop.id) }}" class="grid-form compact"><input type="hidden" name="subject_person_id" value="{{ prop.owner_person_id }}"><label class="span2">Subject Person <input value="{{ prop.owner_first }} {{ prop.owner_last }}" readonly></label><label class="span2">Obituary URL <input name="obituary_url" placeholder="https://www.legacy.com/..." required></label><button type="submit">AI Import Relationships</button></form></div><div><table><thead><tr><th>Date</th><th>Source</th><th>Excerpt</th></tr></thead><tbody>{% for row in obituary_imports %}<tr><td>{{ row.created_at }}</td><td><a href="{{ row.source_url }}" target="_blank">Source</a></td><td>{{ row.raw_text[:160] }}...</td></tr>{% endfor %}</tbody></table></div></div></details></section>
+<section class="panel"><details><summary><strong>Obituary Import</strong></summary><div class="split"><div><form id="obitAiImportForm" method="post" action="{{ url_for('import_obituary_ai_route', property_id=prop.id) }}" class="grid-form compact"><input type="hidden" name="subject_person_id" value="{{ prop.owner_person_id }}"><label class="span2">Subject Person <input value="{{ prop.owner_first }} {{ prop.owner_middle or '' }} {{ prop.owner_last }}" readonly></label><label class="span2">Obituary URL <input name="obituary_url" placeholder="https://www.legacy.com/..." required></label><button type="submit">AI Import Relationships</button></form></div><div><table><thead><tr><th>Date</th><th>Source</th><th>Excerpt</th></tr></thead><tbody>{% for row in obituary_imports %}<tr><td>{{ row.created_at }}</td><td><a href="{{ row.source_url }}" target="_blank">Source</a></td><td>{{ row.raw_text[:160] }}...</td></tr>{% endfor %}</tbody></table></div></div></details></section>
 
 <section class="panel"><details><summary><strong>Upload Phone/Email CSV</strong></summary><p><a href="{{ url_for('phone_email_template') }}">Download template</a></p><form method="post" action="{{ url_for('upload_owner_contacts', property_id=prop.id) }}" enctype="multipart/form-data" class="grid-form compact"><label class="span2">CSV File <input type="file" name="contacts_file" accept=".csv" required></label><button type="submit">Upload Contacts</button></form></details></section>
+
+<section class="panel">
+    <details>
+        <summary><strong>General Notes</strong></summary>
+        <textarea id="propertyNotes" rows="5">{{ prop.notes or '' }}</textarea>
+    </details>
+</section>
+
+<div id="mailPreviewModal" class="mail-preview-modal" hidden>
+    <div class="mail-preview-backdrop" data-close-mail-preview="1"></div>
+    <div class="mail-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="mailPreviewTitle">
+        <div class="mail-preview-head">
+            <h3 id="mailPreviewTitle">Direct Mail Preview</h3>
+            <button type="button" class="mail-preview-close" data-close-mail-preview="1" aria-label="Close">x</button>
+        </div>
+        <div id="mailPreviewContent" class="mail-preview-content"></div>
+        <div class="mail-preview-actions">
+            <button type="button" id="mailPreviewSendBtn">Review Proofs</button>
+            <button type="button" class="muted" data-close-mail-preview="1">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<div id="mailProofModal" class="mail-preview-modal" hidden>
+    <div class="mail-preview-backdrop" data-close-mail-proof="1"></div>
+    <div class="mail-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="mailProofTitle">
+        <div class="mail-preview-head">
+            <h3 id="mailProofTitle">Confirm Proofs Before Purchase</h3>
+            <button type="button" class="mail-preview-close" data-close-mail-proof="1" aria-label="Close">x</button>
+        </div>
+        <div id="mailProofContent" class="mail-preview-content"></div>
+        <div class="mail-preview-actions">
+            <button type="button" id="mailProofSendBtn">Approve and Pay</button>
+            <button type="button" class="muted" data-close-mail-proof="1">Back</button>
+        </div>
+    </div>
+</div>
 
 <script>
 const propertyId = {{ prop.id }};
 const ownerId = {{ prop.owner_person_id }};
 let commChannel = 'ALL';
+const ownerPhoneOptions = {{ owner_phone_options|tojson }};
+const ownerEmailOptions = {{ owner_email_options|tojson }};
 
 const patchJson = (url, body) => fetch(url, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
 const postJson = (url, body) => fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(r=>r.json().then(j=>({ok:r.ok, data:j})));
@@ -265,6 +328,272 @@ function flash(el){ el.classList.add('fade-highlight'); setTimeout(()=>el.classL
 function esc(text) {
   return (text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+
+function formatPhone(v) {
+  const raw = (v || '').trim();
+  let d = raw.replace(/\D/g, '');
+  if (d.length === 11 && d.startsWith('1')) d = d.slice(1);
+  if (d.length === 10) return `(${d.slice(0,3)})${d.slice(3,6)}-${d.slice(6)}`;
+  return raw;
+}
+
+const mailPreviewModal = document.getElementById('mailPreviewModal');
+const mailPreviewContent = document.getElementById('mailPreviewContent');
+const mailPreviewTitle = document.getElementById('mailPreviewTitle');
+const mailPreviewSendBtn = document.getElementById('mailPreviewSendBtn');
+const mailProofModal = document.getElementById('mailProofModal');
+const mailProofContent = document.getElementById('mailProofContent');
+const mailProofSendBtn = document.getElementById('mailProofSendBtn');
+let mailPreviewSendPath = '';
+let mailPreviewProofPath = '';
+let pendingPreviewPayload = null;
+let pendingTemplateMeta = null;
+
+function closeMailPreview() {
+  mailPreviewModal.hidden = true;
+  mailPreviewSendBtn.disabled = false;
+  mailPreviewSendBtn.textContent = 'Review Proofs';
+  mailPreviewSendPath = '';
+  mailPreviewProofPath = '';
+  pendingPreviewPayload = null;
+  pendingTemplateMeta = null;
+}
+
+function closeMailProof() {
+  mailProofModal.hidden = true;
+  mailProofSendBtn.disabled = false;
+  mailProofSendBtn.textContent = 'Approve and Pay';
+}
+
+function fullAddress(c) {
+  return [c.address1, c.address2, `${c.city || ''}, ${c.state || ''} ${c.zip || ''}`.trim()].filter(Boolean).join(', ');
+}
+
+function contactRowsHtml(contacts) {
+  if (!contacts || !contacts.length) return '<p>No recipients found.</p>';
+  return `
+    <div class="mail-vars-accordion">
+      ${contacts.map((c, idx) => {
+        const raw = Object.assign({}, c || {});
+        const pairs = [
+          ['propertyState', 'state'],
+          ['propertyZip', 'zip'],
+          ['propertyCity', 'city'],
+          ['propertyAddress', 'address1']
+        ];
+        pairs.forEach(([propKey, baseKey]) => {
+          const a = String(raw[propKey] || '').trim().toLowerCase();
+          const b = String(raw[baseKey] || '').trim().toLowerCase();
+          if (a && b && a === b) delete raw[propKey];
+        });
+        const firstKeys = [
+          'firstName','lastName','propertyOwnerName','address1','address2','city','state','zip','country',
+          'propertyStreet','propertyAddress','propertyCity','propertyState','propertyZip','propertyPostalCode',
+          'subjectPropertyStreet','subjectPropertyAddress','subjectPropertyCity','subjectPropertyState','subjectPropertyZip'
+        ];
+        const lastPrefixes = ['contactMe', 'contact_me_', 'returnAddress', 'return_address'];
+        const weight = (k) => {
+          const i = firstKeys.indexOf(k);
+          if (i >= 0) return i;
+          if (lastPrefixes.some((p) => k.startsWith(p))) return 1000;
+          return 200 + k.toLowerCase().charCodeAt(0);
+        };
+        const allVars = Object.entries(raw).sort((a, b) => {
+          const wa = weight(a[0]);
+          const wb = weight(b[0]);
+          if (wa !== wb) return wa - wb;
+          return a[0].localeCompare(b[0]);
+        });
+        return `
+          <details class="mail-vars-item">
+            <summary>
+              <span class="mail-vars-main">${esc(c.firstName || '(No first name)')}</span>
+              <span class="mail-vars-sub">${esc(fullAddress(c) || '(No address)')}</span>
+            </summary>
+            <table class="crm-table mail-preview-table">
+              <thead><tr><th>Variable</th><th>Value</th></tr></thead>
+              <tbody>
+                ${allVars.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v == null ? '' : String(v))}</td></tr>`).join('')}
+              </tbody>
+            </table>
+          </details>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
+function previewImagesHtml(meta, proofs, compact=false) {
+  const proofRows = Array.isArray(proofs) ? proofs : [];
+  const usableProofs = proofRows.filter((p) => p && p.ok);
+  const failedProofs = proofRows.filter((p) => p && !p.ok);
+  if (usableProofs.length) {
+    return `
+      <div class="mail-preview-images proof-grid">
+        ${usableProofs.map((p, idx) => {
+          const contact = p.contact || {};
+          const label = `${contact.firstName || ''} ${contact.lastName || ''}`.trim() || `Recipient ${idx + 1}`;
+          const envelope = (p.envelope_urls || []).map((u) => `<img src="${esc(u)}" alt="Envelope proof ${esc(label)}">`).join('');
+          const letter = (p.letter_urls || p.image_urls || []).map((u) => `<img src="${esc(u)}" alt="Letter proof ${esc(label)}">`).join('');
+          const pdfs = (p.pdf_urls || []).map((u) => `<a href="${esc(u)}" target="_blank">PDF Proof</a>`).join(' ');
+          const pdfPreviews = (p.pdf_urls || []).map((u) => `<iframe class="proof-pdf-frame" src="${esc(u)}"></iframe>`).join('');
+          const debug = (p.debug_entries || []).map((d) => `<tr><td>${esc(d.path || '')}</td><td>${esc(d.url || '')}</td></tr>`).join('');
+          return `<div class="proof-item">
+            <div class="proof-title">${esc(label)}</div>
+            ${envelope ? `<div class="proof-label">Envelope</div>${envelope}` : ''}
+            ${letter ? `<div class="proof-label">Letter</div>${letter}` : ''}
+            ${pdfPreviews ? `<div class="proof-label">PDF Preview</div>${pdfPreviews}` : ''}
+            ${(!envelope && !letter && pdfs) ? `<div class="proof-label">Proof File</div>` : ''}
+            ${pdfs ? `<div class="proof-links">${pdfs}</div>` : ''}
+            ${(!envelope && !letter && !pdfs && debug) ? `<details><summary>Proof debug</summary><table class="crm-table mail-preview-table"><thead><tr><th>Path</th><th>URL snippet</th></tr></thead><tbody>${debug}</tbody></table></details>` : ''}
+          </div>`;
+        }).join('')}
+      </div>
+      ${failedProofs.length ? `<p class="warn-line">Some proofs failed to generate (${failedProofs.length}).</p>` : ''}
+    `;
+  }
+  if (failedProofs.length) {
+    return `
+      <p class="warn-line">Proof generation failed for ${failedProofs.length} recipient(s).</p>
+      ${failedProofs.map((p, idx) => `<details class="mail-preview-payload"><summary>Recipient ${idx + 1} error</summary><pre>${esc(JSON.stringify(p.response || {error:p.error || 'unknown error'}, null, 2))}</pre></details>`).join('')}
+    `;
+  }
+  if (!meta) return '';
+  const front = meta.thumbnailUrl ? `<img src="${esc(meta.thumbnailUrl)}" alt="Front preview">` : '';
+  const back = meta.backThumbnailUrl ? `<img src="${esc(meta.backThumbnailUrl)}" alt="Back preview">` : '';
+  if (!front && !back) return '';
+  return `<div class="mail-preview-images ${compact ? 'is-compact' : ''}">${front}${back}</div>`;
+}
+
+function normalizeToken(raw) {
+  return String(raw || '').replace(/[{}]/g, '').trim();
+}
+
+function parseTemplateFields(meta) {
+  const fields = Array.isArray(meta && meta.fields) ? meta.fields : [];
+  return fields.map((f) => {
+    const key = normalizeToken(f.key || f.variable || f.name || f.field || f.token || f.slug || '');
+    return {
+      key,
+      required: Boolean(f.required || f.isRequired),
+      label: f.label || f.name || key || '(unknown)'
+    };
+  }).filter((f) => !!f.key);
+}
+
+function requiredVarsHtml(fields, contacts, payload) {
+  const requiredFields = fields.filter((f) => f.required);
+  if (!requiredFields.length) return '<p>No required template fields were returned by the template API.</p>';
+  const returnAddress = payload.returnAddress || {};
+  const missing = [];
+  requiredFields.forEach((f) => {
+    const missingRecipients = [];
+    contacts.forEach((c, idx) => {
+      const hasContactValue = c[f.key] !== undefined && c[f.key] !== null && String(c[f.key]).trim() !== '';
+      const hasReturnValue = returnAddress[f.key] !== undefined && returnAddress[f.key] !== null && String(returnAddress[f.key]).trim() !== '';
+      if (!hasContactValue && !hasReturnValue) missingRecipients.push(idx + 1);
+    });
+    if (missingRecipients.length) missing.push({ field: f, missingRecipients });
+  });
+  if (!missing.length) return '<p class="ok-line">All required template variables appear populated for all recipients.</p>';
+  return `
+    <p class="warn-line">Some required variables are missing.</p>
+    <ul class="mail-required-list">
+      ${missing.map((m) => `<li><strong>${esc(m.field.label)}</strong> (${esc(m.field.key)}) missing for recipient(s): ${esc(m.missingRecipients.join(', '))}</li>`).join('')}
+    </ul>
+  `;
+}
+
+function showMailPreview(modeLabel, preview, sendPath) {
+  const payload = preview && preview.payload ? preview.payload : {};
+  const contacts = payload.contacts || [];
+  const meta = preview.template_meta || {};
+  const proofs = preview.proofs || [];
+  const templateFields = parseTemplateFields(meta);
+  pendingPreviewPayload = payload;
+  pendingTemplateMeta = meta;
+  pendingTemplateMeta._proofs = proofs;
+  mailPreviewTitle.textContent = `Direct Mail Preview - ${modeLabel}`;
+  mailPreviewContent.innerHTML = `
+    <p><strong>Template:</strong> ${esc(meta.title || `ID ${meta.id || 'Unknown'}`)}</p>
+    <p><strong>Recipients:</strong> ${contacts.length}</p>
+    ${previewImagesHtml(meta, [], true)}
+    <h4>Required Variables Check</h4>
+    ${requiredVarsHtml(templateFields, contacts, payload)}
+    <h4>Recipient Variables</h4>
+    ${contactRowsHtml(contacts)}
+    <details class="mail-preview-payload">
+      <summary><strong>Raw Payload JSON</strong></summary>
+      <pre>${esc(JSON.stringify(payload, null, 2))}</pre>
+    </details>
+  `;
+  mailPreviewSendPath = sendPath;
+  mailPreviewModal.hidden = false;
+  flash(mailPreviewContent);
+}
+
+async function openMailPreview(previewPath, sendPath, modeLabel) {
+  mailPreviewTitle.textContent = `Direct Mail Preview - ${modeLabel}`;
+  mailPreviewContent.innerHTML = '<p>Loading preview...</p>';
+  mailPreviewSendBtn.disabled = true;
+  mailPreviewModal.hidden = false;
+  try {
+    const res = await fetch(previewPath);
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      closeMailPreview();
+      alert((data && data.error) ? data.error : 'Failed to load mail preview.');
+      return;
+    }
+    showMailPreview(modeLabel, data, sendPath);
+    mailPreviewProofPath = `${previewPath}${previewPath.includes('?') ? '&' : '?'}include_proofs=1`;
+    mailPreviewSendBtn.disabled = false;
+  } catch (err) {
+    closeMailPreview();
+    alert('Failed to load mail preview.');
+  }
+}
+
+async function openProofConfirm() {
+  if (!pendingPreviewPayload) return;
+  mailProofContent.innerHTML = `
+    <div class="proof-loading">
+      <span class="proof-spinner" aria-hidden="true"></span>
+      <span>Generating proof previews...</span>
+    </div>
+  `;
+  mailProofModal.hidden = false;
+  try {
+    const res = await fetch(mailPreviewProofPath || '');
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      mailProofContent.innerHTML = `<p class="warn-line">${esc((data && data.error) ? data.error : 'Failed to load proofs.')}</p>`;
+      return;
+    }
+    const payload = data.payload || pendingPreviewPayload;
+    const contacts = payload.contacts || [];
+    const proofs = data.proofs || [];
+    pendingTemplateMeta = pendingTemplateMeta || {};
+    pendingTemplateMeta._proofs = proofs;
+    mailProofContent.innerHTML = `
+      <p>Please verify each proof before purchase.</p>
+      <p><strong>Template:</strong> ${esc((pendingTemplateMeta && pendingTemplateMeta.title) || `ID ${(pendingTemplateMeta && pendingTemplateMeta.id) || 'Unknown'}`)}</p>
+      <p><strong>Recipients:</strong> ${contacts.length}</p>
+      ${previewImagesHtml(pendingTemplateMeta || {}, proofs, false)}
+      ${proofs.length ? '' : '<p class="warn-line">No proof images were returned yet. Please try again in a moment.</p>'}
+      <h4>Recipients</h4>
+      <table class="crm-table mail-preview-table">
+        <thead><tr><th>First Name</th><th>Full Address</th></tr></thead>
+        <tbody>
+          ${contacts.map((c) => `<tr><td>${esc(c.firstName || '')}</td><td>${esc(fullAddress(c))}</td></tr>`).join('')}
+        </tbody>
+      </table>
+    `;
+  } catch (err) {
+    mailProofContent.innerHTML = '<p class="warn-line">Failed to load proofs.</p>';
+  }
+}
+
 function socialUrl(platform, handle, url) {
   const rawUrl = (url || '').trim();
   if (rawUrl) return /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
@@ -295,16 +624,97 @@ function setCommChannel(channel) {
   const mode = document.getElementById('composerMode');
   const sendBtn = document.getElementById('smsSendBtn');
   const toSelect = document.getElementById('commToNumber');
+  const toLabel = document.getElementById('commToLabel');
+  const subject = document.getElementById('commEmailSubject');
   const isEmail = channel === 'EMAIL';
-  mode.textContent = isEmail ? 'Email coming next' : 'From {{ smrt_from_number }} (SMS mode)';
-  sendBtn.disabled = isEmail || !toSelect.value;
-  toSelect.disabled = isEmail;
+  const list = isEmail ? ownerEmailOptions : ownerPhoneOptions;
+  toSelect.innerHTML = '';
+  if (list && list.length) {
+    list.forEach((val) => {
+      const o = document.createElement('option');
+      o.value = val;
+      o.textContent = isEmail ? val : formatPhone(val);
+      toSelect.appendChild(o);
+    });
+  } else {
+    const o = document.createElement('option');
+    o.value = '';
+    o.textContent = isEmail ? 'No email on file' : 'No phone on file';
+    toSelect.appendChild(o);
+  }
+  toLabel.textContent = isEmail ? 'Send to (Email)' : 'Send to (Phone)';
+  mode.textContent = isEmail ? 'Email sent via Gmail' : 'From {{ smrt_from_number }} (SMS mode)';
+  if (isEmail && !subject.value.trim()) subject.value = 'Question re: {{ prop.street }}';
+  sendBtn.disabled = !toSelect.value;
+  toSelect.disabled = false;
+  subject.classList.toggle('hidden', !isEmail);
   applyCommFilter();
 }
 
 document.getElementById('propertyStatusSelect').addEventListener('change', async (e) => {
   const r = await patchJson(`/api/properties/${propertyId}/status`, {status:e.target.value});
   if (r.ok) flash(e.target);
+});
+
+document.getElementById('propertySkipTraceBtn').addEventListener('click', async () => {
+  if (!window.confirm('Run property skip trace now? This will refresh owners, co-owner links, and sale data.')) return;
+  const btn = document.getElementById('propertySkipTraceBtn');
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  try {
+    const res = await postJson(`/api/properties/${propertyId}/skip-trace-property`, {});
+    if (!res.ok) {
+      alert((res.data && res.data.error) ? res.data.error : 'Property skip trace failed.');
+    } else {
+      window.location.reload();
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Skip Trace Property (Owners)';
+  }
+});
+
+const mailAllRelativesBtn = document.getElementById('mailAllRelativesBtn');
+if (mailAllRelativesBtn) {
+  mailAllRelativesBtn.addEventListener('click', async () => {
+    await openMailPreview(
+      `/api/properties/${propertyId}/mail/preview/relatives`,
+      `/api/properties/${propertyId}/mail/relatives`,
+      'Mail All Relatives'
+    );
+  });
+}
+
+mailPreviewModal.addEventListener('click', (e) => {
+  if (e.target.dataset.closeMailPreview === '1') closeMailPreview();
+});
+
+mailPreviewSendBtn.addEventListener('click', async () => {
+  await openProofConfirm();
+});
+
+mailProofModal.addEventListener('click', (e) => {
+  if (e.target.dataset.closeMailProof === '1') closeMailProof();
+});
+
+mailProofSendBtn.addEventListener('click', async () => {
+  if (!mailPreviewSendPath) return;
+  mailProofSendBtn.disabled = true;
+  mailProofSendBtn.textContent = 'Sending...';
+  const res = await postJson(mailPreviewSendPath, {});
+  if (!res.ok) {
+    mailProofSendBtn.disabled = false;
+    mailProofSendBtn.textContent = 'Approve and Pay';
+    alert((res.data && res.data.error) ? res.data.error : 'Failed to submit mail order.');
+    return;
+  }
+  closeMailProof();
+  closeMailPreview();
+  if (res.data && typeof res.data.recipient_count !== 'undefined') {
+    alert(`Mail order submitted. Recipients: ${res.data.recipient_count || 0}.`);
+  } else {
+    alert('Individual mail order submitted.');
+  }
 });
 
 document.getElementById('commTabs').addEventListener('click', (e) => {
@@ -314,17 +724,18 @@ document.getElementById('commTabs').addEventListener('click', (e) => {
 
 document.getElementById('smsComposer').addEventListener('submit', async (e) => {
   e.preventDefault();
-  if (commChannel === 'EMAIL') return;
   const toNumber = document.getElementById('commToNumber').value.trim();
   if (!toNumber) return;
   const bodyInput = document.getElementById('smsBody');
   const body = bodyInput.value.trim();
   if (!body) return;
+  const subject = document.getElementById('commEmailSubject').value.trim();
   const res = await postJson(`/api/properties/${propertyId}/communications`, {
     person_id: ownerId,
-    channel: 'SMS',
+    channel: commChannel === 'EMAIL' ? 'EMAIL' : 'SMS',
     direction: 'Outbound',
     to_number: toNumber,
+    subject,
     body
   });
   if (!res.ok || !res.data.id) {
@@ -335,7 +746,8 @@ document.getElementById('smsComposer').addEventListener('submit', async (e) => {
   const row = document.createElement('article');
   row.className = 'msg-row outbound fade-highlight';
   row.dataset.channel = (m.channel || 'SMS').toUpperCase();
-  const toMeta = m.to_number ? ` to ${esc(m.to_number)}` : '';
+  const isEmail = String(m.channel || '').toUpperCase() === 'EMAIL';
+  const toMeta = m.to_number ? ` to ${esc(isEmail ? m.to_number : formatPhone(m.to_number))}` : '';
   row.innerHTML = `<div class="msg-meta"><span>${esc(m.direction)}${toMeta}</span><span>${esc(m.sent_at)}</span><span class="msg-status">${esc(m.status)}</span></div><div class="msg-bubble">${esc(m.body)}</div>`;
   document.getElementById('commFeed').appendChild(row);
   bodyInput.value = '';
@@ -350,7 +762,6 @@ document.getElementById('smsBody').addEventListener('keydown', (e) => {
 });
 
 document.getElementById('commToNumber').addEventListener('change', () => {
-  if (commChannel === 'EMAIL') return;
   document.getElementById('smsSendBtn').disabled = !document.getElementById('commToNumber').value;
 });
 
@@ -392,9 +803,31 @@ document.addEventListener('change', async (e) => {
     const r = await patchJson(`/api/socials/${id}/status`, {status:e.target.value});
     if (r.ok) flash(e.target.closest('tr'));
   }
+  if (e.target.classList.contains('relationship-status')) {
+    const personId = e.target.dataset.personId;
+    const r = await patchJson(`/api/people/${personId}/status`, {status:e.target.value});
+    if (r.ok) flash(e.target.closest('tr'));
+  }
 });
 
 document.addEventListener('click', async (e) => {
+  if (e.target.classList.contains('reorder-rel-btn')) {
+    const id = e.target.dataset.id;
+    const direction = e.target.dataset.direction;
+    const res = await patchJson(`/api/properties/${propertyId}/relationships/${id}/move`, {direction});
+    if (!res.ok) return;
+    const row = e.target.closest('tr');
+    if (!row) return;
+    const sibling = direction === 'up' ? row.previousElementSibling : row.nextElementSibling;
+    if (!sibling) return;
+    if (direction === 'up') {
+      row.parentNode.insertBefore(row, sibling);
+    } else {
+      row.parentNode.insertBefore(sibling, row);
+    }
+    flash(row);
+    return;
+  }
   if (e.target.classList.contains('delete-touch')) {
     if (!window.confirm('Delete this phone/email record? This cannot be undone.')) return;
     const id = e.target.dataset.id;
@@ -407,7 +840,34 @@ document.addEventListener('click', async (e) => {
     const r = await delReq(`/api/socials/${id}`);
     if (r.ok) e.target.closest('tr').remove();
   }
+  if (e.target.classList.contains('delete-relationship')) {
+    if (!window.confirm('Delete this relationship? This cannot be undone.')) return;
+    const id = e.target.dataset.id;
+    const r = await delReq(`/api/relationships/${id}`);
+    if (r.ok) e.target.closest('tr').remove();
+  }
 });
+
+async function saveRelationshipType(input) {
+  const id = input.dataset.id;
+  const value = (input.value || '').trim();
+  if (!id || !value) return;
+  const r = await patchJson(`/api/relationships/${id}`, {relationship_type: value});
+  if (r.ok) flash(input.closest('tr'));
+}
+
+document.addEventListener('keydown', (e) => {
+  if (!e.target.classList.contains('relationship-type-input')) return;
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    saveRelationshipType(e.target);
+  }
+});
+
+document.addEventListener('blur', (e) => {
+  if (!e.target.classList.contains('relationship-type-input')) return;
+  saveRelationshipType(e.target);
+}, true);
 
 function bindEnter(formId, handler) {
   const form = document.getElementById(formId);
@@ -423,7 +883,7 @@ bindEnter('addPhoneForm', async (form) => {
   if (!res.ok || !res.data.id) return;
   const tr = document.createElement('tr');
   tr.dataset.touchpointId = res.data.id;
-  tr.innerHTML = `<td><select class="touch-label" data-id="${res.data.id}"><option ${label==='Landline'?'selected':''}>Landline</option><option ${label==='Mobile'?'selected':''}>Mobile</option><option ${label==='VoIP'?'selected':''}>VoIP</option><option ${label==='Fax'?'selected':''}>Fax</option><option ${label==='Unknown'?'selected':''}>Unknown</option></select></td><td>${value}</td><td><select class="touch-status" data-id="${res.data.id}"><option>Correct</option><option>Incorrect</option><option>DNC</option><option>DNT</option><option>No Answer</option><option>Dead</option><option>Undeliverable</option><option>Not in service</option><option selected>Unknown</option></select></td><td><button type="button" class="icon-btn delete-touch" data-id="${res.data.id}">x</button></td>`;
+  tr.innerHTML = `<td><select class="touch-label" data-id="${res.data.id}"><option ${label==='Landline'?'selected':''}>Landline</option><option ${label==='Mobile'?'selected':''}>Mobile</option><option ${label==='VoIP'?'selected':''}>VoIP</option><option ${label==='Fax'?'selected':''}>Fax</option><option ${label==='Unknown'?'selected':''}>Unknown</option></select></td><td>${esc(formatPhone(value))}</td><td><select class="touch-status" data-id="${res.data.id}"><option>Correct</option><option>Incorrect</option><option>DNC</option><option>DNT</option><option>No Answer</option><option>Dead</option><option>Undeliverable</option><option>Not in service</option><option selected>Unknown</option></select></td><td><button type="button" class="icon-btn delete-touch" data-id="${res.data.id}">x</button></td>`;
   tr.classList.add('fade-highlight');
   document.getElementById('phoneRows').prepend(tr);
   form.reset();

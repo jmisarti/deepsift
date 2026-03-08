@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Global Settings</h2>
+    <p>Use the navigation tabs to manage app modules and integration numbers.</p>
+    {% if notice %}
+    <div class="notice-banner">{{ notice }}</div>
+    {% endif %}
+    {% if error_notice %}
+    <div class="error-banner">{{ error_notice }}</div>
+    {% endif %}
+    <nav class="settings-tabs">
+        <a class="settings-tab {% if active_tab == 'direct_mail' %}active{% endif %}" href="{{ url_for('settings_page', tab='direct_mail') }}">Direct Mail Settings</a>
+        <a class="settings-tab {% if active_tab == 'deep_dive' %}active{% endif %}" href="{{ url_for('settings_page', tab='deep_dive') }}">Deep Dive Settings</a>
+        <a class="settings-tab {% if active_tab == 'referral' %}active{% endif %}" href="{{ url_for('settings_page', tab='referral') }}">Referral Settings</a>
+        <a class="settings-tab {% if active_tab == 'email' %}active{% endif %}" href="{{ url_for('settings_page', tab='email') }}">Email Settings</a>
+        <a class="settings-tab {% if active_tab == 'helpers' %}active{% endif %}" href="{{ url_for('settings_page', tab='helpers') }}">Helpers</a>
+    </nav>
+
+    {% if active_tab == 'direct_mail' %}
+        <p>Configure sender variables used for direct mail orders (template {{ template_id }}).</p>
+        {% if options_error %}
+        <div class="error-banner">Could not load live product options: {{ options_error }}</div>
+        {% endif %}
+        <form method="post" class="grid-form">
+            <input type="hidden" name="settings_tab" value="direct_mail">
+            <label>Sender First Name <input name="dm_sender_first_name" value="{{ dm.sender_first_name }}"></label>
+            <label>Sender Last Name <input name="dm_sender_last_name" value="{{ dm.sender_last_name }}"></label>
+            <label>Company Name <input name="dm_sender_company_name" value="{{ dm.sender_company_name }}"></label>
+            <label>Phone <input name="dm_sender_phone" value="{{ dm.sender_phone }}"></label>
+            <label>Email <input name="dm_sender_email" value="{{ dm.sender_email }}"></label>
+            <label>Website <input name="dm_sender_website" value="{{ dm.sender_website }}"></label>
+            <label>Postage Type
+                <select name="dm_postage_type">
+                    <option value="">Use Template Default</option>
+                    {% for option in postage_options %}
+                    <option value="{{ option }}" {% if dm.postage_type == option %}selected{% endif %}>{{ option }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>Envelope Style
+                <select name="dm_envelope_type">
+                    <option value="">Use Template Default</option>
+                    {% for option in envelope_options %}
+                    <option value="{{ option }}" {% if dm.envelope_type == option %}selected{% endif %}>{{ option }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>Custom Postage Type <input name="dm_postage_type_custom" value="" placeholder="optional override"></label>
+            <label>Custom Envelope Style <input name="dm_envelope_type_custom" value="" placeholder="optional override"></label>
+            <label class="span2">Address Line 1 <input name="dm_sender_address1" value="{{ dm.sender_address1 }}"></label>
+            <label>City <input name="dm_sender_city" value="{{ dm.sender_city }}"></label>
+            <label>State <input name="dm_sender_state" value="{{ dm.sender_state }}"></label>
+            <label>ZIP <input name="dm_sender_zip" value="{{ dm.sender_zip }}"></label>
+            <button type="submit">Save Direct Mail Settings</button>
+        </form>
+    {% elif active_tab == 'deep_dive' %}
+        <form method="post" class="grid-form">
+            <input type="hidden" name="settings_tab" value="deep_dive">
+            <label class="span2">Outgoing SmrtPhone Number (Deep Dive)
+                <input name="deep_dive_smrtphone_from" value="{{ deep_dive_smrtphone_from }}" placeholder="19088679098">
+            </label>
+            <button type="submit">Save Deep Dive Settings</button>
+        </form>
+    {% elif active_tab == 'referral' %}
+        <form method="post" class="grid-form">
+            <input type="hidden" name="settings_tab" value="referral">
+            <label class="span2">Outgoing SmrtPhone Number (Referral)
+                <input name="referral_smrtphone_from" value="{{ referral_smrtphone_from }}" placeholder="19085551212">
+            </label>
+            <button type="submit">Save Referral Settings</button>
+        </form>
+    {% elif active_tab == 'email' %}
+        <p>Fastest proof-of-concept: Gmail App Password (SMTP + IMAP).</p>
+        <form method="post" class="grid-form">
+            <input type="hidden" name="settings_tab" value="email">
+            <label>From Name <input name="email_from_name" value="{{ email_settings.from_name }}"></label>
+            <label>From Address <input name="email_from_address" value="{{ email_settings.from_address }}" placeholder="yourname@gmail.com"></label>
+            <label>Gmail App Password <input name="email_app_password" value="{{ email_settings.app_password }}"></label>
+            <label>SMTP Host <input name="email_smtp_host" value="{{ email_settings.smtp_host }}"></label>
+            <label>SMTP Port <input name="email_smtp_port" value="{{ email_settings.smtp_port }}"></label>
+            <label>IMAP Host <input name="email_imap_host" value="{{ email_settings.imap_host }}"></label>
+            <label>IMAP Port <input name="email_imap_port" value="{{ email_settings.imap_port }}"></label>
+            <label>Email Polling
+                <select name="email_poll_enabled">
+                    <option value="1" {% if (email_settings.poll_enabled or '1') in ['1','true','TRUE','yes','on'] %}selected{% endif %}>Enabled</option>
+                    <option value="0" {% if (email_settings.poll_enabled or '1') in ['0','false','FALSE','no','off'] %}selected{% endif %}>Disabled</option>
+                </select>
+            </label>
+            <div class="inline-actions span2">
+                <button type="submit">Save Email Settings</button>
+                <button type="submit" name="email_action" value="test_login">Save + Test Email Login</button>
+            </div>
+        </form>
+    {% else %}
+        <h3>On-Market Checker (Beta Helper)</h3>
+        <p>This helper generates fast lookup links for Zillow/Realtor/Redfin based on a property address. Use it to quickly verify whether a property appears as coming soon, active, pending, or sold.</p>
+        <p><strong>Current functionality:</strong> link generation only (no direct scraping, no automatic status write-back to property records).</p>
+        <p><strong>Why this is helper-only:</strong> direct site scraping can be rate-limited and terms-restricted. This keeps checks lightweight until a data-provider integration is finalized.</p>
+        <form method="post" class="grid-form">
+            <input type="hidden" name="settings_tab" value="helpers">
+            <input type="hidden" name="helpers_action" value="market_links">
+            <label class="span2">Property Address
+                <input name="market_helper_address" value="{{ market_helper_address or '' }}" placeholder="925 Essex Ave Linden, NJ 07036-2231">
+            </label>
+            <button type="submit">Generate Lookup Links</button>
+        </form>
+        {% if market_helper_result and market_helper_result.links %}
+        <div class="table-wrap" style="margin-top:0.75rem;">
+            <table class="compact-table">
+                <thead>
+                    <tr>
+                        <th>Source</th>
+                        <th>Open</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for link in market_helper_result.links %}
+                    <tr>
+                        <td>{{ link.label }}</td>
+                        <td><a href="{{ link.url }}" target="_blank" rel="noopener">Open Search</a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+
+        <h3 style="margin-top:1.25rem;">ReiSIFT Add Property (Beta)</h3>
+        <p>Runs the 3-step flow: map autocomplete -> map_id address lookup -> create property in ReiSIFT.</p>
+        <form method="post" class="grid-form">
+            <input type="hidden" name="settings_tab" value="helpers">
+            <input type="hidden" name="helpers_action" value="reisift_add_property">
+            <label class="span2">Search Address
+                <input name="reisift_search" value="{{ (reisift_add_request.search if reisift_add_request else '') or '' }}" placeholder="59 Mayfair Dr West Orange">
+            </label>
+            <label>Status Slug
+                <input name="reisift_status" value="new_lead" readonly>
+            </label>
+            <label>Lists (comma-separated)
+                <input name="reisift_lists" value="{{ (reisift_add_request.lists if reisift_add_request else '') or '' }}" placeholder="Carrot,Clever">
+            </label>
+            <label>Tags (comma-separated)
+                <input name="reisift_tags" value="{{ (reisift_add_request.tags if reisift_add_request else '') or '' }}" placeholder="probate,import">
+            </label>
+            <label class="span2">Notes
+                <input name="reisift_notes" value="{{ (reisift_add_request.notes if reisift_add_request else '') or '' }}" placeholder="Imported via Deep Dive helper">
+            </label>
+            <button type="submit">Push Property To ReiSIFT</button>
+        </form>
+        {% if reisift_add_result %}
+        <details class="collapsed-section" style="margin-top:0.75rem;" open>
+            <summary>Last ReiSIFT Add Result</summary>
+            <p style="margin-top:0.5rem;"><strong>map_id:</strong> {{ reisift_add_result.map_id or '-' }}</p>
+            <p><strong>created_uuid:</strong> {{ reisift_add_result.created_uuid or '-' }}</p>
+            <p><strong>enrich_wait_seconds:</strong> {{ reisift_add_result.enrich_wait_seconds or 0 }}</p>
+            <pre style="white-space:pre-wrap;">{{ reisift_add_result.created | tojson(indent=2) }}</pre>
+            {% if reisift_add_result.enrich %}
+            <pre style="white-space:pre-wrap;">{{ reisift_add_result.enrich | tojson(indent=2) }}</pre>
+            {% endif %}
+        </details>
+        {% endif %}
+    {% endif %}
+
+    <details class="collapsed-section" style="margin-top: 1rem;" open>
+        <summary>Recent App Errors</summary>
+        {% if recent_errors and recent_errors|length > 0 %}
+        <div class="table-wrap" style="margin-top: 0.75rem;">
+            <table class="compact-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Source</th>
+                        <th>Route</th>
+                        <th>Status</th>
+                        <th>Error</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in recent_errors %}
+                    <tr>
+                        <td>{{ row.created_at }}</td>
+                        <td>{{ row.source }}</td>
+                        <td>{{ row.route or '-' }}</td>
+                        <td>{{ row.status_code or '-' }}</td>
+                        <td>{{ row.error_message }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p style="margin-top:0.75rem;">No logged errors yet.</p>
+        {% endif %}
+    </details>
+</section>
+{% endblock %}

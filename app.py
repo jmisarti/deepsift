@@ -8454,6 +8454,14 @@ def settings_page():
         LIMIT 15
         """
     ).fetchall()
+    clever_webhook_notes = db.execute(
+        """
+        SELECT id, event_key, note_body, created_at
+        FROM clever_lead_webhook_notes
+        ORDER BY id DESC
+        LIMIT 50
+        """
+    ).fetchall()
     return render_template(
         "settings.html",
         dm=settings,
@@ -8470,6 +8478,7 @@ def settings_page():
         options_error=options_error,
         error_notice=error_notice,
         recent_errors=recent_errors,
+        clever_webhook_notes=clever_webhook_notes,
         template_id=OPENLETTERCONNECT_TEMPLATE_ID,
         market_helper_address=market_helper_address,
         market_helper_result=market_helper_result,

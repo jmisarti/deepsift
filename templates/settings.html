@@ -240,5 +240,33 @@
         <p style="margin-top:0.75rem;">No logged errors yet.</p>
         {% endif %}
     </details>
+
+    <details class="collapsed-section" style="margin-top: 1rem;" open>
+        <summary>Clever Leads Webhook Log</summary>
+        {% if clever_webhook_notes and clever_webhook_notes|length > 0 %}
+        <div class="table-wrap" style="margin-top: 0.75rem;">
+            <table class="compact-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Event Key</th>
+                        <th>Summary</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in clever_webhook_notes %}
+                    <tr>
+                        <td>{{ row.created_at }}</td>
+                        <td>{{ row.event_key or '-' }}</td>
+                        <td style="white-space: pre-wrap;">{{ row.note_body }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p style="margin-top:0.75rem;">No Clever webhook notes yet.</p>
+        {% endif %}
+    </details>
 </section>
 {% endblock %}

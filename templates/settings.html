@@ -160,6 +160,23 @@
             {% endif %}
         </details>
         {% endif %}
+
+        <h3 style="margin-top:1.25rem;">Import Referral/Realtor Bundle</h3>
+        <p>Upload JSON exports from local migration bundle to copy only referral and realtor data into this environment.</p>
+        <form method="post" enctype="multipart/form-data" class="grid-form">
+            <input type="hidden" name="settings_tab" value="helpers">
+            <input type="hidden" name="helpers_action" value="import_referral_bundle">
+            <label class="span2">`referral_realtors.json`
+                <input type="file" name="referral_realtors_file" accept=".json,application/json">
+            </label>
+            <label class="span2">`reisift_referrals.json`
+                <input type="file" name="reisift_referrals_file" accept=".json,application/json">
+            </label>
+            <label class="span2">`referral_push_activity.json`
+                <input type="file" name="referral_push_activity_file" accept=".json,application/json">
+            </label>
+            <button type="submit">Import Referral Bundle</button>
+        </form>
     {% endif %}
 
     <details class="collapsed-section" style="margin-top: 1rem;" open>

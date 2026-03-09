@@ -3722,6 +3722,132 @@ def set_setting(db, key, value):
     )
 
 
+def _parse_uploaded_json_rows(upload):
+    if not upload:
+        return []
+    raw = upload.read()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    parsed = json.loads(raw)
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("rows"), list):
+            parsed = parsed.get("rows")
+        else:
+            parsed = [parsed]
+    if not isinstance(parsed, list):
+        raise ValueError("Uploaded JSON must be an array of row objects.")
+    cleaned = []
+    for item in parsed:
+        if isinstance(item, dict):
+            cleaned.append(item)
+    return cleaned
+
+
+def import_referral_bundle_rows(db, realtor_rows, referral_rows, push_rows):
+    counts = {
+        "referral_realtors": 0,
+        "reisift_referrals": 0,
+        "referral_push_activity": 0,
+    }
+
+    for r in realtor_rows:
+        db.execute(
+            """
+            INSERT INTO referral_realtors (id, first_name, last_name, email, phone, brokerage, target_markets, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                first_name = excluded.first_name,
+                last_name = excluded.last_name,
+                email = excluded.email,
+                phone = excluded.phone,
+                brokerage = excluded.brokerage,
+                target_markets = excluded.target_markets,
+                created_at = excluded.created_at
+            """,
+            (
+                r.get("id"),
+                r.get("first_name"),
+                r.get("last_name"),
+                r.get("email"),
+                r.get("phone"),
+                r.get("brokerage"),
+                r.get("target_markets"),
+                r.get("created_at"),
+            ),
+        )
+        counts["referral_realtors"] += 1
+
+    for r in referral_rows:
+        db.execute(
+            """
+            INSERT INTO reisift_referrals (
+                id, property_uuid, status, full_address, owner_names, payload_json,
+                referral_status, winning_realtor_id, referral_notes, is_active, last_synced_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(property_uuid) DO UPDATE SET
+                status = excluded.status,
+                full_address = excluded.full_address,
+                owner_names = excluded.owner_names,
+                payload_json = excluded.payload_json,
+                referral_status = excluded.referral_status,
+                winning_realtor_id = excluded.winning_realtor_id,
+                referral_notes = excluded.referral_notes,
+                is_active = excluded.is_active,
+                last_synced_at = excluded.last_synced_at
+            """,
+            (
+                r.get("id"),
+                r.get("property_uuid"),
+                r.get("status"),
+                r.get("full_address"),
+                r.get("owner_names"),
+                r.get("payload_json"),
+                r.get("referral_status"),
+                r.get("winning_realtor_id"),
+                r.get("referral_notes"),
+                r.get("is_active"),
+                r.get("last_synced_at"),
+            ),
+        )
+        counts["reisift_referrals"] += 1
+
+    for r in push_rows:
+        db.execute(
+            """
+            INSERT INTO referral_push_activity (
+                id, property_uuid, realtor_id, to_number, message_body, status, external_id, response_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                property_uuid = excluded.property_uuid,
+                realtor_id = excluded.realtor_id,
+                to_number = excluded.to_number,
+                message_body = excluded.message_body,
+                status = excluded.status,
+                external_id = excluded.external_id,
+                response_json = excluded.response_json,
+                created_at = excluded.created_at
+            """,
+            (
+                r.get("id"),
+                r.get("property_uuid"),
+                r.get("realtor_id"),
+                r.get("to_number"),
+                r.get("message_body"),
+                r.get("status"),
+                r.get("external_id"),
+                r.get("response_json"),
+                r.get("created_at"),
+            ),
+        )
+        counts["referral_push_activity"] += 1
+    return counts
+
+
 def get_direct_mail_settings(db):
     return {
         "sender_first_name": get_setting(db, "dm_sender_first_name", ""),
@@ -7696,6 +7822,37 @@ def reisift_create_property_api():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.route("/api/admin/import-referral-bundle", methods=["POST"])
+def import_referral_bundle_api():
+    ensure_db()
+    db = get_db()
+    try:
+        payload = request.get_json(silent=True) or {}
+        realtor_rows = payload.get("referral_realtors")
+        referral_rows = payload.get("reisift_referrals")
+        push_rows = payload.get("referral_push_activity")
+        realtor_rows = realtor_rows if isinstance(realtor_rows, list) else []
+        referral_rows = referral_rows if isinstance(referral_rows, list) else []
+        push_rows = push_rows if isinstance(push_rows, list) else []
+        if not (realtor_rows or referral_rows or push_rows):
+            return jsonify({"ok": False, "error": "No import rows provided."}), 400
+        counts = import_referral_bundle_rows(db, realtor_rows, referral_rows, push_rows)
+        db.commit()
+        return jsonify({"ok": True, "imported": counts})
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="import_referral_bundle_api",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/api/admin/import-referral-bundle",
+            status_code=500,
+        )
+        db.commit()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/settings", methods=["GET", "POST"])
 def settings_page():
     ensure_db()
@@ -7818,6 +7975,31 @@ def settings_page():
                             route="/settings",
                             status_code=500,
                         )
+            elif helper_action == "import_referral_bundle":
+                try:
+                    realtor_rows = _parse_uploaded_json_rows(request.files.get("referral_realtors_file"))
+                    referral_rows = _parse_uploaded_json_rows(request.files.get("reisift_referrals_file"))
+                    push_rows = _parse_uploaded_json_rows(request.files.get("referral_push_activity_file"))
+                    if not (realtor_rows or referral_rows or push_rows):
+                        raise ValueError("Upload at least one JSON file to import.")
+                    counts = import_referral_bundle_rows(db, realtor_rows, referral_rows, push_rows)
+                    notice = (
+                        "Referral bundle imported. "
+                        f"Realtors: {counts['referral_realtors']}, "
+                        f"Referrals: {counts['reisift_referrals']}, "
+                        f"Push Activity: {counts['referral_push_activity']}."
+                    )
+                except Exception as exc:
+                    db.rollback()
+                    error_notice = f"Referral bundle import failed: {exc}"
+                    log_app_error(
+                        db,
+                        source="import_referral_bundle",
+                        error_message=str(exc),
+                        details=traceback.format_exc(),
+                        route="/settings",
+                        status_code=500,
+                    )
         db.commit()
 
     settings = get_direct_mail_settings(db)

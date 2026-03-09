@@ -8006,6 +8006,50 @@ def logout():
     return redirect(url_for("dashboard"))
 
 
+def communication_counts_for_people(db, person_ids, property_id=None):
+    clean_ids = []
+    seen = set()
+    for pid in person_ids or []:
+        try:
+            val = int(pid)
+        except Exception:
+            continue
+        if val <= 0 or val in seen:
+            continue
+        seen.add(val)
+        clean_ids.append(val)
+    if not clean_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(clean_ids))
+    where = [f"person_id IN ({placeholders})"]
+    params = list(clean_ids)
+    if property_id is not None:
+        where.append("property_id = ?")
+        params.append(int(property_id))
+    rows = db.execute(
+        f"""
+        SELECT person_id,
+               SUM(CASE WHEN upper(channel)='SMS' AND lower(direction)='outbound' THEN 1 ELSE 0 END) AS sms_outbound,
+               SUM(CASE WHEN upper(channel)='SMS' AND lower(direction)='inbound' THEN 1 ELSE 0 END) AS sms_inbound,
+               SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='outbound' THEN 1 ELSE 0 END) AS email_outbound,
+               SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='inbound' THEN 1 ELSE 0 END) AS email_inbound
+        FROM communications
+        WHERE {' AND '.join(where)}
+        GROUP BY person_id
+        """,
+        tuple(params),
+    ).fetchall()
+    out = {}
+    for r in rows:
+        out[int(r["person_id"])] = {
+            "sms_outbound": int(r["sms_outbound"] or 0),
+            "sms_inbound": int(r["sms_inbound"] or 0),
+            "email_outbound": int(r["email_outbound"] or 0),
+            "email_inbound": int(r["email_inbound"] or 0),
+        }
+    return out
+
+
 @app.route("/")
 def dashboard():
     ensure_db()
@@ -9772,6 +9816,7 @@ def property_detail(property_id):
 
     sms_rollup = {"sent": 0, "received": 0}
     verified_contacts = []
+    property_comm_summary_rows = []
     if network_ids:
         placeholders = ",".join(["?"] * len(network_ids))
         sent = db.execute(
@@ -9828,6 +9873,43 @@ def property_detail(property_id):
                         "verified_social_count": verified_social,
                     }
                 )
+    summary_people = []
+    if owner:
+        summary_people.append(
+            {
+                "person_id": int(owner["id"]),
+                "full_name": person_name(owner),
+                "relationship_type": "Owner",
+            }
+        )
+    for rel in owner_relationships:
+        summary_people.append(
+            {
+                "person_id": int(rel["person_id"]),
+                "full_name": person_name(rel),
+                "relationship_type": (rel["relationship_type"] or "Unknown"),
+            }
+        )
+    dedup_summary_people = []
+    seen_summary_ids = set()
+    for row in summary_people:
+        pid = int(row["person_id"])
+        if pid in seen_summary_ids:
+            continue
+        seen_summary_ids.add(pid)
+        dedup_summary_people.append(row)
+    counts_map = communication_counts_for_people(db, [r["person_id"] for r in dedup_summary_people], property_id=property_id)
+    for row in dedup_summary_people:
+        c = counts_map.get(int(row["person_id"]), {})
+        property_comm_summary_rows.append(
+            {
+                **row,
+                "sms_outbound": int(c.get("sms_outbound", 0)),
+                "sms_inbound": int(c.get("sms_inbound", 0)),
+                "email_outbound": int(c.get("email_outbound", 0)),
+                "email_inbound": int(c.get("email_inbound", 0)),
+            }
+        )
     sequence_campaigns = get_sequence_campaigns(db, only_active=True)
     target_ids = _property_sequence_targets(db, property_id)
     sequence_targets = []
@@ -9862,6 +9944,7 @@ def property_detail(property_id):
         all_people=all_people,
         related_people_options=related_people_options,
         sms_rollup=sms_rollup,
+        property_comm_summary_rows=property_comm_summary_rows,
         verified_contacts=verified_contacts,
         touchpoints=touchpoints,
         socials=socials,
@@ -10067,6 +10150,47 @@ def person_detail(person_id):
         (person_id,),
     ).fetchone()
 
+    person_summary_people = [
+        {
+            "person_id": int(person["id"]),
+            "full_name": person_name(person),
+            "relationship_type": "Self",
+        }
+    ]
+    for rel in relationship_rows:
+        person_summary_people.append(
+            {
+                "person_id": int(rel["person_id"]),
+                "full_name": person_name(rel),
+                "relationship_type": (rel["relationship_type"] or "Unknown"),
+            }
+        )
+    dedup_person_summary = []
+    seen_person_summary = set()
+    for row in person_summary_people:
+        pid = int(row["person_id"])
+        if pid in seen_person_summary:
+            continue
+        seen_person_summary.add(pid)
+        dedup_person_summary.append(row)
+    person_counts_map = communication_counts_for_people(
+        db,
+        [r["person_id"] for r in dedup_person_summary],
+        property_id=(default_property_id if default_property_id else None),
+    )
+    person_comm_summary_rows = []
+    for row in dedup_person_summary:
+        c = person_counts_map.get(int(row["person_id"]), {})
+        person_comm_summary_rows.append(
+            {
+                **row,
+                "sms_outbound": int(c.get("sms_outbound", 0)),
+                "sms_inbound": int(c.get("sms_inbound", 0)),
+                "email_outbound": int(c.get("email_outbound", 0)),
+                "email_inbound": int(c.get("email_inbound", 0)),
+            }
+        )
+
     return render_template(
         "person_detail.html",
         person=person,
@@ -10088,6 +10212,7 @@ def person_detail(person_id):
         social_url=normalize_social_profile_url,
         sequence_campaigns=sequence_campaigns,
         person_enrollments=person_enrollments,
+        person_comm_summary_rows=person_comm_summary_rows,
         seq_notice=(request.args.get("seq_notice") or "").strip(),
     )
 

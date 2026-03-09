@@ -14,6 +14,7 @@
             <summary><strong>Integrations</strong></summary>
             <div class="entity-integrations-menu">
                 <button type="button" id="propertySkipTraceBtn">Skip Trace Property (Owners)</button>
+                <button type="button" id="bulkSmsBtn">Bulk Text This Property</button>
                 <a href="{{ url_for('sequences_page') }}">Sequence Automation</a>
             </div>
         </details>
@@ -53,124 +54,12 @@
     </table>
 </section>
 
-<section class="panel split">
-    <div>
-        <h3>Contact Information</h3>
-        {% set phone_rows = owner_touchpoints | selectattr('channel_type', 'equalto', 'Phone') | list %}
-        {% set email_rows = owner_touchpoints | selectattr('channel_type', 'equalto', 'Email') | list %}
-
-        <section class="contact-card">
-        <div class="contact-card-head">
-            <h4>Phone Numbers ({{ phone_rows|length }})</h4>
-            <details class="inline-add-details">
-                <summary>Add New Phone</summary>
-                <form id="addPhoneForm" class="grid-form compact">
-                    <label>Type
-                        <select name="channel_label">
-                            <option value="Landline">Landline</option><option value="Mobile">Mobile</option><option value="VoIP">VoIP</option><option value="Fax">Fax</option><option value="Unknown">Unknown</option>
-                        </select>
-                    </label>
-                    <label>Number <input name="value" required></label>
-                </form>
-            </details>
-        </div>
-        <table class="crm-table contact-table">
-            <thead><tr><th>Type</th><th>Number</th><th>Status</th><th></th></tr></thead>
-            <tbody id="phoneRows">
-                {% for t in phone_rows %}
-                <tr data-touchpoint-id="{{ t.id }}">
-                    <td>
-                        <select class="touch-label" data-id="{{ t.id }}">
-                            {% for phone_type in ['Landline','Mobile','VoIP','Fax','Unknown'] %}
-                            <option value="{{ phone_type }}" {% if t.channel_label == phone_type %}selected{% endif %}>{{ phone_type }}</option>
-                            {% endfor %}
-                        </select>
-                    </td>
-                    <td>{{ t.value|fmt_phone }}</td>
-                    <td>
-                        <select class="touch-status" data-id="{{ t.id }}">
-                            {% for s in ['Correct','Incorrect','DNC','DNT','No Answer','Dead','Undeliverable','Not in service','Unknown'] %}
-                            <option value="{{ s }}" {% if t.status == s %}selected{% endif %}>{{ s }}</option>
-                            {% endfor %}
-                        </select>
-                    </td>
-                    <td><button type="button" class="icon-btn delete-touch" data-id="{{ t.id }}">x</button></td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        </section>
-
-        <section class="contact-card">
-        <div class="contact-card-head">
-            <h4>Emails ({{ email_rows|length }})</h4>
-            <details class="inline-add-details">
-                <summary>Add New Email</summary>
-                <form id="addEmailForm" class="grid-form compact">
-                    <label class="span2">Email Address <input name="value" required></label>
-                </form>
-            </details>
-        </div>
-        <table class="crm-table contact-table">
-            <thead><tr><th>Email</th><th>Status</th><th></th></tr></thead>
-            <tbody id="emailRows">
-                {% for t in email_rows %}
-                <tr data-touchpoint-id="{{ t.id }}">
-                    <td>{{ t.value }}</td>
-                    <td>
-                        <select class="touch-status" data-id="{{ t.id }}">
-                            {% for s in ['Correct','Incorrect','DNC','DNT','No Answer','Dead','Undeliverable','Not in service','Unknown'] %}
-                            <option value="{{ s }}" {% if t.status == s %}selected{% endif %}>{{ s }}</option>
-                            {% endfor %}
-                        </select>
-                    </td>
-                    <td><button type="button" class="icon-btn delete-touch" data-id="{{ t.id }}">x</button></td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        </section>
-
-        <section class="contact-card">
-        <div class="contact-card-head">
-            <h4>Social Accounts</h4>
-            <details class="inline-add-details">
-                <summary>Add New Social</summary>
-                <form id="addSocialForm" class="grid-form compact">
-                    <label>Platform <input name="platform" value="LinkedIn"></label>
-                    <label>Handle <input name="handle"></label>
-                    <label>URL <input name="url"></label>
-                </form>
-            </details>
-        </div>
-        <table class="crm-table contact-table">
-            <thead><tr><th>Platform</th><th>Handle</th><th>Status</th><th></th></tr></thead>
-            <tbody id="socialRows">
-                {% for s in socials if s.person_id == prop.owner_person_id %}
-                <tr data-social-id="{{ s.id }}">
-                    <td>{{ s.platform }}</td>
-                    <td><a href="{{ social_url(s.platform, s.handle, s.url) }}" target="_blank">{{ s.handle or social_url(s.platform, s.handle, s.url) }}</a></td>
-                    <td>
-                        <select class="social-status" data-id="{{ s.id }}">
-                            {% for st in ['Unverified','Verified','Incorrect','Dead'] %}
-                            <option value="{{ st }}" {% if s.status == st %}selected{% endif %}>{{ st }}</option>
-                            {% endfor %}
-                        </select>
-                    </td>
-                    <td><button type="button" class="icon-btn delete-social" data-id="{{ s.id }}">x</button></td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        </section>
-
-    </div>
-
-    <div>
-        <h3>Relationships</h3>
-        <table class="crm-table">
-            <thead><tr><th>Order</th><th>Full Name</th><th>Relationship</th><th>Deceased</th><th>Status</th><th></th></tr></thead>
-            <tbody>
+<section class="panel">
+    <h3>Relationship Navigator</h3>
+    <table class="crm-table">
+        <thead><tr><th>Order</th><th>Full Name</th><th>Relationship</th><th>Deceased</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+            {% if owner_relationships %}
                 {% for rel in owner_relationships %}
                 <tr data-relationship-id="{{ rel.relationship_id }}" data-person-id="{{ rel.person_id }}" class="{% if rel.deceased %}deceased-row{% endif %}">
                     <td>
@@ -180,9 +69,7 @@
                         </div>
                     </td>
                     <td><a href="{{ url_for('person_detail', person_id=rel.person_id, property_id=prop.id) }}">{{ rel.first_name }} {{ rel.middle_name or '' }} {{ rel.last_name }}</a></td>
-                    <td>
-                        <input type="text" class="relationship-type-input" value="{{ rel.relationship_type }}" data-id="{{ rel.relationship_id }}">
-                    </td>
+                    <td><input type="text" class="relationship-type-input" value="{{ rel.relationship_type }}" data-id="{{ rel.relationship_id }}"></td>
                     <td>{{ 'Yes' if rel.deceased else 'No' }}</td>
                     <td>
                         {% set rel_status = 'Skip Traced' if rel.skip_traced else (rel.outreach_status or 'No Contact') %}
@@ -195,79 +82,62 @@
                     <td><button type="button" class="icon-btn delete-relationship" data-id="{{ rel.relationship_id }}">x</button></td>
                 </tr>
                 {% endfor %}
-            </tbody>
-        </table>
+            {% elif owner %}
+                <tr>
+                    <td>-</td>
+                    <td><a href="{{ url_for('person_detail', person_id=owner.id, property_id=prop.id) }}">{{ owner.first_name }} {{ owner.middle_name or '' }} {{ owner.last_name }}</a></td>
+                    <td>Owner</td>
+                    <td>{{ 'Yes' if owner.deceased else 'No' }}</td>
+                    <td>{{ owner.outreach_status or 'No Contact' }}</td>
+                    <td></td>
+                </tr>
+            {% else %}
+                <tr><td colspan="6">No owner record found.</td></tr>
+            {% endif %}
+        </tbody>
+    </table>
 
-        <details>
-            <summary><strong>Add a New Relationship</strong></summary>
-            <form method="post" action="{{ url_for('add_new_relationship', property_id=prop.id) }}" class="grid-form compact">
-                <label>First Name <input name="related_first_name" required></label>
-                <label>Last Name <input name="related_last_name" required></label>
-                <label>Relationship Type <input name="relationship_type" value="Relative"></label>
-                <label>Status
-                    <select name="related_status"><option>No Contact</option><option>Contact No Response</option><option>Follow Up</option><option>Outreach Attempted</option><option>In Touch</option><option>Not Skipped</option><option>Skipped</option><option>Skipped, No Info</option><option>Skip Traced</option></select>
-                </label>
-                <label>Phone <input name="related_phone"></label>
-                <label>Email <input name="related_email"></label>
-                <label>Street <input name="related_street"></label>
-                <label>City <input name="related_city"></label>
-                <label>State <input name="related_state"></label>
-                <label>ZIP <input name="related_zip"></label>
-                <label class="span2">Relationship Note <textarea name="note"></textarea></label>
-                <label class="span2">Person Notes <textarea name="related_notes"></textarea></label>
-                <button type="submit">Create + Link</button>
-            </form>
-        </details>
-    </div>
+    <details>
+        <summary><strong>Add a New Relationship</strong></summary>
+        <form method="post" action="{{ url_for('add_new_relationship', property_id=prop.id) }}" class="grid-form compact">
+            <label>First Name <input name="related_first_name" required></label>
+            <label>Last Name <input name="related_last_name" required></label>
+            <label>Relationship Type <input name="relationship_type" value="Relative"></label>
+            <label>Status
+                <select name="related_status"><option>No Contact</option><option>Contact No Response</option><option>Follow Up</option><option>Outreach Attempted</option><option>In Touch</option><option>Not Skipped</option><option>Skipped</option><option>Skipped, No Info</option><option>Skip Traced</option></select>
+            </label>
+            <label>Phone <input name="related_phone"></label>
+            <label>Email <input name="related_email"></label>
+            <label>Street <input name="related_street"></label>
+            <label>City <input name="related_city"></label>
+            <label>State <input name="related_state"></label>
+            <label>ZIP <input name="related_zip"></label>
+            <label class="span2">Relationship Note <textarea name="note"></textarea></label>
+            <label class="span2">Person Notes <textarea name="related_notes"></textarea></label>
+            <button type="submit">Create + Link</button>
+        </form>
+    </details>
 </section>
 
 <section class="panel">
-    <h3>Communications</h3>
-    <section class="comm-card">
-        <div class="comm-tabs" id="commTabs">
-            <button type="button" class="comm-tab active" data-channel="ALL">All</button>
-            <button type="button" class="comm-tab" data-channel="SMS">SMS</button>
-            <button type="button" class="comm-tab" data-channel="EMAIL">Email</button>
-        </div>
-
-        <div class="comm-header">
-            <strong id="commToLabel">Send to (Phone)</strong>
-            <select id="commToNumber">
-                {% if owner_phone_options %}
-                    {% for ph in owner_phone_options %}
-                    <option value="{{ ph }}">{{ ph|fmt_phone }}</option>
-                    {% endfor %}
-                {% else %}
-                    <option value="">No phone on file</option>
-                {% endif %}
-            </select>
-        </div>
-        <input type="text" id="commEmailSubject" placeholder="Email subject" value="Question re: {{ prop.street }}" class="comm-subject hidden">
-
-        <div id="commFeed" class="comm-feed">
-            {% for m in communications %}
-            <article class="msg-row {{ 'outbound' if m.direction|lower == 'outbound' else 'inbound' }}" data-channel="{{ m.channel|upper }}">
-                <div class="msg-meta">
-                    <span>{{ m.direction }}{% if m.direction|lower == 'outbound' and m.to_number %} to {% if (m.channel or '')|upper == 'EMAIL' %}{{ m.to_number }}{% else %}{{ m.to_number|fmt_phone }}{% endif %}{% elif m.direction|lower == 'inbound' and m.from_number %} from {% if (m.channel or '')|upper == 'EMAIL' %}{{ m.from_number }}{% else %}{{ m.from_number|fmt_phone }}{% endif %}{% endif %}</span>
-                    <span>{{ m.sent_at }}</span>
-                    <span class="msg-status">{{ m.status }}</span>
-                </div>
-                <div class="msg-bubble">{{ m.body }}</div>
-            </article>
+    <h3>Communication Summary (By Individual)</h3>
+    <table class="crm-table">
+        <thead><tr><th>Individual</th><th>Relationship</th><th>SMS Out</th><th>SMS In</th><th>Email Out</th><th>Email In</th></tr></thead>
+        <tbody>
+            {% for row in property_comm_summary_rows %}
+            <tr>
+                <td><a href="{{ url_for('person_detail', person_id=row.person_id, property_id=prop.id) }}">{{ row.full_name }}</a></td>
+                <td>{{ row.relationship_type }}</td>
+                <td>{{ row.sms_outbound }}</td>
+                <td>{{ row.sms_inbound }}</td>
+                <td>{{ row.email_outbound }}</td>
+                <td>{{ row.email_inbound }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6">No communication activity yet.</td></tr>
             {% endfor %}
-        </div>
-
-        <form id="smsComposer" class="comm-compose">
-            <textarea id="smsBody" placeholder="Jot something down..." rows="2"></textarea>
-            <div class="comm-actions">
-                <span id="composerMode">From {{ smrt_from_number }} (SMS mode)</span>
-                <button type="submit" id="smsSendBtn">Send</button>
-            </div>
-        </form>
-    </section>
-    <div class="bulk-row">
-        <button type="button" id="bulkSmsBtn" class="bulk-btn">Bulk Text This Property</button>
-    </div>
+        </tbody>
+    </table>
 </section>
 
 <section class="panel"><details><summary><strong>Activity Log</strong></summary><table><thead><tr><th>Date</th><th>Person ID</th><th>Type</th><th>Outcome</th><th>Note</th></tr></thead><tbody>{% for a in activities %}<tr><td>{{ a.created_at }}</td><td>{{ a.person_id }}</td><td>{{ a.activity_type }}</td><td>{{ a.outcome }}</td><td>{{ a.note }}</td></tr>{% endfor %}</tbody></table></details></section>
@@ -316,7 +186,7 @@
 <script>
 const propertyId = {{ prop.id }};
 const ownerId = {{ prop.owner_person_id }};
-let commChannel = 'ALL';
+let commChannel = 'SMS';
 let ownerPhoneOptions = {{ owner_phone_options|tojson }};
 let ownerEmailOptions = {{ owner_email_options|tojson }};
 
@@ -621,22 +491,26 @@ function socialUrl(platform, handle, url) {
 }
 
 function applyCommFilter() {
-  document.querySelectorAll('#commFeed .msg-row').forEach((row) => {
+  const feed = document.getElementById('commFeed');
+  if (!feed) return;
+  feed.querySelectorAll('.msg-row').forEach((row) => {
     const show = commChannel === 'ALL' || (row.dataset.channel || '') === commChannel;
     row.style.display = show ? '' : 'none';
   });
 }
 
 function setCommChannel(channel) {
-  commChannel = channel;
-  document.querySelectorAll('#commTabs .comm-tab').forEach((btn) => {
-    btn.classList.toggle('active', btn.dataset.channel === channel);
-  });
+  const tabsRoot = document.getElementById('commTabs');
   const mode = document.getElementById('composerMode');
   const sendBtn = document.getElementById('smsSendBtn');
   const toSelect = document.getElementById('commToNumber');
   const toLabel = document.getElementById('commToLabel');
   const subject = document.getElementById('commEmailSubject');
+  if (!tabsRoot || !mode || !sendBtn || !toSelect || !toLabel || !subject) return;
+  commChannel = channel;
+  document.querySelectorAll('#commTabs .comm-tab').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.channel === channel);
+  });
   const isEmail = channel === 'EMAIL';
   const list = isEmail ? ownerEmailOptions : ownerPhoneOptions;
   toSelect.innerHTML = '';
@@ -728,12 +602,14 @@ mailProofSendBtn.addEventListener('click', async () => {
   }
 });
 
-document.getElementById('commTabs').addEventListener('click', (e) => {
+const commTabsEl = document.getElementById('commTabs');
+if (commTabsEl) commTabsEl.addEventListener('click', (e) => {
   if (!e.target.classList.contains('comm-tab')) return;
   setCommChannel(e.target.dataset.channel);
 });
 
-document.getElementById('smsComposer').addEventListener('submit', async (e) => {
+const smsComposerEl = document.getElementById('smsComposer');
+if (smsComposerEl) smsComposerEl.addEventListener('submit', async (e) => {
   e.preventDefault();
   const toNumber = document.getElementById('commToNumber').value.trim();
   if (!toNumber) return;
@@ -765,14 +641,16 @@ document.getElementById('smsComposer').addEventListener('submit', async (e) => {
   applyCommFilter();
 });
 
-document.getElementById('smsBody').addEventListener('keydown', (e) => {
+const smsBodyEl = document.getElementById('smsBody');
+if (smsBodyEl) smsBodyEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     document.getElementById('smsComposer').requestSubmit();
   }
 });
 
-document.getElementById('commToNumber').addEventListener('change', () => {
+const commToNumberEl = document.getElementById('commToNumber');
+if (commToNumberEl) commToNumberEl.addEventListener('change', () => {
   document.getElementById('smsSendBtn').disabled = !document.getElementById('commToNumber').value;
 });
 
@@ -791,7 +669,7 @@ document.getElementById('bulkSmsBtn').addEventListener('click', async () => {
   alert(`Bulk SMS queued. Targets: ${res.data.target_count}.`);
 });
 
-setCommChannel('ALL');
+setCommChannel('SMS');
 
 document.getElementById('propertyNotes').addEventListener('blur', async (e) => {
   const r = await patchJson(`/api/properties/${propertyId}/notes`, {notes:e.target.value});
@@ -891,6 +769,7 @@ document.addEventListener('blur', (e) => {
 
 function bindEnter(formId, handler) {
   const form = document.getElementById(formId);
+  if (!form) return;
   form.addEventListener('submit', (e)=>{ e.preventDefault(); handler(form); });
   form.addEventListener('keydown', (e)=>{ if (e.key==='Enter') { e.preventDefault(); form.requestSubmit(); } });
 }

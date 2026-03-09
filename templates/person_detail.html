@@ -53,6 +53,33 @@
     </div>
 </section>
 
+<section class="panel">
+    <h3>Communication Summary (By Individual)</h3>
+    <table class="crm-table">
+        <thead><tr><th>Individual</th><th>Relationship</th><th>SMS Out</th><th>SMS In</th><th>Email Out</th><th>Email In</th></tr></thead>
+        <tbody>
+            {% for row in person_comm_summary_rows %}
+            <tr>
+                <td>
+                    {% if row.person_id == person.id %}
+                    {{ row.full_name }}
+                    {% else %}
+                    <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=(default_property_id if default_property_id else '')) }}">{{ row.full_name }}</a>
+                    {% endif %}
+                </td>
+                <td>{{ row.relationship_type }}</td>
+                <td>{{ row.sms_outbound }}</td>
+                <td>{{ row.sms_inbound }}</td>
+                <td>{{ row.email_outbound }}</td>
+                <td>{{ row.email_inbound }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6">No communication activity yet.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
 <section class="panel split">
     <div>
         <h3>Contact Information</h3>
@@ -140,8 +167,7 @@
     <h3>Communications</h3>
     <section class="comm-card">
         <div class="comm-tabs" id="personCommTabs">
-            <button type="button" class="comm-tab active" data-channel="ALL">All</button>
-            <button type="button" class="comm-tab" data-channel="SMS">SMS</button>
+            <button type="button" class="comm-tab active" data-channel="SMS">SMS</button>
             <button type="button" class="comm-tab" data-channel="EMAIL">Email</button>
         </div>
 
@@ -243,7 +269,7 @@
 <script>
 const personId = {{ person.id }};
 const personCommPropertyId = {{ default_property_id if default_property_id else 'null' }};
-let personCommChannel = 'ALL';
+let personCommChannel = 'SMS';
 let personPhoneOptions = {{ person_phone_options|tojson }};
 let personEmailOptions = {{ person_email_options|tojson }};
 const patchJson = (url, body) => fetch(url, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
@@ -628,7 +654,7 @@ document.getElementById('personCommToNumber').addEventListener('change', () => {
   document.getElementById('personSmsSendBtn').disabled = !document.getElementById('personCommToNumber').value || !personCommPropertyId;
 });
 
-setPersonCommChannel('ALL');
+setPersonCommChannel('SMS');
 sortPersonPhoneRows();
 </script>
 {% endblock %}

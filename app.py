@@ -6368,6 +6368,42 @@ def _reisift_find_first_owner_dict(payload):
     return {}
 
 
+def _reisift_find_owner_uuid(payload):
+    if not isinstance(payload, (dict, list)):
+        return ""
+    queue = [payload]
+    while queue:
+        current = queue.pop(0)
+        if isinstance(current, dict):
+            for key in ("owner_uuid", "owner_id"):
+                candidate = str(current.get(key) or "").strip()
+                if candidate:
+                    return candidate
+            owner = current.get("owner")
+            if isinstance(owner, dict):
+                for key in ("uuid", "id"):
+                    candidate = str(owner.get(key) or "").strip()
+                    if candidate:
+                        return candidate
+            owners = current.get("owners")
+            if isinstance(owners, list):
+                for owner_item in owners:
+                    if not isinstance(owner_item, dict):
+                        continue
+                    for key in ("uuid", "id"):
+                        candidate = str(owner_item.get(key) or "").strip()
+                        if candidate:
+                            return candidate
+            for value in current.values():
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+        elif isinstance(current, list):
+            for item in current:
+                if isinstance(item, (dict, list)):
+                    queue.append(item)
+    return ""
+
+
 def _reisift_parse_owner_name(owner):
     if not isinstance(owner, dict):
         return {"first_name": "", "last_name": ""}
@@ -6623,6 +6659,69 @@ def reisift_enrich_property_uuid(token, property_uuid):
     return {"request": enrich_payload, "response": body}
 
 
+def reisift_upsert_owner_contacts(token, owner_uuid, phones, emails):
+    owner_uuid = str(owner_uuid or "").strip()
+    if not owner_uuid:
+        return {"ok": False, "error": "owner_uuid missing"}
+    out = {"ok": True, "owner_uuid": owner_uuid, "phones": None, "emails": None}
+    normalized_phones = []
+    seen_phones = set()
+    for p in phones or []:
+        if isinstance(p, dict):
+            number = normalize_phone(p.get("number") or p.get("phone") or "")
+            p_type = (p.get("type") or "UNKNOWN").strip().upper()
+        else:
+            number = normalize_phone(str(p or ""))
+            p_type = "UNKNOWN"
+        if not number or number in seen_phones:
+            continue
+        seen_phones.add(number)
+        normalized_phones.append({"type": p_type or "UNKNOWN", "tags": [], "number": number})
+
+    normalized_emails = []
+    seen_emails = set()
+    for e in emails or []:
+        val = str(e or "").strip().lower()
+        if not val or val in seen_emails:
+            continue
+        seen_emails.add(val)
+        normalized_emails.append(val)
+
+    if normalized_phones:
+        phone_payload = {"phones": normalized_phones}
+        phone_res = requests.post(
+            f"{REISIFT_BASE_URL}/api/internal/owner/{owner_uuid}/upsert-phones/",
+            headers=reisift_auth_headers(token),
+            json=phone_payload,
+            timeout=30,
+        )
+        try:
+            phone_body = phone_res.json()
+        except ValueError:
+            phone_body = {"raw_text": phone_res.text}
+        if not phone_res.ok:
+            raise ValueError(f"ReiSift owner phone upsert failed ({phone_res.status_code}): {phone_body}")
+        out["phones"] = {"request": phone_payload, "response": phone_body}
+
+    if normalized_emails:
+        email_payload = {"emails": normalized_emails}
+        email_res = requests.post(
+            f"{REISIFT_BASE_URL}/api/internal/owner/{owner_uuid}/upsert-emails/",
+            headers=reisift_auth_headers(token),
+            json=email_payload,
+            timeout=30,
+        )
+        try:
+            email_body = email_res.json()
+        except ValueError:
+            email_body = {"raw_text": email_res.text}
+        if not email_res.ok:
+            raise ValueError(f"ReiSift owner email upsert failed ({email_res.status_code}): {email_body}")
+        out["emails"] = {"request": email_payload, "response": email_body}
+
+    return out
+
+
 def create_reisift_property_from_search(input_payload):
     search = (input_payload.get("search") or input_payload.get("address_search") or "").strip()
     if not search:
@@ -6675,6 +6774,16 @@ def create_reisift_property_from_search(input_payload):
         create_body = {"raw_text": create_res.text}
     create_res.raise_for_status()
     created_uuid = str(create_body.get("uuid") or create_body.get("id") or "").strip()
+    owner_uuid = _reisift_find_owner_uuid(create_body)
+    owner_payload = create_payload.get("owner") if isinstance(create_payload.get("owner"), dict) else {}
+    owner_phones = _reisift_parse_owner_phones(owner_payload)
+    owner_emails = _reisift_parse_owner_emails(owner_payload)
+    owner_contact_sync = None
+    if owner_uuid and (owner_phones or owner_emails):
+        try:
+            owner_contact_sync = reisift_upsert_owner_contacts(token, owner_uuid, owner_phones, owner_emails)
+        except Exception as exc:
+            owner_contact_sync = {"ok": False, "owner_uuid": owner_uuid, "error": str(exc)}
 
     # Wait 2-5 seconds before enrich to allow create propagation.
     enrich_result = None
@@ -6689,6 +6798,8 @@ def create_reisift_property_from_search(input_payload):
         "create_payload": create_payload,
         "created": create_body,
         "created_uuid": created_uuid,
+        "owner_uuid": owner_uuid,
+        "owner_contact_sync": owner_contact_sync,
         "enrich_wait_seconds": enrich_wait_seconds if created_uuid else 0,
         "enrich": enrich_result,
         "autocomplete": autocomplete_payload,
@@ -8365,6 +8476,8 @@ def reisift_create_property_api():
                 "created_uuid": result.get("created_uuid") or created.get("uuid") or created.get("id"),
                 "created": created,
                 "create_payload": result.get("create_payload"),
+                "owner_uuid": result.get("owner_uuid"),
+                "owner_contact_sync": result.get("owner_contact_sync"),
                 "enrich_wait_seconds": result.get("enrich_wait_seconds", 0),
                 "enrich": result.get("enrich"),
             }
@@ -8398,6 +8511,8 @@ def integrations_reisift_create_property_api():
                 "map_id": result.get("map_id"),
                 "created_uuid": result.get("created_uuid") or created.get("uuid") or created.get("id"),
                 "created": created,
+                "owner_uuid": result.get("owner_uuid"),
+                "owner_contact_sync": result.get("owner_contact_sync"),
                 "enrich": result.get("enrich"),
             }
         )

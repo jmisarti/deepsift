@@ -1,0 +1,101 @@
+[
+  {
+    "id": 1,
+    "property_uuid": "10909061-2494-47ed-84c1-35b4d16ecd2a",
+    "realtor_id": 1,
+    "to_number": "13475703265",
+    "message_body": "New Lead: 1 Garfield Pl, Parlin, NJ 7326880529",
+    "status": "Sent",
+    "external_id": "SMba26cfb229c863d6c2ce0867c30d8a6d",
+    "response_json": "{\"smsId\": \"SMba26cfb229c863d6c2ce0867c30d8a6d\"}",
+    "created_at": "2026-03-06 15:11:11"
+  },
+  {
+    "id": 2,
+    "property_uuid": "5218ee32-21c3-4542-ab85-34b4451878b2",
+    "realtor_id": 5,
+    "to_number": "15167491123",
+    "message_body": "New Listing Lead\nName: Paresh Pitalia\nAddress: 50 Dahlia Ct, Piscataway, NJ\nPhone: 7325893595\nEmail: paresh102030@yahoo.com",
+    "status": "Sent",
+    "external_id": "SMf8dae14fc1a082cf0f5f6c87c7b97968",
+    "response_json": "{\"smsId\": \"SMf8dae14fc1a082cf0f5f6c87c7b97968\"}",
+    "created_at": "2026-03-06 16:58:47"
+  },
+  {
+    "id": 3,
+    "property_uuid": "5218ee32-21c3-4542-ab85-34b4451878b2",
+    "realtor_id": 2,
+    "to_number": "12014003907",
+    "message_body": "New Listing Lead\nName: Paresh Pitalia\nAddress: 50 Dahlia Ct, Piscataway, NJ\nPhone: 7325893595\nEmail: paresh102030@yahoo.com",
+    "status": "Sent",
+    "external_id": "SM0a79ac8782dda56f146583b80dd0c885",
+    "response_json": "{\"smsId\": \"SM0a79ac8782dda56f146583b80dd0c885\"}",
+    "created_at": "2026-03-06 17:11:48"
+  },
+  {
+    "id": 4,
+    "property_uuid": "5218ee32-21c3-4542-ab85-34b4451878b2",
+    "realtor_id": 6,
+    "to_number": "7327894774",
+    "message_body": "New Listing Lead\nName: Paresh Pitalia\nAddress: 50 Dahlia Ct, Piscataway, NJ\nPhone: 7325893595\nEmail: paresh102030@yahoo.com",
+    "status": "Sent",
+    "external_id": "SMf238148ed707f2adda52db6399f969b7",
+    "response_json": "{\"smsId\": \"SMf238148ed707f2adda52db6399f969b7\"}",
+    "created_at": "2026-03-06 17:11:50"
+  },
+  {
+    "id": 5,
+    "property_uuid": "10909061-2494-47ed-84c1-35b4d16ecd2a",
+    "realtor_id": 5,
+    "to_number": "15167491123",
+    "message_body": "New Listing Lead\nName: Rafael Aguiles\nAddress: 1 Garfield Pl, Parlin, NJ\nPhone: 7326880529\nEmail: raguiles@yahoo.com",
+    "status": "Sent",
+    "external_id": "SMbf133f18182e5de3741cfa9ed2d8fa94",
+    "response_json": "{\"smsId\": \"SMbf133f18182e5de3741cfa9ed2d8fa94\"}",
+    "created_at": "2026-03-06 17:13:51"
+  },
+  {
+    "id": 6,
+    "property_uuid": "10909061-2494-47ed-84c1-35b4d16ecd2a",
+    "realtor_id": 6,
+    "to_number": "7327894774",
+    "message_body": "New Listing Lead\nName: Rafael Aguiles\nAddress: 1 Garfield Pl, Parlin, NJ\nPhone: 7326880529\nEmail: raguiles@yahoo.com",
+    "status": "Sent",
+    "external_id": "SM911ce9636c9418144e7a66731f6640aa",
+    "response_json": "{\"smsId\": \"SM911ce9636c9418144e7a66731f6640aa\"}",
+    "created_at": "2026-03-06 17:13:52"
+  },
+  {
+    "id": 7,
+    "property_uuid": "10909061-2494-47ed-84c1-35b4d16ecd2a",
+    "realtor_id": 8,
+    "to_number": "17324869116",
+    "message_body": "New Listing Lead\nName: Rafael Aguiles\nAddress: 1 Garfield Pl, Parlin, NJ\nPhone: 7326880529\nEmail: raguiles@yahoo.com",
+    "status": "Sent",
+    "external_id": "SMedc06950e3ab67d11ac8b2c84c9a029e",
+    "response_json": "{\"smsId\": \"SMedc06950e3ab67d11ac8b2c84c9a029e\"}",
+    "created_at": "2026-03-06 17:13:54"
+  },
+  {
+    "id": 8,
+    "property_uuid": "f0d2de95-57a5-4dad-8f70-e31c33f1c378",
+    "realtor_id": 3,
+    "to_number": "17326449084",
+    "message_body": "New Listing Lead\nName: Mary Abbate\nAddress: 390C Picardy Ct, Lakewood, NJ\nPhone: 6469191742\nEmail: mary.redapples@gmail.com",
+    "status": "Sent",
+    "external_id": "SM00138245d4f48d3aa6e227e4ab189b8a",
+    "response_json": "{\"smsId\": \"SM00138245d4f48d3aa6e227e4ab189b8a\"}",
+    "created_at": "2026-03-06 22:55:20"
+  },
+  {
+    "id": 9,
+    "property_uuid": "5218ee32-21c3-4542-ab85-34b4451878b2",
+    "realtor_id": 10,
+    "to_number": "16093899025",
+    "message_body": "New Listing Lead\nName: Paresh Pitalia\nAddress: 50 Dahlia Ct, Piscataway, NJ\nPhone: 7325893595\nEmail: paresh102030@yahoo.com",
+    "status": "Sent",
+    "external_id": "SM02e896b6af27758c712af590fe3b1458",
+    "response_json": "{\"smsId\": \"SM02e896b6af27758c712af590fe3b1458\"}",
+    "created_at": "2026-03-07 00:09:01"
+  }
+]

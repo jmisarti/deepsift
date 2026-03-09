@@ -1,0 +1,82 @@
+[
+  {
+    "id": 1,
+    "first_name": "Andre",
+    "last_name": "Logan",
+    "email": "andre.logan@vyllateamnj.com",
+    "phone": "13475703265",
+    "brokerage": "VYLLA HOME",
+    "target_markets": "Middlesex",
+    "created_at": "2026-03-06 15:10:21"
+  },
+  {
+    "id": 2,
+    "first_name": "Christina",
+    "last_name": "GERGES",
+    "email": "christinagsellsnj@gmail.com",
+    "phone": "12014003907",
+    "brokerage": "",
+    "target_markets": "Bergen, Essex, Middlesex, Morris, Passaic, Union",
+    "created_at": "2026-03-06 15:49:54"
+  },
+  {
+    "id": 3,
+    "first_name": "Thomas",
+    "last_name": "Zdanowicz",
+    "email": "Tjzhomes@gmail.com",
+    "phone": "17326449084",
+    "brokerage": "RE/MAX Revolution",
+    "target_markets": "Atlantic, Monmouth, Ocean",
+    "created_at": "2026-03-06 16:01:17"
+  },
+  {
+    "id": 4,
+    "first_name": "Travis",
+    "last_name": "Soine",
+    "email": "tsoine@gmail.com",
+    "phone": "12017870495",
+    "brokerage": "Keller Williams  Park Views Realty",
+    "target_markets": "Bergen, Essex, Hudson, Passaic, Union",
+    "created_at": "2026-03-06 16:07:02"
+  },
+  {
+    "id": 5,
+    "first_name": "Zulekha",
+    "last_name": "Gordon",
+    "email": "zulekha.gordon@exprealty.com",
+    "phone": "15167491123",
+    "brokerage": "Exp Realty",
+    "target_markets": "Essex, Middlesex, Union",
+    "created_at": "2026-03-06 16:45:39"
+  },
+  {
+    "id": 6,
+    "first_name": "Colin",
+    "last_name": "Payyappilly",
+    "email": "cmorse63@yahoo.com",
+    "phone": "7327894774",
+    "brokerage": "JJ Elek Realty Co",
+    "target_markets": "Camden, Middlesex, Somerset, Union, Hunterdon",
+    "created_at": "2026-03-06 16:50:00"
+  },
+  {
+    "id": 8,
+    "first_name": "Richard",
+    "last_name": "Montero",
+    "email": "rmontero.united@gmail.com",
+    "phone": "17324869116",
+    "brokerage": "United Real Estate North Jersey",
+    "target_markets": "Middlesex",
+    "created_at": "2026-03-06 16:55:17"
+  },
+  {
+    "id": 10,
+    "first_name": "Srinivas",
+    "last_name": "Vyakaranam",
+    "email": "srriini99@gmail.com",
+    "phone": "16093899025",
+    "brokerage": "Realty Mark",
+    "target_markets": "Mercer, Middlesex, Monmouth, Ocean, Somerset, Union",
+    "created_at": "2026-03-06 21:52:09"
+  }
+]

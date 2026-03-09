@@ -3932,6 +3932,7 @@ def get_email_settings(db):
         "gmail_api_client_id": get_setting(db, "email_gmail_api_client_id", ""),
         "gmail_api_client_secret": get_setting(db, "email_gmail_api_client_secret", ""),
         "gmail_api_refresh_token": get_setting(db, "email_gmail_api_refresh_token", ""),
+        "gmail_webhook_token": get_setting(db, "email_gmail_webhook_token", ""),
     }
 
 
@@ -4742,6 +4743,263 @@ def _send_gmail_api_email(settings, to_email, subject, body, property_id=None, p
     return {"message_id": message_id, "subject": full_subject, "provider": "gmail_api", "response": send_body}
 
 
+def _gmail_header_value(headers, key):
+    key_l = (key or "").strip().lower()
+    for h in headers or []:
+        name = (h.get("name") or "").strip().lower()
+        if name == key_l:
+            return h.get("value") or ""
+    return ""
+
+
+def _gmail_extract_plain_text(payload):
+    if not isinstance(payload, dict):
+        return ""
+    mime = (payload.get("mimeType") or "").lower()
+    body = payload.get("body") or {}
+    data = (body.get("data") or "").strip()
+    if mime == "text/plain" and data:
+        try:
+            return base64.urlsafe_b64decode(data + "===").decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    for part in payload.get("parts") or []:
+        text = _gmail_extract_plain_text(part)
+        if text:
+            return text
+    return ""
+
+
+def _process_gmail_api_message(db, settings, message_obj):
+    payload = message_obj.get("payload") or {}
+    headers = payload.get("headers") or []
+    from_addr = (settings.get("from_address") or "").strip().lower()
+    from_email = extract_email_address(_gmail_header_value(headers, "From"))
+    to_email = extract_email_address(_gmail_header_value(headers, "To"))
+    if from_email and from_addr and from_email == from_addr:
+        return False
+
+    gm_msgid = str(message_obj.get("id") or "").strip()
+    gm_thrid = str(message_obj.get("threadId") or "").strip()
+    ext_id = (_gmail_header_value(headers, "Message-ID") or "").strip()
+    if not ext_id:
+        ext_id = f"GMAIL-{gm_msgid}"
+
+    if ext_id:
+        exists = db.execute("SELECT id FROM communications WHERE external_id = ?", (ext_id,)).fetchone()
+        if exists:
+            return False
+    if gm_msgid:
+        exists2 = db.execute("SELECT id FROM communications WHERE gmail_msgid = ?", (gm_msgid,)).fetchone()
+        if exists2:
+            return False
+
+    subject = decode_mime_header(_gmail_header_value(headers, "Subject"))
+    in_reply_to = (_gmail_header_value(headers, "In-Reply-To") or "").strip()
+    refs = (_gmail_header_value(headers, "References") or "").strip()
+    raw_body = _gmail_extract_plain_text(payload)
+    body = clean_inbound_email_body(raw_body)
+    is_bounce = (
+        "mailer-daemon" in (from_email or "")
+        or "postmaster" in (from_email or "")
+        or any(x in (subject or "").lower() for x in ["undeliverable", "delivery status notification", "delivery failure", "returned mail"])
+    )
+
+    known_email_rows = db.execute(
+        """
+        SELECT lower(value) AS email
+        FROM touchpoints
+        WHERE lower(channel_type) = 'email' AND value IS NOT NULL AND trim(value) <> ''
+        UNION
+        SELECT lower(primary_email) AS email
+        FROM people
+        WHERE primary_email IS NOT NULL AND trim(primary_email) <> ''
+        """
+    ).fetchall()
+    known_emails = {str(r["email"]).strip().lower() for r in known_email_rows if (r["email"] or "").strip()}
+    bounce_target_email = extract_bounce_target_email(raw_body, known_emails) if is_bounce else ""
+
+    property_id = None
+    person_id = None
+    token_source = f"{subject or ''} {_gmail_header_value(headers, 'X-DeepProspect-Thread') or ''} {raw_body or ''} {body or ''}"
+    token_match = re.search(r"\[DP-P(\d+)-PE(\d+)\]", token_source)
+    if token_match:
+        property_id = int(token_match.group(1)) if token_match.group(1).isdigit() and token_match.group(1) != "0" else None
+        person_id = int(token_match.group(2)) if token_match.group(2).isdigit() and token_match.group(2) != "0" else None
+    if person_id is None:
+        h_person = (_gmail_header_value(headers, "X-DeepProspect-Person-ID") or "").strip()
+        if h_person.isdigit():
+            person_id = int(h_person)
+    if property_id is None:
+        h_prop = (_gmail_header_value(headers, "X-DeepProspect-Property-ID") or "").strip()
+        if h_prop.isdigit():
+            property_id = int(h_prop)
+
+    if person_id is None or property_id is None:
+        ref_ids = []
+        ref_ids.extend(extract_message_ids(in_reply_to))
+        ref_ids.extend(extract_message_ids(refs))
+        for ref in ref_ids:
+            prior = db.execute(
+                """
+                SELECT id, property_id, person_id
+                FROM communications
+                WHERE upper(channel) = 'EMAIL' AND external_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (ref,),
+            ).fetchone()
+            if prior:
+                if property_id is None:
+                    property_id = prior["property_id"]
+                if person_id is None:
+                    person_id = prior["person_id"]
+                break
+
+    if (person_id is None or property_id is None) and gm_thrid:
+        prior = db.execute(
+            """
+            SELECT property_id, person_id
+            FROM communications
+            WHERE upper(channel) = 'EMAIL' AND gmail_thread_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (gm_thrid,),
+        ).fetchone()
+        if prior:
+            property_id = property_id or prior["property_id"]
+            person_id = person_id or prior["person_id"]
+
+    if person_id is None and from_email:
+        tp = db.execute(
+            """
+            SELECT person_id
+            FROM touchpoints
+            WHERE lower(channel_type) = 'email' AND lower(value) = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (from_email.lower(),),
+        ).fetchone()
+        if tp:
+            person_id = tp["person_id"]
+
+    if person_id is None and bounce_target_email:
+        tp_b = db.execute(
+            """
+            SELECT person_id
+            FROM touchpoints
+            WHERE lower(channel_type) = 'email' AND lower(value) = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (bounce_target_email.lower(),),
+        ).fetchone()
+        if tp_b:
+            person_id = tp_b["person_id"]
+
+    if property_id is None and person_id is not None:
+        pr = db.execute(
+            "SELECT id FROM properties WHERE owner_person_id = ? OR resident_person_id = ? ORDER BY created_at DESC LIMIT 1",
+            (person_id, person_id),
+        ).fetchone()
+        if pr:
+            property_id = pr["id"]
+
+    if property_id is None:
+        return False
+
+    if is_bounce and bounce_target_email:
+        db.execute(
+            """
+            UPDATE touchpoints
+            SET status = 'Bounced'
+            WHERE lower(channel_type) = 'email' AND lower(value) = lower(?)
+            """,
+            (bounce_target_email,),
+        )
+
+    status_label = "Bounced" if is_bounce else "Received"
+    db.execute(
+        """
+        INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id, gmail_msgid, gmail_thread_id, in_reply_to)
+        VALUES (?, ?, 'EMAIL', 'Inbound', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+        """,
+        (
+            property_id,
+            person_id,
+            from_email,
+            to_email or (settings.get("from_address") or ""),
+            (body or "").strip(),
+            status_label,
+            format_db_time(datetime.utcnow()),
+            ext_id,
+            gm_msgid or None,
+            gm_thrid or None,
+            in_reply_to or None,
+        ),
+    )
+    return True
+
+
+def process_gmail_api_inbound_once(max_messages=20):
+    ensure_db()
+    db = open_sqlite_connection()
+    try:
+        s = get_email_settings(db)
+        if (s.get("provider") or "").strip().lower() != "gmail_api":
+            return {"ok": True, "skipped": "provider_not_gmail_api"}
+        access_token = _get_gmail_api_access_token(s)
+        from_addr = (s.get("from_address") or "").strip()
+        if not from_addr:
+            return {"ok": False, "error": "From address is missing for Gmail API inbound processing."}
+        q = f"to:{from_addr} -from:{from_addr} newer_than:7d"
+        list_res = requests.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"q": q, "maxResults": max_messages},
+            timeout=30,
+        )
+        list_body = list_res.json() if list_res.content else {}
+        if not list_res.ok:
+            raise ValueError(f"Gmail API list failed ({list_res.status_code}): {list_body}")
+        messages = list_body.get("messages") or []
+        inserted = 0
+        for m in messages:
+            msg_id = (m.get("id") or "").strip()
+            if not msg_id:
+                continue
+            get_res = requests.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"format": "full"},
+                timeout=30,
+            )
+            get_body = get_res.json() if get_res.content else {}
+            if not get_res.ok:
+                continue
+            if _process_gmail_api_message(db, s, get_body):
+                inserted += 1
+        db.commit()
+        return {"ok": True, "fetched": len(messages), "inserted": inserted}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="gmail_api_inbound",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="process_gmail_api_inbound_once",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
 def send_gmail_email(db, to_email, subject, body, property_id=None, person_id=None):
     s = get_email_settings(db)
     provider = (s.get("provider") or "smtp").strip().lower()
@@ -5015,6 +5273,8 @@ def poll_gmail_inbound_once():
     db = open_sqlite_connection()
     try:
         s = get_email_settings(db)
+        if (s.get("provider") or "").strip().lower() == "gmail_api":
+            return
         if (s.get("poll_enabled") or "1").strip() not in {"1", "true", "TRUE", "yes", "on"}:
             return
         from_addr = (s.get("from_address") or "").strip()
@@ -8767,6 +9027,7 @@ def settings_page():
                 "email_gmail_api_client_id": request.form.get("email_gmail_api_client_id", ""),
                 "email_gmail_api_client_secret": request.form.get("email_gmail_api_client_secret", ""),
                 "email_gmail_api_refresh_token": request.form.get("email_gmail_api_refresh_token", ""),
+                "email_gmail_webhook_token": request.form.get("email_gmail_webhook_token", ""),
             }
             for key, value in fields.items():
                 set_setting(db, key, value)
@@ -12095,11 +12356,63 @@ def smrtphone_webhook_events_api():
     return jsonify([dict(r) for r in rows])
 
 
+@app.route("/webhooks/gmail/pubsub", methods=["POST"])
+def gmail_pubsub_webhook():
+    ensure_db()
+    db = get_db()
+    try:
+        s = get_email_settings(db)
+        expected = (s.get("gmail_webhook_token") or "").strip()
+        provided = (request.args.get("token") or request.headers.get("X-Gmail-Webhook-Token") or "").strip()
+        if expected and provided != expected:
+            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        payload = request.get_json(silent=True) or {}
+        message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        event_key = (message.get("messageId") or "").strip() or datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+        upsert_integration_event(db, "gmail_pubsub_webhook", event_key, payload)
+        result = process_gmail_api_inbound_once(max_messages=20)
+        db.commit()
+        return jsonify({"ok": True, "event_key": event_key, "result": result}), 200
+    except Exception as exc:
+        log_app_error(
+            db,
+            source="gmail_pubsub_webhook",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route=request.path,
+            status_code=500,
+        )
+        db.commit()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/webhooks/reisift/automation", methods=["POST"])
+def reisift_automation_placeholder_webhook():
+    ensure_db()
+    db = get_db()
+    payload = request.get_json(silent=True) or {}
+    event_key = (
+        (payload.get("event_key") or "").strip()
+        or (payload.get("eventKey") or "").strip()
+        or (payload.get("id") or "").strip()
+        or datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    )
+    upsert_integration_event(db, "reisift_automation_placeholder", event_key, payload)
+    db.commit()
+    return jsonify({"ok": True, "placeholder": True, "event_key": event_key}), 200
+
+
 @app.route("/api/email/poll-now", methods=["POST"])
 def email_poll_now():
     try:
+        ensure_db()
+        db = get_db()
+        provider = (get_email_settings(db).get("provider") or "smtp").strip().lower()
+        if provider == "gmail_api":
+            result = process_gmail_api_inbound_once(max_messages=30)
+            return jsonify({"ok": bool(result.get("ok")), "result": result}), (200 if result.get("ok") else 500)
         poll_gmail_inbound_once()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "result": {"mode": "imap_poll"}})
     except Exception as exc:
         ensure_db()
         db = get_db()

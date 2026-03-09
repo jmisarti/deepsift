@@ -88,6 +88,7 @@
             <label>Gmail OAuth Client ID <input name="email_gmail_api_client_id" value="{{ email_settings.gmail_api_client_id }}"></label>
             <label>Gmail OAuth Client Secret <input name="email_gmail_api_client_secret" value="{{ email_settings.gmail_api_client_secret }}"></label>
             <label class="span2">Gmail OAuth Refresh Token <input name="email_gmail_api_refresh_token" value="{{ email_settings.gmail_api_refresh_token }}"></label>
+            <label class="span2">Gmail Webhook Verify Token <input name="email_gmail_webhook_token" value="{{ email_settings.gmail_webhook_token }}" placeholder="optional shared secret"></label>
             <label>Resend API Key <input name="email_resend_api_key" value="{{ email_settings.resend_api_key }}"></label>
             <label>Resend Base URL <input name="email_resend_base_url" value="{{ email_settings.resend_base_url or 'https://api.resend.com' }}"></label>
             <label>Gmail App Password <input name="email_app_password" value="{{ email_settings.app_password }}"></label>
@@ -106,6 +107,8 @@
                 <button type="submit" name="email_action" value="test_login">Save + Test Email Login</button>
             </div>
         </form>
+        <p><strong>Gmail push webhook endpoint:</strong> <code>POST /webhooks/gmail/pubsub?token=&lt;your_token&gt;</code></p>
+        <p class="muted-text">Use this for Pub/Sub push delivery to trigger inbound email sync without IMAP polling.</p>
     {% elif active_tab == 'integrations' %}
         <p>Configure external system ingress and Slack notifications.</p>
         <form method="post" class="grid-form">
@@ -132,6 +135,8 @@
         <p><code>POST /api/integrations/google-sheets/row-added</code></p>
         <p><strong>Slack inbound endpoints:</strong></p>
         <p><code>POST /webhooks/slack/command</code> and <code>POST /webhooks/slack/events</code></p>
+        <p><strong>ReiSift placeholder webhook:</strong></p>
+        <p><code>POST /webhooks/reisift/automation</code></p>
     {% elif active_tab == 'automations' %}
         <p>These switches control entire automations. If off, the automation does not run at all.</p>
         <div class="table-wrap">

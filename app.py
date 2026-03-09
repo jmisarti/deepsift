@@ -9,6 +9,7 @@ import imaplib
 import os
 import random
 import re
+import secrets
 import sqlite3
 import socket
 import smtplib
@@ -427,6 +428,9 @@ def migrate_db(db):
     ensure_column(db, "communications", "gmail_msgid", "gmail_msgid TEXT")
     ensure_column(db, "communications", "gmail_thread_id", "gmail_thread_id TEXT")
     ensure_column(db, "communications", "in_reply_to", "in_reply_to TEXT")
+    ensure_column(db, "communications", "open_tracking_token", "open_tracking_token TEXT")
+    ensure_column(db, "communications", "opened_at", "opened_at TEXT")
+    ensure_column(db, "communications", "open_count", "open_count INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "people", "age", "age INTEGER")
     ensure_column(db, "people", "deceased", "deceased INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "people", "birth_year", "birth_year TEXT")
@@ -4385,6 +4389,22 @@ def email_sender_label(settings):
     return "Email sent via Gmail"
 
 
+def generate_open_tracking_token():
+    return secrets.token_urlsafe(24)
+
+
+def build_open_tracking_url(token):
+    if not token:
+        return ""
+    try:
+        return url_for("email_open_tracking_pixel", token=token, _external=True)
+    except Exception:
+        return ""
+
+
+OPEN_TRACK_PIXEL_GIF = base64.b64decode("R0lGODlhAQABAIABAP///wAAACwAAAAAAQABAAACAkQBADs=")
+
+
 def email_thread_token(property_id=None, person_id=None):
     p = int(property_id) if str(property_id or "").isdigit() else 0
     pe = int(person_id) if str(person_id or "").isdigit() else 0
@@ -4713,7 +4733,7 @@ def _open_imap_with_fallback(imap_host, imap_port, from_addr, app_pw):
     raise ValueError("IMAP login failed across fallbacks: " + " | ".join(errors[-6:]))
 
 
-def _send_resend_email(settings, to_email, subject, body, property_id=None, person_id=None):
+def _send_resend_email(settings, to_email, subject, body, property_id=None, person_id=None, open_tracking_url=""):
     api_key = (settings.get("resend_api_key") or "").strip()
     from_addr = (settings.get("from_address") or "").strip()
     from_name = (settings.get("from_name") or "").strip()
@@ -4723,11 +4743,18 @@ def _send_resend_email(settings, to_email, subject, body, property_id=None, pers
     if not from_addr:
         raise ValueError("From address is required for Resend.")
     from_field = f"{from_name} <{from_addr}>" if from_name else from_addr
+    html_body = f"<div>{(body or '').replace(chr(10), '<br>')}</div>"
+    if open_tracking_url:
+        html_body += (
+            f'<img src="{open_tracking_url}" width="1" height="1" '
+            f'style="display:block;border:0;outline:none;text-decoration:none;" alt=""/>'
+        )
     payload = {
         "from": from_field,
         "to": [to_email],
         "subject": subject or "",
         "text": body or "",
+        "html": html_body,
         "headers": {
             "X-DeepProspect-Property-ID": str(property_id or ""),
             "X-DeepProspect-Person-ID": str(person_id or ""),
@@ -4781,7 +4808,7 @@ def _get_gmail_api_access_token(settings):
     return access_token
 
 
-def _send_gmail_api_email(settings, to_email, subject, body, property_id=None, person_id=None):
+def _send_gmail_api_email(settings, to_email, subject, body, property_id=None, person_id=None, open_tracking_url=""):
     from_addr = (settings.get("from_address") or "").strip()
     from_name = (settings.get("from_name") or "").strip()
     if not from_addr:
@@ -4799,6 +4826,13 @@ def _send_gmail_api_email(settings, to_email, subject, body, property_id=None, p
     msg["X-DeepProspect-Person-ID"] = str(person_id or "")
     msg["X-DeepProspect-Thread"] = email_thread_token(property_id, person_id)
     msg.set_content(body or "")
+    if open_tracking_url:
+        html_body = (
+            f"<div>{(body or '').replace(chr(10), '<br>')}</div>"
+            f'<img src="{open_tracking_url}" width="1" height="1" '
+            f'style="display:block;border:0;outline:none;text-decoration:none;" alt=""/>'
+        )
+        msg.add_alternative(html_body, subtype="html")
 
     raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
     access_token = _get_gmail_api_access_token(settings)
@@ -5078,13 +5112,29 @@ def process_gmail_api_inbound_once(max_messages=20):
         db.close()
 
 
-def send_gmail_email(db, to_email, subject, body, property_id=None, person_id=None):
+def send_gmail_email(db, to_email, subject, body, property_id=None, person_id=None, open_tracking_url=""):
     s = get_email_settings(db)
     provider = (s.get("provider") or "gmail_api").strip().lower()
     if provider == "resend":
-        return _send_resend_email(s, to_email, subject, body, property_id=property_id, person_id=person_id)
+        return _send_resend_email(
+            s,
+            to_email,
+            subject,
+            body,
+            property_id=property_id,
+            person_id=person_id,
+            open_tracking_url=open_tracking_url,
+        )
     if provider == "gmail_api":
-        return _send_gmail_api_email(s, to_email, subject, body, property_id=property_id, person_id=person_id)
+        return _send_gmail_api_email(
+            s,
+            to_email,
+            subject,
+            body,
+            property_id=property_id,
+            person_id=person_id,
+            open_tracking_url=open_tracking_url,
+        )
     raise ValueError("Unsupported email provider. Use gmail_api or resend.")
 
 
@@ -10682,6 +10732,8 @@ def create_property_communication(property_id):
     from_number = (payload.get("from_number") or get_deep_dive_sms_number(db)).strip()
     external_id = (payload.get("external_id") or "").strip()
     subject = (payload.get("subject") or "").strip()
+    open_tracking_token = ""
+    open_tracking_url = ""
     if channel == "EMAIL":
         from_number = "Email sent via Gmail"
 
@@ -10715,6 +10767,8 @@ def create_property_communication(property_id):
         if not ok_email:
             return jsonify({"error": f"Email blocked: {email_reason}"}), 400
         try:
+            open_tracking_token = generate_open_tracking_token()
+            open_tracking_url = build_open_tracking_url(open_tracking_token)
             sent = send_gmail_email(
                 db,
                 to_email=to_number,
@@ -10722,6 +10776,7 @@ def create_property_communication(property_id):
                 body=body,
                 property_id=property_id,
                 person_id=person_id,
+                open_tracking_url=open_tracking_url,
             )
             external_id = sent.get("message_id") or external_id
             status = "Sent"
@@ -10730,10 +10785,23 @@ def create_property_communication(property_id):
             status = "Failed"
             cur = db.execute(
                 """
-                INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id, open_tracking_token)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (property_id, person_id, channel, direction, from_number, to_number, body, status, 1, sent_at, external_id),
+                (
+                    property_id,
+                    person_id,
+                    channel,
+                    direction,
+                    from_number,
+                    to_number,
+                    body,
+                    status,
+                    1,
+                    sent_at,
+                    external_id,
+                    open_tracking_token,
+                ),
             )
             log_app_error(
                 db,
@@ -10749,8 +10817,8 @@ def create_property_communication(property_id):
 
     cur = db.execute(
         """
-        INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id, open_tracking_token)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             property_id,
@@ -10764,6 +10832,7 @@ def create_property_communication(property_id):
             1,
             sent_at,
             external_id,
+            open_tracking_token,
         ),
     )
     if channel == "EMAIL" and direction == "Outbound":
@@ -10847,6 +10916,8 @@ def create_person_communication(person_id):
     from_number = (payload.get("from_number") or get_deep_dive_sms_number(db)).strip()
     external_id = (payload.get("external_id") or "").strip()
     subject = (payload.get("subject") or "").strip()
+    open_tracking_token = ""
+    open_tracking_url = ""
     if channel == "EMAIL":
         from_number = "Email sent via Gmail"
 
@@ -10880,6 +10951,8 @@ def create_person_communication(person_id):
         if not ok_email:
             return jsonify({"error": f"Email blocked: {email_reason}"}), 400
         try:
+            open_tracking_token = generate_open_tracking_token()
+            open_tracking_url = build_open_tracking_url(open_tracking_token)
             sent = send_gmail_email(
                 db,
                 to_email=to_number,
@@ -10887,6 +10960,7 @@ def create_person_communication(person_id):
                 body=body,
                 property_id=property_id,
                 person_id=person_id,
+                open_tracking_url=open_tracking_url,
             )
             external_id = sent.get("message_id") or external_id
             status = "Sent"
@@ -10895,10 +10969,23 @@ def create_person_communication(person_id):
             status = "Failed"
             cur = db.execute(
                 """
-                INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id, open_tracking_token)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (property_id, person_id, channel, direction, from_number, to_number, body, status, 1, sent_at, external_id),
+                (
+                    property_id,
+                    person_id,
+                    channel,
+                    direction,
+                    from_number,
+                    to_number,
+                    body,
+                    status,
+                    1,
+                    sent_at,
+                    external_id,
+                    open_tracking_token,
+                ),
             )
             log_app_error(
                 db,
@@ -10914,8 +11001,8 @@ def create_person_communication(person_id):
 
     cur = db.execute(
         """
-        INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id, open_tracking_token)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             property_id,
@@ -10929,6 +11016,7 @@ def create_person_communication(person_id):
             1,
             sent_at,
             external_id,
+            open_tracking_token,
         ),
     )
     if channel == "EMAIL" and direction == "Outbound":
@@ -12368,6 +12456,43 @@ def gmail_pubsub_webhook():
         )
         db.commit()
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/webhooks/email/open/<token>.gif", methods=["GET"])
+def email_open_tracking_pixel(token):
+    ensure_db()
+    db = get_db()
+    clean_token = (token or "").strip()
+    if clean_token:
+        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        db.execute(
+            """
+            UPDATE communications
+            SET open_count = COALESCE(open_count, 0) + 1,
+                opened_at = COALESCE(opened_at, ?),
+                status = CASE
+                    WHEN upper(channel) = 'EMAIL' AND lower(direction) = 'outbound' AND (
+                        COALESCE(status, '') = '' OR lower(status) IN ('sent', 'queued', 'delivered')
+                    )
+                    THEN 'Opened'
+                    ELSE status
+                END
+            WHERE open_tracking_token = ?
+              AND upper(channel) = 'EMAIL'
+              AND lower(direction) = 'outbound'
+            """,
+            (now_str, clean_token),
+        )
+        db.commit()
+    return app.response_class(
+        OPEN_TRACK_PIXEL_GIF,
+        mimetype="image/gif",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @app.route("/webhooks/reisift/automation", methods=["POST"])

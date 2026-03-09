@@ -12439,8 +12439,10 @@ def gmail_pubsub_webhook():
         message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
         event_key = (message.get("messageId") or "").strip() or datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
         upsert_integration_event(db, "gmail_pubsub_webhook", event_key, payload)
-        result = process_gmail_api_inbound_once(max_messages=20)
+        # Commit webhook ingest before inbound processing opens its own DB connection.
+        # This avoids SQLite write-lock contention between concurrent connections.
         db.commit()
+        result = process_gmail_api_inbound_once(max_messages=20)
         return jsonify({"ok": True, "event_key": event_key, "result": result}), 200
     except Exception as exc:
         log_app_error(

@@ -25,8 +25,9 @@
                 <th>Referral Status</th>
                 <th>Outreach</th>
                 <th>Status</th>
+                <th>On-Market</th>
                 <th>Owners</th>
-                <th>UUID</th>
+                <th>Sift Link</th>
             </tr>
         </thead>
         <tbody>
@@ -44,16 +45,50 @@
                 </td>
                 <td>{{ 'Sent' if row.push_count else 'Not Sent' }}</td>
                 <td><span class="pill">{{ row.status or "-" }}</span></td>
+                <td><span class="pill">{{ row.on_market_status or "Unknown" }}</span></td>
                 <td>{{ row.owner_names or "-" }}</td>
                 <td>
                     <a href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener">
-                        <code>{{ row.property_uuid }}</code>
+                        Open in Sift
                     </a>
                 </td>
             </tr>
             {% else %}
             <tr>
-                <td colspan="6">No records found.</td>
+                <td colspan="7">No records found.</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="panel">
+    <h3>Auto Send Queue (Preview)</h3>
+    <p>This queue shows county-matched referral routing candidates before SMS automation is turned on.</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Property</th>
+                <th>County</th>
+                <th>Realtor</th>
+                <th>Queue Status</th>
+                <th>Note</th>
+                <th>Queued At</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for q in queue_rows %}
+            <tr>
+                <td>{{ q.full_address or q.property_uuid }}</td>
+                <td>{{ q.county or "-" }}</td>
+                <td>{% if q.realtor_id %}{{ q.first_name }} {{ q.last_name }}{% else %}-{% endif %}</td>
+                <td><span class="pill">{{ q.queue_status }}</span></td>
+                <td>{{ q.note or "-" }}</td>
+                <td>{{ q.created_at }}</td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="6">No queued entries yet.</td>
             </tr>
             {% endfor %}
         </tbody>

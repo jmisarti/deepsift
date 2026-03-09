@@ -118,6 +118,7 @@ except ZoneInfoNotFoundError:
 BULK_SMS_WORKER_STARTED = False
 EMAIL_POLL_WORKER_STARTED = False
 CLEVER_LEADS_WORKER_STARTED = False
+REFERRAL_MARKET_WORKER_STARTED = False
 NJ_COUNTIES = [
     "Atlantic",
     "Bergen",
@@ -277,6 +278,7 @@ def require_login_if_enabled():
         start_bulk_sms_worker()
         start_email_poll_worker()
         start_clever_leads_worker()
+        start_referral_on_market_worker()
     if not APP_AUTH_ENABLED:
         return None
     endpoint = request.endpoint or ""
@@ -394,6 +396,8 @@ def migrate_db(db):
     ensure_column(db, "reisift_referrals", "referral_status", "referral_status TEXT NOT NULL DEFAULT 'Untouched'")
     ensure_column(db, "reisift_referrals", "winning_realtor_id", "winning_realtor_id INTEGER")
     ensure_column(db, "reisift_referrals", "referral_notes", "referral_notes TEXT")
+    ensure_column(db, "reisift_referrals", "county", "county TEXT")
+    ensure_column(db, "reisift_referrals", "on_market_status", "on_market_status TEXT NOT NULL DEFAULT 'Unknown'")
     ensure_column(db, "reisift_followups", "events_json", "events_json TEXT")
     ensure_column(db, "reisift_followups", "tasks_json", "tasks_json TEXT")
     db.execute(
@@ -455,6 +459,21 @@ def migrate_db(db):
             payload_json TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(source, event_key)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS referral_auto_send_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            property_uuid TEXT NOT NULL,
+            realtor_id INTEGER,
+            county TEXT,
+            queue_status TEXT NOT NULL DEFAULT 'Queued',
+            note TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
@@ -3943,9 +3962,11 @@ def get_automation_settings(db):
     if not clever_enabled_raw:
         clever_enabled_raw = get_setting(db, "automation_test_enabled", "1")
     reisift_placeholder_raw = get_setting(db, "automation_reisift_placeholder_enabled", "1")
+    auto_send_realtors_raw = get_setting(db, "automation_auto_send_realtors_enabled", "1")
     return {
         "clever_leads_enabled": (clever_enabled_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
         "reisift_placeholder_enabled": (reisift_placeholder_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
+        "auto_send_realtors_enabled": (auto_send_realtors_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
     }
 
 
@@ -4243,6 +4264,12 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
                     msg_lines.append("Post-Enrich Status: refer_lead")
                 except Exception as status_exc:
                     post_status_result = {"ok": False, "error": str(status_exc)}
+            referral_refresh_result = None
+            try:
+                referral_refresh_result = refresh_reisift_referrals_cache(db)
+                msg_lines.append("Referral Queue: auto-refreshed")
+            except Exception as refresh_exc:
+                referral_refresh_result = {"ok": False, "error": str(refresh_exc)}
             send_slack_notification(db, "\n".join(msg_lines))
             add_clever_webhook_note(
                 db,
@@ -4261,6 +4288,7 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
                     "created_uuid": created_uuid,
                     "status": sift_status,
                     "post_enrich_status_update": post_status_result,
+                    "referral_cache_refresh": referral_refresh_result,
                 },
             )
             db.commit()
@@ -5111,6 +5139,71 @@ def poll_gmail_inbound_once():
 
 def start_email_poll_worker():
     return
+
+
+def run_referral_on_market_refresh_once():
+    ensure_db()
+    db = open_sqlite_connection()
+    try:
+        today_et = datetime.now(EST_TZ).strftime("%Y-%m-%d")
+        last_run_date = (get_setting(db, "referral_on_market_last_run_date", "") or "").strip()
+        if last_run_date == today_et:
+            return {"ok": True, "skipped": "already_ran_today", "date": today_et}
+        result = refresh_reisift_referrals_cache(db)
+        set_setting(db, "referral_on_market_last_run_date", today_et)
+        db.commit()
+        try:
+            send_slack_notification(
+                db,
+                "\n".join(
+                    [
+                        "Nightly Referral Refresh Complete",
+                        f"Date (ET): {today_et}",
+                        f"Synced: {result.get('synced', 0)}",
+                        f"On-Market statuses updated from cached ReiSIFT property payload.",
+                    ]
+                ),
+            )
+        except Exception:
+            pass
+        return {"ok": True, "result": result, "date": today_et}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="referral_on_market_worker",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="run_referral_on_market_refresh_once",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+def start_referral_on_market_worker():
+    global REFERRAL_MARKET_WORKER_STARTED
+    if REFERRAL_MARKET_WORKER_STARTED:
+        return
+    REFERRAL_MARKET_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                now_et = datetime.now(EST_TZ)
+                if now_et.hour == 0 and now_et.minute < 10:
+                    run_referral_on_market_refresh_once()
+                    # Prevent duplicate refreshes during the midnight window.
+                    time.sleep(600)
+                    continue
+            except Exception:
+                pass
+            time.sleep(60)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
 
 
 def run_clever_leads_poll_once():
@@ -7028,17 +7121,56 @@ def summarize_reisift_property(payload):
     }
 
 
+def infer_county_from_reisift_payload(payload):
+    if not isinstance(payload, dict):
+        return ""
+    address = payload.get("address") if isinstance(payload.get("address"), dict) else {}
+    county = (address.get("county") or address.get("county_name") or "").strip()
+    if county:
+        return county
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    county = (metadata.get("county") or metadata.get("county_name") or "").strip()
+    if county:
+        return county
+    return ""
+
+
+def infer_on_market_status_from_payload(payload):
+    if not isinstance(payload, dict):
+        return "Unknown"
+    for key in ("listed_on_market", "listedOnMarket", "on_market", "onMarket"):
+        val = payload.get(key)
+        if isinstance(val, bool):
+            return "On Market" if val else "Off Market"
+        if isinstance(val, str) and val.strip():
+            text = val.strip().lower()
+            if text in {"yes", "true", "listed", "on market", "active"}:
+                return "On Market"
+            if text in {"no", "false", "off market", "not listed"}:
+                return "Off Market"
+    notes = str(payload.get("notes") or "")
+    if "Listed On Market: Yes" in notes:
+        return "On Market"
+    if "Listed On Market: No" in notes:
+        return "Off Market"
+    return "Unknown"
+
+
 def upsert_reisift_referral(db, property_uuid, payload, is_active=1):
     summary = summarize_reisift_property(payload)
+    county = infer_county_from_reisift_payload(payload)
+    on_market_status = infer_on_market_status_from_payload(payload)
     db.execute(
         """
         INSERT INTO reisift_referrals
-            (property_uuid, status, full_address, owner_names, payload_json, is_active, last_synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (property_uuid, status, full_address, owner_names, county, on_market_status, payload_json, is_active, last_synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(property_uuid) DO UPDATE SET
             status = excluded.status,
             full_address = excluded.full_address,
             owner_names = excluded.owner_names,
+            county = excluded.county,
+            on_market_status = excluded.on_market_status,
             payload_json = excluded.payload_json,
             is_active = excluded.is_active,
             last_synced_at = excluded.last_synced_at
@@ -7048,11 +7180,93 @@ def upsert_reisift_referral(db, property_uuid, payload, is_active=1):
             summary["status"],
             summary["full_address"],
             summary["owner_names"],
+            county,
+            on_market_status,
             json.dumps(payload),
             int(bool(is_active)),
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         ),
     )
+
+
+def queue_referral_auto_send_candidates(db):
+    rows = db.execute(
+        """
+        SELECT property_uuid, full_address, county, owner_names
+        FROM reisift_referrals
+        WHERE is_active = 1
+        ORDER BY id DESC
+        """
+    ).fetchall()
+    queued = 0
+    no_realtor = 0
+    for row in rows:
+        property_uuid = (row["property_uuid"] or "").strip()
+        county = (row["county"] or "").strip()
+        if not property_uuid:
+            continue
+        existing = db.execute(
+            "SELECT id FROM referral_auto_send_queue WHERE property_uuid = ? LIMIT 1",
+            (property_uuid,),
+        ).fetchone()
+        if existing:
+            continue
+        if not county:
+            db.execute(
+                """
+                INSERT INTO referral_auto_send_queue (property_uuid, realtor_id, county, queue_status, note, payload_json)
+                VALUES (?, NULL, ?, 'No Realtor', ?, ?)
+                """,
+                (
+                    property_uuid,
+                    county,
+                    "County missing on referral; waiting for manual routing.",
+                    json.dumps({"full_address": row["full_address"], "owner_names": row["owner_names"]}),
+                ),
+            )
+            no_realtor += 1
+            continue
+
+        realtors = db.execute(
+            """
+            SELECT id, first_name, last_name
+            FROM referral_realtors
+            WHERE lower(target_markets) LIKE ?
+            ORDER BY id ASC
+            """,
+            (f"%{county.lower()}%",),
+        ).fetchall()
+        if not realtors:
+            db.execute(
+                """
+                INSERT INTO referral_auto_send_queue (property_uuid, realtor_id, county, queue_status, note, payload_json)
+                VALUES (?, NULL, ?, 'No Realtor', ?, ?)
+                """,
+                (
+                    property_uuid,
+                    county,
+                    "No realtor currently tagged for this county.",
+                    json.dumps({"full_address": row["full_address"], "owner_names": row["owner_names"]}),
+                ),
+            )
+            no_realtor += 1
+            continue
+        for realtor in realtors:
+            db.execute(
+                """
+                INSERT INTO referral_auto_send_queue (property_uuid, realtor_id, county, queue_status, note, payload_json)
+                VALUES (?, ?, ?, 'Queued', ?, ?)
+                """,
+                (
+                    property_uuid,
+                    realtor["id"],
+                    county,
+                    "Queued for review before auto-send.",
+                    json.dumps({"full_address": row["full_address"], "owner_names": row["owner_names"]}),
+                ),
+            )
+            queued += 1
+    return {"queued": queued, "no_realtor": no_realtor}
 
 
 def refresh_reisift_referrals_cache(db):
@@ -7098,12 +7312,14 @@ def refresh_reisift_referrals_cache(db):
             upsert_reisift_referral(db, property_uuid, row, is_active=1)
             synced += 1
 
+    queue_summary = queue_referral_auto_send_candidates(db)
     db.commit()
     return {
         "status_slug": status_slug,
         "total": payload.get("count", len(rows)),
         "synced": synced,
         "errors": errors,
+        "queue_summary": queue_summary,
     }
 
 
@@ -7111,6 +7327,7 @@ def get_cached_referrals(db):
     rows = db.execute(
         """
         SELECT r.property_uuid, r.status, r.full_address, r.owner_names, r.payload_json, r.last_synced_at,
+               r.county, COALESCE(r.on_market_status, 'Unknown') AS on_market_status,
                COALESCE(r.referral_status, 'Untouched') AS referral_status,
                COALESCE(a.push_count, 0) AS push_count
         FROM reisift_referrals r
@@ -7708,9 +7925,20 @@ def referral_dashboard():
             notice = f"Referral cache initialized ({data['synced']} synced)."
         except Exception as exc:
             error = str(exc)
+    queue_rows = db.execute(
+        """
+        SELECT q.*, r.first_name, r.last_name, rr.full_address
+        FROM referral_auto_send_queue q
+        LEFT JOIN referral_realtors r ON r.id = q.realtor_id
+        LEFT JOIN reisift_referrals rr ON rr.property_uuid = q.property_uuid
+        ORDER BY q.id DESC
+        LIMIT 200
+        """
+    ).fetchall()
     return render_template(
         "referral.html",
         referrals=referrals,
+        queue_rows=queue_rows,
         total_count=total_count,
         status_slug=status_slug,
         error=error,
@@ -7727,6 +7955,8 @@ def referral_refresh():
     try:
         data = refresh_reisift_referrals_cache(db)
         notice = f"Referral cache refreshed. {data['synced']} rows synced."
+        q = data.get("queue_summary") or {}
+        notice += f" Queue: {q.get('queued', 0)} queued, {q.get('no_realtor', 0)} with no realtor."
         if data["errors"]:
             notice += f" {len(data['errors'])} rows used fallback payload."
     except Exception as exc:
@@ -8641,6 +8871,9 @@ def settings_page():
             elif automation_key == "reisift_placeholder":
                 reisift_enabled = (request.form.get("automation_reisift_placeholder_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
                 set_setting(db, "automation_reisift_placeholder_enabled", "1" if reisift_enabled else "0")
+            elif automation_key == "auto_send_realtors":
+                auto_send_enabled = (request.form.get("automation_auto_send_realtors_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
+                set_setting(db, "automation_auto_send_realtors_enabled", "1" if auto_send_enabled else "0")
             notice = "Automation settings saved."
         elif active_tab == "helpers":
             market_helper_address = (request.form.get("market_helper_address") or "").strip()
@@ -12075,6 +12308,7 @@ if __name__ == "__main__":
         start_bulk_sms_worker()
         start_email_poll_worker()
         start_clever_leads_worker()
+        start_referral_on_market_worker()
     app.run(host=host, port=port, debug=debug_mode)
 
 

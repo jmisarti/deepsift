@@ -171,6 +171,23 @@
                             </form>
                         </td>
                     </tr>
+                    <tr>
+                        <td><strong>Auto Send to Realtors</strong></td>
+                        <td>Front-end placeholder for upcoming county-based auto-send workflow. Queue is visible in Referral Queue for review.</td>
+                        <td>
+                            <form method="post" class="automation-toggle-form">
+                                <input type="hidden" name="settings_tab" value="automations">
+                                <input type="hidden" name="automation_key" value="auto_send_realtors">
+                                <label class="toggle-switch" title="Toggle Auto Send to Realtors placeholder">
+                                    <input type="checkbox" name="automation_auto_send_realtors_enabled" value="1" {% if automation_settings.auto_send_realtors_enabled %}checked{% endif %} onchange="this.form.submit()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span class="toggle-text {% if automation_settings.auto_send_realtors_enabled %}on{% else %}off{% endif %}">
+                                    {% if automation_settings.auto_send_realtors_enabled %}On{% else %}Off{% endif %}
+                                </span>
+                            </form>
+                        </td>
+                    </tr>
                 </tbody>
             </table>
         </div>

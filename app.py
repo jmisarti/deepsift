@@ -3920,13 +3920,7 @@ def get_email_settings(db):
     return {
         "from_name": get_setting(db, "email_from_name", ""),
         "from_address": get_setting(db, "email_from_address", ""),
-        "provider": (get_setting(db, "email_provider", "smtp") or "smtp").strip().lower(),
-        "app_password": get_setting(db, "email_app_password", ""),
-        "smtp_host": get_setting(db, "email_smtp_host", "smtp.gmail.com"),
-        "smtp_port": get_setting(db, "email_smtp_port", "587"),
-        "imap_host": get_setting(db, "email_imap_host", "imap.gmail.com"),
-        "imap_port": get_setting(db, "email_imap_port", "993"),
-        "poll_enabled": get_setting(db, "email_poll_enabled", "1"),
+        "provider": (get_setting(db, "email_provider", "gmail_api") or "gmail_api").strip().lower(),
         "resend_api_key": get_setting(db, "email_resend_api_key", ""),
         "resend_base_url": get_setting(db, "email_resend_base_url", "https://api.resend.com"),
         "gmail_api_client_id": get_setting(db, "email_gmail_api_client_id", ""),
@@ -4299,7 +4293,7 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
 
 
 def email_sender_label(settings):
-    provider = ((settings or {}).get("provider") or "smtp").strip().lower()
+    provider = ((settings or {}).get("provider") or "gmail_api").strip().lower()
     if provider == "resend":
         return "Email sent via Resend"
     if provider == "gmail_api":
@@ -5002,134 +4996,21 @@ def process_gmail_api_inbound_once(max_messages=20):
 
 def send_gmail_email(db, to_email, subject, body, property_id=None, person_id=None):
     s = get_email_settings(db)
-    provider = (s.get("provider") or "smtp").strip().lower()
+    provider = (s.get("provider") or "gmail_api").strip().lower()
     if provider == "resend":
         return _send_resend_email(s, to_email, subject, body, property_id=property_id, person_id=person_id)
     if provider == "gmail_api":
         return _send_gmail_api_email(s, to_email, subject, body, property_id=property_id, person_id=person_id)
-    from_addr = (s["from_address"] or "").strip()
-    app_pw = (s["app_password"] or "").strip()
-    if not from_addr or not app_pw:
-        raise ValueError("Email settings incomplete: from address or app password missing")
-
-    from_name = (s["from_name"] or "").strip()
-    smtp_host = (s["smtp_host"] or "smtp.gmail.com").strip()
-    smtp_port = int((s["smtp_port"] or "587").strip() or "587")
-    full_subject = (subject or "").strip()
-    if not full_subject:
-        property_label = "Property Address"
-        if str(property_id or "").isdigit():
-            prop_row = db.execute(
-                """
-                SELECT a.street
-                FROM properties p
-                JOIN addresses a ON a.id = p.property_address_id
-                WHERE p.id = ?
-                """,
-                (int(property_id),),
-            ).fetchone()
-            if prop_row and (prop_row["street"] or "").strip():
-                property_label = prop_row["street"].strip()
-        full_subject = f"Question re: {property_label}"
-
-    msg = EmailMessage()
-    msg["From"] = f"{from_name} <{from_addr}>" if from_name else from_addr
-    msg["To"] = to_email
-    msg["Subject"] = full_subject
-    msg["Message-ID"] = make_msgid(domain=(from_addr.split("@", 1)[1] if "@" in from_addr else None))
-    msg["X-DeepProspect-Property-ID"] = str(property_id or "")
-    msg["X-DeepProspect-Person-ID"] = str(person_id or "")
-    msg["X-DeepProspect-Thread"] = email_thread_token(property_id, person_id)
-    msg.set_content(body or "")
-
-    _smtp_send_with_fallback(smtp_host, smtp_port, from_addr, app_pw, msg)
-
-    message_id = (msg.get("Message-ID") or "").strip()
-    return {"message_id": message_id, "subject": full_subject}
+    raise ValueError("Unsupported email provider. Use gmail_api or resend.")
 
 
 def backfill_outbound_gmail_ids(db, communication_id):
-    row = db.execute(
-        """
-        SELECT id, external_id
-        FROM communications
-        WHERE id = ?
-        """,
-        (communication_id,),
-    ).fetchone()
-    if not row:
-        return
-    message_id = (row["external_id"] or "").strip()
-    if not message_id:
-        return
-
-    s = get_email_settings(db)
-    provider = (s.get("provider") or "smtp").strip().lower()
-    if provider != "smtp":
-        return
-    from_addr = (s.get("from_address") or "").strip()
-    app_pw = (s.get("app_password") or "").strip()
-    imap_host = (s.get("imap_host") or "imap.gmail.com").strip()
-    imap_port = int((s.get("imap_port") or "993").strip() or "993")
-    if not from_addr or not app_pw:
-        return
-
-    try:
-        m = _open_imap_with_fallback(imap_host, imap_port, from_addr, app_pw)
-        sent_box = _find_sent_mailbox(m)
-        if not sent_box:
-            m.logout()
-            return
-        m.select(f'"{sent_box}"')
-        msg_id_clean = message_id.strip("<>")
-        typ, data = m.search(None, "X-GM-RAW", f'rfc822msgid:{msg_id_clean}')
-        if typ != "OK" or not data or not data[0]:
-            m.logout()
-            return
-        ids = data[0].split()
-        if not ids:
-            m.logout()
-            return
-        newest = ids[-1]
-        f_typ, fetched = m.fetch(newest, "(X-GM-THRID X-GM-MSGID)")
-        if f_typ == "OK" and fetched and isinstance(fetched[0], tuple):
-            gm_msgid, gm_thrid = _extract_imap_fetch_meta(fetched[0][0])
-            if gm_msgid or gm_thrid:
-                db.execute(
-                    """
-                    UPDATE communications
-                    SET gmail_msgid = COALESCE(?, gmail_msgid),
-                        gmail_thread_id = COALESCE(?, gmail_thread_id)
-                    WHERE id = ?
-                    """,
-                    (
-                        gm_msgid or None,
-                        gm_thrid or None,
-                        communication_id,
-                    ),
-                )
-        m.logout()
-    except Exception as exc:
-        log_app_error(
-            db,
-            source="email_outbound_id_backfill",
-            error_message=str(exc),
-            details=traceback.format_exc(),
-            route="backfill_outbound_gmail_ids",
-            status_code=500,
-        )
+    return
 
 
 def test_email_login(db):
     s = get_email_settings(db)
-    provider = (s.get("provider") or "smtp").strip().lower()
-    from_addr = (s.get("from_address") or "").strip()
-    app_pw = (s.get("app_password") or "").strip()
-    smtp_host = (s.get("smtp_host") or "smtp.gmail.com").strip()
-    smtp_port = int((s.get("smtp_port") or "587").strip() or "587")
-    imap_host = (s.get("imap_host") or "imap.gmail.com").strip()
-    imap_port = int((s.get("imap_port") or "993").strip() or "993")
-
+    provider = (s.get("provider") or "gmail_api").strip().lower()
     if provider == "gmail_api":
         api_ok = False
         api_error = ""
@@ -5138,78 +5019,21 @@ def test_email_login(db):
             api_ok = True
         except Exception as exc:
             api_error = str(exc)
-
-        poll_enabled = (s.get("poll_enabled") or "1").strip() in {"1", "true", "TRUE", "yes", "on"}
-        imap_ok = False
-        imap_error = ""
-        if not poll_enabled:
-            imap_ok = True
-        elif from_addr and app_pw:
-            try:
-                m = _open_imap_with_fallback(imap_host, imap_port, from_addr, app_pw)
-                m.logout()
-                imap_ok = True
-            except Exception as exc:
-                imap_error = str(exc)
-        else:
-            imap_error = "IMAP app password missing (required only for inbound polling)."
-        ok = api_ok and imap_ok
-        parts = []
-        if api_error:
-            parts.append(f"Gmail API: {api_error}")
-        if imap_error and poll_enabled:
-            parts.append(f"IMAP: {imap_error}")
         return {
-            "ok": ok,
+            "ok": api_ok,
             "gmail_api_ok": api_ok,
-            "imap_ok": imap_ok,
             "gmail_api_error": api_error,
-            "imap_error": imap_error,
-            "error": " | ".join(parts),
+            "error": (f"Gmail API: {api_error}" if api_error else ""),
         }
-
-    if not from_addr or not app_pw:
-        return {
-            "ok": False,
-            "smtp_ok": False,
-            "imap_ok": False,
-            "error": "Email settings incomplete: from address or app password missing",
-        }
-
-    smtp_ok = False
-    imap_ok = False
-    smtp_error = ""
-    imap_error = ""
-
-    try:
-        smtp_ok, smtp_error = _smtp_probe_with_fallback(smtp_host, smtp_port, from_addr, app_pw)
-    except Exception as exc:
-        smtp_error = str(exc)
-
-    try:
-        m = _open_imap_with_fallback(imap_host, imap_port, from_addr, app_pw)
-        m.logout()
-        imap_ok = True
-    except Exception as exc:
-        imap_error = str(exc)
-
-    ok = smtp_ok and imap_ok
-    error = ""
-    if not ok:
-        parts = []
-        if smtp_error:
-            parts.append(f"SMTP: {smtp_error}")
-        if imap_error:
-            parts.append(f"IMAP: {imap_error}")
-        error = " | ".join(parts) if parts else "Unknown login error"
-
+    if provider == "resend":
+        api_key = (s.get("resend_api_key") or "").strip()
+        from_addr = (s.get("from_address") or "").strip()
+        ok = bool(api_key and from_addr)
+        err = "" if ok else "Resend requires API key and from address."
+        return {"ok": ok, "error": err, "resend_ok": ok}
     return {
-        "ok": ok,
-        "smtp_ok": smtp_ok,
-        "imap_ok": imap_ok,
-        "smtp_error": smtp_error,
-        "imap_error": imap_error,
-        "error": error,
+        "ok": False,
+        "error": "Unsupported email provider. Use gmail_api or resend.",
     }
 
 def split_markets(markets_csv):
@@ -5269,305 +5093,11 @@ def start_bulk_sms_worker():
 
 
 def poll_gmail_inbound_once():
-    ensure_db()
-    db = open_sqlite_connection()
-    try:
-        s = get_email_settings(db)
-        if (s.get("provider") or "").strip().lower() == "gmail_api":
-            return
-        if (s.get("poll_enabled") or "1").strip() not in {"1", "true", "TRUE", "yes", "on"}:
-            return
-        from_addr = (s.get("from_address") or "").strip()
-        app_pw = (s.get("app_password") or "").strip()
-        imap_host = (s.get("imap_host") or "imap.gmail.com").strip()
-        imap_port = int((s.get("imap_port") or "993").strip() or "993")
-        if not from_addr or not app_pw:
-            return
-
-        m = _open_imap_with_fallback(imap_host, imap_port, from_addr, app_pw)
-        m.select("INBOX")
-        typ_unseen, data_unseen = m.search(None, "(UNSEEN)")
-        raw_query = f'to:{from_addr} newer_than:7d -from:{from_addr}'
-        typ_recent, data_recent = m.search(None, "X-GM-RAW", f'"{raw_query}"')
-        if typ_unseen != "OK" and typ_recent != "OK":
-            m.logout()
-            return
-        ids = []
-        if typ_unseen == "OK" and data_unseen and data_unseen[0]:
-            ids.extend(data_unseen[0].split())
-        if typ_recent == "OK" and data_recent and data_recent[0]:
-            ids.extend(data_recent[0].split())
-        seen_ids = set()
-        dedup_ids = []
-        for i in ids:
-            key = i.decode(errors="ignore") if isinstance(i, bytes) else str(i)
-            if key in seen_ids:
-                continue
-            seen_ids.add(key)
-            dedup_ids.append(i)
-        ids = dedup_ids[-160:]
-        if not ids:
-            m.logout()
-            return
-
-        known_email_rows = db.execute(
-            """
-            SELECT lower(value) AS email
-            FROM touchpoints
-            WHERE lower(channel_type) = 'email' AND value IS NOT NULL AND trim(value) <> ''
-            UNION
-            SELECT lower(primary_email) AS email
-            FROM people
-            WHERE primary_email IS NOT NULL AND trim(primary_email) <> ''
-            """
-        ).fetchall()
-        known_emails = {str(r["email"]).strip().lower() for r in known_email_rows if (r["email"] or "").strip()}
-        for msg_id in ids:
-            typ, msg_data = m.fetch(msg_id, "(X-GM-THRID X-GM-MSGID RFC822)")
-            if typ != "OK" or not msg_data or not msg_data[0]:
-                continue
-            first = msg_data[0]
-            meta_chunk = first[0] if isinstance(first, tuple) else b""
-            raw_bytes = first[1] if isinstance(first, tuple) else b""
-            gm_msgid, gm_thrid = _extract_imap_fetch_meta(meta_chunk)
-            if not raw_bytes:
-                continue
-            msg = message_from_bytes(raw_bytes)
-            subject = decode_mime_header(msg.get("Subject"))
-            from_email = extract_email_address(msg.get("From") or "")
-            to_email = extract_email_address(msg.get("To") or "")
-            ext_id = (msg.get("Message-ID") or "").strip()
-            if from_email and from_addr and from_email.lower() == from_addr.lower():
-                continue
-            if not ext_id:
-                ext_id = f"IMAP-{msg_id.decode(errors='ignore')}"
-            if ext_id:
-                exists = db.execute("SELECT id FROM communications WHERE external_id = ?", (ext_id,)).fetchone()
-                if exists:
-                    continue
-            if gm_msgid:
-                exists2 = db.execute("SELECT id FROM communications WHERE gmail_msgid = ?", (gm_msgid,)).fetchone()
-                if exists2:
-                    continue
-
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    ctype = (part.get_content_type() or "").lower()
-                    disp = str(part.get("Content-Disposition") or "")
-                    if ctype == "text/plain" and "attachment" not in disp.lower():
-                        try:
-                            body = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="replace")
-                        except Exception:
-                            body = str(part.get_payload())
-                        break
-            else:
-                try:
-                    body = msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", errors="replace")
-                except Exception:
-                    body = str(msg.get_payload())
-            raw_body = body
-            body = clean_inbound_email_body(body)
-            is_bounce = (
-                "mailer-daemon" in (from_email or "")
-                or "postmaster" in (from_email or "")
-                or any(
-                    x in (subject or "").lower()
-                    for x in ["undeliverable", "delivery status notification", "delivery failure", "returned mail"]
-                )
-            )
-            bounce_target_email = extract_bounce_target_email(raw_body, known_emails) if is_bounce else ""
-
-            property_id = None
-            person_id = None
-            token_source = f"{subject or ''} {msg.get('X-DeepProspect-Thread') or ''} {raw_body or ''} {body or ''}"
-            token_match = re.search(r"\[DP-P(\d+)-PE(\d+)\]", token_source)
-            if token_match:
-                property_id = int(token_match.group(1)) if token_match.group(1).isdigit() and token_match.group(1) != "0" else None
-                person_id = int(token_match.group(2)) if token_match.group(2).isdigit() and token_match.group(2) != "0" else None
-            if person_id is None:
-                h_person = (msg.get("X-DeepProspect-Person-ID") or "").strip()
-                if h_person.isdigit():
-                    person_id = int(h_person)
-            if property_id is None:
-                h_prop = (msg.get("X-DeepProspect-Property-ID") or "").strip()
-                if h_prop.isdigit():
-                    property_id = int(h_prop)
-
-            if person_id is None or property_id is None:
-                ref_ids = []
-                ref_ids.extend(extract_message_ids(msg.get("In-Reply-To") or ""))
-                ref_ids.extend(extract_message_ids(msg.get("References") or ""))
-                for ref in ref_ids:
-                    prior = db.execute(
-                        """
-                        SELECT id, property_id, person_id
-                        FROM communications
-                        WHERE upper(channel) = 'EMAIL' AND external_id = ?
-                        ORDER BY id DESC
-                        LIMIT 1
-                        """,
-                        (ref,),
-                    ).fetchone()
-                    if prior:
-                        if property_id is None:
-                            property_id = prior["property_id"]
-                        if person_id is None:
-                            person_id = prior["person_id"]
-                        if gm_thrid:
-                            db.execute(
-                                """
-                                UPDATE communications
-                                SET gmail_thread_id = COALESCE(gmail_thread_id, ?)
-                                WHERE id = ?
-                                """,
-                                (gm_thrid, prior["id"]),
-                            )
-                        break
-            if (person_id is None or property_id is None) and gm_thrid:
-                prior = db.execute(
-                    """
-                    SELECT property_id, person_id
-                    FROM communications
-                    WHERE upper(channel) = 'EMAIL' AND gmail_thread_id = ?
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (gm_thrid,),
-                ).fetchone()
-                if prior:
-                    if property_id is None:
-                        property_id = prior["property_id"]
-                    if person_id is None:
-                        person_id = prior["person_id"]
-
-            if person_id is None and from_email:
-                tp = db.execute(
-                    """
-                    SELECT person_id
-                    FROM touchpoints
-                    WHERE lower(channel_type) = 'email' AND lower(value) = ?
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (from_email.lower(),),
-                ).fetchone()
-                if tp:
-                    person_id = tp["person_id"]
-            if person_id is None and from_email:
-                p = db.execute(
-                    """
-                    SELECT id
-                    FROM people
-                    WHERE lower(primary_email) = ?
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (from_email.lower(),),
-                ).fetchone()
-                if p:
-                    person_id = p["id"]
-            if person_id is None and bounce_target_email:
-                tp_b = db.execute(
-                    """
-                    SELECT person_id
-                    FROM touchpoints
-                    WHERE lower(channel_type) = 'email' AND lower(value) = ?
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (bounce_target_email.lower(),),
-                ).fetchone()
-                if tp_b:
-                    person_id = tp_b["person_id"]
-            if person_id is None and bounce_target_email:
-                p_b = db.execute(
-                    """
-                    SELECT id
-                    FROM people
-                    WHERE lower(primary_email) = ?
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (bounce_target_email.lower(),),
-                ).fetchone()
-                if p_b:
-                    person_id = p_b["id"]
-            if property_id is None and person_id is not None:
-                pr = db.execute(
-                    "SELECT id FROM properties WHERE owner_person_id = ? OR resident_person_id = ? ORDER BY created_at DESC LIMIT 1",
-                    (person_id, person_id),
-                ).fetchone()
-                if pr:
-                    property_id = pr["id"]
-            has_reply_headers = bool((msg.get("In-Reply-To") or "").strip() or (msg.get("References") or "").strip())
-            if property_id is None:
-                if from_email and from_email not in known_emails and not has_reply_headers and not gm_thrid:
-                    continue
-                continue
-            status_label = "Bounced" if is_bounce else "Received"
-            if is_bounce and bounce_target_email:
-                db.execute(
-                    """
-                    UPDATE touchpoints
-                    SET status = 'Bounced'
-                    WHERE lower(channel_type) = 'email' AND lower(value) = lower(?)
-                    """,
-                    (bounce_target_email,),
-                )
-
-            db.execute(
-                """
-                INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id, gmail_msgid, gmail_thread_id, in_reply_to)
-                VALUES (?, ?, 'EMAIL', 'Inbound', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
-                """,
-                (
-                    property_id,
-                    person_id,
-                    from_email,
-                    to_email or from_addr,
-                    (body or "").strip(),
-                    status_label,
-                    format_db_time(datetime.utcnow()),
-                    ext_id,
-                    gm_msgid or None,
-                    gm_thrid or None,
-                    (msg.get("In-Reply-To") or "").strip() or None,
-                ),
-            )
-        db.commit()
-        m.logout()
-    except Exception as exc:
-        db.rollback()
-        log_app_error(
-            db,
-            source="email_poll_worker",
-            error_message=str(exc),
-            details=traceback.format_exc(),
-            route="poll_gmail_inbound_once",
-            status_code=500,
-        )
-        db.commit()
-    finally:
-        db.close()
+    return
 
 
 def start_email_poll_worker():
-    global EMAIL_POLL_WORKER_STARTED
-    if EMAIL_POLL_WORKER_STARTED:
-        return
-    EMAIL_POLL_WORKER_STARTED = True
-
-    def worker():
-        while True:
-            try:
-                poll_gmail_inbound_once()
-            except Exception:
-                pass
-            time.sleep(60)
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
+    return
 
 
 def run_clever_leads_poll_once():
@@ -9015,13 +8545,7 @@ def settings_page():
             fields = {
                 "email_from_name": request.form.get("email_from_name", ""),
                 "email_from_address": request.form.get("email_from_address", ""),
-                "email_provider": request.form.get("email_provider", "smtp"),
-                "email_app_password": request.form.get("email_app_password", ""),
-                "email_smtp_host": request.form.get("email_smtp_host", "smtp.gmail.com"),
-                "email_smtp_port": request.form.get("email_smtp_port", "587"),
-                "email_imap_host": request.form.get("email_imap_host", "imap.gmail.com"),
-                "email_imap_port": request.form.get("email_imap_port", "993"),
-                "email_poll_enabled": request.form.get("email_poll_enabled", "1"),
+                "email_provider": request.form.get("email_provider", "gmail_api"),
                 "email_resend_api_key": request.form.get("email_resend_api_key", ""),
                 "email_resend_base_url": request.form.get("email_resend_base_url", "https://api.resend.com"),
                 "email_gmail_api_client_id": request.form.get("email_gmail_api_client_id", ""),
@@ -9035,7 +8559,7 @@ def settings_page():
             if email_action == "test_login":
                 check = test_email_login(db)
                 if check.get("ok"):
-                    notice = "Email settings saved. SMTP and IMAP login test passed."
+                    notice = "Email settings saved. API login test passed."
                 else:
                     error_notice = f"Email settings saved, but login test failed: {check.get('error') or 'Unknown error'}"
                     log_app_error(
@@ -12419,12 +11943,11 @@ def email_poll_now():
     try:
         ensure_db()
         db = get_db()
-        provider = (get_email_settings(db).get("provider") or "smtp").strip().lower()
+        provider = (get_email_settings(db).get("provider") or "gmail_api").strip().lower()
         if provider == "gmail_api":
             result = process_gmail_api_inbound_once(max_messages=30)
             return jsonify({"ok": bool(result.get("ok")), "result": result}), (200 if result.get("ok") else 500)
-        poll_gmail_inbound_once()
-        return jsonify({"ok": True, "result": {"mode": "imap_poll"}})
+        return jsonify({"ok": False, "error": "API-only mode enabled. Select gmail_api or resend."}), 400
     except Exception as exc:
         ensure_db()
         db = get_db()

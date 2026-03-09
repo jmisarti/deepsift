@@ -4054,14 +4054,19 @@ def _parse_seller_name_for_owner(name):
     bits = [b for b in raw.split() if b.strip()]
     if len(bits) == 1:
         return {"first_name": bits[0], "last_name": ""}
-    return {"first_name": bits[0], "last_name": " ".join(bits[1:])}
+    # Keep first/last deterministic for downstream CRMs that expect strict split fields.
+    return {"first_name": bits[0], "last_name": bits[-1]}
 
 
 def _build_clever_lead_notes(row_data):
+    owner_name = _row_value_by_keys(row_data, ["Seller Name"])
+    owner_split = _parse_seller_name_for_owner(owner_name)
     fields = [
         ("Create Date", _row_value_by_keys(row_data, ["Create Date"])),
         ("Portal Link (Provide Updates)", _row_value_by_keys(row_data, ["Portal Link (Provide Updates)", "Portal Link"])),
         ("Seller Name", _row_value_by_keys(row_data, ["Seller Name"])),
+        ("Owner First Name", owner_split.get("first_name") or ""),
+        ("Owner Last Name", owner_split.get("last_name") or ""),
         ("Address", _row_value_by_keys(row_data, ["Address"])),
         ("Phone Number", _row_value_by_keys(row_data, ["Phone Number", "Phone"])),
         ("Email", _row_value_by_keys(row_data, ["Email"])),

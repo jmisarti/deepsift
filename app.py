@@ -142,6 +142,49 @@ NJ_COUNTIES = [
     "Union",
     "Warren",
 ]
+
+AGENT_DEFINITIONS = [
+    {
+        "key": "conversation_closer",
+        "name": "Conversation Closer Agent",
+        "objective": "Own outbound/inbound SMS, email, and direct-mail orchestration with human-like intent to secure a live phone call with acquisitions.",
+        "inputs": "People, touchpoints, communications, campaign rules, and property context.",
+        "outputs": "Suggested or automated responses, sentiment labels, next-step intents, and escalation recommendations.",
+        "status": "Planned",
+    },
+    {
+        "key": "underwriting",
+        "name": "Underwriting Agent",
+        "objective": "Estimate listing value, cash offer ranges, and confidence bands from available property data and comparables.",
+        "inputs": "Property profile, historical sales, condition notes, and comp sources.",
+        "outputs": "Value range, offer range, assumptions, and confidence scores.",
+        "status": "Planned",
+    },
+    {
+        "key": "lead_intake",
+        "name": "Lead Intake Agent",
+        "objective": "Collect internet leads, clean/normalize data, deduplicate, and push qualified records into ReiSift and Deep Dive.",
+        "inputs": "Webhooks, sheet feeds, scraped/public data, import files.",
+        "outputs": "Normalized lead packets, source-attribution notes, and ingestion outcomes.",
+        "status": "In Progress",
+    },
+    {
+        "key": "lead_monitor",
+        "name": "Lead Monitor Agent",
+        "objective": "Track lead lifecycle and identify stalled steps: missing offers, pending deadlines, and follow-up gaps.",
+        "inputs": "ReiSift statuses, communication activity, tasks, and timelines.",
+        "outputs": "Alerts, action queue, and recommended owner/relative escalation.",
+        "status": "Planned",
+    },
+    {
+        "key": "referral_orchestrator",
+        "name": "Referral Orchestrator Agent",
+        "objective": "Monitor Clever referral leads, ensure realtor outreach progress, and trigger next routing when engagement is missing.",
+        "inputs": "Referral queue, realtor routing queue, communication outcomes, and on-market status.",
+        "outputs": "Auto-send queue decisions, escalation prompts, and referral health summaries.",
+        "status": "In Progress",
+    },
+]
 REFERRAL_STATUSES = ["Untouched", "Referred", "Under Contract", "Dead", "Other"]
 
 
@@ -5046,7 +5089,92 @@ def send_gmail_email(db, to_email, subject, body, property_id=None, person_id=No
 
 
 def backfill_outbound_gmail_ids(db, communication_id):
-    return
+    row = db.execute(
+        """
+        SELECT id, channel, direction, external_id, gmail_msgid, gmail_thread_id, in_reply_to
+        FROM communications
+        WHERE id = ?
+        """,
+        (communication_id,),
+    ).fetchone()
+    if not row:
+        return
+    if (row["channel"] or "").strip().upper() != "EMAIL" or (row["direction"] or "").strip().title() != "Outbound":
+        return
+    settings = get_email_settings(db)
+    if (settings.get("provider") or "").strip().lower() != "gmail_api":
+        return
+    access_token = _get_gmail_api_access_token(settings)
+
+    ext = (row["external_id"] or "").strip()
+    gmail_msgid = (row["gmail_msgid"] or "").strip()
+    message_obj = None
+    message_id = ""
+
+    # Gmail API message IDs are opaque tokens; RFC822 Message-IDs usually contain '@' and angle brackets.
+    ext_is_rfc = ("@" in ext and "<" in ext and ">" in ext) or ("@" in ext and ext.startswith("<"))
+    candidate_gmail_id = gmail_msgid or ("" if ext_is_rfc else ext)
+
+    if candidate_gmail_id:
+        res = requests.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{candidate_gmail_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"format": "metadata", "metadataHeaders": ["Message-ID", "In-Reply-To"]},
+            timeout=20,
+        )
+        if res.ok:
+            message_obj = res.json() if res.content else {}
+            message_id = candidate_gmail_id
+
+    if message_obj is None and ext_is_rfc:
+        query = ext.strip("<>")
+        list_res = requests.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"q": f"rfc822msgid:{query}", "maxResults": 1},
+            timeout=20,
+        )
+        if list_res.ok:
+            list_body = list_res.json() if list_res.content else {}
+            msgs = list_body.get("messages") or []
+            if msgs:
+                message_id = (msgs[0].get("id") or "").strip()
+                if message_id:
+                    get_res = requests.get(
+                        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+                        headers={"Authorization": f"Bearer {access_token}"},
+                        params={"format": "metadata", "metadataHeaders": ["Message-ID", "In-Reply-To"]},
+                        timeout=20,
+                    )
+                    if get_res.ok:
+                        message_obj = get_res.json() if get_res.content else {}
+
+    if not isinstance(message_obj, dict):
+        return
+    payload = message_obj.get("payload") if isinstance(message_obj.get("payload"), dict) else {}
+    headers = payload.get("headers") if isinstance(payload.get("headers"), list) else []
+    rfc_message_id = (_gmail_header_value(headers, "Message-ID") or "").strip()
+    thread_id = (message_obj.get("threadId") or "").strip()
+    actual_gmail_id = (message_obj.get("id") or message_id or "").strip()
+    in_reply_to = (_gmail_header_value(headers, "In-Reply-To") or "").strip()
+
+    db.execute(
+        """
+        UPDATE communications
+        SET external_id = COALESCE(NULLIF(?, ''), external_id),
+            gmail_msgid = COALESCE(NULLIF(?, ''), gmail_msgid),
+            gmail_thread_id = COALESCE(NULLIF(?, ''), gmail_thread_id),
+            in_reply_to = COALESCE(NULLIF(?, ''), in_reply_to)
+        WHERE id = ?
+        """,
+        (
+            rfc_message_id or ext,
+            actual_gmail_id,
+            thread_id,
+            in_reply_to or (row["in_reply_to"] or ""),
+            communication_id,
+        ),
+    )
 
 
 def test_email_login(db):
@@ -7907,6 +8035,29 @@ def coming_soon():
     return render_template("coming_soon.html")
 
 
+@app.route("/agents")
+def agents_page():
+    ensure_db()
+    db = get_db()
+    queue_counts = db.execute(
+        """
+        SELECT
+            SUM(CASE WHEN queue_status = 'Queued' THEN 1 ELSE 0 END) AS queued_count,
+            SUM(CASE WHEN queue_status = 'No Realtor' THEN 1 ELSE 0 END) AS no_realtor_count
+        FROM referral_auto_send_queue
+        """
+    ).fetchone()
+    summary = {
+        "queued_count": int((queue_counts["queued_count"] or 0) if queue_counts else 0),
+        "no_realtor_count": int((queue_counts["no_realtor_count"] or 0) if queue_counts else 0),
+    }
+    return render_template(
+        "agents.html",
+        agents=AGENT_DEFINITIONS,
+        summary=summary,
+    )
+
+
 @app.route("/referral")
 def referral_dashboard():
     ensure_db()
@@ -7925,20 +8076,29 @@ def referral_dashboard():
             notice = f"Referral cache initialized ({data['synced']} synced)."
         except Exception as exc:
             error = str(exc)
-    queue_rows = db.execute(
-        """
+    queue_filter = (request.args.get("queue_filter") or "all").strip().lower()
+    valid_queue_filters = {"all", "queued", "no_realtor"}
+    if queue_filter not in valid_queue_filters:
+        queue_filter = "all"
+    queue_sql = """
         SELECT q.*, r.first_name, r.last_name, rr.full_address
         FROM referral_auto_send_queue q
         LEFT JOIN referral_realtors r ON r.id = q.realtor_id
         LEFT JOIN reisift_referrals rr ON rr.property_uuid = q.property_uuid
-        ORDER BY q.id DESC
-        LIMIT 200
-        """
+    """
+    if queue_filter == "queued":
+        queue_sql += " WHERE q.queue_status = 'Queued'"
+    elif queue_filter == "no_realtor":
+        queue_sql += " WHERE q.queue_status = 'No Realtor'"
+    queue_sql += " ORDER BY q.id DESC LIMIT 200"
+    queue_rows = db.execute(
+        queue_sql,
     ).fetchall()
     return render_template(
         "referral.html",
         referrals=referrals,
         queue_rows=queue_rows,
+        queue_filter=queue_filter,
         total_count=total_count,
         status_slug=status_slug,
         error=error,
@@ -10607,7 +10767,17 @@ def create_property_communication(property_id):
         ),
     )
     if channel == "EMAIL" and direction == "Outbound":
-        backfill_outbound_gmail_ids(db, cur.lastrowid)
+        try:
+            backfill_outbound_gmail_ids(db, cur.lastrowid)
+        except Exception as exc:
+            log_app_error(
+                db,
+                source="email_backfill_property",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route=request.path,
+                status_code=500,
+            )
     db.commit()
     row = db.execute("SELECT * FROM communications WHERE id = ?", (cur.lastrowid,)).fetchone()
     return jsonify(dict(row)), 201
@@ -10762,7 +10932,17 @@ def create_person_communication(person_id):
         ),
     )
     if channel == "EMAIL" and direction == "Outbound":
-        backfill_outbound_gmail_ids(db, cur.lastrowid)
+        try:
+            backfill_outbound_gmail_ids(db, cur.lastrowid)
+        except Exception as exc:
+            log_app_error(
+                db,
+                source="email_backfill_person",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route=request.path,
+                status_code=500,
+            )
     db.commit()
     row = db.execute("SELECT * FROM communications WHERE id = ?", (cur.lastrowid,)).fetchone()
     return jsonify(dict(row)), 201

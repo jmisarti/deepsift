@@ -65,6 +65,15 @@
 <section class="panel">
     <h3>Auto Send Queue (Preview)</h3>
     <p>This queue shows county-matched referral routing candidates before SMS automation is turned on.</p>
+    <form method="get" class="inline-form" style="margin-bottom:0.5rem;">
+        <label>Queue Filter
+            <select name="queue_filter" onchange="this.form.submit()">
+                <option value="all" {% if queue_filter == 'all' %}selected{% endif %}>All</option>
+                <option value="queued" {% if queue_filter == 'queued' %}selected{% endif %}>Queued</option>
+                <option value="no_realtor" {% if queue_filter == 'no_realtor' %}selected{% endif %}>No Realtor</option>
+            </select>
+        </label>
+    </form>
     <table>
         <thead>
             <tr>

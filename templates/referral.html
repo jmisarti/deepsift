@@ -7,6 +7,9 @@
         <form method="post" action="{{ url_for('referral_refresh') }}">
             <button type="submit">Refresh From REISift</button>
         </form>
+        <form method="post" action="{{ url_for('referral_clear_queue') }}" onsubmit="return confirm('Clear the referral auto-send queue?');">
+            <button type="submit">Clear Queue</button>
+        </form>
         <p><a href="{{ url_for('referral_realtors_page') }}">Manage Realtors</a></p>
     </div>
     {% if notice %}

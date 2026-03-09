@@ -108,7 +108,7 @@
             </div>
         </form>
         <p><strong>Gmail push webhook endpoint:</strong> <code>POST /webhooks/gmail/pubsub?token=&lt;your_token&gt;</code></p>
-        <p class="muted-text">Use this for Pub/Sub push delivery to trigger inbound email sync without IMAP polling.</p>
+        <p class="muted-text">You can also authenticate this endpoint using your Integration API key: <code>X-Integration-Key</code> header or <code>?integration_key=...</code>.</p>
     {% elif active_tab == 'integrations' %}
         <p>Configure external system ingress and Slack notifications.</p>
         <form method="post" class="grid-form">

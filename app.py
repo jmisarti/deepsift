@@ -12364,8 +12364,20 @@ def gmail_pubsub_webhook():
         s = get_email_settings(db)
         expected = (s.get("gmail_webhook_token") or "").strip()
         provided = (request.args.get("token") or request.headers.get("X-Gmail-Webhook-Token") or "").strip()
-        if expected and provided != expected:
-            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        integration_key = (
+            (request.args.get("integration_key") or "").strip()
+            or (request.headers.get("X-Integration-Key") or "").strip()
+            or (request.headers.get("Authorization") or "").replace("Bearer", "").strip()
+        )
+        expected_integration_key = get_integration_api_key(db)
+        integration_ok = bool(expected_integration_key and integration_key and hmac.compare_digest(integration_key, expected_integration_key))
+        token_ok = bool(expected and provided and hmac.compare_digest(provided, expected))
+        if expected:
+            if not (token_ok or integration_ok):
+                return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        else:
+            if not integration_ok:
+                return jsonify({"ok": False, "error": "Unauthorized"}), 401
         payload = request.get_json(silent=True) or {}
         message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
         event_key = (message.get("messageId") or "").strip() or datetime.utcnow().strftime("%Y%m%d%H%M%S%f")

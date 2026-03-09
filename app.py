@@ -15,7 +15,7 @@ import ssl
 import threading
 import time
 import traceback
-from urllib.parse import quote_plus, urlsplit
+from urllib.parse import quote, quote_plus, urlsplit
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
 from email.header import decode_header, make_header
@@ -30,6 +30,12 @@ from flask import Flask, g, jsonify, redirect, render_template, request, session
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 from werkzeug.exceptions import HTTPException
+try:
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+except Exception:
+    service_account = None
+    GoogleAuthRequest = None
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("CRM_DB_PATH", str(BASE_DIR / "crm.db"))).expanduser()
@@ -98,12 +104,17 @@ APP_AUTH_USERNAME = os.getenv("APP_AUTH_USERNAME", "").strip()
 APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD", "")
 APP_AUTH_PASSWORD_HASH = os.getenv("APP_AUTH_PASSWORD_HASH", "").strip()
 RUN_BACKGROUND_WORKERS = env_flag("RUN_BACKGROUND_WORKERS", True)
+GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
+GOOGLE_SHEETS_WORKSHEET_NAME = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "List of Customers").strip() or "List of Customers"
+GOOGLE_SHEETS_POLL_SECONDS = max(int((os.getenv("GOOGLE_SHEETS_POLL_SECONDS") or "300").strip() or "300"), 60)
+CLEVER_LEADS_EVENT_SOURCE = "clever_leads_ingest"
 try:
     EST_TZ = ZoneInfo("America/New_York")
 except ZoneInfoNotFoundError:
     EST_TZ = timezone(timedelta(hours=-5))
 BULK_SMS_WORKER_STARTED = False
 EMAIL_POLL_WORKER_STARTED = False
+CLEVER_LEADS_WORKER_STARTED = False
 NJ_COUNTIES = [
     "Atlantic",
     "Bergen",
@@ -262,6 +273,7 @@ def require_login_if_enabled():
         # Start idempotent worker threads when running under Gunicorn.
         start_bulk_sms_worker()
         start_email_poll_worker()
+        start_clever_leads_worker()
     if not APP_AUTH_ENABLED:
         return None
     endpoint = request.endpoint or ""
@@ -3928,7 +3940,7 @@ def get_slack_settings(db):
 def get_automation_settings(db):
     clever_enabled_raw = get_setting(db, "automation_clever_leads_enabled", "")
     if not clever_enabled_raw:
-        clever_enabled_raw = get_setting(db, "automation_test_enabled", "0")
+        clever_enabled_raw = get_setting(db, "automation_test_enabled", "1")
     return {
         "clever_leads_enabled": (clever_enabled_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
     }
@@ -4080,6 +4092,196 @@ def add_clever_webhook_note(db, event_key, note_body, payload=None):
             json.dumps(payload or {}),
         ),
     )
+
+
+def _get_google_service_account_info():
+    raw = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON: {exc}") from exc
+
+
+def fetch_google_sheet_rows():
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        raise ValueError("GOOGLE_SHEETS_SPREADSHEET_ID is not configured.")
+    if service_account is None or GoogleAuthRequest is None:
+        raise ValueError("google-auth dependency is not available.")
+    info = _get_google_service_account_info()
+    if not info:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not configured.")
+
+    creds = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    )
+    creds.refresh(GoogleAuthRequest())
+    range_name = f"{GOOGLE_SHEETS_WORKSHEET_NAME}!A:ZZ"
+    endpoint = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/"
+        f"{quote(GOOGLE_SHEETS_SPREADSHEET_ID, safe='')}/values/{quote(range_name, safe='!')}"
+    )
+    response = requests.get(
+        endpoint,
+        headers={"Authorization": f"Bearer {creds.token}"},
+        params={"majorDimension": "ROWS"},
+        timeout=30,
+    )
+    if not response.ok:
+        raise ValueError(f"Google Sheets API failed ({response.status_code}): {response.text}")
+    payload = response.json() or {}
+    rows = payload.get("values") or []
+    if not rows:
+        return []
+    headers = [str(h or "").strip() for h in (rows[0] or [])]
+    data_rows = []
+    for idx, values in enumerate(rows[1:], start=2):
+        row_map = {}
+        for col_i, header in enumerate(headers):
+            if not header:
+                continue
+            row_map[header] = str(values[col_i]).strip() if col_i < len(values) else ""
+        if any(str(v).strip() for v in row_map.values()):
+            data_rows.append({"row_index": idx, "row_data": row_map})
+    return data_rows
+
+
+def process_clever_lead_payload(db, payload, source_label="webhook"):
+    spreadsheet_id = (payload.get("spreadsheet_id") or payload.get("spreadsheetId") or "").strip()
+    sheet_name = (payload.get("sheet_name") or payload.get("sheetName") or "").strip()
+    row_index = payload.get("row_index") if payload.get("row_index") is not None else payload.get("rowIndex")
+    row_data = payload.get("row_data") if isinstance(payload.get("row_data"), dict) else (payload.get("rowData") or {})
+    event_key = (
+        (payload.get("event_key") or "").strip()
+        or (payload.get("eventKey") or "").strip()
+        or f"{spreadsheet_id}:{sheet_name}:{row_index}"
+    )
+    address = _row_value_by_keys(row_data, ["Address", "address", "Property Address"])
+    seller_name = _row_value_by_keys(row_data, ["Seller Name", "seller_name", "owner", "Owner Name"])
+    phone = _row_value_by_keys(row_data, ["Phone Number", "phone", "Phone"])
+    email = _row_value_by_keys(row_data, ["Email", "email"])
+    portal_link = _row_value_by_keys(row_data, ["Portal Link (Provide Updates)", "Portal Link"])
+
+    is_new = upsert_integration_event(
+        db,
+        CLEVER_LEADS_EVENT_SOURCE,
+        event_key,
+        payload,
+    )
+    if source_label == "webhook" or is_new:
+        note_lines = [
+            f"Clever Leads payload received ({source_label})",
+            f"Event Key: {event_key or '-'}",
+            f"Sheet: {sheet_name or '-'}",
+            f"Row: {row_index if row_index is not None else '-'}",
+            f"Address: {address or '-'}",
+            f"Seller: {seller_name or '-'}",
+            f"Phone: {phone or '-'}",
+            f"Email: {email or '-'}",
+        ]
+        add_clever_webhook_note(
+            db,
+            event_key,
+            "\n".join(note_lines),
+            payload,
+        )
+    db.commit()
+    if not is_new:
+        return {"ok": True, "duplicate": True, "event_key": event_key}
+
+    if address:
+        try:
+            owner_name = _parse_seller_name_for_owner(seller_name)
+            owner_payload = {}
+            if owner_name.get("first_name") or owner_name.get("last_name"):
+                owner_payload["first_name"] = owner_name.get("first_name") or "Unknown"
+                owner_payload["last_name"] = owner_name.get("last_name") or "Owner"
+            if email:
+                owner_payload["emails"] = [email]
+            if phone:
+                owner_payload["phones"] = [{"number": phone, "type": "UNKNOWN", "status": "UNKNOWN"}]
+
+            clever_notes = _build_clever_lead_notes(row_data)
+            create_payload = {
+                "search": address,
+                "status": "new_lead",
+                "lists": "Clever Leads",
+                "tags": "clever,google_sheet",
+                "notes": clever_notes,
+                "owner": owner_payload,
+            }
+            result = create_reisift_property_from_search(create_payload)
+            created = result.get("created") or {}
+            created_uuid = (result.get("created_uuid") or created.get("uuid") or created.get("id") or "").strip()
+            sift_status = (created.get("status") or result.get("create_payload", {}).get("status") or "new_lead").strip()
+            sift_link = f"https://app.reisift.io/records/properties/{created_uuid}/details?page=1" if created_uuid else ""
+            msg_lines = [
+                "New Clever Lead Received",
+                f"SIFT Status: {sift_status}",
+                f"Address: {address}",
+            ]
+            if seller_name:
+                msg_lines.append(f"Seller: {seller_name}")
+            if portal_link:
+                msg_lines.append(f"Portal: {portal_link}")
+            if sift_link:
+                msg_lines.append(f"SIFT Record: {sift_link}")
+            send_slack_notification(db, "\n".join(msg_lines))
+            add_clever_webhook_note(
+                db,
+                event_key,
+                "\n".join(
+                    [
+                        "Clever Leads processing result",
+                        "Result: success",
+                        f"SIFT Status: {sift_status}",
+                        f"SIFT Record: {sift_link or '-'}",
+                    ]
+                ),
+                {"created": created, "created_uuid": created_uuid, "status": sift_status},
+            )
+            db.commit()
+        except Exception as exc:
+            err_text = str(exc)
+            try:
+                send_slack_notification(
+                    db,
+                    "\n".join(
+                        [
+                            "New Clever Lead Received",
+                            "SIFT Status: failed",
+                            f"Address: {address}",
+                            f"Error: {err_text}",
+                        ]
+                    ),
+                )
+            except Exception:
+                pass
+            log_app_error(
+                db,
+                source="integrations_google_sheets_row_added_api",
+                error_message=err_text,
+                details=traceback.format_exc(),
+                route="/api/integrations/google-sheets/row-added",
+                status_code=500,
+            )
+            add_clever_webhook_note(
+                db,
+                event_key,
+                "\n".join(
+                    [
+                        "Clever Leads processing result",
+                        "Result: failed",
+                        f"Error: {err_text}",
+                    ]
+                ),
+                {"error": err_text},
+            )
+            db.commit()
+            return {"ok": False, "error": err_text, "event_key": event_key}
+    return {"ok": True, "event_key": event_key}
 
 
 def email_sender_label(settings):
@@ -4976,6 +5178,73 @@ def start_email_poll_worker():
             except Exception:
                 pass
             time.sleep(60)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
+def run_clever_leads_poll_once():
+    ensure_db()
+    db = open_sqlite_connection()
+    try:
+        automation = get_automation_settings(db)
+        if not automation.get("clever_leads_enabled"):
+            return {"ok": True, "skipped": "disabled"}
+        if not GOOGLE_SHEETS_SPREADSHEET_ID or not (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip():
+            return {"ok": True, "skipped": "missing_google_sheets_config"}
+        if service_account is None or GoogleAuthRequest is None:
+            return {"ok": True, "skipped": "google_auth_dependency_missing"}
+        rows = fetch_google_sheet_rows()
+        processed = 0
+        duplicates = 0
+        failed = 0
+        for item in rows:
+            row_index = item.get("row_index")
+            row_data = item.get("row_data") if isinstance(item.get("row_data"), dict) else {}
+            payload = {
+                "spreadsheet_id": GOOGLE_SHEETS_SPREADSHEET_ID,
+                "sheet_name": GOOGLE_SHEETS_WORKSHEET_NAME,
+                "row_index": row_index,
+                "event_key": f"{GOOGLE_SHEETS_SPREADSHEET_ID}:{GOOGLE_SHEETS_WORKSHEET_NAME}:{row_index}",
+                "row_data": row_data,
+            }
+            result = process_clever_lead_payload(db, payload, source_label="poller")
+            if result.get("duplicate"):
+                duplicates += 1
+            elif result.get("ok"):
+                processed += 1
+            else:
+                failed += 1
+        return {"ok": True, "processed": processed, "duplicates": duplicates, "failed": failed, "rows": len(rows)}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="clever_leads_worker",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="run_clever_leads_poll_once",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+def start_clever_leads_worker():
+    global CLEVER_LEADS_WORKER_STARTED
+    if CLEVER_LEADS_WORKER_STARTED:
+        return
+    CLEVER_LEADS_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                run_clever_leads_poll_once()
+            except Exception:
+                pass
+            time.sleep(GOOGLE_SHEETS_POLL_SECONDS)
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
@@ -8063,148 +8332,9 @@ def integrations_google_sheets_row_added_api():
     if not integration_auth_ok(db, request):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     payload = request.get_json(force=True) or {}
-    spreadsheet_id = (payload.get("spreadsheet_id") or payload.get("spreadsheetId") or "").strip()
-    sheet_name = (payload.get("sheet_name") or payload.get("sheetName") or "").strip()
-    row_index = payload.get("row_index") if payload.get("row_index") is not None else payload.get("rowIndex")
-    row_data = payload.get("row_data") if isinstance(payload.get("row_data"), dict) else (payload.get("rowData") or {})
-    event_key = (
-        (payload.get("event_key") or "").strip()
-        or (payload.get("eventKey") or "").strip()
-        or f"{spreadsheet_id}:{sheet_name}:{row_index}"
-    )
-    address = _row_value_by_keys(row_data, ["Address", "address", "Property Address"])
-    seller_name = _row_value_by_keys(row_data, ["Seller Name", "seller_name", "owner", "Owner Name"])
-    phone = _row_value_by_keys(row_data, ["Phone Number", "phone", "Phone"])
-    email = _row_value_by_keys(row_data, ["Email", "email"])
-    portal_link = _row_value_by_keys(row_data, ["Portal Link (Provide Updates)", "Portal Link"])
-
-    is_new = upsert_integration_event(
-        db,
-        "google_sheets_row_added",
-        event_key,
-        payload,
-    )
-    note_lines = [
-        "Clever Leads webhook received",
-        f"Event Key: {event_key or '-'}",
-        f"Sheet: {sheet_name or '-'}",
-        f"Row: {row_index if row_index is not None else '-'}",
-        f"Address: {address or '-'}",
-        f"Seller: {seller_name or '-'}",
-        f"Phone: {phone or '-'}",
-        f"Email: {email or '-'}",
-    ]
-    add_clever_webhook_note(
-        db,
-        event_key,
-        "\n".join(note_lines),
-        payload,
-    )
-    db.commit()
-    if not is_new:
-        return jsonify({"ok": True, "duplicate": True, "event_key": event_key})
-
-    summary_text = f"address={address or '-'}, seller={seller_name or '-'}, phone={phone or '-'}, email={email or '-'}"
-
-    if address:
-        try:
-            owner_name = _parse_seller_name_for_owner(seller_name)
-            owner_payload = {}
-            if owner_name.get("first_name") or owner_name.get("last_name"):
-                owner_payload["first_name"] = owner_name.get("first_name") or "Unknown"
-                owner_payload["last_name"] = owner_name.get("last_name") or "Owner"
-            if email:
-                owner_payload["emails"] = [email]
-            if phone:
-                owner_payload["phones"] = [{"number": phone, "type": "UNKNOWN", "status": "UNKNOWN"}]
-
-            clever_notes = _build_clever_lead_notes(row_data)
-            create_payload = {
-                "search": address,
-                "status": "new_lead",
-                "lists": "Clever Leads",
-                "tags": "clever,google_sheet",
-                "notes": clever_notes,
-                "owner": owner_payload,
-            }
-            result = create_reisift_property_from_search(create_payload)
-            created = result.get("created") or {}
-            created_uuid = (result.get("created_uuid") or created.get("uuid") or created.get("id") or "").strip()
-            sift_status = (created.get("status") or result.get("create_payload", {}).get("status") or "new_lead").strip()
-            sift_link = f"https://app.reisift.io/records/properties/{created_uuid}/details?page=1" if created_uuid else ""
-            msg_lines = [
-                "New Clever Lead Received",
-                f"SIFT Status: {sift_status}",
-                f"Address: {address}",
-            ]
-            if seller_name:
-                msg_lines.append(f"Seller: {seller_name}")
-            if portal_link:
-                msg_lines.append(f"Portal: {portal_link}")
-            if sift_link:
-                msg_lines.append(f"SIFT Record: {sift_link}")
-            send_slack_notification(db, "\n".join(msg_lines))
-            add_clever_webhook_note(
-                db,
-                event_key,
-                "\n".join(
-                    [
-                        "Clever Leads processing result",
-                        "Result: success",
-                        f"SIFT Status: {sift_status}",
-                        f"SIFT Record: {sift_link or '-'}",
-                    ]
-                ),
-                {"created": created, "created_uuid": created_uuid, "status": sift_status},
-            )
-        except Exception as exc:
-            err_text = str(exc)
-            try:
-                send_slack_notification(
-                    db,
-                    "\n".join(
-                        [
-                            "New Clever Lead Received",
-                            "SIFT Status: failed",
-                            f"Address: {address}",
-                            f"Error: {err_text}",
-                        ]
-                    ),
-                )
-            except Exception:
-                pass
-            log_app_error(
-                db,
-                source="integrations_google_sheets_row_added_api",
-                error_message=err_text,
-                details=traceback.format_exc(),
-                route="/api/integrations/google-sheets/row-added",
-                status_code=500,
-            )
-            add_clever_webhook_note(
-                db,
-                event_key,
-                "\n".join(
-                    [
-                        "Clever Leads processing result",
-                        "Result: failed",
-                        f"Error: {err_text}",
-                    ]
-                ),
-                {"error": err_text},
-            )
-            db.commit()
-            return jsonify({"ok": False, "error": err_text}), 500
-
-    try:
-        send_slack_notification(
-            db,
-            f"Google Sheets row added: sheet='{sheet_name or '-'}' row='{row_index}' spreadsheet='{spreadsheet_id or '-'}' {summary_text}",
-        )
-    except Exception:
-        pass
-    db.commit()
-    return jsonify({"ok": True, "event_key": event_key})
+    result = process_clever_lead_payload(db, payload, source_label="webhook")
+    status_code = 500 if not result.get("ok") else 200
+    return jsonify(result), status_code
 
 
 @app.route("/api/admin/import-referral-bundle", methods=["POST"])
@@ -8479,6 +8609,7 @@ def settings_page():
         error_notice=error_notice,
         recent_errors=recent_errors,
         clever_webhook_notes=clever_webhook_notes,
+        clever_poll_minutes=max(int(GOOGLE_SHEETS_POLL_SECONDS / 60), 1),
         template_id=OPENLETTERCONNECT_TEMPLATE_ID,
         market_helper_address=market_helper_address,
         market_helper_result=market_helper_result,
@@ -11718,6 +11849,7 @@ if __name__ == "__main__":
     if (not debug_mode) or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         start_bulk_sms_worker()
         start_email_poll_worker()
+        start_clever_leads_worker()
     app.run(host=host, port=port, debug=debug_mode)
 
 

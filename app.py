@@ -12442,7 +12442,7 @@ def gmail_pubsub_webhook():
         # Commit webhook ingest before inbound processing opens its own DB connection.
         # This avoids SQLite write-lock contention between concurrent connections.
         db.commit()
-        result = process_gmail_api_inbound_once(max_messages=20)
+        result = process_gmail_api_inbound_once(max_messages=8)
         return jsonify({"ok": True, "event_key": event_key, "result": result}), 200
     except Exception as exc:
         log_app_error(
@@ -12517,7 +12517,7 @@ def email_poll_now():
         db = get_db()
         provider = (get_email_settings(db).get("provider") or "gmail_api").strip().lower()
         if provider == "gmail_api":
-            result = process_gmail_api_inbound_once(max_messages=30)
+            result = process_gmail_api_inbound_once(max_messages=12)
             return jsonify({"ok": bool(result.get("ok")), "result": result}), (200 if result.get("ok") else 500)
         return jsonify({"ok": False, "error": "API-only mode enabled. Select gmail_api or resend."}), 400
     except Exception as exc:

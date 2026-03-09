@@ -45,7 +45,11 @@
                 <td>{{ 'Sent' if row.push_count else 'Not Sent' }}</td>
                 <td><span class="pill">{{ row.status or "-" }}</span></td>
                 <td>{{ row.owner_names or "-" }}</td>
-                <td><code>{{ row.property_uuid }}</code></td>
+                <td>
+                    <a href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener">
+                        <code>{{ row.property_uuid }}</code>
+                    </a>
+                </td>
             </tr>
             {% else %}
             <tr>

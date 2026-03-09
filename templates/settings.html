@@ -14,6 +14,7 @@
         <a class="settings-tab {% if active_tab == 'deep_dive' %}active{% endif %}" href="{{ url_for('settings_page', tab='deep_dive') }}">Deep Dive Settings</a>
         <a class="settings-tab {% if active_tab == 'referral' %}active{% endif %}" href="{{ url_for('settings_page', tab='referral') }}">Referral Settings</a>
         <a class="settings-tab {% if active_tab == 'email' %}active{% endif %}" href="{{ url_for('settings_page', tab='email') }}">Email Settings</a>
+        <a class="settings-tab {% if active_tab == 'integrations' %}active{% endif %}" href="{{ url_for('settings_page', tab='integrations') }}">Integration Settings</a>
         <a class="settings-tab {% if active_tab == 'helpers' %}active{% endif %}" href="{{ url_for('settings_page', tab='helpers') }}">Helpers</a>
     </nav>
 
@@ -71,11 +72,19 @@
             <button type="submit">Save Referral Settings</button>
         </form>
     {% elif active_tab == 'email' %}
-        <p>Fastest proof-of-concept: Gmail App Password (SMTP + IMAP).</p>
+        <p>Configure outbound email provider and inbound polling credentials.</p>
         <form method="post" class="grid-form">
             <input type="hidden" name="settings_tab" value="email">
+            <label>Provider
+                <select name="email_provider">
+                    <option value="smtp" {% if (email_settings.provider or 'smtp') == 'smtp' %}selected{% endif %}>SMTP (Gmail App Password)</option>
+                    <option value="resend" {% if (email_settings.provider or 'smtp') == 'resend' %}selected{% endif %}>Resend API (recommended for hosted)</option>
+                </select>
+            </label>
             <label>From Name <input name="email_from_name" value="{{ email_settings.from_name }}"></label>
             <label>From Address <input name="email_from_address" value="{{ email_settings.from_address }}" placeholder="yourname@gmail.com"></label>
+            <label>Resend API Key <input name="email_resend_api_key" value="{{ email_settings.resend_api_key }}"></label>
+            <label>Resend Base URL <input name="email_resend_base_url" value="{{ email_settings.resend_base_url or 'https://api.resend.com' }}"></label>
             <label>Gmail App Password <input name="email_app_password" value="{{ email_settings.app_password }}"></label>
             <label>SMTP Host <input name="email_smtp_host" value="{{ email_settings.smtp_host }}"></label>
             <label>SMTP Port <input name="email_smtp_port" value="{{ email_settings.smtp_port }}"></label>
@@ -92,6 +101,32 @@
                 <button type="submit" name="email_action" value="test_login">Save + Test Email Login</button>
             </div>
         </form>
+    {% elif active_tab == 'integrations' %}
+        <p>Configure external system ingress and Slack notifications.</p>
+        <form method="post" class="grid-form">
+            <input type="hidden" name="settings_tab" value="integrations">
+            <label class="span2">Integration API Key (for external POST endpoints)
+                <input name="integration_api_key" value="{{ integration_api_key }}">
+            </label>
+            <label class="span2">Slack Incoming Webhook URL
+                <input name="slack_webhook_url" value="{{ slack_settings.webhook_url }}">
+            </label>
+            <label>Slack Signing Secret
+                <input name="slack_signing_secret" value="{{ slack_settings.signing_secret }}">
+            </label>
+            <label>Slack Default Channel (optional)
+                <input name="slack_default_channel" value="{{ slack_settings.default_channel }}" placeholder="#alerts">
+            </label>
+            <div class="inline-actions span2">
+                <button type="submit">Save Integration Settings</button>
+                <button type="submit" name="integration_action" value="test_slack">Save + Test Slack</button>
+            </div>
+        </form>
+        <p><strong>External endpoints (Bearer or X-Integration-Key):</strong></p>
+        <p><code>POST /api/integrations/reisift/create-property</code></p>
+        <p><code>POST /api/integrations/google-sheets/row-added</code></p>
+        <p><strong>Slack inbound endpoints:</strong></p>
+        <p><code>POST /webhooks/slack/command</code> and <code>POST /webhooks/slack/events</code></p>
     {% else %}
         <h3>On-Market Checker (Beta Helper)</h3>
         <p>This helper generates fast lookup links for Zillow/Realtor/Redfin based on a property address. Use it to quickly verify whether a property appears as coming soon, active, pending, or sold.</p>

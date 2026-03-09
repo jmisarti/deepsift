@@ -1,6 +1,7 @@
 ﻿
 import csv
 import hmac
+import hashlib
 import io
 import json
 import imaplib
@@ -271,6 +272,9 @@ def require_login_if_enabled():
     # Third-party callbacks must stay unauthenticated.
     if request.path.startswith("/webhooks/"):
         return None
+    # External integrations authenticate via API key header.
+    if request.path.startswith("/api/integrations/"):
+        return None
     if session.get("auth_ok"):
         return None
     if request.path.startswith("/api/"):
@@ -424,6 +428,18 @@ def migrate_db(db):
             note TEXT,
             details_json TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS integration_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            event_key TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(source, event_key)
         )
         """
     )
@@ -3888,6 +3904,98 @@ def get_email_settings(db):
         "resend_api_key": get_setting(db, "email_resend_api_key", ""),
         "resend_base_url": get_setting(db, "email_resend_base_url", "https://api.resend.com"),
     }
+
+
+def get_slack_settings(db):
+    return {
+        "webhook_url": get_setting(db, "slack_webhook_url", ""),
+        "signing_secret": get_setting(db, "slack_signing_secret", ""),
+        "default_channel": get_setting(db, "slack_default_channel", ""),
+    }
+
+
+def get_integration_api_key(db):
+    return (get_setting(db, "integration_api_key", "") or os.getenv("INTEGRATION_API_KEY", "")).strip()
+
+
+def integration_auth_ok(db, req):
+    expected = get_integration_api_key(db)
+    if not expected:
+        return False
+    provided = (
+        (req.headers.get("X-Integration-Key") or "").strip()
+        or (req.headers.get("Authorization") or "").replace("Bearer", "").strip()
+    )
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, expected)
+
+
+def send_slack_notification(db, text, blocks=None, channel=""):
+    settings = get_slack_settings(db)
+    webhook_url = (settings.get("webhook_url") or "").strip()
+    if not webhook_url:
+        return {"ok": False, "error": "Slack webhook not configured"}
+    payload = {"text": (text or "").strip() or "Notification"}
+    target_channel = (channel or settings.get("default_channel") or "").strip()
+    if target_channel:
+        payload["channel"] = target_channel
+    if isinstance(blocks, list) and blocks:
+        payload["blocks"] = blocks
+    response = requests.post(
+        webhook_url,
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=15,
+    )
+    if not response.ok:
+        raise ValueError(f"Slack webhook failed ({response.status_code}): {response.text}")
+    return {"ok": True}
+
+
+def verify_slack_signature(req, signing_secret):
+    secret = (signing_secret or "").strip()
+    if not secret:
+        return False, "Missing Slack signing secret configuration"
+    timestamp = (req.headers.get("X-Slack-Request-Timestamp") or "").strip()
+    signature = (req.headers.get("X-Slack-Signature") or "").strip()
+    if not timestamp or not signature:
+        return False, "Missing Slack signature headers"
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        return False, "Invalid Slack timestamp"
+    now_ts = int(time.time())
+    if abs(now_ts - ts) > 60 * 5:
+        return False, "Slack timestamp too old"
+    body = req.get_data(as_text=True) or ""
+    basestring = f"v0:{timestamp}:{body}"
+    digest = hmac.new(secret.encode("utf-8"), basestring.encode("utf-8"), hashlib.sha256).hexdigest()
+    expected = f"v0={digest}"
+    if not hmac.compare_digest(expected, signature):
+        return False, "Slack signature mismatch"
+    return True, ""
+
+
+def upsert_integration_event(db, source, event_key, payload):
+    key = (event_key or "").strip()
+    if not key:
+        db.execute(
+            "INSERT INTO integration_events (source, event_key, payload_json) VALUES (?, NULL, ?)",
+            ((source or "").strip(), json.dumps(payload or {})),
+        )
+        return True
+    exists = db.execute(
+        "SELECT id FROM integration_events WHERE source = ? AND event_key = ?",
+        ((source or "").strip(), key),
+    ).fetchone()
+    if exists:
+        return False
+    db.execute(
+        "INSERT INTO integration_events (source, event_key, payload_json) VALUES (?, ?, ?)",
+        ((source or "").strip(), key, json.dumps(payload or {})),
+    )
+    return True
 
 
 def email_sender_label(settings):
@@ -7822,6 +7930,89 @@ def reisift_create_property_api():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.route("/api/integrations/reisift/create-property", methods=["POST"])
+def integrations_reisift_create_property_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(force=True) or {}
+    try:
+        result = create_reisift_property_from_search(payload)
+        created = result.get("created") or {}
+        return jsonify(
+            {
+                "ok": True,
+                "map_id": result.get("map_id"),
+                "created_uuid": result.get("created_uuid") or created.get("uuid") or created.get("id"),
+                "created": created,
+                "enrich": result.get("enrich"),
+            }
+        )
+    except Exception as exc:
+        err_text = str(exc)
+        search_value = (payload.get("search") or payload.get("address_search") or "").strip()
+        if ("map_id" in err_text.lower()) or ("autocomplete" in err_text.lower()):
+            try:
+                send_slack_notification(
+                    db,
+                    f"ReiSift intake failed: address not found in map autocomplete. Search='{search_value or '-'}'. Error='{err_text}'",
+                )
+            except Exception:
+                pass
+        log_app_error(
+            db,
+            source="integrations_reisift_create_property_api",
+            error_message=err_text,
+            details=traceback.format_exc(),
+            route="/api/integrations/reisift/create-property",
+            status_code=500,
+        )
+        db.commit()
+        return jsonify({"ok": False, "error": err_text}), 500
+
+
+@app.route("/api/integrations/google-sheets/row-added", methods=["POST"])
+def integrations_google_sheets_row_added_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(force=True) or {}
+    spreadsheet_id = (payload.get("spreadsheet_id") or payload.get("spreadsheetId") or "").strip()
+    sheet_name = (payload.get("sheet_name") or payload.get("sheetName") or "").strip()
+    row_index = payload.get("row_index") if payload.get("row_index") is not None else payload.get("rowIndex")
+    row_data = payload.get("row_data") if isinstance(payload.get("row_data"), dict) else (payload.get("rowData") or {})
+    event_key = (
+        (payload.get("event_key") or "").strip()
+        or (payload.get("eventKey") or "").strip()
+        or f"{spreadsheet_id}:{sheet_name}:{row_index}"
+    )
+    is_new = upsert_integration_event(
+        db,
+        "google_sheets_row_added",
+        event_key,
+        payload,
+    )
+    db.commit()
+    if not is_new:
+        return jsonify({"ok": True, "duplicate": True, "event_key": event_key})
+
+    summary = []
+    for k in ("address", "owner", "phone", "email"):
+        if isinstance(row_data, dict) and row_data.get(k):
+            summary.append(f"{k}={row_data.get(k)}")
+    summary_text = ", ".join(summary) if summary else "(no mapped fields)"
+    try:
+        send_slack_notification(
+            db,
+            f"Google Sheets row added: sheet='{sheet_name or '-'}' row='{row_index}' spreadsheet='{spreadsheet_id or '-'}' {summary_text}",
+        )
+    except Exception:
+        pass
+    return jsonify({"ok": True, "event_key": event_key})
+
+
 @app.route("/api/admin/import-referral-bundle", methods=["POST"])
 def import_referral_bundle_api():
     ensure_db()
@@ -7906,12 +8097,15 @@ def settings_page():
             fields = {
                 "email_from_name": request.form.get("email_from_name", ""),
                 "email_from_address": request.form.get("email_from_address", ""),
+                "email_provider": request.form.get("email_provider", "smtp"),
                 "email_app_password": request.form.get("email_app_password", ""),
                 "email_smtp_host": request.form.get("email_smtp_host", "smtp.gmail.com"),
                 "email_smtp_port": request.form.get("email_smtp_port", "587"),
                 "email_imap_host": request.form.get("email_imap_host", "imap.gmail.com"),
                 "email_imap_port": request.form.get("email_imap_port", "993"),
                 "email_poll_enabled": request.form.get("email_poll_enabled", "1"),
+                "email_resend_api_key": request.form.get("email_resend_api_key", ""),
+                "email_resend_base_url": request.form.get("email_resend_base_url", "https://api.resend.com"),
             }
             for key, value in fields.items():
                 set_setting(db, key, value)
@@ -7932,6 +8126,32 @@ def settings_page():
                     )
             else:
                 notice = "Email settings saved."
+        elif active_tab == "integrations":
+            fields = {
+                "integration_api_key": request.form.get("integration_api_key", ""),
+                "slack_webhook_url": request.form.get("slack_webhook_url", ""),
+                "slack_signing_secret": request.form.get("slack_signing_secret", ""),
+                "slack_default_channel": request.form.get("slack_default_channel", ""),
+            }
+            for key, value in fields.items():
+                set_setting(db, key, value)
+            test_action = (request.form.get("integration_action") or "").strip().lower()
+            if test_action == "test_slack":
+                try:
+                    send_slack_notification(db, "DeepSift test notification: Slack integration is configured.")
+                    notice = "Integrations saved. Slack test sent."
+                except Exception as exc:
+                    error_notice = f"Integrations saved, but Slack test failed: {exc}"
+                    log_app_error(
+                        db,
+                        source="slack_test",
+                        error_message=str(exc),
+                        details=traceback.format_exc(),
+                        route="/settings",
+                        status_code=400,
+                    )
+            else:
+                notice = "Integrations settings saved."
         elif active_tab == "helpers":
             market_helper_address = (request.form.get("market_helper_address") or "").strip()
             reisift_add_request = {
@@ -8004,6 +8224,8 @@ def settings_page():
 
     settings = get_direct_mail_settings(db)
     email_settings = get_email_settings(db)
+    slack_settings = get_slack_settings(db)
+    integration_api_key = get_integration_api_key(db)
     deep_dive_smrtphone_from = get_setting(db, "deep_dive_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     referral_smrtphone_from = get_setting(db, "referral_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     postage_options = []
@@ -8037,6 +8259,8 @@ def settings_page():
         "settings.html",
         dm=settings,
         email_settings=email_settings,
+        slack_settings=slack_settings,
+        integration_api_key=integration_api_key,
         active_tab=active_tab,
         deep_dive_smrtphone_from=deep_dive_smrtphone_from,
         referral_smrtphone_from=referral_smrtphone_from,
@@ -10649,6 +10873,73 @@ def prospecting_snapshot_api(property_id):
             "error": error,
         }
     )
+
+
+@app.route("/webhooks/slack/command", methods=["POST"])
+def slack_command_webhook():
+    ensure_db()
+    db = get_db()
+    s = get_slack_settings(db)
+    secret = (s.get("signing_secret") or "").strip()
+    if secret:
+        ok, reason = verify_slack_signature(request, secret)
+        if not ok:
+            return jsonify({"ok": False, "error": reason}), 401
+    text = (request.form.get("text") or "").strip()
+    cmd = (request.form.get("command") or "").strip()
+    user_name = (request.form.get("user_name") or "").strip()
+    low = text.lower()
+    if low in {"help", "?"}:
+        return jsonify(
+            {
+                "response_type": "ephemeral",
+                "text": "Commands: `status` (counts), `health` (app health), `help`.",
+            }
+        )
+    if low in {"status", "counts"}:
+        counts = {
+            "properties": db.execute("SELECT COUNT(*) AS c FROM properties").fetchone()["c"],
+            "people": db.execute("SELECT COUNT(*) AS c FROM people").fetchone()["c"],
+            "referrals": db.execute("SELECT COUNT(*) AS c FROM reisift_referrals").fetchone()["c"],
+            "realtors": db.execute("SELECT COUNT(*) AS c FROM referral_realtors").fetchone()["c"],
+        }
+        msg = (
+            f"DeepSift status for @{user_name or 'user'}: "
+            f"properties={counts['properties']}, people={counts['people']}, "
+            f"referrals={counts['referrals']}, realtors={counts['realtors']}"
+        )
+        return jsonify({"response_type": "ephemeral", "text": msg})
+    if low in {"health", "ping"}:
+        return jsonify({"response_type": "ephemeral", "text": "DeepSift is online."})
+    return jsonify({"response_type": "ephemeral", "text": f"Unknown command `{text or cmd}`. Try `help`."})
+
+
+@app.route("/webhooks/slack/events", methods=["POST"])
+def slack_events_webhook():
+    ensure_db()
+    db = get_db()
+    s = get_slack_settings(db)
+    secret = (s.get("signing_secret") or "").strip()
+    if secret:
+        ok, reason = verify_slack_signature(request, secret)
+        if not ok:
+            return jsonify({"ok": False, "error": reason}), 401
+    payload = request.get_json(force=True, silent=True) or {}
+    if payload.get("type") == "url_verification":
+        return jsonify({"challenge": payload.get("challenge", "")})
+    event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+    event_id = (payload.get("event_id") or "").strip() or f"slack_event_{int(time.time())}"
+    is_new = upsert_integration_event(db, "slack_event", event_id, payload)
+    db.commit()
+    if not is_new:
+        return jsonify({"ok": True, "duplicate": True})
+    try:
+        if event.get("type") == "app_mention":
+            text = (event.get("text") or "").strip()
+            send_slack_notification(db, f"Slack mention received: {text}")
+    except Exception:
+        pass
+    return jsonify({"ok": True})
 
 
 @app.route("/webhooks/smrtphone/inbound", methods=["POST"])

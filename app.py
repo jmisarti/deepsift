@@ -3915,8 +3915,11 @@ def get_slack_settings(db):
 
 
 def get_automation_settings(db):
+    clever_enabled_raw = get_setting(db, "automation_clever_leads_enabled", "")
+    if not clever_enabled_raw:
+        clever_enabled_raw = get_setting(db, "automation_test_enabled", "0")
     return {
-        "test_enabled": (get_setting(db, "automation_test_enabled", "0") or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
+        "clever_leads_enabled": (clever_enabled_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
     }
 
 
@@ -4002,6 +4005,56 @@ def upsert_integration_event(db, source, event_key, payload):
         ((source or "").strip(), key, json.dumps(payload or {})),
     )
     return True
+
+
+def _row_value_by_keys(row_data, keys):
+    if not isinstance(row_data, dict):
+        return ""
+    lowered = {str(k).strip().lower(): v for k, v in row_data.items()}
+    for key in keys:
+        val = lowered.get(str(key).strip().lower())
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return ""
+
+
+def _parse_seller_name_for_owner(name):
+    raw = (name or "").strip()
+    if not raw:
+        return {"first_name": "", "last_name": ""}
+    if "," in raw:
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(parts) >= 2:
+            return {"first_name": parts[1], "last_name": parts[0]}
+    bits = [b for b in raw.split() if b.strip()]
+    if len(bits) == 1:
+        return {"first_name": bits[0], "last_name": ""}
+    return {"first_name": bits[0], "last_name": " ".join(bits[1:])}
+
+
+def _build_clever_lead_notes(row_data):
+    fields = [
+        ("Create Date", _row_value_by_keys(row_data, ["Create Date"])),
+        ("Portal Link (Provide Updates)", _row_value_by_keys(row_data, ["Portal Link (Provide Updates)", "Portal Link"])),
+        ("Seller Name", _row_value_by_keys(row_data, ["Seller Name"])),
+        ("Address", _row_value_by_keys(row_data, ["Address"])),
+        ("Phone Number", _row_value_by_keys(row_data, ["Phone Number", "Phone"])),
+        ("Email", _row_value_by_keys(row_data, ["Email"])),
+        ("Time Frame", _row_value_by_keys(row_data, ["Time Frame"])),
+        ("Property Type", _row_value_by_keys(row_data, ["Property Type"])),
+        ("Home Condition", _row_value_by_keys(row_data, ["Home Condition"])),
+        ("Market Value Estimate", _row_value_by_keys(row_data, ["Market Value Estimate"])),
+        ("Asking Price", _row_value_by_keys(row_data, ["Asking Price"])),
+        ("Occupancy Type", _row_value_by_keys(row_data, ["Occupancy Type"])),
+        ("Listed On Market", _row_value_by_keys(row_data, ["Listed On Market"])),
+        ("Investor Internal Notes", _row_value_by_keys(row_data, ["Investor Internal Notes"])),
+        ("Clever Notes", _row_value_by_keys(row_data, ["Clever Notes"])),
+    ]
+    lines = ["Source: Clever Leads (Google Sheets)"]
+    for label, value in fields:
+        if value:
+            lines.append(f"{label}: {value}")
+    return "\n".join(lines)
 
 
 def email_sender_label(settings):
@@ -8004,11 +8057,78 @@ def integrations_google_sheets_row_added_api():
     if not is_new:
         return jsonify({"ok": True, "duplicate": True, "event_key": event_key})
 
-    summary = []
-    for k in ("address", "owner", "phone", "email"):
-        if isinstance(row_data, dict) and row_data.get(k):
-            summary.append(f"{k}={row_data.get(k)}")
-    summary_text = ", ".join(summary) if summary else "(no mapped fields)"
+    address = _row_value_by_keys(row_data, ["Address", "address", "Property Address"])
+    seller_name = _row_value_by_keys(row_data, ["Seller Name", "seller_name", "owner", "Owner Name"])
+    phone = _row_value_by_keys(row_data, ["Phone Number", "phone", "Phone"])
+    email = _row_value_by_keys(row_data, ["Email", "email"])
+    portal_link = _row_value_by_keys(row_data, ["Portal Link (Provide Updates)", "Portal Link"])
+    summary_text = f"address={address or '-'}, seller={seller_name or '-'}, phone={phone or '-'}, email={email or '-'}"
+
+    if address:
+        try:
+            owner_name = _parse_seller_name_for_owner(seller_name)
+            owner_payload = {}
+            if owner_name.get("first_name") or owner_name.get("last_name"):
+                owner_payload["first_name"] = owner_name.get("first_name") or "Unknown"
+                owner_payload["last_name"] = owner_name.get("last_name") or "Owner"
+            if email:
+                owner_payload["emails"] = [email]
+            if phone:
+                owner_payload["phones"] = [{"number": phone, "type": "UNKNOWN", "status": "UNKNOWN"}]
+
+            clever_notes = _build_clever_lead_notes(row_data)
+            create_payload = {
+                "search": address,
+                "status": "new_lead",
+                "lists": "Clever Leads",
+                "tags": "clever,google_sheet",
+                "notes": clever_notes,
+                "owner": owner_payload,
+            }
+            result = create_reisift_property_from_search(create_payload)
+            created = result.get("created") or {}
+            created_uuid = (result.get("created_uuid") or created.get("uuid") or created.get("id") or "").strip()
+            sift_status = (created.get("status") or result.get("create_payload", {}).get("status") or "new_lead").strip()
+            sift_link = f"https://app.reisift.io/records/properties/{created_uuid}/details?page=1" if created_uuid else ""
+            msg_lines = [
+                "New Clever Lead Received",
+                f"SIFT Status: {sift_status}",
+                f"Address: {address}",
+            ]
+            if seller_name:
+                msg_lines.append(f"Seller: {seller_name}")
+            if portal_link:
+                msg_lines.append(f"Portal: {portal_link}")
+            if sift_link:
+                msg_lines.append(f"SIFT Record: {sift_link}")
+            send_slack_notification(db, "\n".join(msg_lines))
+        except Exception as exc:
+            err_text = str(exc)
+            try:
+                send_slack_notification(
+                    db,
+                    "\n".join(
+                        [
+                            "New Clever Lead Received",
+                            "SIFT Status: failed",
+                            f"Address: {address}",
+                            f"Error: {err_text}",
+                        ]
+                    ),
+                )
+            except Exception:
+                pass
+            log_app_error(
+                db,
+                source="integrations_google_sheets_row_added_api",
+                error_message=err_text,
+                details=traceback.format_exc(),
+                route="/api/integrations/google-sheets/row-added",
+                status_code=500,
+            )
+            db.commit()
+            return jsonify({"ok": False, "error": err_text}), 500
+
     try:
         send_slack_notification(
             db,
@@ -8159,8 +8279,8 @@ def settings_page():
             else:
                 notice = "Integrations settings saved."
         elif active_tab == "automations":
-            test_enabled = (request.form.get("automation_test_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
-            set_setting(db, "automation_test_enabled", "1" if test_enabled else "0")
+            clever_enabled = (request.form.get("automation_clever_leads_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
+            set_setting(db, "automation_clever_leads_enabled", "1" if clever_enabled else "0")
             notice = "Automation settings saved."
         elif active_tab == "helpers":
             market_helper_address = (request.form.get("market_helper_address") or "").strip()

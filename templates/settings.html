@@ -133,8 +133,8 @@
         <form method="post" class="grid-form">
             <input type="hidden" name="settings_tab" value="automations">
             <label class="span2" style="display:flex; align-items:center; gap:0.5rem;">
-                <input type="checkbox" name="automation_test_enabled" value="1" {% if automation_settings.test_enabled %}checked{% endif %}>
-                <span><strong>Test</strong> (enabled)</span>
+                <input type="checkbox" name="automation_clever_leads_enabled" value="1" {% if automation_settings.clever_leads_enabled %}checked{% endif %}>
+                <span><strong>Clever Leads</strong> (enabled)</span>
             </label>
             <button type="submit">Save Automation Settings</button>
         </form>

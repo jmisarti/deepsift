@@ -317,8 +317,8 @@
 const propertyId = {{ prop.id }};
 const ownerId = {{ prop.owner_person_id }};
 let commChannel = 'ALL';
-const ownerPhoneOptions = {{ owner_phone_options|tojson }};
-const ownerEmailOptions = {{ owner_email_options|tojson }};
+let ownerPhoneOptions = {{ owner_phone_options|tojson }};
+let ownerEmailOptions = {{ owner_email_options|tojson }};
 
 const patchJson = (url, body) => fetch(url, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
 const postJson = (url, body) => fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(r=>r.json().then(j=>({ok:r.ok, data:j})));
@@ -335,6 +335,17 @@ function formatPhone(v) {
   if (d.length === 11 && d.startsWith('1')) d = d.slice(1);
   if (d.length === 10) return `(${d.slice(0,3)})${d.slice(3,6)}-${d.slice(6)}`;
   return raw;
+}
+
+async function refreshOwnerCommTargets() {
+  try {
+    const res = await fetch(`/api/people/${ownerId}/communication-targets`);
+    if (!res.ok) return;
+    const data = await res.json();
+    ownerPhoneOptions = Array.isArray(data.sms) ? data.sms : [];
+    ownerEmailOptions = Array.isArray(data.email) ? data.email : [];
+    setCommChannel(commChannel);
+  } catch (_err) {}
 }
 
 const mailPreviewModal = document.getElementById('mailPreviewModal');
@@ -791,12 +802,18 @@ document.addEventListener('change', async (e) => {
   if (e.target.classList.contains('touch-label')) {
     const id = e.target.dataset.id;
     const r = await patchJson(`/api/touchpoints/${id}/label`, {channel_label:e.target.value});
-    if (r.ok) flash(e.target.closest('tr'));
+    if (r.ok) {
+      flash(e.target.closest('tr'));
+      await refreshOwnerCommTargets();
+    }
   }
   if (e.target.classList.contains('touch-status')) {
     const id = e.target.dataset.id;
     const r = await patchJson(`/api/touchpoints/${id}/status`, {status:e.target.value});
-    if (r.ok) flash(e.target.closest('tr'));
+    if (r.ok) {
+      flash(e.target.closest('tr'));
+      await refreshOwnerCommTargets();
+    }
   }
   if (e.target.classList.contains('social-status')) {
     const id = e.target.dataset.id;
@@ -832,7 +849,10 @@ document.addEventListener('click', async (e) => {
     if (!window.confirm('Delete this phone/email record? This cannot be undone.')) return;
     const id = e.target.dataset.id;
     const r = await delReq(`/api/touchpoints/${id}`);
-    if (r.ok) e.target.closest('tr').remove();
+    if (r.ok) {
+      e.target.closest('tr').remove();
+      await refreshOwnerCommTargets();
+    }
   }
   if (e.target.classList.contains('delete-social')) {
     if (!window.confirm('Delete this social account? This cannot be undone.')) return;
@@ -887,6 +907,7 @@ bindEnter('addPhoneForm', async (form) => {
   tr.classList.add('fade-highlight');
   document.getElementById('phoneRows').prepend(tr);
   form.reset();
+  await refreshOwnerCommTargets();
 });
 
 bindEnter('addEmailForm', async (form) => {
@@ -900,6 +921,7 @@ bindEnter('addEmailForm', async (form) => {
   tr.classList.add('fade-highlight');
   document.getElementById('emailRows').prepend(tr);
   form.reset();
+  await refreshOwnerCommTargets();
 });
 
 bindEnter('addSocialForm', async (form) => {

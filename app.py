@@ -3749,13 +3749,23 @@ def get_email_settings(db):
     return {
         "from_name": get_setting(db, "email_from_name", ""),
         "from_address": get_setting(db, "email_from_address", ""),
+        "provider": (get_setting(db, "email_provider", "smtp") or "smtp").strip().lower(),
         "app_password": get_setting(db, "email_app_password", ""),
         "smtp_host": get_setting(db, "email_smtp_host", "smtp.gmail.com"),
         "smtp_port": get_setting(db, "email_smtp_port", "587"),
         "imap_host": get_setting(db, "email_imap_host", "imap.gmail.com"),
         "imap_port": get_setting(db, "email_imap_port", "993"),
         "poll_enabled": get_setting(db, "email_poll_enabled", "1"),
+        "resend_api_key": get_setting(db, "email_resend_api_key", ""),
+        "resend_base_url": get_setting(db, "email_resend_base_url", "https://api.resend.com"),
     }
+
+
+def email_sender_label(settings):
+    provider = ((settings or {}).get("provider") or "smtp").strip().lower()
+    if provider == "resend":
+        return "Email sent via Resend"
+    return "Email sent via Gmail"
 
 
 def email_thread_token(property_id=None, person_id=None):
@@ -4086,8 +4096,51 @@ def _open_imap_with_fallback(imap_host, imap_port, from_addr, app_pw):
     raise ValueError("IMAP login failed across fallbacks: " + " | ".join(errors[-6:]))
 
 
+def _send_resend_email(settings, to_email, subject, body, property_id=None, person_id=None):
+    api_key = (settings.get("resend_api_key") or "").strip()
+    from_addr = (settings.get("from_address") or "").strip()
+    from_name = (settings.get("from_name") or "").strip()
+    base_url = (settings.get("resend_base_url") or "https://api.resend.com").strip().rstrip("/")
+    if not api_key:
+        raise ValueError("Resend API key missing in email settings.")
+    if not from_addr:
+        raise ValueError("From address is required for Resend.")
+    from_field = f"{from_name} <{from_addr}>" if from_name else from_addr
+    payload = {
+        "from": from_field,
+        "to": [to_email],
+        "subject": subject or "",
+        "text": body or "",
+        "headers": {
+            "X-DeepProspect-Property-ID": str(property_id or ""),
+            "X-DeepProspect-Person-ID": str(person_id or ""),
+            "X-DeepProspect-Thread": email_thread_token(property_id, person_id),
+        },
+    }
+    response = requests.post(
+        f"{base_url}/emails",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"raw_text": response.text}
+    if not response.ok:
+        raise ValueError(f"Resend send failed ({response.status_code}): {data}")
+    message_id = str(data.get("id") or "").strip()
+    return {"message_id": message_id, "subject": subject or "", "provider": "resend"}
+
+
 def send_gmail_email(db, to_email, subject, body, property_id=None, person_id=None):
     s = get_email_settings(db)
+    provider = (s.get("provider") or "smtp").strip().lower()
+    if provider == "resend":
+        return _send_resend_email(s, to_email, subject, body, property_id=property_id, person_id=person_id)
     from_addr = (s["from_address"] or "").strip()
     app_pw = (s["app_password"] or "").strip()
     if not from_addr or not app_pw:
@@ -9437,6 +9490,18 @@ def list_person_communications(person_id):
         tuple(params),
     ).fetchall()
     return jsonify([dict(row) for row in rows])
+
+
+@app.route("/api/people/<int:person_id>/communication-targets", methods=["GET"])
+def get_person_communication_targets(person_id):
+    ensure_db()
+    db = get_db()
+    person = db.execute("SELECT id FROM people WHERE id = ?", (person_id,)).fetchone()
+    if not person:
+        return jsonify({"error": "Person not found"}), 404
+    sms_targets = get_manual_sms_targets_for_person(db, person_id)
+    email_targets = get_manual_email_targets_for_person(db, person_id)
+    return jsonify({"sms": sms_targets, "email": email_targets})
 
 
 @app.route("/api/people/<int:person_id>/communications", methods=["POST"])

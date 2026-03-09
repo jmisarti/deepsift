@@ -97,6 +97,7 @@ REISIFT_BASE_URL = os.getenv("REISIFT_BASE_URL", "https://apiv2.reisift.io")
 REISIFT_MAP_BASE_URL = os.getenv("REISIFT_MAP_BASE_URL", "https://map.reisift.io")
 REISIFT_UI_VERSION = "2022.02.01.7"
 REISIFT_FOLLOWUPS_EXCLUDE_TAG = os.getenv("REISIFT_FOLLOWUPS_EXCLUDE_TAG", "3cf5a950-ac8f-47b0-87e1-bcea2604e2e1").strip()
+REISIFT_DISABLE_MAP_LOOKUP = env_flag("REISIFT_DISABLE_MAP_LOOKUP", True)
 OPENLETTERCONNECT_BASE_URL = os.getenv("OPENLETTERCONNECT_BASE_URL", "https://api.openletterconnect.com/api/v1")
 OPENLETTERCONNECT_TEMPLATE_ID = int(os.getenv("OPENLETTERCONNECT_TEMPLATE_ID", "9256"))
 APP_AUTH_ENABLED = env_flag("APP_AUTH_ENABLED", False)
@@ -107,6 +108,7 @@ RUN_BACKGROUND_WORKERS = env_flag("RUN_BACKGROUND_WORKERS", True)
 GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
 GOOGLE_SHEETS_WORKSHEET_NAME = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "List of Customers").strip() or "List of Customers"
 GOOGLE_SHEETS_POLL_SECONDS = max(int((os.getenv("GOOGLE_SHEETS_POLL_SECONDS") or "300").strip() or "300"), 60)
+GOOGLE_SHEETS_POLL_MODE = (os.getenv("GOOGLE_SHEETS_POLL_MODE") or "latest_only").strip().lower()
 CLEVER_LEADS_EVENT_SOURCE = "clever_leads_ingest"
 try:
     EST_TZ = ZoneInfo("America/New_York")
@@ -5195,6 +5197,8 @@ def run_clever_leads_poll_once():
         if service_account is None or GoogleAuthRequest is None:
             return {"ok": True, "skipped": "google_auth_dependency_missing"}
         rows = fetch_google_sheet_rows()
+        if GOOGLE_SHEETS_POLL_MODE == "latest_only" and rows:
+            rows = [rows[-1]]
         processed = 0
         duplicates = 0
         failed = 0
@@ -6501,6 +6505,90 @@ def _reisift_build_property_create_payload(address_info_payload, input_payload):
     }
 
 
+def _parse_search_address_simple(search):
+    text = (search or "").strip()
+    text = re.sub(r"\s*,\s*United States\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    street = city = state = postal_code = ""
+
+    m = re.match(r"^(.*?),\s*([^,]+),\s*([A-Za-z]{2}|[A-Za-z ]+)\s+(\d{5}(?:-\d{4})?)\s*$", text)
+    if m:
+        street, city, state, postal_code = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
+    else:
+        m2 = re.match(r"^(.*?)\s+([^,]+),?\s+([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)\s*$", text)
+        if m2:
+            street, city, state, postal_code = m2.group(1).strip(), m2.group(2).strip(), m2.group(3).strip(), m2.group(4).strip()
+    if len(state) > 2:
+        state_map = {
+            "new jersey": "NJ",
+            "new york": "NY",
+            "california": "CA",
+            "connecticut": "CT",
+            "pennsylvania": "PA",
+            "massachusetts": "MA",
+            "illinois": "IL",
+            "north carolina": "NC",
+            "virginia": "VA",
+            "texas": "TX",
+            "florida": "FL",
+        }
+        state = state_map.get(state.strip().lower(), state[:2].upper())
+    return {
+        "street": street,
+        "city": city,
+        "state": state.upper(),
+        "postal_code": postal_code,
+    }
+
+
+def _reisift_build_property_create_payload_from_input(input_payload):
+    input_payload = input_payload or {}
+    search = (input_payload.get("search") or input_payload.get("address_search") or "").strip()
+    parsed = _parse_search_address_simple(search)
+    property_address = {
+        "street": (input_payload.get("street") or parsed["street"] or "").strip(),
+        "city": (input_payload.get("city") or parsed["city"] or "").strip(),
+        "state": (input_payload.get("state") or parsed["state"] or "").strip(),
+        "postal_code": (input_payload.get("postal_code") or parsed["postal_code"] or "").strip(),
+    }
+    if not property_address["street"] or not property_address["city"]:
+        raise ValueError("Could not parse property address without map lookup.")
+
+    override_owner = input_payload.get("owner") if isinstance(input_payload.get("owner"), dict) else {}
+    owner_name = _reisift_parse_owner_name(override_owner)
+    first_name = (override_owner.get("first_name") or owner_name["first_name"] or "").strip() or "Unknown"
+    last_name = (override_owner.get("last_name") or owner_name["last_name"] or "").strip() or "Owner"
+    emails = _reisift_parse_owner_emails(override_owner)
+    phones = _reisift_parse_owner_phones(override_owner)
+    owner_address = {
+        "street": (override_owner.get("address_street") or property_address["street"]).strip(),
+        "city": (override_owner.get("address_city") or property_address["city"]).strip(),
+        "state": (override_owner.get("address_state") or property_address["state"]).strip(),
+        "postal_code": (override_owner.get("address_postal_code") or property_address["postal_code"]).strip(),
+    }
+    lists = parse_csv_list(input_payload.get("lists"))
+    tags = parse_csv_list(input_payload.get("tags"))
+    notes = (input_payload.get("notes") or "").strip()
+    return {
+        "address": property_address,
+        "status": "new_lead",
+        "lists": lists,
+        "tags": tags,
+        "notes": notes,
+        "owner": {
+            "first_name": first_name,
+            "last_name": last_name,
+            "company": override_owner.get("company"),
+            "address": owner_address,
+            "emails": emails,
+            "emails_info": {e: {"verified": False} for e in emails},
+            "primary_email": None,
+            "phones": phones,
+            "primary_phone": None,
+        },
+    }
+
+
 def reisift_enrich_property_uuid(token, property_uuid):
     property_uuid = str(property_uuid or "").strip()
     if not property_uuid:
@@ -6536,33 +6624,39 @@ def create_reisift_property_from_search(input_payload):
         raise ValueError("search is required.")
     token = reisift_get_access_token()
 
-    autocomplete_body = {
-        "search": search,
-        "entity_types": input_payload.get("entity_types")
-        or ["state", "county", "municipality", "address", "zip"],
-    }
-    autocomplete = requests.post(
-        f"{REISIFT_MAP_BASE_URL}/properties/search-autocomplete/",
-        headers=reisift_auth_headers(token),
-        json=autocomplete_body,
-        timeout=30,
-    )
-    autocomplete.raise_for_status()
-    autocomplete_payload = autocomplete.json()
-    map_id = _reisift_find_first_map_id(autocomplete_payload)
-    if not map_id:
-        raise ValueError("Could not resolve map_id from ReiSift map autocomplete response.")
+    use_map_lookup = not REISIFT_DISABLE_MAP_LOOKUP and not bool(input_payload.get("skip_map_lookup"))
+    map_id = None
+    autocomplete_payload = {}
+    address_info_payload = {}
+    if use_map_lookup:
+        autocomplete_body = {
+            "search": search,
+            "entity_types": input_payload.get("entity_types")
+            or ["state", "county", "municipality", "address", "zip"],
+        }
+        autocomplete = requests.post(
+            f"{REISIFT_MAP_BASE_URL}/properties/search-autocomplete/",
+            headers=reisift_auth_headers(token),
+            json=autocomplete_body,
+            timeout=30,
+        )
+        autocomplete.raise_for_status()
+        autocomplete_payload = autocomplete.json()
+        map_id = _reisift_find_first_map_id(autocomplete_payload)
+        if not map_id:
+            raise ValueError("Could not resolve map_id from ReiSift map autocomplete response.")
 
-    address_info_res = requests.post(
-        f"{REISIFT_BASE_URL}/api/internal/property/address-info-from-map-id/",
-        headers=reisift_auth_headers(token),
-        json={"map_id": map_id},
-        timeout=30,
-    )
-    address_info_res.raise_for_status()
-    address_info_payload = address_info_res.json()
-
-    create_payload = _reisift_build_property_create_payload(address_info_payload, input_payload)
+        address_info_res = requests.post(
+            f"{REISIFT_BASE_URL}/api/internal/property/address-info-from-map-id/",
+            headers=reisift_auth_headers(token),
+            json={"map_id": map_id},
+            timeout=30,
+        )
+        address_info_res.raise_for_status()
+        address_info_payload = address_info_res.json()
+        create_payload = _reisift_build_property_create_payload(address_info_payload, input_payload)
+    else:
+        create_payload = _reisift_build_property_create_payload_from_input(input_payload)
     create_res = requests.post(
         f"{REISIFT_BASE_URL}/api/internal/property/",
         headers=reisift_auth_headers(token),

@@ -7074,57 +7074,22 @@ def reisift_search_referral_rows(token, status_slug):
         "x-reisift-ui-version": REISIFT_UI_VERSION,
         "x-http-method-override": "GET",
     }
-    status_candidates = []
-    raw = (status_slug or "").strip()
-    if raw:
-        status_candidates.append(raw)
-    spaced = raw.replace("_", " ").strip()
-    if spaced and spaced not in status_candidates:
-        status_candidates.append(spaced)
-    titled = spaced.title() if spaced else ""
-    if titled and titled not in status_candidates:
-        status_candidates.append(titled)
-    if raw.lower() == "refer_lead":
-        for alt in ["Cold Lead", "cold lead"]:
-            if alt not in status_candidates:
-                status_candidates.append(alt)
-    bodies = []
-    for candidate in status_candidates:
-        bodies.append(
-            {
-                "limit": 200,
-                "offset": 0,
-                "ordering": "-list_count",
-                "query": {"must": {"any_property_status": [candidate]}},
-            }
-        )
-    seen = set()
-    merged = []
-    total = 0
-    last_exc = None
-    for body in bodies:
-        try:
-            response = requests.post(
-                f"{REISIFT_BASE_URL}/api/internal/property/",
-                headers=headers,
-                json=body,
-                timeout=30,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            total = max(total, int(payload.get("count") or 0))
-            for row in (payload.get("results") or []):
-                uid = (row.get("uuid") or "").strip()
-                if not uid or uid in seen:
-                    continue
-                seen.add(uid)
-                merged.append(row)
-        except Exception as exc:
-            last_exc = exc
-            continue
-    if not merged and last_exc is not None:
-        raise last_exc
-    return merged, (total or len(merged))
+    body = {
+        "limit": 200,
+        "offset": 0,
+        "ordering": "-list_count",
+        "query": {"must": {"any_property_status": [status_slug]}},
+    }
+    response = requests.post(
+        f"{REISIFT_BASE_URL}/api/internal/property/",
+        headers=headers,
+        json=body,
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("results") or []
+    return rows, int(payload.get("count") or len(rows))
 
 
 def fetch_reisift_property_payload(token, property_uuid):

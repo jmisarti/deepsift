@@ -268,6 +268,9 @@ def require_login_if_enabled():
         return None
     if request.path.startswith("/static/") or request.path == "/healthz":
         return None
+    # Third-party callbacks must stay unauthenticated.
+    if request.path.startswith("/webhooks/"):
+        return None
     if session.get("auth_ok"):
         return None
     if request.path.startswith("/api/"):

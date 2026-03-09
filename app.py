@@ -1,5 +1,6 @@
 ﻿
 import csv
+import base64
 import hmac
 import hashlib
 import io
@@ -3928,6 +3929,9 @@ def get_email_settings(db):
         "poll_enabled": get_setting(db, "email_poll_enabled", "1"),
         "resend_api_key": get_setting(db, "email_resend_api_key", ""),
         "resend_base_url": get_setting(db, "email_resend_base_url", "https://api.resend.com"),
+        "gmail_api_client_id": get_setting(db, "email_gmail_api_client_id", ""),
+        "gmail_api_client_secret": get_setting(db, "email_gmail_api_client_secret", ""),
+        "gmail_api_refresh_token": get_setting(db, "email_gmail_api_refresh_token", ""),
     }
 
 
@@ -3943,8 +3947,10 @@ def get_automation_settings(db):
     clever_enabled_raw = get_setting(db, "automation_clever_leads_enabled", "")
     if not clever_enabled_raw:
         clever_enabled_raw = get_setting(db, "automation_test_enabled", "1")
+    reisift_placeholder_raw = get_setting(db, "automation_reisift_placeholder_enabled", "1")
     return {
         "clever_leads_enabled": (clever_enabled_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
+        "reisift_placeholder_enabled": (reisift_placeholder_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
     }
 
 
@@ -4295,6 +4301,8 @@ def email_sender_label(settings):
     provider = ((settings or {}).get("provider") or "smtp").strip().lower()
     if provider == "resend":
         return "Email sent via Resend"
+    if provider == "gmail_api":
+        return "Email sent via Gmail API"
     return "Email sent via Gmail"
 
 
@@ -4666,11 +4674,81 @@ def _send_resend_email(settings, to_email, subject, body, property_id=None, pers
     return {"message_id": message_id, "subject": subject or "", "provider": "resend"}
 
 
+def _get_gmail_api_access_token(settings):
+    client_id = (settings.get("gmail_api_client_id") or "").strip()
+    client_secret = (settings.get("gmail_api_client_secret") or "").strip()
+    refresh_token = (settings.get("gmail_api_refresh_token") or "").strip()
+    if not client_id or not client_secret or not refresh_token:
+        raise ValueError("Gmail API OAuth settings incomplete: client id, client secret, and refresh token are required.")
+    token_res = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+        timeout=20,
+    )
+    try:
+        token_body = token_res.json()
+    except ValueError:
+        token_body = {"raw_text": token_res.text}
+    if not token_res.ok:
+        raise ValueError(f"Gmail OAuth token refresh failed ({token_res.status_code}): {token_body}")
+    access_token = (token_body.get("access_token") or "").strip()
+    if not access_token:
+        raise ValueError("Gmail OAuth token refresh did not return an access_token.")
+    return access_token
+
+
+def _send_gmail_api_email(settings, to_email, subject, body, property_id=None, person_id=None):
+    from_addr = (settings.get("from_address") or "").strip()
+    from_name = (settings.get("from_name") or "").strip()
+    if not from_addr:
+        raise ValueError("From address is required for Gmail API.")
+    full_subject = (subject or "").strip()
+    if not full_subject:
+        full_subject = "Question re: Property Address"
+
+    msg = EmailMessage()
+    msg["From"] = f"{from_name} <{from_addr}>" if from_name else from_addr
+    msg["To"] = to_email
+    msg["Subject"] = full_subject
+    msg["Message-ID"] = make_msgid(domain=(from_addr.split("@", 1)[1] if "@" in from_addr else None))
+    msg["X-DeepProspect-Property-ID"] = str(property_id or "")
+    msg["X-DeepProspect-Person-ID"] = str(person_id or "")
+    msg["X-DeepProspect-Thread"] = email_thread_token(property_id, person_id)
+    msg.set_content(body or "")
+
+    raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    access_token = _get_gmail_api_access_token(settings)
+    send_res = requests.post(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json={"raw": raw_message},
+        timeout=30,
+    )
+    try:
+        send_body = send_res.json()
+    except ValueError:
+        send_body = {"raw_text": send_res.text}
+    if not send_res.ok:
+        raise ValueError(f"Gmail API send failed ({send_res.status_code}): {send_body}")
+    message_id = str(send_body.get("id") or msg.get("Message-ID") or "").strip()
+    return {"message_id": message_id, "subject": full_subject, "provider": "gmail_api", "response": send_body}
+
+
 def send_gmail_email(db, to_email, subject, body, property_id=None, person_id=None):
     s = get_email_settings(db)
     provider = (s.get("provider") or "smtp").strip().lower()
     if provider == "resend":
         return _send_resend_email(s, to_email, subject, body, property_id=property_id, person_id=person_id)
+    if provider == "gmail_api":
+        return _send_gmail_api_email(s, to_email, subject, body, property_id=property_id, person_id=person_id)
     from_addr = (s["from_address"] or "").strip()
     app_pw = (s["app_password"] or "").strip()
     if not from_addr or not app_pw:
@@ -4728,6 +4806,9 @@ def backfill_outbound_gmail_ids(db, communication_id):
         return
 
     s = get_email_settings(db)
+    provider = (s.get("provider") or "smtp").strip().lower()
+    if provider != "smtp":
+        return
     from_addr = (s.get("from_address") or "").strip()
     app_pw = (s.get("app_password") or "").strip()
     imap_host = (s.get("imap_host") or "imap.gmail.com").strip()
@@ -4783,12 +4864,51 @@ def backfill_outbound_gmail_ids(db, communication_id):
 
 def test_email_login(db):
     s = get_email_settings(db)
+    provider = (s.get("provider") or "smtp").strip().lower()
     from_addr = (s.get("from_address") or "").strip()
     app_pw = (s.get("app_password") or "").strip()
     smtp_host = (s.get("smtp_host") or "smtp.gmail.com").strip()
     smtp_port = int((s.get("smtp_port") or "587").strip() or "587")
     imap_host = (s.get("imap_host") or "imap.gmail.com").strip()
     imap_port = int((s.get("imap_port") or "993").strip() or "993")
+
+    if provider == "gmail_api":
+        api_ok = False
+        api_error = ""
+        try:
+            _get_gmail_api_access_token(s)
+            api_ok = True
+        except Exception as exc:
+            api_error = str(exc)
+
+        poll_enabled = (s.get("poll_enabled") or "1").strip() in {"1", "true", "TRUE", "yes", "on"}
+        imap_ok = False
+        imap_error = ""
+        if not poll_enabled:
+            imap_ok = True
+        elif from_addr and app_pw:
+            try:
+                m = _open_imap_with_fallback(imap_host, imap_port, from_addr, app_pw)
+                m.logout()
+                imap_ok = True
+            except Exception as exc:
+                imap_error = str(exc)
+        else:
+            imap_error = "IMAP app password missing (required only for inbound polling)."
+        ok = api_ok and imap_ok
+        parts = []
+        if api_error:
+            parts.append(f"Gmail API: {api_error}")
+        if imap_error and poll_enabled:
+            parts.append(f"IMAP: {imap_error}")
+        return {
+            "ok": ok,
+            "gmail_api_ok": api_ok,
+            "imap_ok": imap_ok,
+            "gmail_api_error": api_error,
+            "imap_error": imap_error,
+            "error": " | ".join(parts),
+        }
 
     if not from_addr or not app_pw:
         return {
@@ -8644,6 +8764,9 @@ def settings_page():
                 "email_poll_enabled": request.form.get("email_poll_enabled", "1"),
                 "email_resend_api_key": request.form.get("email_resend_api_key", ""),
                 "email_resend_base_url": request.form.get("email_resend_base_url", "https://api.resend.com"),
+                "email_gmail_api_client_id": request.form.get("email_gmail_api_client_id", ""),
+                "email_gmail_api_client_secret": request.form.get("email_gmail_api_client_secret", ""),
+                "email_gmail_api_refresh_token": request.form.get("email_gmail_api_refresh_token", ""),
             }
             for key, value in fields.items():
                 set_setting(db, key, value)
@@ -8691,8 +8814,13 @@ def settings_page():
             else:
                 notice = "Integrations settings saved."
         elif active_tab == "automations":
-            clever_enabled = (request.form.get("automation_clever_leads_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
-            set_setting(db, "automation_clever_leads_enabled", "1" if clever_enabled else "0")
+            automation_key = (request.form.get("automation_key") or "").strip().lower()
+            if automation_key == "clever_leads":
+                clever_enabled = (request.form.get("automation_clever_leads_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
+                set_setting(db, "automation_clever_leads_enabled", "1" if clever_enabled else "0")
+            elif automation_key == "reisift_placeholder":
+                reisift_enabled = (request.form.get("automation_reisift_placeholder_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
+                set_setting(db, "automation_reisift_placeholder_enabled", "1" if reisift_enabled else "0")
             notice = "Automation settings saved."
         elif active_tab == "helpers":
             market_helper_address = (request.form.get("market_helper_address") or "").strip()

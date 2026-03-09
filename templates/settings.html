@@ -79,11 +79,15 @@
             <label>Provider
                 <select name="email_provider">
                     <option value="smtp" {% if (email_settings.provider or 'smtp') == 'smtp' %}selected{% endif %}>SMTP (Gmail App Password)</option>
+                    <option value="gmail_api" {% if (email_settings.provider or 'smtp') == 'gmail_api' %}selected{% endif %}>Gmail API (OAuth)</option>
                     <option value="resend" {% if (email_settings.provider or 'smtp') == 'resend' %}selected{% endif %}>Resend API (recommended for hosted)</option>
                 </select>
             </label>
             <label>From Name <input name="email_from_name" value="{{ email_settings.from_name }}"></label>
             <label>From Address <input name="email_from_address" value="{{ email_settings.from_address }}" placeholder="yourname@gmail.com"></label>
+            <label>Gmail OAuth Client ID <input name="email_gmail_api_client_id" value="{{ email_settings.gmail_api_client_id }}"></label>
+            <label>Gmail OAuth Client Secret <input name="email_gmail_api_client_secret" value="{{ email_settings.gmail_api_client_secret }}"></label>
+            <label class="span2">Gmail OAuth Refresh Token <input name="email_gmail_api_refresh_token" value="{{ email_settings.gmail_api_refresh_token }}"></label>
             <label>Resend API Key <input name="email_resend_api_key" value="{{ email_settings.resend_api_key }}"></label>
             <label>Resend Base URL <input name="email_resend_base_url" value="{{ email_settings.resend_base_url or 'https://api.resend.com' }}"></label>
             <label>Gmail App Password <input name="email_app_password" value="{{ email_settings.app_password }}"></label>
@@ -146,12 +150,30 @@
                         <td>
                             <form method="post" class="automation-toggle-form">
                                 <input type="hidden" name="settings_tab" value="automations">
+                                <input type="hidden" name="automation_key" value="clever_leads">
                                 <label class="toggle-switch" title="Toggle Clever Leads automation">
                                     <input type="checkbox" name="automation_clever_leads_enabled" value="1" {% if automation_settings.clever_leads_enabled %}checked{% endif %} onchange="this.form.submit()">
                                     <span class="toggle-slider"></span>
                                 </label>
                                 <span class="toggle-text {% if automation_settings.clever_leads_enabled %}on{% else %}off{% endif %}">
                                     {% if automation_settings.clever_leads_enabled %}On{% else %}Off{% endif %}
+                                </span>
+                            </form>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong>ReiSift Automation</strong></td>
+                        <td>Placeholder toggle for future ReiSift automation workflows and webhook-driven ingest. No processing logic is attached yet.</td>
+                        <td>
+                            <form method="post" class="automation-toggle-form">
+                                <input type="hidden" name="settings_tab" value="automations">
+                                <input type="hidden" name="automation_key" value="reisift_placeholder">
+                                <label class="toggle-switch" title="Toggle ReiSift placeholder automation">
+                                    <input type="checkbox" name="automation_reisift_placeholder_enabled" value="1" {% if automation_settings.reisift_placeholder_enabled %}checked{% endif %} onchange="this.form.submit()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span class="toggle-text {% if automation_settings.reisift_placeholder_enabled %}on{% else %}off{% endif %}">
+                                    {% if automation_settings.reisift_placeholder_enabled %}On{% else %}Off{% endif %}
                                 </span>
                             </form>
                         </td>

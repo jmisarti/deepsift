@@ -4236,6 +4236,13 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
                 msg_lines.append(f"Portal: {portal_link}")
             if sift_link:
                 msg_lines.append(f"SIFT Record: {sift_link}")
+            post_status_result = None
+            if created_uuid:
+                try:
+                    post_status_result = reisift_update_property_status(reisift_get_access_token(), created_uuid, "refer_lead")
+                    msg_lines.append("Post-Enrich Status: refer_lead")
+                except Exception as status_exc:
+                    post_status_result = {"ok": False, "error": str(status_exc)}
             send_slack_notification(db, "\n".join(msg_lines))
             add_clever_webhook_note(
                 db,
@@ -4245,10 +4252,16 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
                         "Clever Leads processing result",
                         "Result: success",
                         f"SIFT Status: {sift_status}",
+                        "Post-Enrich Status: refer_lead",
                         f"SIFT Record: {sift_link or '-'}",
                     ]
                 ),
-                {"created": created, "created_uuid": created_uuid, "status": sift_status},
+                {
+                    "created": created,
+                    "created_uuid": created_uuid,
+                    "status": sift_status,
+                    "post_enrich_status_update": post_status_result,
+                },
             )
             db.commit()
         except Exception as exc:
@@ -6567,6 +6580,28 @@ def reisift_enrich_property_uuid(token, property_uuid):
     if not response.ok:
         raise ValueError(f"ReiSift enrich failed ({response.status_code}): {body}")
     return {"request": enrich_payload, "response": body}
+
+
+def reisift_update_property_status(token, property_uuid, status_slug):
+    property_uuid = str(property_uuid or "").strip()
+    status_slug = str(status_slug or "").strip()
+    if not property_uuid:
+        raise ValueError("property_uuid is required for status update.")
+    if not status_slug:
+        raise ValueError("status_slug is required for status update.")
+    response = requests.post(
+        f"{REISIFT_BASE_URL}/api/internal/property/{property_uuid}/status/",
+        headers=reisift_auth_headers(token),
+        json={"status": status_slug},
+        timeout=30,
+    )
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_text": response.text}
+    if not response.ok:
+        raise ValueError(f"ReiSift status update failed ({response.status_code}): {body}")
+    return {"request": {"status": status_slug}, "response": body}
 
 
 def reisift_upsert_owner_contacts(token, owner_uuid, phones, emails):

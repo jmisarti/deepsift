@@ -25,17 +25,6 @@
     </p>
     <p><strong>Last Sold Date:</strong> {{ prop.attom_last_sold_date or '-' }}</p>
     <p><strong>Last Sale Price:</strong> {% if prop.attom_last_sold_price is not none %}${{ "{:,.0f}".format(prop.attom_last_sold_price) }}{% else %}-{% endif %}</p>
-</section>
-
-<section class="panel">
-    <h3>Property SMS Snapshot</h3>
-    <table>
-        <thead><tr><th>Metric</th><th>Count</th></tr></thead>
-        <tbody>
-            <tr><td>SMS Sent (All Contacts)</td><td>{{ sms_rollup.sent }}</td></tr>
-            <tr><td>SMS Received (All Contacts)</td><td>{{ sms_rollup.received }}</td></tr>
-        </tbody>
-    </table>
     <h4>Confirmed / Verified Contacts</h4>
     <table>
         <thead><tr><th>Contact</th><th>Confirmed Phones</th><th>Verified Socials</th></tr></thead>

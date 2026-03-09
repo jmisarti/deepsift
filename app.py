@@ -10150,29 +10150,13 @@ def person_detail(person_id):
         (person_id,),
     ).fetchone()
 
-    person_summary_people = [
+    dedup_person_summary = [
         {
             "person_id": int(person["id"]),
             "full_name": person_name(person),
             "relationship_type": "Self",
         }
     ]
-    for rel in relationship_rows:
-        person_summary_people.append(
-            {
-                "person_id": int(rel["person_id"]),
-                "full_name": person_name(rel),
-                "relationship_type": (rel["relationship_type"] or "Unknown"),
-            }
-        )
-    dedup_person_summary = []
-    seen_person_summary = set()
-    for row in person_summary_people:
-        pid = int(row["person_id"])
-        if pid in seen_person_summary:
-            continue
-        seen_person_summary.add(pid)
-        dedup_person_summary.append(row)
     person_counts_map = communication_counts_for_people(
         db,
         [r["person_id"] for r in dedup_person_summary],

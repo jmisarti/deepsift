@@ -10,6 +10,7 @@ import re
 import sqlite3
 import socket
 import smtplib
+import ssl
 import threading
 import time
 import traceback
@@ -3929,6 +3930,162 @@ def _extract_imap_fetch_meta(meta_chunk):
     return (msg.group(1) if msg else ""), (thr.group(1) if thr else "")
 
 
+def _is_ip_literal(host):
+    return bool(re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", str(host or "").strip()))
+
+
+def _resolve_ipv4_addresses(host):
+    resolved = []
+    seen = set()
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except Exception:
+        return resolved
+    for info in infos:
+        addr = (info[4] or [""])[0]
+        if addr and addr not in seen:
+            seen.add(addr)
+            resolved.append(addr)
+    return resolved
+
+
+def _smtp_send_with_fallback(smtp_host, smtp_port, from_addr, app_pw, message):
+    candidates = []
+    seen = set()
+
+    def add(host, port, use_ssl):
+        key = (str(host).strip(), int(port), bool(use_ssl))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(key)
+
+    add(smtp_host, smtp_port, False)
+    if not (str(smtp_host).strip().lower() == "smtp.gmail.com" and int(smtp_port) == 587):
+        add("smtp.gmail.com", 587, False)
+    add("smtp.gmail.com", 465, True)
+
+    errors = []
+    for host, port, use_ssl in candidates:
+        try:
+            if use_ssl:
+                tls_ctx = ssl.create_default_context()
+                with smtplib.SMTP_SSL(host, port, timeout=30, context=tls_ctx) as server:
+                    server.login(from_addr, app_pw)
+                    server.send_message(message)
+                    return
+            else:
+                tls_ctx = ssl.create_default_context()
+                with smtplib.SMTP(host, port, timeout=30) as server:
+                    server.ehlo()
+                    server.starttls(context=tls_ctx)
+                    server.ehlo()
+                    server.login(from_addr, app_pw)
+                    server.send_message(message)
+                    return
+        except Exception as exc:
+            errors.append(f"{host}:{port} ({'SSL' if use_ssl else 'STARTTLS'}): {exc}")
+            for ip in _resolve_ipv4_addresses(host):
+                try:
+                    tls_ctx_ip = ssl.create_default_context()
+                    tls_ctx_ip.check_hostname = False
+                    if use_ssl:
+                        with smtplib.SMTP_SSL(ip, port, timeout=30, context=tls_ctx_ip) as server:
+                            server.login(from_addr, app_pw)
+                            server.send_message(message)
+                            return
+                    else:
+                        with smtplib.SMTP(ip, port, timeout=30) as server:
+                            server.ehlo()
+                            server.starttls(context=tls_ctx_ip)
+                            server.ehlo()
+                            server.login(from_addr, app_pw)
+                            server.send_message(message)
+                            return
+                except Exception as ip_exc:
+                    errors.append(f"{ip}:{port} ({'SSL' if use_ssl else 'STARTTLS'}): {ip_exc}")
+    raise ValueError("SMTP delivery failed across fallbacks: " + " | ".join(errors[-6:]))
+
+
+def _smtp_probe_with_fallback(smtp_host, smtp_port, from_addr, app_pw):
+    candidates = []
+    seen = set()
+
+    def add(host, port, use_ssl):
+        key = (str(host).strip(), int(port), bool(use_ssl))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(key)
+
+    add(smtp_host, smtp_port, False)
+    if not (str(smtp_host).strip().lower() == "smtp.gmail.com" and int(smtp_port) == 587):
+        add("smtp.gmail.com", 587, False)
+    add("smtp.gmail.com", 465, True)
+
+    errors = []
+    for host, port, use_ssl in candidates:
+        try:
+            if use_ssl:
+                tls_ctx = ssl.create_default_context()
+                with smtplib.SMTP_SSL(host, port, timeout=30, context=tls_ctx) as server:
+                    server.login(from_addr, app_pw)
+                    return True, ""
+            else:
+                tls_ctx = ssl.create_default_context()
+                with smtplib.SMTP(host, port, timeout=30) as server:
+                    server.ehlo()
+                    server.starttls(context=tls_ctx)
+                    server.ehlo()
+                    server.login(from_addr, app_pw)
+                    return True, ""
+        except Exception as exc:
+            errors.append(f"{host}:{port} ({'SSL' if use_ssl else 'STARTTLS'}): {exc}")
+            for ip in _resolve_ipv4_addresses(host):
+                try:
+                    tls_ctx_ip = ssl.create_default_context()
+                    tls_ctx_ip.check_hostname = False
+                    if use_ssl:
+                        with smtplib.SMTP_SSL(ip, port, timeout=30, context=tls_ctx_ip) as server:
+                            server.login(from_addr, app_pw)
+                            return True, ""
+                    else:
+                        with smtplib.SMTP(ip, port, timeout=30) as server:
+                            server.ehlo()
+                            server.starttls(context=tls_ctx_ip)
+                            server.ehlo()
+                            server.login(from_addr, app_pw)
+                            return True, ""
+                except Exception as ip_exc:
+                    errors.append(f"{ip}:{port} ({'SSL' if use_ssl else 'STARTTLS'}): {ip_exc}")
+    return False, "SMTP login failed across fallbacks: " + " | ".join(errors[-6:])
+
+
+def _open_imap_with_fallback(imap_host, imap_port, from_addr, app_pw):
+    hosts = []
+    for h in [imap_host, "imap.gmail.com"]:
+        h = (h or "").strip()
+        if h and h not in hosts:
+            hosts.append(h)
+    errors = []
+    for host in hosts:
+        try:
+            ctx = ssl.create_default_context()
+            conn = imaplib.IMAP4_SSL(host, imap_port, ssl_context=ctx)
+            conn.login(from_addr, app_pw)
+            return conn
+        except Exception as exc:
+            errors.append(f"{host}:{imap_port}: {exc}")
+            for ip in _resolve_ipv4_addresses(host):
+                try:
+                    ctx_ip = ssl.create_default_context()
+                    ctx_ip.check_hostname = False
+                    conn = imaplib.IMAP4_SSL(ip, imap_port, ssl_context=ctx_ip)
+                    conn.login(from_addr, app_pw)
+                    return conn
+                except Exception as ip_exc:
+                    errors.append(f"{ip}:{imap_port}: {ip_exc}")
+    raise ValueError("IMAP login failed across fallbacks: " + " | ".join(errors[-6:]))
+
+
 def send_gmail_email(db, to_email, subject, body, property_id=None, person_id=None):
     s = get_email_settings(db)
     from_addr = (s["from_address"] or "").strip()
@@ -3966,10 +4123,7 @@ def send_gmail_email(db, to_email, subject, body, property_id=None, person_id=No
     msg["X-DeepProspect-Thread"] = email_thread_token(property_id, person_id)
     msg.set_content(body or "")
 
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-        server.starttls()
-        server.login(from_addr, app_pw)
-        server.send_message(msg)
+    _smtp_send_with_fallback(smtp_host, smtp_port, from_addr, app_pw, msg)
 
     message_id = (msg.get("Message-ID") or "").strip()
     return {"message_id": message_id, "subject": full_subject}
@@ -3999,8 +4153,7 @@ def backfill_outbound_gmail_ids(db, communication_id):
         return
 
     try:
-        m = imaplib.IMAP4_SSL(imap_host, imap_port)
-        m.login(from_addr, app_pw)
+        m = _open_imap_with_fallback(imap_host, imap_port, from_addr, app_pw)
         sent_box = _find_sent_mailbox(m)
         if not sent_box:
             m.logout()
@@ -4068,16 +4221,12 @@ def test_email_login(db):
     imap_error = ""
 
     try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-            server.starttls()
-            server.login(from_addr, app_pw)
-        smtp_ok = True
+        smtp_ok, smtp_error = _smtp_probe_with_fallback(smtp_host, smtp_port, from_addr, app_pw)
     except Exception as exc:
         smtp_error = str(exc)
 
     try:
-        m = imaplib.IMAP4_SSL(imap_host, imap_port)
-        m.login(from_addr, app_pw)
+        m = _open_imap_with_fallback(imap_host, imap_port, from_addr, app_pw)
         m.logout()
         imap_ok = True
     except Exception as exc:
@@ -4172,8 +4321,7 @@ def poll_gmail_inbound_once():
         if not from_addr or not app_pw:
             return
 
-        m = imaplib.IMAP4_SSL(imap_host, imap_port)
-        m.login(from_addr, app_pw)
+        m = _open_imap_with_fallback(imap_host, imap_port, from_addr, app_pw)
         m.select("INBOX")
         typ_unseen, data_unseen = m.search(None, "(UNSEEN)")
         raw_query = f'to:{from_addr} newer_than:7d -from:{from_addr}'

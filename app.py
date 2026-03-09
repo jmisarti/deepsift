@@ -443,6 +443,17 @@ def migrate_db(db):
         )
         """
     )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clever_lead_webhook_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT,
+            note_body TEXT NOT NULL,
+            payload_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
 
 def log_app_error(db, source, error_message, details="", route="", status_code=None):
@@ -4055,6 +4066,20 @@ def _build_clever_lead_notes(row_data):
         if value:
             lines.append(f"{label}: {value}")
     return "\n".join(lines)
+
+
+def add_clever_webhook_note(db, event_key, note_body, payload=None):
+    db.execute(
+        """
+        INSERT INTO clever_lead_webhook_notes (event_key, note_body, payload_json)
+        VALUES (?, ?, ?)
+        """,
+        (
+            (event_key or "").strip() or None,
+            (note_body or "").strip(),
+            json.dumps(payload or {}),
+        ),
+    )
 
 
 def email_sender_label(settings):
@@ -8047,21 +8072,38 @@ def integrations_google_sheets_row_added_api():
         or (payload.get("eventKey") or "").strip()
         or f"{spreadsheet_id}:{sheet_name}:{row_index}"
     )
+    address = _row_value_by_keys(row_data, ["Address", "address", "Property Address"])
+    seller_name = _row_value_by_keys(row_data, ["Seller Name", "seller_name", "owner", "Owner Name"])
+    phone = _row_value_by_keys(row_data, ["Phone Number", "phone", "Phone"])
+    email = _row_value_by_keys(row_data, ["Email", "email"])
+    portal_link = _row_value_by_keys(row_data, ["Portal Link (Provide Updates)", "Portal Link"])
+
     is_new = upsert_integration_event(
         db,
         "google_sheets_row_added",
         event_key,
         payload,
     )
+    note_lines = [
+        "Clever Leads webhook received",
+        f"Event Key: {event_key or '-'}",
+        f"Sheet: {sheet_name or '-'}",
+        f"Row: {row_index if row_index is not None else '-'}",
+        f"Address: {address or '-'}",
+        f"Seller: {seller_name or '-'}",
+        f"Phone: {phone or '-'}",
+        f"Email: {email or '-'}",
+    ]
+    add_clever_webhook_note(
+        db,
+        event_key,
+        "\n".join(note_lines),
+        payload,
+    )
     db.commit()
     if not is_new:
         return jsonify({"ok": True, "duplicate": True, "event_key": event_key})
 
-    address = _row_value_by_keys(row_data, ["Address", "address", "Property Address"])
-    seller_name = _row_value_by_keys(row_data, ["Seller Name", "seller_name", "owner", "Owner Name"])
-    phone = _row_value_by_keys(row_data, ["Phone Number", "phone", "Phone"])
-    email = _row_value_by_keys(row_data, ["Email", "email"])
-    portal_link = _row_value_by_keys(row_data, ["Portal Link (Provide Updates)", "Portal Link"])
     summary_text = f"address={address or '-'}, seller={seller_name or '-'}, phone={phone or '-'}, email={email or '-'}"
 
     if address:
@@ -8102,6 +8144,19 @@ def integrations_google_sheets_row_added_api():
             if sift_link:
                 msg_lines.append(f"SIFT Record: {sift_link}")
             send_slack_notification(db, "\n".join(msg_lines))
+            add_clever_webhook_note(
+                db,
+                event_key,
+                "\n".join(
+                    [
+                        "Clever Leads processing result",
+                        "Result: success",
+                        f"SIFT Status: {sift_status}",
+                        f"SIFT Record: {sift_link or '-'}",
+                    ]
+                ),
+                {"created": created, "created_uuid": created_uuid, "status": sift_status},
+            )
         except Exception as exc:
             err_text = str(exc)
             try:
@@ -8126,6 +8181,18 @@ def integrations_google_sheets_row_added_api():
                 route="/api/integrations/google-sheets/row-added",
                 status_code=500,
             )
+            add_clever_webhook_note(
+                db,
+                event_key,
+                "\n".join(
+                    [
+                        "Clever Leads processing result",
+                        "Result: failed",
+                        f"Error: {err_text}",
+                    ]
+                ),
+                {"error": err_text},
+            )
             db.commit()
             return jsonify({"ok": False, "error": err_text}), 500
 
@@ -8136,6 +8203,7 @@ def integrations_google_sheets_row_added_api():
         )
     except Exception:
         pass
+    db.commit()
     return jsonify({"ok": True, "event_key": event_key})
 
 

@@ -4214,7 +4214,7 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
             create_payload = {
                 "search": address,
                 "status": "new_lead",
-                "lists": "Clever Leads",
+                "lists": "Clever",
                 "tags": "clever,google_sheet",
                 "notes": clever_notes,
                 "owner": owner_payload,

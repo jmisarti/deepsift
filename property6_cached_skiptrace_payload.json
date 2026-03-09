@@ -1,0 +1,2591 @@
+{
+  "summary": {
+    "matched_people": 10,
+    "phones_added": 0,
+    "emails_added": 0,
+    "addresses_added": 0,
+    "relatives_added": 0,
+    "deduped_people_merged": 0,
+    "deduped_groups": 0
+  },
+  "response": {
+    "person_results": [
+      {
+        "lookup": {
+          "first_name": "Marie",
+          "middle_name": null,
+          "last_name": "Tuccillo",
+          "age": null,
+          "email": null,
+          "phone_number": null,
+          "mailing_addresses": [
+            {
+              "street": "78 Lake Dr",
+              "street2": null,
+              "city": "Beverly",
+              "state": "NJ",
+              "zipcode": "08010-3301"
+            }
+          ]
+        },
+        "effective_lookup": {
+          "first_name": "Marie",
+          "middle_name": null,
+          "last_name": "Tuccillo",
+          "age": null,
+          "email": null,
+          "phone_number": null,
+          "mailing_addresses": [
+            {
+              "street": "",
+              "street2": null,
+              "city": null,
+              "state": "NJ",
+              "zipcode": null
+            }
+          ]
+        },
+        "expected_results": 15,
+        "persons": [
+          {
+            "object_id": "b40dcf408f",
+            "source_metadata": {
+              "object_id": "G-5645026088569538057",
+              "provider_id": "R20"
+            },
+            "person_name": {
+              "title": "",
+              "first_name": "Marie",
+              "middle_name": "",
+              "last_name": "Tuccillo",
+              "suffix": ""
+            },
+            "age": 102,
+            "deceased": false,
+            "date_of_birth_month_year": "03-1923",
+            "bankruptcy": false,
+            "debts": null,
+            "relatives": [
+              {
+                "name": "Paul Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Paul",
+                  "middle_name": "",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 24,
+                "deceased": false,
+                "date_of_birth_month_year": "12-2001",
+                "relation_type": null
+              },
+              {
+                "name": "Aldo J Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Aldo",
+                  "middle_name": "J",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 28,
+                "deceased": false,
+                "date_of_birth_month_year": "10-1997",
+                "relation_type": null
+              }
+            ],
+            "name": "Marie Tuccillo",
+            "addresses": [
+              {
+                "object_id": "1ec3f85af4",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "60 Central Ave",
+                "delivery_line2": null,
+                "last_line": "Pompton Lakes, NJ 07442",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "60 Central Ave",
+                  "city": "Pompton Lakes",
+                  "state": "NJ",
+                  "zipcode": "07442"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Passaic",
+                  "fips": "34031"
+                },
+                "attom": {
+                  "attom_id": 34630903,
+                  "attom_last_sold_date": "2018-07-09",
+                  "attom_last_sold_price": 285000
+                }
+              },
+              {
+                "object_id": "994fa6ba1b",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "713 PO Box",
+                "delivery_line2": null,
+                "last_line": "Fair Lawn, NJ 07410",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "713 PO Box",
+                  "city": "Fair Lawn",
+                  "state": "NJ",
+                  "zipcode": "07410"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Bergen",
+                  "fips": "34003"
+                },
+                "attom": null
+              },
+              {
+                "object_id": "3a85bde939",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "15-04 Chandler Dr",
+                "delivery_line2": null,
+                "last_line": "Fair Lawn, NJ 07410",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "15-04 Chandler Dr",
+                  "city": "Fair Lawn",
+                  "state": "NJ",
+                  "zipcode": "07410"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Bergen",
+                  "fips": "34003"
+                },
+                "attom": {
+                  "attom_id": 32263487,
+                  "attom_last_sold_date": null,
+                  "attom_last_sold_price": null
+                }
+              }
+            ],
+            "emails": [
+              {
+                "email_address": "mtuccillo@aol.com"
+              },
+              {
+                "email_address": "vmtuccillor59@aol.com"
+              }
+            ],
+            "phone_numbers": [
+              {
+                "e164_format": "+12017962749",
+                "local_format": "(201) 796-2749",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New Jersey Inc",
+                "last_seen": "2026-02-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+12016750150",
+                "local_format": "(201) 675-0150",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "mobile",
+                "carrier": "New Cingular Wireless PCS LLC - DC",
+                "last_seen": "2025-07-09",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+13157595502",
+                "local_format": "(315) 759-5502",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "other",
+                "carrier": "Time Warner Cable Information Services (New Hampshire) LLC dba Time Warner Cable - NH",
+                "last_seen": "2009-04-30",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              }
+            ],
+            "employers": []
+          },
+          {
+            "object_id": "017fc5d4dd",
+            "source_metadata": {
+              "object_id": "G352526554240598454",
+              "provider_id": "R20"
+            },
+            "person_name": {
+              "title": "",
+              "first_name": "Marie",
+              "middle_name": "A",
+              "last_name": "Tuccillo",
+              "suffix": ""
+            },
+            "age": 63,
+            "deceased": false,
+            "date_of_birth_month_year": "12-1962",
+            "bankruptcy": false,
+            "debts": null,
+            "relatives": [
+              {
+                "name": "Barbara A Rooks",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Barbara",
+                  "middle_name": "A",
+                  "last_name": "Rooks",
+                  "suffix": ""
+                },
+                "age": 74,
+                "deceased": false,
+                "date_of_birth_month_year": "07-1951",
+                "relation_type": null
+              },
+              {
+                "name": "Charles D Orban",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Charles",
+                  "middle_name": "D",
+                  "last_name": "Orban",
+                  "suffix": ""
+                },
+                "age": 78,
+                "deceased": true,
+                "date_of_birth_month_year": "02-1948",
+                "relation_type": null
+              }
+            ],
+            "name": "Marie A Tuccillo",
+            "addresses": [
+              {
+                "object_id": "33f2f49821",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "271 Flock Rd",
+                "delivery_line2": null,
+                "last_line": "Hamilton, NJ 08619",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "271 Flock Rd",
+                  "city": "Hamilton",
+                  "state": "NJ",
+                  "zipcode": "08619"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Mercer",
+                  "fips": "34021"
+                },
+                "attom": null
+              },
+              {
+                "object_id": "2bb8adb958",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "1333 Avenue A",
+                "delivery_line2": null,
+                "last_line": "Manahawkin, NJ 08050",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "1333 Avenue A",
+                  "city": "Manahawkin",
+                  "state": "NJ",
+                  "zipcode": "08050"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Ocean",
+                  "fips": "34029"
+                },
+                "attom": {
+                  "attom_id": 34519486,
+                  "attom_last_sold_date": "2016-06-02",
+                  "attom_last_sold_price": null
+                }
+              },
+              {
+                "object_id": "8e5bed4050",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "1337 Avenue A",
+                "delivery_line2": null,
+                "last_line": "Manahawkin, NJ 08050",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "1337 Avenue A",
+                  "city": "Manahawkin",
+                  "state": "NJ",
+                  "zipcode": "08050"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Ocean",
+                  "fips": "34029"
+                },
+                "attom": null
+              }
+            ],
+            "emails": [
+              {
+                "email_address": "m.tuccillo62@yahoo.com"
+              },
+              {
+                "email_address": "m.tuccillo@att.net"
+              }
+            ],
+            "phone_numbers": [
+              {
+                "e164_format": "+16095848149",
+                "local_format": "(609) 584-8149",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon Services Corporation",
+                "last_seen": "2026-02-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+16095878629",
+                "local_format": "(609) 587-8629",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New Jersey Inc",
+                "last_seen": "2016-10-15",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              }
+            ],
+            "employers": [
+              {
+                "name": "CICI'S PIZZA",
+                "address": {
+                  "object_id": "e8f56b748d",
+                  "source_metadata": {
+                    "object_id": null,
+                    "provider_id": "P31"
+                  },
+                  "delivery_line1": "1080 W Bethel Rd",
+                  "delivery_line2": null,
+                  "last_line": "Coppell, TX 75019",
+                  "country_code": "USA",
+                  "is_verified_deliverable": true,
+                  "us_address": {
+                    "street": "1080 W Bethel Rd",
+                    "city": "Coppell",
+                    "state": "TX",
+                    "zipcode": "75019"
+                  },
+                  "metadata": {
+                    "latitude": null,
+                    "longitude": null,
+                    "is_vacant": false,
+                    "provider_id": null,
+                    "county_name": "Dallas",
+                    "fips": "48113"
+                  },
+                  "attom": {
+                    "attom_id": 44135152,
+                    "attom_last_sold_date": "1999-04-30",
+                    "attom_last_sold_price": 1000000
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "object_id": "a13b8ad597",
+            "source_metadata": {
+              "object_id": "G1280702911494946904",
+              "provider_id": "R20"
+            },
+            "person_name": {
+              "title": "",
+              "first_name": "Maria",
+              "middle_name": "M",
+              "last_name": "Tuccillo",
+              "suffix": ""
+            },
+            "age": 66,
+            "deceased": false,
+            "date_of_birth_month_year": "10-1959",
+            "bankruptcy": false,
+            "debts": null,
+            "relatives": [
+              {
+                "name": "Anthony Tuccillo JR",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Anthony",
+                  "middle_name": "",
+                  "last_name": "Tuccillo",
+                  "suffix": "JR"
+                },
+                "age": 59,
+                "deceased": false,
+                "date_of_birth_month_year": "07-1966",
+                "relation_type": null
+              },
+              {
+                "name": "Michael A Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Michael",
+                  "middle_name": "A",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 27,
+                "deceased": false,
+                "date_of_birth_month_year": "06-1998",
+                "relation_type": null
+              }
+            ],
+            "name": "Maria M Tuccillo",
+            "addresses": [
+              {
+                "object_id": "d84d3810f2",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "62 Renee Pl",
+                "delivery_line2": null,
+                "last_line": "Staten Island, NY 10314",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "62 Renee Pl",
+                  "city": "Staten Island",
+                  "state": "NY",
+                  "zipcode": "10314"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Richmond",
+                  "fips": "36085"
+                },
+                "attom": {
+                  "attom_id": 72506112,
+                  "attom_last_sold_date": "1994-05-11",
+                  "attom_last_sold_price": null
+                }
+              },
+              {
+                "object_id": "b2ddfd07e9",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "210 Dongan Hills Ave",
+                "delivery_line2": null,
+                "last_line": "Staten Island, NY 10305",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "210 Dongan Hills Ave",
+                  "city": "Staten Island",
+                  "state": "NY",
+                  "zipcode": "10305"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Richmond",
+                  "fips": "36085"
+                },
+                "attom": {
+                  "attom_id": 72553493,
+                  "attom_last_sold_date": "2020-10-28",
+                  "attom_last_sold_price": 788000
+                }
+              },
+              {
+                "object_id": "4d7da5fd08",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "70 Renee Pl",
+                "delivery_line2": null,
+                "last_line": "Staten Island, NY 10314",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "70 Renee Pl",
+                  "city": "Staten Island",
+                  "state": "NY",
+                  "zipcode": "10314"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Richmond",
+                  "fips": "36085"
+                },
+                "attom": {
+                  "attom_id": 72506157,
+                  "attom_last_sold_date": null,
+                  "attom_last_sold_price": null
+                }
+              }
+            ],
+            "emails": [
+              {
+                "email_address": "marbia1@sbcglobal.net"
+              },
+              {
+                "email_address": "mariamolino@att.net"
+              },
+              {
+                "email_address": "marbia2@sbcglobal.net"
+              }
+            ],
+            "phone_numbers": [
+              {
+                "e164_format": "+17189831196",
+                "local_format": "(718) 983-1196",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon Services Corporation",
+                "last_seen": "2026-02-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+17182325273",
+                "local_format": "(718) 232-5273",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New York Inc",
+                "last_seen": "2022-08-15",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+17189830000",
+                "local_format": "(718) 983-0000",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New York Inc",
+                "last_seen": "2012-10-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              }
+            ],
+            "employers": [
+              {
+                "name": "LADENBURG THALMANN",
+                "address": {
+                  "object_id": "2e057adbe2",
+                  "source_metadata": {
+                    "object_id": null,
+                    "provider_id": "P31"
+                  },
+                  "delivery_line1": "4400 Biscayne Blvd",
+                  "delivery_line2": null,
+                  "last_line": "Miami, FL 33137",
+                  "country_code": "USA",
+                  "is_verified_deliverable": true,
+                  "us_address": {
+                    "street": "4400 Biscayne Blvd",
+                    "city": "Miami",
+                    "state": "FL",
+                    "zipcode": "33137"
+                  },
+                  "metadata": {
+                    "latitude": null,
+                    "longitude": null,
+                    "is_vacant": false,
+                    "provider_id": null,
+                    "county_name": "Miami-Dade",
+                    "fips": "12086"
+                  },
+                  "attom": {
+                    "attom_id": 111726313,
+                    "attom_last_sold_date": "2006-09-06",
+                    "attom_last_sold_price": 18000000
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "object_id": "ed0801e7e0",
+            "source_metadata": {
+              "object_id": "G2375867159997393283",
+              "provider_id": "R20"
+            },
+            "person_name": {
+              "title": "",
+              "first_name": "Marie",
+              "middle_name": "T",
+              "last_name": "Cantor",
+              "suffix": ""
+            },
+            "age": 96,
+            "deceased": false,
+            "date_of_birth_month_year": "12-1929",
+            "bankruptcy": false,
+            "debts": {
+              "date_most_recent_bankruptcy": "2005-10-13",
+              "date_most_recent_judgment": null,
+              "date_most_recent_lien": null,
+              "number_of_bankrupcies": 1,
+              "number_of_judgments": 0,
+              "number_of_liens": 0
+            },
+            "relatives": [
+              {
+                "name": "Dean F Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Dean",
+                  "middle_name": "F",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 68,
+                "deceased": false,
+                "date_of_birth_month_year": "03-1957",
+                "relation_type": null
+              },
+              {
+                "name": "Deborah Iero",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Deborah",
+                  "middle_name": "",
+                  "last_name": "Iero",
+                  "suffix": ""
+                },
+                "age": 67,
+                "deceased": false,
+                "date_of_birth_month_year": "09-1958",
+                "relation_type": null
+              }
+            ],
+            "name": "Marie T Cantor",
+            "addresses": [
+              {
+                "object_id": "988238475c",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "60 Gates Mill Ct",
+                "delivery_line2": null,
+                "last_line": "Trenton, NJ 08690",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "60 Gates Mill Ct",
+                  "city": "Trenton",
+                  "state": "NJ",
+                  "zipcode": "08690"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Mercer",
+                  "fips": "34021"
+                },
+                "attom": null
+              },
+              {
+                "object_id": "1967e59e27",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "245 Emanuel St",
+                "delivery_line2": null,
+                "last_line": "Trenton, NJ 08610",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "245 Emanuel St",
+                  "city": "Trenton",
+                  "state": "NJ",
+                  "zipcode": "08610"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Mercer",
+                  "fips": "34021"
+                },
+                "attom": {
+                  "attom_id": 33525449,
+                  "attom_last_sold_date": "2024-10-30",
+                  "attom_last_sold_price": 350000
+                }
+              },
+              {
+                "object_id": "9a73bebdb1",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "68 Gates Mill Ct",
+                "delivery_line2": "Apt 68",
+                "last_line": "Hamilton, NJ 08690",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "68 Gates Mill Ct",
+                  "city": "Hamilton",
+                  "state": "NJ",
+                  "zipcode": "08690"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Mercer",
+                  "fips": "34021"
+                },
+                "attom": null
+              }
+            ],
+            "emails": [],
+            "phone_numbers": [
+              {
+                "e164_format": "+16095841330",
+                "local_format": "(609) 584-1330",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New Jersey Inc",
+                "last_seen": "2026-02-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+16093935522",
+                "local_format": "(609) 393-5522",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New Jersey Inc",
+                "last_seen": "2008-06-19",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              }
+            ],
+            "employers": []
+          },
+          {
+            "object_id": "ca956841ce",
+            "source_metadata": {
+              "object_id": "G1383851682626804995",
+              "provider_id": "R20"
+            },
+            "person_name": {
+              "title": "",
+              "first_name": "Mary",
+              "middle_name": "",
+              "last_name": "Tuccillo",
+              "suffix": ""
+            },
+            "age": 96,
+            "deceased": true,
+            "date_of_birth_month_year": "03-1930",
+            "bankruptcy": false,
+            "debts": null,
+            "relatives": [
+              {
+                "name": "Anthony F Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Anthony",
+                  "middle_name": "F",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 76,
+                "deceased": false,
+                "date_of_birth_month_year": "10-1949",
+                "relation_type": null
+              },
+              {
+                "name": "Anthony Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Anthony",
+                  "middle_name": "",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 76,
+                "deceased": false,
+                "date_of_birth_month_year": "10-1949",
+                "relation_type": null
+              }
+            ],
+            "name": "Mary Tuccillo",
+            "addresses": [
+              {
+                "object_id": "661f6098a5",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "55 Spring St",
+                "delivery_line2": null,
+                "last_line": "Lodi, NJ 07644",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "55 Spring St",
+                  "city": "Lodi",
+                  "state": "NJ",
+                  "zipcode": "07644"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Bergen",
+                  "fips": "34003"
+                },
+                "attom": {
+                  "attom_id": 32294814,
+                  "attom_last_sold_date": "2025-08-22",
+                  "attom_last_sold_price": 325000
+                }
+              }
+            ],
+            "emails": [],
+            "phone_numbers": [
+              {
+                "e164_format": "+19737780857",
+                "local_format": "(973) 778-0857",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New Jersey Inc",
+                "last_seen": "2026-02-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+12017780857",
+                "local_format": "(201) 778-0857",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Bandwidth.com CLEC LLC",
+                "last_seen": "2016-03-16",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              }
+            ],
+            "employers": []
+          },
+          {
+            "object_id": "c5dcbd8d05",
+            "source_metadata": {
+              "object_id": "G3034581441628932938",
+              "provider_id": "R20"
+            },
+            "person_name": {
+              "title": "",
+              "first_name": "Mary",
+              "middle_name": "E",
+              "last_name": "Stout",
+              "suffix": ""
+            },
+            "age": 80,
+            "deceased": false,
+            "date_of_birth_month_year": "12-1945",
+            "bankruptcy": false,
+            "debts": null,
+            "relatives": [
+              {
+                "name": "Amber J Stout",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Amber",
+                  "middle_name": "J",
+                  "last_name": "Stout",
+                  "suffix": ""
+                },
+                "age": 59,
+                "deceased": false,
+                "date_of_birth_month_year": "03-1966",
+                "relation_type": null
+              },
+              {
+                "name": "Jean S Stout",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Jean",
+                  "middle_name": "S",
+                  "last_name": "Stout",
+                  "suffix": ""
+                },
+                "age": 109,
+                "deceased": true,
+                "date_of_birth_month_year": "05-1916",
+                "relation_type": null
+              }
+            ],
+            "name": "Mary E Stout",
+            "addresses": [
+              {
+                "object_id": "0308bbab14",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "38 Benson Ln",
+                "delivery_line2": null,
+                "last_line": "Trenton, NJ 08610",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "38 Benson Ln",
+                  "city": "Trenton",
+                  "state": "NJ",
+                  "zipcode": "08610"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Mercer",
+                  "fips": "34021"
+                },
+                "attom": {
+                  "attom_id": 33485024,
+                  "attom_last_sold_date": "1987-04-29",
+                  "attom_last_sold_price": null
+                }
+              },
+              {
+                "object_id": "36dfb19101",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "4184 Skeffington Ct",
+                "delivery_line2": null,
+                "last_line": "Southport, NC 28461",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "4184 Skeffington Ct",
+                  "city": "Southport",
+                  "state": "NC",
+                  "zipcode": "28461"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Brunswick",
+                  "fips": "37019"
+                },
+                "attom": {
+                  "attom_id": 97308996,
+                  "attom_last_sold_date": "2020-10-29",
+                  "attom_last_sold_price": 100000
+                }
+              },
+              {
+                "object_id": "28e76e7d38",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "38 Benson Ln",
+                "delivery_line2": null,
+                "last_line": "Hamilton, NJ 08610",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "38 Benson Ln",
+                  "city": "Hamilton",
+                  "state": "NJ",
+                  "zipcode": "08610"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Mercer",
+                  "fips": "34021"
+                },
+                "attom": null
+              }
+            ],
+            "emails": [
+              {
+                "email_address": "mbstout@verizon.net"
+              },
+              {
+                "email_address": "kaan.kavaz98@hotmail.com"
+              },
+              {
+                "email_address": "mbstout@msn.com"
+              }
+            ],
+            "phone_numbers": [
+              {
+                "e164_format": "+16095851889",
+                "local_format": "(609) 585-1889",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon Services Corporation",
+                "last_seen": "2026-02-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+16092785042",
+                "local_format": "(609) 278-5042",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Infinite Communication LLC",
+                "last_seen": "2009-01-05",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+16093932693",
+                "local_format": "(609) 393-2693",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New Jersey Inc",
+                "last_seen": "2016-03-16",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              }
+            ],
+            "employers": [
+              {
+                "name": "CONTINENTAL REFRIGERATOR",
+                "address": {
+                  "object_id": "c1808f50c7",
+                  "source_metadata": {
+                    "object_id": null,
+                    "provider_id": "P31"
+                  },
+                  "delivery_line1": "840 S Frontage Rd",
+                  "delivery_line2": null,
+                  "last_line": "Woodridge, IL 60517",
+                  "country_code": "USA",
+                  "is_verified_deliverable": true,
+                  "us_address": {
+                    "street": "840 S Frontage Rd",
+                    "city": "Woodridge",
+                    "state": "IL",
+                    "zipcode": "60517"
+                  },
+                  "metadata": {
+                    "latitude": null,
+                    "longitude": null,
+                    "is_vacant": false,
+                    "provider_id": null,
+                    "county_name": "Dupage",
+                    "fips": "17043"
+                  },
+                  "attom": {
+                    "attom_id": 56723985,
+                    "attom_last_sold_date": "2014-01-16",
+                    "attom_last_sold_price": 9182000
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "object_id": "282504e075",
+            "source_metadata": {
+              "object_id": "G-403917412386597088",
+              "provider_id": "R20"
+            },
+            "person_name": {
+              "title": "",
+              "first_name": "Mary",
+              "middle_name": "Ellen",
+              "last_name": "Tuccillo",
+              "suffix": ""
+            },
+            "age": 60,
+            "deceased": false,
+            "date_of_birth_month_year": "10-1965",
+            "bankruptcy": false,
+            "debts": null,
+            "relatives": [
+              {
+                "name": "Joseph J Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Joseph",
+                  "middle_name": "J",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 97,
+                "deceased": true,
+                "date_of_birth_month_year": "09-1928",
+                "relation_type": null
+              },
+              {
+                "name": "Mark J Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Mark",
+                  "middle_name": "J",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 71,
+                "deceased": false,
+                "date_of_birth_month_year": "10-1954",
+                "relation_type": null
+              }
+            ],
+            "name": "Mary Ellen Tuccillo",
+            "addresses": [
+              {
+                "object_id": "a543331641",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "43 Bettswood Rd",
+                "delivery_line2": null,
+                "last_line": "Norwalk, CT 06851",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "43 Bettswood Rd",
+                  "city": "Norwalk",
+                  "state": "CT",
+                  "zipcode": "06851"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Western Ct",
+                  "fips": "09190"
+                },
+                "attom": {
+                  "attom_id": 35898250,
+                  "attom_last_sold_date": null,
+                  "attom_last_sold_price": null
+                }
+              },
+              {
+                "object_id": "675866f1f2",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "306 S 3rd Ave",
+                "delivery_line2": "Unit C",
+                "last_line": "Highland Park, NJ 08904",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "306 S 3rd Ave",
+                  "city": "Highland Park",
+                  "state": "NJ",
+                  "zipcode": "08904"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Middlesex",
+                  "fips": "34023"
+                },
+                "attom": {
+                  "attom_id": 33593934,
+                  "attom_last_sold_date": null,
+                  "attom_last_sold_price": null
+                }
+              },
+              {
+                "object_id": "1451c3949a",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "4602 PO Box",
+                "delivery_line2": null,
+                "last_line": "Charlottesville, VA 22905",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "4602 PO Box",
+                  "city": "Charlottesville",
+                  "state": "VA",
+                  "zipcode": "22905"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Charlottesville City",
+                  "fips": "51540"
+                },
+                "attom": null
+              }
+            ],
+            "emails": [
+              {
+                "email_address": "tuccillome@yahoo.com"
+              }
+            ],
+            "phone_numbers": [
+              {
+                "e164_format": "+16177753932",
+                "local_format": "(617) 775-3932",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "mobile",
+                "carrier": "New Cingular Wireless PCS LLC - DC",
+                "last_seen": "2026-02-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+16176004794",
+                "local_format": "(617) 600-4794",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "RCN Telecom Services Inc - NY",
+                "last_seen": "2019-07-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+12038667756",
+                "local_format": "(203) 866-7756",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Southern New England Telephone Company",
+                "last_seen": "2020-11-18",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+17325659494",
+                "local_format": "(732) 565-9494",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New Jersey Inc",
+                "last_seen": "2011-10-15",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+19735659494",
+                "local_format": "(973) 565-9494",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New Jersey Inc",
+                "last_seen": "2001-06-19",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+18049718264",
+                "local_format": "(804) 971-8264",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "mobile",
+                "carrier": "Cellco Partnership dba Verizon Wireless - VA",
+                "last_seen": "2016-03-16",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              }
+            ],
+            "employers": []
+          },
+          {
+            "object_id": "fc984d3a82",
+            "source_metadata": {
+              "object_id": "G4640872097417096296",
+              "provider_id": "R20"
+            },
+            "person_name": {
+              "title": "",
+              "first_name": "Mary",
+              "middle_name": "L",
+              "last_name": "Tuccillo",
+              "suffix": ""
+            },
+            "age": 51,
+            "deceased": false,
+            "date_of_birth_month_year": "10-1974",
+            "bankruptcy": false,
+            "debts": null,
+            "relatives": [
+              {
+                "name": "Michael P Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Michael",
+                  "middle_name": "P",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 76,
+                "deceased": false,
+                "date_of_birth_month_year": "05-1949",
+                "relation_type": null
+              },
+              {
+                "name": "Aidan M Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Aidan",
+                  "middle_name": "M",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 20,
+                "deceased": false,
+                "date_of_birth_month_year": "08-2005",
+                "relation_type": null
+              }
+            ],
+            "name": "Mary L Tuccillo",
+            "addresses": [
+              {
+                "object_id": "a48d0bf563",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "34 Raynor Ave",
+                "delivery_line2": null,
+                "last_line": "North Middletown, NJ 07748",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "34 Raynor Ave",
+                  "city": "North Middletown",
+                  "state": "NJ",
+                  "zipcode": "07748"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Monmouth",
+                  "fips": "34025"
+                },
+                "attom": {
+                  "attom_id": 34039456,
+                  "attom_last_sold_date": "2002-10-24",
+                  "attom_last_sold_price": 280000
+                }
+              },
+              {
+                "object_id": "3a0fba84c2",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "861 Castleton Ave",
+                "delivery_line2": null,
+                "last_line": "Staten Island, NY 10310",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "861 Castleton Ave",
+                  "city": "Staten Island",
+                  "state": "NY",
+                  "zipcode": "10310"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Richmond",
+                  "fips": "36085"
+                },
+                "attom": {
+                  "attom_id": 72525572,
+                  "attom_last_sold_date": null,
+                  "attom_last_sold_price": null
+                }
+              },
+              {
+                "object_id": "d7b600398e",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "650 Bement Ave",
+                "delivery_line2": null,
+                "last_line": "Staten Island, NY 10310",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "650 Bement Ave",
+                  "city": "Staten Island",
+                  "state": "NY",
+                  "zipcode": "10310"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Richmond",
+                  "fips": "36085"
+                },
+                "attom": {
+                  "attom_id": 72484154,
+                  "attom_last_sold_date": "2023-11-01",
+                  "attom_last_sold_price": 610000
+                }
+              }
+            ],
+            "emails": [
+              {
+                "email_address": "ktt2721@yahoo.com"
+              },
+              {
+                "email_address": "mtuccillo@hotmail.com"
+              },
+              {
+                "email_address": "mary.tuccillo@zurichna.com"
+              }
+            ],
+            "phone_numbers": [
+              {
+                "e164_format": "+19176124369",
+                "local_format": "(917) 612-4369",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "mobile",
+                "carrier": "Cellco Partnership dba Verizon Wireless - NY",
+                "last_seen": "2026-02-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+17324955350",
+                "local_format": "(732) 495-5350",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New Jersey Inc",
+                "last_seen": "2018-05-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+17189816375",
+                "local_format": "(718) 981-6375",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon Services Corporation",
+                "last_seen": "2003-09-03",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+17326749732",
+                "local_format": "(732) 674-9732",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "mobile",
+                "carrier": "New Cingular Wireless PCS LLC - GA",
+                "last_seen": "2021-04-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+12624423151",
+                "local_format": "(262) 442-3151",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "mobile",
+                "carrier": "New Cingular Wireless PCS LLC - GA",
+                "last_seen": "2021-04-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+17184480448",
+                "local_format": "(718) 448-0448",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New York Inc",
+                "last_seen": "2020-05-15",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+17189812931",
+                "local_format": "(718) 981-2931",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New York Inc",
+                "last_seen": "2018-06-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              }
+            ],
+            "employers": [
+              {
+                "name": "D&O PARTNERS, INC.",
+                "address": null
+              }
+            ]
+          },
+          {
+            "object_id": "1dc2bf0516",
+            "source_metadata": {
+              "object_id": "G-9162987016878980222",
+              "provider_id": "R20"
+            },
+            "person_name": {
+              "title": "",
+              "first_name": "Mary",
+              "middle_name": "M",
+              "last_name": "Tuccillo",
+              "suffix": ""
+            },
+            "age": 74,
+            "deceased": true,
+            "date_of_birth_month_year": "10-1951",
+            "bankruptcy": false,
+            "debts": null,
+            "relatives": [
+              {
+                "name": "Margaret A Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Margaret",
+                  "middle_name": "A",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 116,
+                "deceased": true,
+                "date_of_birth_month_year": "12-1909",
+                "relation_type": null
+              },
+              {
+                "name": "Patrice A Dangelo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Patrice",
+                  "middle_name": "A",
+                  "last_name": "Dangelo",
+                  "suffix": ""
+                },
+                "age": 53,
+                "deceased": false,
+                "date_of_birth_month_year": "01-1973",
+                "relation_type": null
+              }
+            ],
+            "name": "Mary M Tuccillo",
+            "addresses": [
+              {
+                "object_id": "180d8d8113",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "25 Albemarle Ave",
+                "delivery_line2": null,
+                "last_line": "Ewing, NJ 08638",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "25 Albemarle Ave",
+                  "city": "Ewing",
+                  "state": "NJ",
+                  "zipcode": "08638"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Mercer",
+                  "fips": "34021"
+                },
+                "attom": {
+                  "attom_id": 33444138,
+                  "attom_last_sold_date": "2014-07-29",
+                  "attom_last_sold_price": 60000
+                }
+              },
+              {
+                "object_id": "281714b65a",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "29 6th St",
+                "delivery_line2": null,
+                "last_line": "Florence, NJ 08518",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "29 6th St",
+                  "city": "Florence",
+                  "state": "NJ",
+                  "zipcode": "08518"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Burlington",
+                  "fips": "34005"
+                },
+                "attom": null
+              },
+              {
+                "object_id": "98bf7c9176",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "66 Vermont St",
+                "delivery_line2": null,
+                "last_line": "Trenton, NJ 08648",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "66 Vermont St",
+                  "city": "Trenton",
+                  "state": "NJ",
+                  "zipcode": "08648"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Mercer",
+                  "fips": "34021"
+                },
+                "attom": null
+              }
+            ],
+            "emails": [
+              {
+                "email_address": "ten-pin@att.net"
+              },
+              {
+                "email_address": "mtuccillo@bellsouth.net"
+              },
+              {
+                "email_address": "tenpin@firmbachcpas.com"
+              }
+            ],
+            "phone_numbers": [
+              {
+                "e164_format": "+16098833734",
+                "local_format": "(609) 883-3734",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "other",
+                "carrier": "Comcast Business Communications LLC - MD",
+                "last_seen": "2026-02-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+16099327854",
+                "local_format": "(609) 932-7854",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "mobile",
+                "carrier": "New Cingular Wireless PCS LLC - DC",
+                "last_seen": "2024-12-03",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+16094265407",
+                "local_format": "(609) 426-5407",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Comcast Business Communications LLC - MD",
+                "last_seen": "2024-06-20",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+16098833134",
+                "local_format": "(609) 883-3134",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New Jersey Inc",
+                "last_seen": "2016-03-16",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              }
+            ],
+            "employers": []
+          },
+          {
+            "object_id": "d31ff9b2b5",
+            "source_metadata": {
+              "object_id": "G1985294101108520833",
+              "provider_id": "R20"
+            },
+            "person_name": {
+              "title": "",
+              "first_name": "Paul",
+              "middle_name": "",
+              "last_name": "Tuccillo",
+              "suffix": ""
+            },
+            "age": 24,
+            "deceased": false,
+            "date_of_birth_month_year": "12-2001",
+            "bankruptcy": false,
+            "debts": null,
+            "relatives": [
+              {
+                "name": "Aldo J Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Aldo",
+                  "middle_name": "J",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 28,
+                "deceased": false,
+                "date_of_birth_month_year": "10-1997",
+                "relation_type": null
+              },
+              {
+                "name": "Allisha Tuccillo",
+                "addresses": [],
+                "person_name": {
+                  "title": "",
+                  "first_name": "Allisha",
+                  "middle_name": "",
+                  "last_name": "Tuccillo",
+                  "suffix": ""
+                },
+                "age": 28,
+                "deceased": false,
+                "date_of_birth_month_year": "07-1997",
+                "relation_type": null
+              }
+            ],
+            "name": "Paul Tuccillo",
+            "addresses": [
+              {
+                "object_id": "8dd4231e10",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "153 Dockside Cir",
+                "delivery_line2": null,
+                "last_line": "Blue Springs, MO 64015",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "153 Dockside Cir",
+                  "city": "Blue Springs",
+                  "state": "MO",
+                  "zipcode": "64015"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Jackson",
+                  "fips": "29095"
+                },
+                "attom": {
+                  "attom_id": 152284323,
+                  "attom_last_sold_date": "2018-07-19",
+                  "attom_last_sold_price": null
+                }
+              },
+              {
+                "object_id": "82698d17c7",
+                "source_metadata": {
+                  "object_id": null,
+                  "provider_id": "P31"
+                },
+                "delivery_line1": "2091 Farmview Dr",
+                "delivery_line2": null,
+                "last_line": "Newtown, PA 18940",
+                "country_code": "USA",
+                "is_verified_deliverable": true,
+                "us_address": {
+                  "street": "2091 Farmview Dr",
+                  "city": "Newtown",
+                  "state": "PA",
+                  "zipcode": "18940"
+                },
+                "metadata": {
+                  "latitude": null,
+                  "longitude": null,
+                  "is_vacant": false,
+                  "provider_id": null,
+                  "county_name": "Bucks",
+                  "fips": "42017"
+                },
+                "attom": {
+                  "attom_id": 143044935,
+                  "attom_last_sold_date": "1994-11-22",
+                  "attom_last_sold_price": 310652
+                }
+              }
+            ],
+            "emails": [
+              {
+                "email_address": "drose578@gmail.com"
+              }
+            ],
+            "phone_numbers": [
+              {
+                "e164_format": "+16099121222",
+                "local_format": "(609) 912-1222",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon New Jersey Inc",
+                "last_seen": "2026-02-01",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+16099121376",
+                "local_format": "(609) 912-1376",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "other",
+                "carrier": "Comcast Business Communications LLC - MD",
+                "last_seen": "2023-07-15",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+12153213720",
+                "local_format": "(215) 321-3720",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon Services Corporation",
+                "last_seen": "2023-01-15",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+18169316833",
+                "local_format": "(816) 931-6833",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Southwestern Bell Telephone L.P.",
+                "last_seen": "2022-12-15",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": true,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": true,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+12156457994",
+                "local_format": "(215) 645-7994",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Bandwidth.com CLEC LLC",
+                "last_seen": "2024-02-22",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+18168986037",
+                "local_format": "(816) 898-6037",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "mobile",
+                "carrier": "DISH WIRELESS  LLC",
+                "last_seen": "2025-12-05",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              },
+              {
+                "e164_format": "+12153211706",
+                "local_format": "(215) 321-1706",
+                "country_code": "USA",
+                "country_calling_code": 1,
+                "type": "landline",
+                "carrier": "Verizon Services Corporation",
+                "last_seen": "2024-03-07",
+                "dnc_statuses": [
+                  {
+                    "is_dnc": false,
+                    "state_co": null,
+                    "state_fl": null,
+                    "state_in": null,
+                    "state_mo": null,
+                    "state_pa": null,
+                    "state_tx": null,
+                    "state_wy": null,
+                    "is_litigator": null,
+                    "date_status": "2026-03-07",
+                    "is_registered": false,
+                    "iso3166_geocode": "US"
+                  }
+                ]
+              }
+            ],
+            "employers": []
+          }
+        ],
+        "status_code": 200,
+        "issues": []
+      }
+    ]
+  }
+}

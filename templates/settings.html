@@ -15,6 +15,7 @@
         <a class="settings-tab {% if active_tab == 'referral' %}active{% endif %}" href="{{ url_for('settings_page', tab='referral') }}">Referral Settings</a>
         <a class="settings-tab {% if active_tab == 'email' %}active{% endif %}" href="{{ url_for('settings_page', tab='email') }}">Email Settings</a>
         <a class="settings-tab {% if active_tab == 'integrations' %}active{% endif %}" href="{{ url_for('settings_page', tab='integrations') }}">Integration Settings</a>
+        <a class="settings-tab {% if active_tab == 'automations' %}active{% endif %}" href="{{ url_for('settings_page', tab='automations') }}">Automations</a>
         <a class="settings-tab {% if active_tab == 'helpers' %}active{% endif %}" href="{{ url_for('settings_page', tab='helpers') }}">Helpers</a>
     </nav>
 
@@ -127,6 +128,16 @@
         <p><code>POST /api/integrations/google-sheets/row-added</code></p>
         <p><strong>Slack inbound endpoints:</strong></p>
         <p><code>POST /webhooks/slack/command</code> and <code>POST /webhooks/slack/events</code></p>
+    {% elif active_tab == 'automations' %}
+        <p>Toggle automations on/off. This controls whether each automation can run.</p>
+        <form method="post" class="grid-form">
+            <input type="hidden" name="settings_tab" value="automations">
+            <label class="span2" style="display:flex; align-items:center; gap:0.5rem;">
+                <input type="checkbox" name="automation_test_enabled" value="1" {% if automation_settings.test_enabled %}checked{% endif %}>
+                <span><strong>Test</strong> (enabled)</span>
+            </label>
+            <button type="submit">Save Automation Settings</button>
+        </form>
     {% else %}
         <h3>On-Market Checker (Beta Helper)</h3>
         <p>This helper generates fast lookup links for Zillow/Realtor/Redfin based on a property address. Use it to quickly verify whether a property appears as coming soon, active, pending, or sold.</p>

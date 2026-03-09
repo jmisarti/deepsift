@@ -3914,6 +3914,12 @@ def get_slack_settings(db):
     }
 
 
+def get_automation_settings(db):
+    return {
+        "test_enabled": (get_setting(db, "automation_test_enabled", "0") or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
+    }
+
+
 def get_integration_api_key(db):
     return (get_setting(db, "integration_api_key", "") or os.getenv("INTEGRATION_API_KEY", "")).strip()
 
@@ -8152,6 +8158,10 @@ def settings_page():
                     )
             else:
                 notice = "Integrations settings saved."
+        elif active_tab == "automations":
+            test_enabled = (request.form.get("automation_test_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
+            set_setting(db, "automation_test_enabled", "1" if test_enabled else "0")
+            notice = "Automation settings saved."
         elif active_tab == "helpers":
             market_helper_address = (request.form.get("market_helper_address") or "").strip()
             reisift_add_request = {
@@ -8225,6 +8235,7 @@ def settings_page():
     settings = get_direct_mail_settings(db)
     email_settings = get_email_settings(db)
     slack_settings = get_slack_settings(db)
+    automation_settings = get_automation_settings(db)
     integration_api_key = get_integration_api_key(db)
     deep_dive_smrtphone_from = get_setting(db, "deep_dive_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     referral_smrtphone_from = get_setting(db, "referral_smrtphone_from", SMRTPHONE_FROM_NUMBER)
@@ -8260,6 +8271,7 @@ def settings_page():
         dm=settings,
         email_settings=email_settings,
         slack_settings=slack_settings,
+        automation_settings=automation_settings,
         integration_api_key=integration_api_key,
         active_tab=active_tab,
         deep_dive_smrtphone_from=deep_dive_smrtphone_from,

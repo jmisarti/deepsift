@@ -4304,20 +4304,36 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
                 msg_lines.append(f"Portal: {portal_link}")
             if sift_link:
                 msg_lines.append(f"SIFT Record: {sift_link}")
-            post_status_result = None
+            post_status_result = {"ok": False, "skipped": True, "reason": "missing_created_uuid"}
             if created_uuid:
                 try:
                     post_status_result = reisift_update_property_status(reisift_get_access_token(), created_uuid, "refer_lead")
                     msg_lines.append("Post-Enrich Status: refer_lead")
                 except Exception as status_exc:
                     post_status_result = {"ok": False, "error": str(status_exc)}
+                    msg_lines.append(f"Post-Enrich Status Error: {status_exc}")
             referral_refresh_result = None
-            try:
-                referral_refresh_result = refresh_reisift_referrals_cache(db)
-                msg_lines.append("Referral Queue: auto-refreshed")
-            except Exception as refresh_exc:
-                referral_refresh_result = {"ok": False, "error": str(refresh_exc)}
+            refresh_error = None
+            # SIFT status updates can take a few seconds to show in search; retry refresh briefly.
+            for attempt in range(3):
+                try:
+                    if attempt > 0:
+                        time.sleep(2)
+                    referral_refresh_result = refresh_reisift_referrals_cache(db)
+                    msg_lines.append("Referral Queue: auto-refreshed")
+                    refresh_error = None
+                    break
+                except Exception as refresh_exc:
+                    refresh_error = refresh_exc
+                    referral_refresh_result = {"ok": False, "error": str(refresh_exc), "attempt": attempt + 1}
+            if refresh_error:
+                msg_lines.append(f"Referral Refresh Error: {refresh_error}")
             send_slack_notification(db, "\n".join(msg_lines))
+            status_note = (
+                "Post-Enrich Status: refer_lead"
+                if post_status_result and post_status_result.get("response") is not None
+                else f"Post-Enrich Status: failed ({post_status_result.get('error') or post_status_result.get('reason')})"
+            )
             add_clever_webhook_note(
                 db,
                 event_key,
@@ -4326,7 +4342,7 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
                         "Clever Leads processing result",
                         "Result: success",
                         f"SIFT Status: {sift_status}",
-                        "Post-Enrich Status: refer_lead",
+                        status_note,
                         f"SIFT Record: {sift_link or '-'}",
                     ]
                 ),
@@ -7372,17 +7388,38 @@ def upsert_reisift_referral(db, property_uuid, payload, is_active=1):
 
 
 def queue_referral_auto_send_candidates(db):
+    watermark_raw = (get_setting(db, "referral_auto_send_last_referral_id", "0") or "0").strip()
+    try:
+        watermark = int(watermark_raw)
+    except (TypeError, ValueError):
+        watermark = 0
+
+    # Initialize watermark to current max to avoid backfilling historical referrals.
+    if watermark <= 0:
+        current_max_row = db.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM reisift_referrals").fetchone()
+        current_max_id = int((current_max_row["max_id"] if current_max_row else 0) or 0)
+        set_setting(db, "referral_auto_send_last_referral_id", str(current_max_id))
+        return {"queued": 0, "no_realtor": 0, "initialized_watermark": current_max_id}
+
     rows = db.execute(
         """
-        SELECT property_uuid, full_address, county, owner_names
+        SELECT id, property_uuid, full_address, county, owner_names
         FROM reisift_referrals
         WHERE is_active = 1
-        ORDER BY id DESC
+          AND id > ?
+          AND lower(COALESCE(referral_status, 'Untouched')) = 'untouched'
+        ORDER BY id ASC
         """
+        ,
+        (watermark,),
     ).fetchall()
     queued = 0
     no_realtor = 0
+    max_seen_id = watermark
     for row in rows:
+        row_id = int((row["id"] or 0))
+        if row_id > max_seen_id:
+            max_seen_id = row_id
         property_uuid = (row["property_uuid"] or "").strip()
         county = (row["county"] or "").strip()
         if not property_uuid:
@@ -7448,6 +7485,8 @@ def queue_referral_auto_send_candidates(db):
                 ),
             )
             queued += 1
+    if max_seen_id > watermark:
+        set_setting(db, "referral_auto_send_last_referral_id", str(max_seen_id))
     return {"queued": queued, "no_realtor": no_realtor}
 
 

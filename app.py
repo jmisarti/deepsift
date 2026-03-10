@@ -7476,6 +7476,14 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
         )
         add_person_note(db, person_id, "Call Recording Analysis", note_body, analysis)
 
+    intent_l = str(analysis.get("caller_intent") or "").strip().lower()
+    summary_l = str(summary_text or "").strip().lower()
+    outcome_l = str(analysis.get("call_outcome_type") or "").strip().lower()
+    call_is_spam = any(
+        token in intent_l or token in summary_l
+        for token in ["solicitor", "solicitation", "wrong number", "spam call"]
+    ) or outcome_l in {"solicitation", "wrong number"}
+
     upsert_agent_signal(
         db,
         source_type="call",
@@ -7488,7 +7496,7 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
         confidence=float(analysis.get("confidence") or 0.0),
         recommended_next_step=(analysis.get("next_best_step") or "").strip(),
         summary_text=summary_text,
-        is_spam=False,
+        is_spam=call_is_spam,
         do_not_contact=(analysis.get("next_best_step") in {"Mark Not Interested", "Mark Opt Out"}),
         payload={"call_sid": call_sid, "analysis": analysis, "recording_url": recording_url},
     )
@@ -7797,11 +7805,28 @@ def route_new_agent_signals_once(db, limit=50):
         person_id = row["person_id"]
         payload = parse_json_object(row["payload_json"] or "{}")
         if not property_id:
-            db.execute(
-                "UPDATE agent_signals SET routing_status = 'unmapped', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (row["id"],),
+            action_type, priority = _map_signal_to_action(row, "")
+            created = _upsert_lead_action(
+                db,
+                0,
+                person_id,
+                action_type,
+                priority,
+                (
+                    f"Unmapped lead signal ({row['source_type']}) recommends "
+                    f"{(row['recommended_next_step'] or 'review')}. Link this signal to a property_id/UUID."
+                ),
+                {"signal_id": row["id"], "signal": payload, "source_key": row["source_key"], "unmapped": True},
+                dedupe_key_override=f"unmapped:{row['source_key']}:{action_type}",
             )
-            skipped += 1
+            db.execute(
+                "UPDATE agent_signals SET routing_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                ("routed_unmapped", row["id"]),
+            )
+            if created:
+                routed += 1
+            else:
+                skipped += 1
             continue
         prop = db.execute("SELECT status FROM properties WHERE id = ?", (property_id,)).fetchone()
         prop_status = str((prop["status"] if prop else "") or "").strip().lower()
@@ -11663,8 +11688,9 @@ def communication_counts_for_people(db, person_ids, property_id=None):
     return out
 
 
-def _upsert_lead_action(db, property_id, person_id, action_type, priority, reason, payload):
-    dedupe_key = f"{int(property_id)}:{int(person_id or 0)}:{action_type}"
+def _upsert_lead_action(db, property_id, person_id, action_type, priority, reason, payload, dedupe_key_override=None):
+    property_val = int(property_id or 0)
+    dedupe_key = (dedupe_key_override or f"{property_val}:{int(person_id or 0)}:{action_type}").strip()
     existing = db.execute(
         "SELECT id, status FROM lead_management_actions WHERE dedupe_key = ?",
         (dedupe_key,),
@@ -11689,7 +11715,7 @@ def _upsert_lead_action(db, property_id, person_id, action_type, priority, reaso
         (dedupe_key, property_id, person_id, action_type, priority, status, reason, payload_json)
         VALUES (?, ?, ?, ?, ?, 'Pending', ?, ?)
         """,
-        (dedupe_key, property_id, person_id, action_type, priority, reason, payload_json),
+        (dedupe_key, property_val, person_id, action_type, priority, reason, payload_json),
     )
     return True
 

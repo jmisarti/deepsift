@@ -225,6 +225,69 @@ ACTIVE_LEAD_STATUSES = {
 }
 NO_ANSWER_OUTCOMES = {"missed", "no_answer", "failed", "busy", "no answer"}
 
+REISIFT_PLAYBOOK_PRIORITY = {
+    "new lead": {
+        "ScheduleAppointment": "High",
+        "FollowUpTouchDue": "High",
+        "EscalateToRelativeOutreach": "High",
+    },
+    "no contact new lead": {
+        "ScheduleAppointment": "High",
+        "FollowUpTouchDue": "High",
+        "EscalateToRelativeOutreach": "High",
+    },
+    "hot lead": {
+        "ScheduleAppointment": "High",
+        "FollowUpTouchDue": "High",
+        "EscalateToRelativeOutreach": "High",
+    },
+    "warm lead": {
+        "ScheduleAppointment": "High",
+        "FollowUpTouchDue": "Medium",
+        "EscalateToRelativeOutreach": "High",
+    },
+    "cold lead": {
+        "ScheduleAppointment": "Medium",
+        "FollowUpTouchDue": "Low",
+        "EscalateToRelativeOutreach": "Medium",
+    },
+    "ghosting lead": {
+        "ScheduleAppointment": "Medium",
+        "FollowUpTouchDue": "Medium",
+        "EscalateToRelativeOutreach": "High",
+    },
+    "nurture new lead": {
+        "ScheduleAppointment": "Medium",
+        "FollowUpTouchDue": "Low",
+        "EscalateToRelativeOutreach": "Medium",
+    },
+    "refer lead": {
+        "ScheduleAppointment": "Low",
+        "FollowUpTouchDue": "Low",
+        "EscalateToRelativeOutreach": "Low",
+    },
+    "listed": {
+        "ScheduleAppointment": "Low",
+        "FollowUpTouchDue": "Low",
+        "EscalateToRelativeOutreach": "Low",
+    },
+    "dead lead": {
+        "ScheduleAppointment": "Low",
+        "FollowUpTouchDue": "Low",
+        "EscalateToRelativeOutreach": "Low",
+    },
+    "not interested": {
+        "ScheduleAppointment": "Low",
+        "FollowUpTouchDue": "Low",
+        "EscalateToRelativeOutreach": "Low",
+    },
+    "opt-out": {
+        "ScheduleAppointment": "Low",
+        "FollowUpTouchDue": "Low",
+        "EscalateToRelativeOutreach": "Low",
+    },
+}
+
 
 def format_phone_display(value):
     raw = (value or "").strip()
@@ -5889,8 +5952,8 @@ def _create_agent_diagnosis_review_action(db, property_id, person_id, call_sid, 
 
 def _recommend_no_answer_next_step(db, property_id, person_id):
     prop = db.execute("SELECT status FROM properties WHERE id = ?", (property_id,)).fetchone()
-    status = str((prop["status"] if prop else "") or "").strip().lower()
-    if status in {"not interested", "not_interested", "opt-out", "opt_out", "dead lead", "dead"}:
+    status = _normalize_reisift_status((prop["status"] if prop else "") or "")
+    if status in {"not interested", "opt-out", "dead lead"}:
         return "No Action", "Lead status is dispositioned; no-answer call should not trigger additional outreach."
 
     row = db.execute(
@@ -5914,7 +5977,7 @@ def _recommend_no_answer_next_step(db, property_id, person_id):
 
     if no_answer_attempts >= 3:
         return "Escalate To Relative", "Three or more no-answer outcomes detected; escalate outreach path."
-    if status in {"new lead", "new_lead", "no contact new lead"}:
+    if status in {"new lead", "no contact new lead"}:
         return "Follow Up", "New lead with no answer; retry follow-up cadence."
     return "Follow Up", "No-answer outcome; keep lead in follow-up workflow."
 
@@ -6257,7 +6320,37 @@ def upsert_agent_signal(
     return cur.lastrowid
 
 
-def _map_signal_to_action(signal_row):
+def _normalize_reisift_status(status_value):
+    raw = str(status_value or "").strip().lower().replace("_", " ")
+    raw = re.sub(r"\s+", " ", raw).strip()
+    aliases = {
+        "new_lead": "new lead",
+        "no contact new lead": "no contact new lead",
+        "nurture new lead": "nurture new lead",
+        "hot lead": "hot lead",
+        "warm lead": "warm lead",
+        "cold lead": "cold lead",
+        "ghosting lead": "ghosting lead",
+        "dead leads": "dead lead",
+        "dead lead": "dead lead",
+        "not interested": "not interested",
+        "not_interested": "not interested",
+        "opt out": "opt-out",
+        "opt-out": "opt-out",
+        "listed": "listed",
+        "refer lead": "refer lead",
+        "refer_lead": "refer lead",
+    }
+    return aliases.get(raw, raw)
+
+
+def _playbook_priority_for_action(property_status, action_type, fallback_priority):
+    status_key = _normalize_reisift_status(property_status)
+    row = REISIFT_PLAYBOOK_PRIORITY.get(status_key, {})
+    return row.get(action_type, fallback_priority)
+
+
+def _map_signal_to_action(signal_row, property_status=""):
     next_step = (signal_row["recommended_next_step"] or "").strip()
     mapping = {
         "Schedule Appointment": ("ScheduleAppointment", "High"),
@@ -6268,7 +6361,9 @@ def _map_signal_to_action(signal_row):
         "Mark Opt Out": ("HumanReviewDisposition", "High"),
         "No Action": ("ReviewInboundAndNextBestAction", "Low"),
     }
-    return mapping.get(next_step, ("ReviewInboundAndNextBestAction", "Medium"))
+    action_type, base_priority = mapping.get(next_step, ("ReviewInboundAndNextBestAction", "Medium"))
+    priority = _playbook_priority_for_action(property_status, action_type, base_priority)
+    return action_type, priority
 
 
 def route_new_agent_signals_once(db, limit=50):
@@ -6319,14 +6414,17 @@ def route_new_agent_signals_once(db, limit=50):
                 {"signal_id": row["id"], "signal": payload},
             )
         else:
-            action_type, priority = _map_signal_to_action(row)
+            action_type, priority = _map_signal_to_action(row, prop_status)
             _upsert_lead_action(
                 db,
                 int(property_id),
                 person_id,
                 action_type,
                 priority,
-                f"Agent signal ({row['source_type']}) recommends: {(row['recommended_next_step'] or 'review')}.",
+                (
+                    f"Agent signal ({row['source_type']}) recommends: {(row['recommended_next_step'] or 'review')}. "
+                    f"Priority derived from ReiSift playbook status '{prop_status or '-'}'."
+                ),
                 {"signal_id": row["id"], "signal": payload},
             )
         db.execute(

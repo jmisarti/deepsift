@@ -113,6 +113,7 @@ APP_AUTH_USERNAME = os.getenv("APP_AUTH_USERNAME", "").strip()
 APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD", "")
 APP_AUTH_PASSWORD_HASH = os.getenv("APP_AUTH_PASSWORD_HASH", "").strip()
 RUN_BACKGROUND_WORKERS = env_flag("RUN_BACKGROUND_WORKERS", True)
+REISIFT_TASK_WRITE_ENABLED = env_flag("REISIFT_TASK_WRITE_ENABLED", False)
 GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
 GOOGLE_SHEETS_WORKSHEET_NAME = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "List of Customers").strip() or "List of Customers"
 GOOGLE_SHEETS_POLL_SECONDS = max(int((os.getenv("GOOGLE_SHEETS_POLL_SECONDS") or "300").strip() or "300"), 60)
@@ -8023,6 +8024,18 @@ def reisift_auth_headers(token, extra=None):
     if isinstance(extra, dict):
         headers.update(extra)
     return headers
+
+
+def reisift_task_writes_enabled():
+    return bool(REISIFT_TASK_WRITE_ENABLED)
+
+
+def ensure_reisift_task_writes_enabled():
+    if not reisift_task_writes_enabled():
+        raise ValueError(
+            "ReiSift task writes are disabled (REISIFT_TASK_WRITE_ENABLED=false). "
+            "Task actions remain notification-only in this app."
+        )
 
 
 def parse_csv_list(value):

@@ -13704,6 +13704,27 @@ def email_test_login():
     return jsonify(result), 200
 
 
+@app.route("/api/integrations/call-recordings/run-once", methods=["POST"])
+def integrations_call_recordings_run_once_api():
+    ensure_db()
+    db = get_db()
+    token = request.headers.get("X-Integration-Key", "").strip()
+    expected = get_integration_api_key(db)
+    if not expected:
+        return jsonify({"ok": False, "error": "Integration API key is not configured"}), 503
+    if not token or token != expected:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    limit_raw = str(payload.get("limit") or request.args.get("limit") or "2").strip()
+    try:
+        limit = max(1, min(10, int(limit_raw)))
+    except ValueError:
+        limit = 2
+    result = run_call_recording_analysis_once(limit=limit)
+    status = 200 if result.get("ok") else 500
+    return jsonify(result), status
+
+
 @app.route("/api/app-errors", methods=["GET"])
 def api_app_errors():
     ensure_db()

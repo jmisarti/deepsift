@@ -190,7 +190,7 @@
             <article class="msg-row {{ 'outbound' if m.direction|lower == 'outbound' else 'inbound' }}" data-channel="{{ m.channel|upper }}">
                 <div class="msg-meta">
                     <span>{{ m.direction }}{% if m.direction|lower == 'outbound' and m.to_number %} to {% if (m.channel or '')|upper == 'EMAIL' %}{{ m.to_number }}{% else %}{{ m.to_number|fmt_phone }}{% endif %}{% elif m.direction|lower == 'inbound' and m.from_number %} from {% if (m.channel or '')|upper == 'EMAIL' %}{{ m.from_number }}{% else %}{{ m.from_number|fmt_phone }}{% endif %}{% endif %}</span>
-                    <span>{{ m.sent_at }}</span>
+                <span>{{ m.sent_at|fmt_est_datetime }}</span>
                     <span class="msg-status">{{ m.status }}</span>
                 </div>
                 <div class="msg-bubble">{{ m.body }}</div>
@@ -219,7 +219,7 @@
         <div id="personNotesList">
             {% for n in person_notes %}
             <article class="note-card">
-                <div class="note-meta"><strong>{{ n.source }}</strong> <span>{{ n.created_at }}</span></div>
+    <div class="note-meta"><strong>{{ n.source }}</strong> <span>{{ n.created_at|fmt_est_datetime }}</span></div>
                 <p>{{ n.note_body|linkify_note|safe }}</p>
                 {% if n.payload_json %}
                 <details>
@@ -583,6 +583,19 @@ document.addEventListener('blur', (e)=>{
 }, true);
 
 function bindEnter(formId, handler){ const form=document.getElementById(formId); form.addEventListener('submit',(e)=>{e.preventDefault(); handler(form);}); form.addEventListener('keydown',(e)=>{ if(e.key==='Enter'){ e.preventDefault(); form.requestSubmit(); }}); }
+function fmtEt(dt){
+  if(!dt) return '';
+  const parsed = new Date(String(dt).replace(' ', 'T') + 'Z');
+  if(Number.isNaN(parsed.getTime())) return dt;
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  }).format(parsed) + ' ET';
+}
 
 bindEnter('addPhoneForm', async(form)=>{ const label=form.querySelector('[name=channel_label]').value; const value=form.querySelector('[name=value]').value.trim(); if(!value) return; const res=await postJson(`/api/people/${personId}/touchpoints`, {channel_type:'Phone',channel_label:label,value,status:'Unknown'}); if(!res.ok||!res.data.id) return; const tr=document.createElement('tr'); tr.innerHTML=`<td><select class="touch-label" data-id="${res.data.id}"><option ${label==='Landline'?'selected':''}>Landline</option><option ${label==='Mobile'?'selected':''}>Mobile</option><option ${label==='VoIP'?'selected':''}>VoIP</option><option ${label==='Fax'?'selected':''}>Fax</option><option ${label==='Unknown'?'selected':''}>Unknown</option></select></td><td>${esc(formatPhone(value))}</td><td><select class="touch-status" data-id="${res.data.id}"><option>Correct</option><option>Incorrect</option><option>DNC</option><option>DNT</option><option>No Answer</option><option>Dead</option><option>Undeliverable</option><option>Not in service</option><option selected>Unknown</option></select></td><td><button type="button" class="icon-btn delete-touch" data-id="${res.data.id}">x</button></td>`; tr.classList.add('fade-highlight'); document.getElementById('phoneRows').appendChild(tr); sortPersonPhoneRows(); form.reset(); await refreshPersonCommTargets(); });
 bindEnter('addEmailForm', async(form)=>{ const value=form.querySelector('[name=value]').value.trim(); if(!value) return; const res=await postJson(`/api/people/${personId}/touchpoints`, {channel_type:'Email',channel_label:'Email',value,status:'Unknown'}); if(!res.ok||!res.data.id) return; const tr=document.createElement('tr'); tr.innerHTML=`<td>${value}</td><td><select class="touch-status" data-id="${res.data.id}"><option>Correct</option><option>Incorrect</option><option>DNC</option><option>DNT</option><option>No Answer</option><option>Dead</option><option>Undeliverable</option><option>Not in service</option><option selected>Unknown</option></select></td><td><button type="button" class="icon-btn delete-touch" data-id="${res.data.id}">x</button></td>`; tr.classList.add('fade-highlight'); document.getElementById('emailRows').prepend(tr); form.reset(); await refreshPersonCommTargets(); });
@@ -598,7 +611,7 @@ document.getElementById('personNoteForm').addEventListener('submit', async (e) =
   const n = res.data;
   const card = document.createElement('article');
   card.className = 'note-card fade-highlight';
-  card.innerHTML = `<div class="note-meta"><strong>${esc(n.source)}</strong> <span>${esc(n.created_at)}</span></div><p>${esc(n.note_body)}</p>`;
+  card.innerHTML = `<div class="note-meta"><strong>${esc(n.source)}</strong> <span>${esc(fmtEt(n.created_at))}</span></div><p>${esc(n.note_body)}</p>`;
   const list = document.getElementById('personNotesList');
   if (list.querySelector('p') && list.querySelector('p').textContent === 'No notes yet.') list.innerHTML = '';
   list.prepend(card);
@@ -637,7 +650,7 @@ document.getElementById('personSmsComposer').addEventListener('submit', async (e
   row.dataset.channel = (m.channel || 'SMS').toUpperCase();
   const isEmail = String(m.channel || '').toUpperCase() === 'EMAIL';
   const toMeta = m.to_number ? ` to ${esc(isEmail ? m.to_number : formatPhone(m.to_number))}` : '';
-  row.innerHTML = `<div class="msg-meta"><span>${esc(m.direction)}${toMeta}</span><span>${esc(m.sent_at)}</span><span class="msg-status">${esc(m.status)}</span></div><div class="msg-bubble">${esc(m.body)}</div>`;
+  row.innerHTML = `<div class="msg-meta"><span>${esc(m.direction)}${toMeta}</span><span>${esc(fmtEt(m.sent_at))}</span><span class="msg-status">${esc(m.status)}</span></div><div class="msg-bubble">${esc(m.body)}</div>`;
   document.getElementById('personCommFeed').appendChild(row);
   bodyInput.value = '';
   applyPersonCommFilter();

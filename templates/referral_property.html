@@ -15,7 +15,7 @@
             <tr><th>Phone(s)</th><td>{% if phones %}{% for p in phones %}{{ p.number|fmt_phone }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}-{% endif %}</td></tr>
             <tr><th>Email(s)</th><td>{% if emails %}{{ emails|join(', ') }}{% else %}-{% endif %}</td></tr>
             <tr><th>Winning Realtor</th><td>{% if winning_realtor %}{{ winning_realtor.first_name }} {{ winning_realtor.last_name }}{% if winning_realtor.brokerage %} ({{ winning_realtor.brokerage }}){% endif %}{% else %}-{% endif %}</td></tr>
-            <tr><th>Last Synced</th><td>{{ referral.last_synced_at }}</td></tr>
+            <tr><th>Last Synced</th><td>{{ referral.last_synced_at|fmt_est_datetime }}</td></tr>
         </tbody>
     </table>
 </section>
@@ -99,7 +99,7 @@ Email: {Contact Email}</pre>
         <tbody>
             {% for a in push_activity %}
             <tr>
-                <td>{{ a.created_at }}</td>
+                <td>{{ a.created_at|fmt_est_datetime }}</td>
                 <td>{{ a.first_name }} {{ a.last_name }}{% if a.brokerage %} ({{ a.brokerage }}){% endif %}</td>
                 <td>{{ a.to_number|fmt_phone if a.to_number else '-' }}</td>
                 <td>{{ a.status or '-' }}</td>

@@ -96,7 +96,7 @@
                 <td>{% if q.realtor_id %}{{ q.first_name }} {{ q.last_name }}{% else %}-{% endif %}</td>
                 <td><span class="pill">{{ q.queue_status }}</span></td>
                 <td>{{ q.note or "-" }}</td>
-                <td>{{ q.created_at }}</td>
+                    <td>{{ q.created_at|fmt_est_datetime }}</td>
             </tr>
             {% else %}
             <tr>

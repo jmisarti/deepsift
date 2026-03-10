@@ -280,7 +280,7 @@
                 <tbody>
                     {% for row in recent_errors %}
                     <tr>
-                        <td>{{ row.created_at }}</td>
+                                <td>{{ row.created_at|fmt_est_datetime }}</td>
                         <td>{{ row.source }}</td>
                         <td>{{ row.route or '-' }}</td>
                         <td>{{ row.status_code or '-' }}</td>
@@ -310,7 +310,7 @@
                 <tbody>
                     {% for row in clever_webhook_notes %}
                     <tr>
-                        <td>{{ row.created_at }}</td>
+                                <td>{{ row.created_at|fmt_est_datetime }}</td>
                         <td>{{ row.event_key or '-' }}</td>
                         <td style="white-space: pre-wrap;">{{ row.note_body }}</td>
                     </tr>

@@ -157,7 +157,7 @@
                 <td>{{ row.fetch_status }}</td>
                 <td>{{ row.analysis_status }}</td>
                 <td>{{ row.summary_text or '-' }}</td>
-                <td>{{ row.updated_at }}</td>
+                <td>{{ row.updated_at|fmt_est_datetime }}</td>
             </tr>
             {% endfor %}
         </tbody>
@@ -234,7 +234,7 @@
                 <td>{{ row.confidence or 0 }}</td>
                 <td>{{ row.recommended_next_step or '-' }}</td>
                 <td>{{ row.routing_status }}</td>
-                <td>{{ row.updated_at }}</td>
+                <td>{{ row.updated_at|fmt_est_datetime }}</td>
             </tr>
             {% endfor %}
         </tbody>
@@ -271,7 +271,7 @@
     </div>
     {% if latest_run %}
     <p style="margin-top:0.75rem;">
-        Last run #{{ latest_run.id }} ({{ latest_run.source }}) at {{ latest_run.created_at }}:
+        Last run #{{ latest_run.id }} ({{ latest_run.source }}) at {{ latest_run.created_at|fmt_est_datetime }}:
         inspected {{ latest_run_summary.inspected or 0 }},
         created {{ latest_run_summary.created_actions or 0 }},
         skipped {{ latest_run_summary.skipped or 0 }}.
@@ -318,7 +318,7 @@
                 <td>{{ row.priority }}</td>
                 <td>{{ row.status }}</td>
                 <td>{{ row.reason }}</td>
-                <td>{{ row.updated_at }}</td>
+                <td>{{ row.updated_at|fmt_est_datetime }}</td>
                 <td>
                     <form method="post" action="{{ url_for('update_lead_action_status_route', action_id=row.id) }}" style="display:flex; gap:0.4rem;">
                         <select name="status">
@@ -365,7 +365,7 @@
     </form>
     {% if advisor_summary_row %}
     <div style="margin-top:0.75rem;">
-        <p><strong>Latest Summary:</strong> {{ advisor_summary_row.created_at }}</p>
+        <p><strong>Latest Summary:</strong> {{ advisor_summary_row.created_at|fmt_est_datetime }}</p>
         <pre style="white-space:pre-wrap;">{{ advisor_summary_row.response_text }}</pre>
     </div>
     {% else %}
@@ -401,7 +401,7 @@
         <tbody>
             {% for row in advisor_qa_rows %}
             <tr>
-                <td>{{ row.created_at }}</td>
+                <td>{{ row.created_at|fmt_est_datetime }}</td>
                 <td>{{ row.question }}</td>
                 <td style="white-space:pre-wrap;">{{ row.response_text }}</td>
             </tr>

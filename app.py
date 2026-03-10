@@ -8692,6 +8692,50 @@ def _parse_search_address_simple(search):
             "florida": "FL",
         }
         state = state_map.get(state.strip().lower(), state[:2].upper())
+    if (not street or not city) and text:
+        # Heuristic fallback for step-1 style addresses such as:
+        # "59 Mayfair Dr West Orange NJ 07052"
+        raw_tokens = [t for t in re.split(r"\s+", text) if t]
+        tokens = [re.sub(r"[^\w#-]", "", t) for t in raw_tokens]
+        if len(tokens) >= 4:
+            zip_candidate = tokens[-1]
+            state_candidate = tokens[-2].upper()
+            has_zip = bool(re.fullmatch(r"\d{5}(?:-\d{4})?", zip_candidate))
+            has_state = bool(re.fullmatch(r"[A-Z]{2}", state_candidate))
+            if has_zip and has_state:
+                postal_code = zip_candidate
+                state = state_candidate
+                body = tokens[:-2]
+                if body:
+                    street_suffixes = {
+                        "st", "street", "ave", "avenue", "rd", "road", "dr", "drive", "ln", "lane",
+                        "blvd", "boulevard", "ct", "court", "pl", "place", "way", "pkwy", "parkway",
+                        "cir", "circle", "trl", "trail", "ter", "terrace", "hwy", "highway",
+                    }
+                    best = None
+                    best_score = -10**9
+                    for i in range(1, len(body)):
+                        street_tokens = body[:i]
+                        city_tokens = body[i:]
+                        score = 0
+                        if not street_tokens or not city_tokens:
+                            continue
+                        if re.fullmatch(r"\d+[A-Za-z]?", street_tokens[0]):
+                            score += 4
+                        if any(t.lower() in street_suffixes for t in street_tokens):
+                            score += 5
+                        if 2 <= len(street_tokens) <= 8:
+                            score += 2
+                        if 1 <= len(city_tokens) <= 4:
+                            score += 3
+                        if all(re.fullmatch(r"[A-Za-z'.-]+", c) for c in city_tokens):
+                            score += 1
+                        if score > best_score:
+                            best_score = score
+                            best = (street_tokens, city_tokens)
+                    if best:
+                        street = " ".join(best[0]).strip()
+                        city = " ".join(best[1]).strip()
     return {
         "street": street,
         "city": city,

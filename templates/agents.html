@@ -395,7 +395,7 @@
         {% endfor %}
     </ul>
     <h4 style="margin-top:1rem;">Lead Watch (Today ET)</h4>
-    {% if advisor_snapshot.lead_watch_today.items %}
+    {% if advisor_snapshot.lead_watch_today['items'] %}
     <table style="margin-top:0.75rem;">
         <thead>
             <tr>
@@ -407,7 +407,7 @@
             </tr>
         </thead>
         <tbody>
-            {% for row in advisor_snapshot.lead_watch_today.items[:30] %}
+            {% for row in advisor_snapshot.lead_watch_today['items'][:30] %}
             <tr>
                 <td>
                     <strong>{{ row.label }}</strong><br>

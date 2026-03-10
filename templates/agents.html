@@ -411,74 +411,92 @@
     </ul>
     <h4 style="margin-top:1rem;">Lead Watch (Today ET)</h4>
     {% if advisor_snapshot.lead_watch_today['items'] %}
-    <div class="cards" style="margin-top:0.75rem;">
-        {% for row in advisor_snapshot.lead_watch_today['items'][:40] %}
-        <article>
-            <h3>{{ row.label or ('Lead ' ~ loop.index) }}</h3>
-            <p>
-                {% if row.property_id %}
-                <a href="{{ url_for('property_detail', property_id=row.property_id) }}">DeepSift Property {{ row.property_id }}</a>
-                {% endif %}
-                {% if row.reisift_property_uuid %}
-                {% if row.property_id %} | {% endif %}
-                ReiSIFT UUID: {{ row.reisift_property_uuid }}
-                {% endif %}
-                {% if row.phones %}
-                <br>Phone(s): {{ row.phones|join(', ') }}
-                {% endif %}
-            </p>
-            <p><strong>What Happened:</strong> {{ row.agent_summary }}</p>
-            <p><strong>Recommendation:</strong> {{ row.recommended }}</p>
-            <p>
-                <strong>Touchpoints:</strong> SMS Out {{ row.sms_outbound }}, SMS In {{ row.sms_inbound }}, Calls {{ row.calls }}.
-                Last activity {{ row.last_activity_at|fmt_est_datetime }}.
-            </p>
-            {% if row.referral and row.referral.property_uuid %}
-            <p>
-                <strong>Referral Context:</strong>
-                Referral status {{ row.referral.referral_status or '-' }}, listing status {{ row.referral.status or '-' }}.
-                <a href="https://app.reisift.io/records/properties/{{ row.referral.property_uuid }}/details?page=1" target="_blank">Open in Sift</a>
-            </p>
-            {% endif %}
-            {% if row.referral_pushes %}
-            <p>
-                <strong>Realtor Push Notes:</strong>
-                {% for p in row.referral_pushes[:3] %}
-                {{ p.first_name or '' }} {{ p.last_name or '' }} {{ p.brokerage or '' }} ({{ p.push_status or '-' }}){% if not loop.last %}; {% endif %}
+    <div style="overflow-x:auto; margin-top:0.75rem;">
+        <table>
+            <thead>
+                <tr>
+                    <th>Lead</th>
+                    <th>What Happened</th>
+                    <th>Recommendation</th>
+                    <th>Touchpoints</th>
+                    <th>Referral Context</th>
+                    <th>Uncertain/Status</th>
+                    <th>Resolution</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in advisor_snapshot.lead_watch_today['items'][:40] %}
+                <tr>
+                    <td>
+                        <strong>{{ row.label or ('Lead ' ~ loop.index) }}</strong><br>
+                        {% if row.property_id %}
+                        <a href="{{ url_for('property_detail', property_id=row.property_id) }}">DeepSift Property {{ row.property_id }}</a><br>
+                        {% endif %}
+                        {% if row.reisift_property_uuid %}
+                        ReiSIFT UUID: {{ row.reisift_property_uuid }}<br>
+                        {% endif %}
+                        {% if row.phones %}
+                        Phone(s): {{ row.phones|join(', ') }}
+                        {% endif %}
+                    </td>
+                    <td>{{ row.agent_summary }}</td>
+                    <td>{{ row.recommended }}</td>
+                    <td>
+                        SMS Out {{ row.sms_outbound }}, SMS In {{ row.sms_inbound }}, Calls {{ row.calls }}.<br>
+                        Last {{ row.last_activity_at|fmt_est_datetime }}
+                    </td>
+                    <td>
+                        {% if row.referral and row.referral.property_uuid %}
+                        Referral {{ row.referral.referral_status or '-' }}, Listing {{ row.referral.status or '-' }}.<br>
+                        <a href="https://app.reisift.io/records/properties/{{ row.referral.property_uuid }}/details?page=1" target="_blank">Open in Sift</a>
+                        {% else %}
+                        -
+                        {% endif %}
+                        {% if row.referral_pushes %}
+                        <br>
+                        {% for p in row.referral_pushes[:3] %}
+                        {{ p.first_name or '' }} {{ p.last_name or '' }} {{ p.brokerage or '' }} ({{ p.push_status or '-' }}){% if not loop.last %}; {% endif %}
+                        {% endfor %}
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if row.unresolved or row.classification == 'unknown' %}
+                        <strong>Uncertain:</strong> {{ row.classification }}
+                        {% else %}
+                        {{ row.classification }}
+                        {% endif %}
+                        <br>
+                        {% if row.unresolved %}<span class="pill">Unresolved</span>{% else %}<span class="pill">Linked</span>{% endif %}
+                        {% if row.ignore_agent2 %}<span class="pill">Ignore Agent 2</span>{% endif %}
+                        {% if row.resolution_status %}<span class="pill">{{ row.resolution_status }}</span>{% endif %}
+                    </td>
+                    <td>
+                        <form method="post" action="{{ url_for('run_agent3_lead_watch_resolve_route') }}" style="display:flex; flex-direction:column; gap:0.3rem; min-width:260px;">
+                            <input type="hidden" name="lead_key" value="{{ row.lead_key }}">
+                            <input type="hidden" name="suggested_property_id" value="{{ row.suggested_property_id or '' }}">
+                            <input type="hidden" name="suggested_property_uuid" value="{{ row.suggested_property_uuid or row.reisift_property_uuid or '' }}">
+                            <select name="classification_override">
+                                <option value="">(Keep)</option>
+                                {% for c in ['potential_seller','potential_buyer','spam','solicitor','unknown'] %}
+                                <option value="{{ c }}" {% if c == row.classification %}selected{% endif %}>{{ c }}</option>
+                                {% endfor %}
+                            </select>
+                            <input type="number" name="approved_property_id" min="1" placeholder="DeepSift property_id" value="{{ row.property_id or row.suggested_property_id or '' }}">
+                            <input type="text" name="approved_property_uuid" placeholder="ReiSIFT UUID" value="{{ row.reisift_property_uuid or row.suggested_property_uuid or '' }}">
+                            <label><input type="checkbox" name="ignore_agent2" {% if row.ignore_agent2 %}checked{% endif %}> Ignore Agent 2</label>
+                            <select name="status">
+                                {% for s in ['Pending','Approved','Rejected'] %}
+                                <option value="{{ s }}" {% if s == row.resolution_status %}selected{% endif %}>{{ s }}</option>
+                                {% endfor %}
+                            </select>
+                            <input type="text" name="notes" placeholder="Notes" value="{{ row.resolution_notes or '' }}">
+                            <button type="submit">Save</button>
+                        </form>
+                    </td>
+                </tr>
                 {% endfor %}
-            </p>
-            {% endif %}
-            {% if row.unresolved or row.classification == 'unknown' %}
-            <p><strong>Uncertain:</strong> This lead is not fully classified or linked yet. Current guess: {{ row.classification }}.</p>
-            {% endif %}
-            <p>
-                {% if row.unresolved %}<span class="pill">Unresolved</span>{% else %}<span class="pill">Linked</span>{% endif %}
-                {% if row.ignore_agent2 %}<span class="pill">Ignore Agent 2</span>{% endif %}
-                {% if row.resolution_status %}<span class="pill">{{ row.resolution_status }}</span>{% endif %}
-            </p>
-            <form method="post" action="{{ url_for('run_agent3_lead_watch_resolve_route') }}" style="display:flex; flex-direction:column; gap:0.3rem;">
-                <input type="hidden" name="lead_key" value="{{ row.lead_key }}">
-                <input type="hidden" name="suggested_property_id" value="{{ row.suggested_property_id or '' }}">
-                <input type="hidden" name="suggested_property_uuid" value="{{ row.suggested_property_uuid or row.reisift_property_uuid or '' }}">
-                <select name="classification_override">
-                    <option value="">(Keep)</option>
-                    {% for c in ['potential_seller','potential_buyer','spam','solicitor','unknown'] %}
-                    <option value="{{ c }}" {% if c == row.classification %}selected{% endif %}>{{ c }}</option>
-                    {% endfor %}
-                </select>
-                <input type="number" name="approved_property_id" min="1" placeholder="DeepSift property_id (optional)" value="{{ row.property_id or row.suggested_property_id or '' }}">
-                <input type="text" name="approved_property_uuid" placeholder="ReiSIFT UUID (optional)" value="{{ row.reisift_property_uuid or row.suggested_property_uuid or '' }}">
-                <label><input type="checkbox" name="ignore_agent2" {% if row.ignore_agent2 %}checked{% endif %}> Ignore Agent 2</label>
-                <select name="status">
-                    {% for s in ['Pending','Approved','Rejected'] %}
-                    <option value="{{ s }}" {% if s == row.resolution_status %}selected{% endif %}>{{ s }}</option>
-                    {% endfor %}
-                </select>
-                <input type="text" name="notes" placeholder="Notes" value="{{ row.resolution_notes or '' }}">
-                <button type="submit">Save</button>
-            </form>
-        </article>
-        {% endfor %}
+            </tbody>
+        </table>
     </div>
     <p style="margin-top:0.75rem;">
         <small>

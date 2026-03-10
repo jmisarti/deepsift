@@ -1460,6 +1460,46 @@ def _infer_call_direction_from_numbers(db, from_number, to_number):
     return "Unknown"
 
 
+def _lookup_call_party_names_from_smrt_events(db, call_sid):
+    sid = (call_sid or "").strip()
+    if not sid:
+        return "", ""
+    like_tokens = (
+        f'%\"callId\": \"{sid}\"%',
+        f'%\"callId\":\"{sid}\"%',
+        f'%\"call_sid\": \"{sid}\"%',
+        f'%\"call_sid\":\"{sid}\"%',
+    )
+    rows = db.execute(
+        """
+        SELECT payload_json
+        FROM smrtphone_webhook_events
+        WHERE event_type = 'call_completed'
+          AND (
+              payload_json LIKE ?
+              OR payload_json LIKE ?
+              OR payload_json LIKE ?
+              OR payload_json LIKE ?
+          )
+        ORDER BY id DESC
+        LIMIT 20
+        """,
+        like_tokens,
+    ).fetchall()
+    for r in rows:
+        payload = parse_json_object(r["payload_json"] or "{}")
+        webhook = payload.get("webhook") if isinstance(payload.get("webhook"), dict) else payload
+        caller = (
+            extract_first_string_by_keys(webhook, ["userName", "user_name", "agentName", "callerName"])
+            or extract_first_string_by_keys(webhook, ["callerIdName", "caller_id_name"])
+            or ""
+        ).strip()
+        callee = (extract_first_string_by_keys(webhook, ["contactName", "contact_name"]) or "").strip()
+        if caller or callee:
+            return caller, callee
+    return "", ""
+
+
 def _word_count(text):
     return len(re.findall(r"[A-Za-z0-9']+", text or ""))
 
@@ -7285,6 +7325,10 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
         extract_first_string_by_keys(webhook, ["contactName", "contact_name"])
         or ""
     ).strip()
+    if not caller_name or not callee_name:
+        event_caller, event_callee = _lookup_call_party_names_from_smrt_events(db, call_sid)
+        caller_name = caller_name or event_caller
+        callee_name = callee_name or event_callee
     call_direction = _infer_call_direction_from_numbers(db, from_number, to_number)
     analysis_context = {
         "direction": call_direction,

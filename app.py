@@ -13236,9 +13236,14 @@ def smrtphone_call_completed_webhook():
     ensure_db()
     db = get_db()
     payload = request.get_json(silent=True) or request.form.to_dict() or {}
-    call_sid = extract_first_string_by_keys(payload, ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "id"])
+    call_sid = extract_first_string_by_keys(
+        payload,
+        ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "callID", "id"],
+    )
     from_number = extract_first_string_by_keys(payload, ["from", "from_number", "fromNumber", "caller", "source", "ani"])
     to_number = extract_first_string_by_keys(payload, ["to", "to_number", "toNumber", "callee", "destination", "dnis"])
+    call_outcome = extract_first_string_by_keys(payload, ["callOutcome", "call_outcome", "outcome", "status"])
+    direct_recording_url = extract_first_string_by_keys(payload, ["recordingUrl", "recording_url", "recording", "url"])
     if not call_sid:
         log_smrtphone_webhook_event(
             db,
@@ -13293,17 +13298,24 @@ def smrtphone_call_completed_webhook():
             if not person_id:
                 person_id = outbound["person_id"]
 
-    recording_url = ""
+    recording_url = (direct_recording_url or "").strip()
     fetch_status = "Queued"
     fetch_raw = {}
-    try:
-        lookup = fetch_smrtphone_recording_url(call_sid)
-        recording_url = (lookup.get("recording_url") or "").strip()
-        fetch_raw = lookup.get("raw") or {}
-        fetch_status = "Fetched" if recording_url else "No Recording URL"
-    except Exception as exc:
-        fetch_status = "Error"
-        fetch_raw = {"error": str(exc)}
+    if recording_url:
+        fetch_status = "Fetched"
+        fetch_raw = {"source": "webhook_payload"}
+    elif (call_outcome or "").strip().lower() in {"missed", "no_answer", "failed"}:
+        fetch_status = "No Recording URL"
+        fetch_raw = {"source": "webhook_payload", "reason": f"call_outcome={call_outcome}"}
+    else:
+        try:
+            lookup = fetch_smrtphone_recording_url(call_sid)
+            recording_url = (lookup.get("recording_url") or "").strip()
+            fetch_raw = lookup.get("raw") or {}
+            fetch_status = "Fetched" if recording_url else "No Recording URL"
+        except Exception as exc:
+            fetch_status = "Error"
+            fetch_raw = {"error": str(exc)}
 
     cur = db.execute(
         """
@@ -13311,7 +13323,16 @@ def smrtphone_call_completed_webhook():
         (call_sid, from_number, to_number, property_id, person_id, recording_url, fetch_status, analysis_status, payload_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?)
         """,
-        (call_sid, from_number, to_number, property_id, person_id, recording_url, fetch_status, json.dumps({"webhook": payload, "recording_lookup": fetch_raw})),
+        (
+            call_sid,
+            from_number,
+            to_number,
+            property_id,
+            person_id,
+            recording_url,
+            fetch_status,
+            json.dumps({"webhook": payload, "recording_lookup": fetch_raw, "call_outcome": call_outcome}),
+        ),
     )
 
     if property_id:

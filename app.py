@@ -8805,7 +8805,7 @@ def _parse_search_address_simple(search):
     text = re.sub(r"\s+", " ", text).strip()
     street = city = state = postal_code = ""
 
-    m = re.match(r"^(.*?),\s*([^,]+),\s*([A-Za-z]{2}|[A-Za-z ]+)\s+(\d{5}(?:-\d{4})?)\s*$", text)
+    m = re.match(r"^(.*?),\s*([^,]+),\s*([A-Za-z]{2}|[A-Za-z ]+),?\s+(\d{5}(?:-\d{4})?)\s*$", text)
     if m:
         street, city, state, postal_code = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
     else:

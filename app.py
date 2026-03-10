@@ -891,6 +891,27 @@ def extract_sms_id_from_payload(payload):
     return ""
 
 
+def extract_first_string_by_keys(payload, keys):
+    keyset = {str(k).strip().lower() for k in (keys or []) if str(k).strip()}
+    if not keyset:
+        return ""
+    queue = [payload]
+    while queue:
+        current = queue.pop(0)
+        if isinstance(current, dict):
+            for k, v in current.items():
+                if str(k).strip().lower() in keyset and isinstance(v, str) and v.strip():
+                    return v.strip()
+            for v in current.values():
+                if isinstance(v, (dict, list)):
+                    queue.append(v)
+        elif isinstance(current, list):
+            for item in current:
+                if isinstance(item, (dict, list)):
+                    queue.append(item)
+    return ""
+
+
 def send_smrtphone_sms(to_number, message_body, from_number=None):
     api_key = os.getenv("SMRTPHONE_API_KEY", "").strip()
     if not api_key:
@@ -13210,9 +13231,9 @@ def smrtphone_call_completed_webhook():
     ensure_db()
     db = get_db()
     payload = request.get_json(silent=True) or request.form.to_dict() or {}
-    call_sid = str(payload.get("call_sid") or payload.get("callSid") or payload.get("sid") or "").strip()
-    from_number = str(payload.get("from") or payload.get("from_number") or payload.get("caller") or "").strip()
-    to_number = str(payload.get("to") or payload.get("to_number") or payload.get("callee") or "").strip()
+    call_sid = extract_first_string_by_keys(payload, ["call_sid", "callSid", "CallSid", "callsid", "sid"])
+    from_number = extract_first_string_by_keys(payload, ["from", "from_number", "fromNumber", "caller", "source", "ani"])
+    to_number = extract_first_string_by_keys(payload, ["to", "to_number", "toNumber", "callee", "destination", "dnis"])
     if not call_sid:
         log_smrtphone_webhook_event(
             db,
@@ -13224,7 +13245,7 @@ def smrtphone_call_completed_webhook():
             error_text="call_sid is required",
         )
         db.commit()
-        return jsonify({"error": "call_sid is required"}), 400
+        return jsonify({"ok": True, "ignored": True, "reason": "missing call_sid"}), 200
 
     existing = db.execute("SELECT id FROM call_recording_jobs WHERE call_sid = ?", (call_sid,)).fetchone()
     if existing:

@@ -187,6 +187,16 @@ AGENT_DEFINITIONS = [
     },
 ]
 REFERRAL_STATUSES = ["Untouched", "Referred", "Under Contract", "Dead", "Other"]
+LEAD_ACTION_STATUSES = ["Pending", "Approved", "Completed", "Dismissed"]
+LEAD_ACTION_PRIORITIES = ["Low", "Medium", "High"]
+LEAD_STOP_STATUSES = {"not interested", "dnc", "opt out", "dead"}
+LEAD_NEGATIVE_INTENT_TOKENS = [
+    "not interested",
+    "stop",
+    "remove",
+    "do not contact",
+    "wrong person",
+]
 
 
 def format_phone_display(value):
@@ -535,6 +545,38 @@ def migrate_db(db):
         )
         """
     )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lead_monitor_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL DEFAULT 'manual',
+            property_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'Running',
+            summary_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lead_management_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            property_id INTEGER NOT NULL,
+            person_id INTEGER,
+            action_type TEXT NOT NULL,
+            priority TEXT NOT NULL DEFAULT 'Medium',
+            status TEXT NOT NULL DEFAULT 'Pending',
+            reason TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_lma_property_status ON lead_management_actions(property_id, status)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_lma_status_priority ON lead_management_actions(status, priority)")
 
 
 def log_app_error(db, source, error_message, details="", route="", status_code=None):
@@ -8089,6 +8131,239 @@ def communication_counts_for_people(db, person_ids, property_id=None):
     return out
 
 
+def _upsert_lead_action(db, property_id, person_id, action_type, priority, reason, payload):
+    dedupe_key = f"{int(property_id)}:{int(person_id or 0)}:{action_type}"
+    existing = db.execute(
+        "SELECT id, status FROM lead_management_actions WHERE dedupe_key = ?",
+        (dedupe_key,),
+    ).fetchone()
+    payload_json = json.dumps(payload or {})
+    if existing:
+        status = (existing["status"] or "Pending").strip()
+        if status in {"Completed", "Dismissed"}:
+            return False
+        db.execute(
+            """
+            UPDATE lead_management_actions
+            SET priority = ?, reason = ?, payload_json = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (priority, reason, payload_json, existing["id"]),
+        )
+        return False
+    db.execute(
+        """
+        INSERT INTO lead_management_actions
+        (dedupe_key, property_id, person_id, action_type, priority, status, reason, payload_json)
+        VALUES (?, ?, ?, ?, ?, 'Pending', ?, ?)
+        """,
+        (dedupe_key, property_id, person_id, action_type, priority, reason, payload_json),
+    )
+    return True
+
+
+def _property_comm_snapshot(db, property_id):
+    row = db.execute(
+        """
+        SELECT
+            SUM(CASE WHEN lower(direction) = 'outbound' THEN 1 ELSE 0 END) AS outbound_total,
+            SUM(CASE WHEN lower(direction) = 'inbound' THEN 1 ELSE 0 END) AS inbound_total,
+            SUM(CASE WHEN upper(channel) = 'SMS' AND lower(direction) = 'outbound' THEN 1 ELSE 0 END) AS sms_outbound,
+            SUM(CASE WHEN upper(channel) = 'SMS' AND lower(direction) = 'inbound' THEN 1 ELSE 0 END) AS sms_inbound,
+            SUM(CASE WHEN upper(channel) = 'EMAIL' AND lower(direction) = 'outbound' THEN 1 ELSE 0 END) AS email_outbound,
+            SUM(CASE WHEN upper(channel) = 'EMAIL' AND lower(direction) = 'inbound' THEN 1 ELSE 0 END) AS email_inbound,
+            MAX(CASE WHEN lower(direction) = 'outbound' THEN COALESCE(sent_at, created_at) END) AS last_outbound_at,
+            MAX(CASE WHEN lower(direction) = 'inbound' THEN COALESCE(sent_at, created_at) END) AS last_inbound_at
+        FROM communications
+        WHERE property_id = ?
+        """,
+        (property_id,),
+    ).fetchone()
+    latest_inbound = db.execute(
+        """
+        SELECT lower(COALESCE(body, '')) AS body
+        FROM communications
+        WHERE property_id = ? AND lower(direction) = 'inbound'
+        ORDER BY COALESCE(sent_at, created_at) DESC, id DESC
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    return {
+        "outbound_total": int((row["outbound_total"] if row else 0) or 0),
+        "inbound_total": int((row["inbound_total"] if row else 0) or 0),
+        "sms_outbound": int((row["sms_outbound"] if row else 0) or 0),
+        "sms_inbound": int((row["sms_inbound"] if row else 0) or 0),
+        "email_outbound": int((row["email_outbound"] if row else 0) or 0),
+        "email_inbound": int((row["email_inbound"] if row else 0) or 0),
+        "last_outbound_at": (row["last_outbound_at"] if row else "") or "",
+        "last_inbound_at": (row["last_inbound_at"] if row else "") or "",
+        "latest_inbound_body": (latest_inbound["body"] if latest_inbound else "") or "",
+    }
+
+
+def _owner_relative_contact_count(db, owner_person_id):
+    if not owner_person_id:
+        return 0
+    row = db.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM person_relationships pr
+        JOIN touchpoints t ON t.person_id = pr.related_person_id
+        WHERE pr.subject_person_id = ?
+          AND pr.related_person_id != pr.subject_person_id
+          AND lower(COALESCE(t.channel_type, '')) IN ('phone', 'email')
+          AND trim(COALESCE(t.value, '')) != ''
+        """,
+        (owner_person_id,),
+    ).fetchone()
+    return int((row["c"] if row else 0) or 0)
+
+
+def evaluate_property_lead_management(db, property_row):
+    property_id = int(property_row["id"])
+    owner_person_id = property_row["owner_person_id"]
+    prop_status = str(property_row["status"] or "").strip().lower()
+    snapshot = _property_comm_snapshot(db, property_id)
+    relative_contact_count = _owner_relative_contact_count(db, owner_person_id)
+    created_actions = 0
+    skipped = False
+
+    if prop_status in LEAD_STOP_STATUSES:
+        return {"property_id": property_id, "skipped": True, "created_actions": 0, "snapshot": snapshot}
+
+    latest_inbound = snapshot["latest_inbound_body"]
+    has_negative_intent = any(token in latest_inbound for token in LEAD_NEGATIVE_INTENT_TOKENS)
+    if has_negative_intent:
+        created_actions += int(
+            _upsert_lead_action(
+                db,
+                property_id,
+                owner_person_id,
+                "HumanReviewDisposition",
+                "High",
+                "Inbound response appears negative and requires a human decision before additional outreach.",
+                {"snapshot": snapshot, "reason": "negative_intent_detected"},
+            )
+        )
+        return {"property_id": property_id, "skipped": skipped, "created_actions": created_actions, "snapshot": snapshot}
+
+    if snapshot["outbound_total"] >= 3 and snapshot["inbound_total"] == 0:
+        if relative_contact_count > 0:
+            created_actions += int(
+                _upsert_lead_action(
+                    db,
+                    property_id,
+                    owner_person_id,
+                    "EscalateToRelativeOutreach",
+                    "High",
+                    "No inbound responses after 3+ touches. Escalate outreach to known relatives/associates.",
+                    {"snapshot": snapshot, "relative_contact_count": relative_contact_count},
+                )
+            )
+        else:
+            created_actions += int(
+                _upsert_lead_action(
+                    db,
+                    property_id,
+                    owner_person_id,
+                    "EscalateToDeepDiveResearch",
+                    "High",
+                    "No inbound responses after 3+ touches and no relative contact channels on file.",
+                    {"snapshot": snapshot, "relative_contact_count": relative_contact_count},
+                )
+            )
+    elif snapshot["outbound_total"] >= 1 and snapshot["inbound_total"] == 0:
+        created_actions += int(
+            _upsert_lead_action(
+                db,
+                property_id,
+                owner_person_id,
+                "FollowUpTouchDue",
+                "Medium",
+                "Lead has outreach activity but no inbound response yet. Schedule next compliant touchpoint.",
+                {"snapshot": snapshot},
+            )
+        )
+
+    if snapshot["inbound_total"] > 0 and snapshot["outbound_total"] > 0:
+        created_actions += int(
+            _upsert_lead_action(
+                db,
+                property_id,
+                owner_person_id,
+                "ReviewInboundAndNextBestAction",
+                "Medium",
+                "Inbound activity exists. Confirm sentiment and set next best action manually.",
+                {"snapshot": snapshot},
+            )
+        )
+
+    return {"property_id": property_id, "skipped": skipped, "created_actions": created_actions, "snapshot": snapshot}
+
+
+def run_lead_monitor_once(db, source="manual", property_id=None):
+    run_cur = db.execute(
+        """
+        INSERT INTO lead_monitor_runs (source, property_id, status, summary_json)
+        VALUES (?, ?, 'Running', ?)
+        """,
+        ((source or "manual")[:40], property_id, "{}"),
+    )
+    run_id = run_cur.lastrowid
+    where = []
+    params = []
+    if property_id:
+        where.append("p.id = ?")
+        params.append(int(property_id))
+    rows = db.execute(
+        f"""
+        SELECT p.id, p.owner_person_id, p.status
+        FROM properties p
+        {'WHERE ' + ' AND '.join(where) if where else ''}
+        ORDER BY p.id DESC
+        """,
+        tuple(params),
+    ).fetchall()
+    inspected = 0
+    skipped = 0
+    created_actions = 0
+    details = []
+    for row in rows:
+        inspected += 1
+        result = evaluate_property_lead_management(db, row)
+        created_actions += int(result.get("created_actions") or 0)
+        if result.get("skipped"):
+            skipped += 1
+        if len(details) < 25:
+            details.append(
+                {
+                    "property_id": result["property_id"],
+                    "created_actions": result["created_actions"],
+                    "skipped": bool(result.get("skipped")),
+                    "outbound_total": (result.get("snapshot") or {}).get("outbound_total", 0),
+                    "inbound_total": (result.get("snapshot") or {}).get("inbound_total", 0),
+                }
+            )
+    summary = {
+        "inspected": inspected,
+        "skipped": skipped,
+        "created_actions": created_actions,
+        "details": details,
+    }
+    db.execute(
+        """
+        UPDATE lead_monitor_runs
+        SET status = 'Completed',
+            summary_json = ?,
+            completed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (json.dumps(summary), run_id),
+    )
+    return {"run_id": run_id, **summary}
+
+
 @app.route("/")
 def dashboard():
     ensure_db()
@@ -8155,6 +8430,7 @@ def coming_soon():
 def agents_page():
     ensure_db()
     db = get_db()
+    notice = (request.args.get("notice") or "").strip()
     queue_counts = db.execute(
         """
         SELECT
@@ -8167,11 +8443,96 @@ def agents_page():
         "queued_count": int((queue_counts["queued_count"] or 0) if queue_counts else 0),
         "no_realtor_count": int((queue_counts["no_realtor_count"] or 0) if queue_counts else 0),
     }
+    lead_counts = db.execute(
+        """
+        SELECT
+            SUM(CASE WHEN status = 'Pending' THEN 1 ELSE 0 END) AS pending_count,
+            SUM(CASE WHEN status = 'Pending' AND priority = 'High' THEN 1 ELSE 0 END) AS high_count,
+            SUM(CASE WHEN status = 'Pending' AND action_type IN ('EscalateToRelativeOutreach', 'EscalateToDeepDiveResearch') THEN 1 ELSE 0 END) AS escalation_count
+        FROM lead_management_actions
+        """
+    ).fetchone()
+    lead_summary = {
+        "pending_count": int((lead_counts["pending_count"] if lead_counts else 0) or 0),
+        "high_count": int((lead_counts["high_count"] if lead_counts else 0) or 0),
+        "escalation_count": int((lead_counts["escalation_count"] if lead_counts else 0) or 0),
+    }
+    lead_actions = db.execute(
+        """
+        SELECT a.id, a.property_id, a.person_id, a.action_type, a.priority, a.status, a.reason, a.created_at, a.updated_at,
+               adr.street, adr.city, adr.state, adr.postal_code,
+               pe.first_name, pe.middle_name, pe.last_name
+        FROM lead_management_actions a
+        LEFT JOIN properties p ON p.id = a.property_id
+        LEFT JOIN addresses adr ON adr.id = p.property_address_id
+        LEFT JOIN people pe ON pe.id = a.person_id
+        ORDER BY
+            CASE a.status WHEN 'Pending' THEN 0 WHEN 'Approved' THEN 1 WHEN 'Completed' THEN 2 ELSE 3 END,
+            CASE a.priority WHEN 'High' THEN 0 WHEN 'Medium' THEN 1 ELSE 2 END,
+            a.updated_at DESC,
+            a.id DESC
+        LIMIT 200
+        """
+    ).fetchall()
+    latest_run = db.execute(
+        """
+        SELECT id, source, property_id, status, summary_json, created_at, completed_at
+        FROM lead_monitor_runs
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    latest_run_summary = {}
+    if latest_run and latest_run["summary_json"]:
+        latest_run_summary = parse_json_object(latest_run["summary_json"])
     return render_template(
         "agents.html",
         agents=AGENT_DEFINITIONS,
         summary=summary,
+        lead_summary=lead_summary,
+        lead_actions=lead_actions,
+        lead_action_statuses=LEAD_ACTION_STATUSES,
+        latest_run=latest_run,
+        latest_run_summary=latest_run_summary,
+        notice=notice,
     )
+
+
+@app.route("/agents/lead-monitor/run", methods=["POST"])
+def run_lead_monitor_route():
+    ensure_db()
+    db = get_db()
+    property_raw = (request.form.get("property_id") or "").strip()
+    property_id = int(property_raw) if property_raw.isdigit() else None
+    try:
+        data = run_lead_monitor_once(db, source="manual", property_id=property_id)
+        db.commit()
+        notice = (
+            f"Lead monitor run #{data['run_id']} completed. "
+            f"Inspected {data['inspected']} properties, created {data['created_actions']} action(s), skipped {data['skipped']}."
+        )
+        return redirect(url_for("agents_page", notice=notice))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("agents_page", notice=f"Lead monitor failed: {exc}"))
+
+
+@app.route("/agents/lead-actions/<int:action_id>/status", methods=["POST"])
+def update_lead_action_status_route(action_id):
+    ensure_db()
+    db = get_db()
+    status = (request.form.get("status") or "").strip()
+    if status not in LEAD_ACTION_STATUSES:
+        return redirect(url_for("agents_page", notice="Invalid lead action status."))
+    row = db.execute("SELECT id FROM lead_management_actions WHERE id = ?", (action_id,)).fetchone()
+    if not row:
+        return redirect(url_for("agents_page", notice="Lead action not found."))
+    db.execute(
+        "UPDATE lead_management_actions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (status, action_id),
+    )
+    db.commit()
+    return redirect(url_for("agents_page", notice=f"Lead action #{action_id} updated to {status}."))
 
 
 @app.route("/referral")

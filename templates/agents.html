@@ -1,5 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
+{% if notice %}
+<section class="panel">
+    <p><strong>{{ notice }}</strong></p>
+</section>
+{% endif %}
+
 <section class="panel">
     <h2>Agent Framework</h2>
     <p>This is the orchestration layer for specialized AI workers. The modules below are scaffolded and ready for iterative implementation.</p>
@@ -42,12 +48,105 @@
 </section>
 
 <section class="panel">
+    <h3>Lead Monitor (Phase 1)</h3>
+    <p>Manual run only. This evaluates lead flow, touchpoint outcomes, and escalation rules to build a human review queue.</p>
+    <form method="post" action="{{ url_for('run_lead_monitor_route') }}" class="inline-form" style="display:flex; gap:0.5rem; align-items:flex-end; flex-wrap:wrap;">
+        <label>
+            Property ID (optional)
+            <input type="number" name="property_id" min="1" placeholder="Run all if empty">
+        </label>
+        <button type="submit">Run Lead Monitor</button>
+    </form>
+    <div class="cards" style="margin-top:0.75rem;">
+        <article>
+            <h3>Pending Actions</h3>
+            <p>{{ lead_summary.pending_count }}</p>
+        </article>
+        <article>
+            <h3>High Priority</h3>
+            <p>{{ lead_summary.high_count }}</p>
+        </article>
+        <article>
+            <h3>Escalations</h3>
+            <p>{{ lead_summary.escalation_count }}</p>
+        </article>
+    </div>
+    {% if latest_run %}
+    <p style="margin-top:0.75rem;">
+        Last run #{{ latest_run.id }} ({{ latest_run.source }}) at {{ latest_run.created_at }}:
+        inspected {{ latest_run_summary.inspected or 0 }},
+        created {{ latest_run_summary.created_actions or 0 }},
+        skipped {{ latest_run_summary.skipped or 0 }}.
+    </p>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <h3>Lead Action Queue</h3>
+    {% if lead_actions %}
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Property</th>
+                <th>Person</th>
+                <th>Action</th>
+                <th>Priority</th>
+                <th>Status</th>
+                <th>Reason</th>
+                <th>Updated</th>
+                <th>Update</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in lead_actions %}
+            <tr>
+                <td>#{{ row.id }}</td>
+                <td>
+                    <a href="{{ url_for('property_detail', property_id=row.property_id) }}">Property {{ row.property_id }}</a><br>
+                    <small>{{ row.street or '' }} {{ row.city or '' }} {{ row.state or '' }} {{ row.postal_code or '' }}</small>
+                </td>
+                <td>
+                    {% if row.person_id %}
+                    <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">
+                        {{ row.first_name or '' }} {{ row.middle_name or '' }} {{ row.last_name or '' }}
+                    </a>
+                    {% else %}
+                    -
+                    {% endif %}
+                </td>
+                <td>{{ row.action_type }}</td>
+                <td>{{ row.priority }}</td>
+                <td>{{ row.status }}</td>
+                <td>{{ row.reason }}</td>
+                <td>{{ row.updated_at }}</td>
+                <td>
+                    <form method="post" action="{{ url_for('update_lead_action_status_route', action_id=row.id) }}" style="display:flex; gap:0.4rem;">
+                        <select name="status">
+                            {% for s in lead_action_statuses %}
+                            <option value="{{ s }}" {% if s == row.status %}selected{% endif %}>{{ s }}</option>
+                            {% endfor %}
+                        </select>
+                        <button type="submit">Save</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No lead actions yet.</p>
+    {% endif %}
+</section>
+
+<section class="panel">
     <h3>Build Notes</h3>
     <ul>
         <li>Each agent will run as an isolated workflow with dedicated prompts, tools, and safety constraints.</li>
         <li>Human-in-the-loop checkpoints can be added per stage: draft response, send approval, escalation approval.</li>
         <li>Cross-model routing (OpenAI + Claude) will be implemented per task type with confidence thresholds.</li>
         <li>Every run should log an audit trail: trigger, model, decision, confidence, action taken, and fallback reason.</li>
+        <li>Lead Monitor Phase 1 is deterministic and manual-triggered only to prevent uncontrolled automation.</li>
     </ul>
 </section>
 {% endblock %}

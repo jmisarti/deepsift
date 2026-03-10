@@ -577,6 +577,26 @@ def migrate_db(db):
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_lma_property_status ON lead_management_actions(property_id, status)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_lma_status_priority ON lead_management_actions(status, priority)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS call_recording_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            call_sid TEXT NOT NULL UNIQUE,
+            from_number TEXT,
+            to_number TEXT,
+            property_id INTEGER,
+            person_id INTEGER,
+            recording_url TEXT,
+            fetch_status TEXT NOT NULL DEFAULT 'Queued',
+            analysis_status TEXT NOT NULL DEFAULT 'Pending',
+            transcript_text TEXT,
+            summary_text TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
 
 def log_app_error(db, source, error_message, details="", route="", status_code=None):
@@ -902,6 +922,44 @@ def send_smrtphone_sms(to_number, message_body, from_number=None):
         status = "Sent"
 
     return {"sms_id": sms_id, "status": status, "raw": raw}
+
+
+def fetch_smrtphone_recording_url(call_sid):
+    api_key = os.getenv("SMRTPHONE_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("SMRTPHONE_API_KEY is not set")
+    clean_sid = (call_sid or "").strip()
+    if not clean_sid:
+        raise ValueError("call_sid is required")
+    headers = {"X-Auth-smrtPhone": api_key}
+    response = requests.get(
+        "https://phone.smrt.studio/api/getRecordingUrl",
+        headers=headers,
+        params={"call_sid": clean_sid},
+        timeout=20,
+    )
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_text": response.text}
+    if not response.ok:
+        raise ValueError(f"SmrtPhone recording lookup failed ({response.status_code}): {body}")
+    recording_url = ""
+    if isinstance(body, dict):
+        for key in ("recording_url", "recordingUrl", "url", "recording"):
+            val = body.get(key)
+            if isinstance(val, str) and val.strip():
+                recording_url = val.strip()
+                break
+        if not recording_url:
+            data = body.get("data")
+            if isinstance(data, dict):
+                for key in ("recording_url", "recordingUrl", "url", "recording"):
+                    val = data.get(key)
+                    if isinstance(val, str) and val.strip():
+                        recording_url = val.strip()
+                        break
+    return {"call_sid": clean_sid, "recording_url": recording_url, "raw": body}
 
 
 def call_skipsherpa_person_lookup(first_name, last_name, street, city="", state="", zipcode="", middle_name=""):
@@ -12737,6 +12795,112 @@ def smrtphone_status_webhook():
     )
     db.commit()
     return jsonify({"ok": True, "communication_id": cur.lastrowid}), 201
+
+
+@app.route("/webhooks/smrtphone/call-completed", methods=["POST"])
+def smrtphone_call_completed_webhook():
+    ensure_db()
+    db = get_db()
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    call_sid = str(payload.get("call_sid") or payload.get("callSid") or payload.get("sid") or "").strip()
+    from_number = str(payload.get("from") or payload.get("from_number") or payload.get("caller") or "").strip()
+    to_number = str(payload.get("to") or payload.get("to_number") or payload.get("callee") or "").strip()
+    if not call_sid:
+        log_smrtphone_webhook_event(
+            db,
+            "call_completed",
+            payload,
+            processing_status="error",
+            from_number=from_number,
+            to_number=to_number,
+            error_text="call_sid is required",
+        )
+        db.commit()
+        return jsonify({"error": "call_sid is required"}), 400
+
+    existing = db.execute("SELECT id FROM call_recording_jobs WHERE call_sid = ?", (call_sid,)).fetchone()
+    if existing:
+        log_smrtphone_webhook_event(
+            db,
+            "call_completed",
+            payload,
+            processing_status="deduped",
+            from_number=from_number,
+            to_number=to_number,
+            error_text="duplicate call_sid",
+        )
+        db.commit()
+        return jsonify({"ok": True, "deduped": True, "job_id": existing["id"]}), 200
+
+    person_id = find_person_id_by_phone(db, from_number) or find_person_id_by_phone(db, to_number)
+    property_id = None
+    if str(payload.get("property_id") or "").isdigit():
+        property_id = int(payload.get("property_id"))
+    elif person_id:
+        property_id = find_property_id_for_person(db, person_id)
+    if not property_id:
+        outbound = db.execute(
+            """
+            SELECT property_id, person_id
+            FROM communications
+            WHERE upper(channel) = 'SMS'
+              AND lower(direction) = 'outbound'
+              AND (
+                    replace(replace(replace(replace(replace(COALESCE(to_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+                 OR replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+              )
+            ORDER BY sent_at DESC, id DESC
+            LIMIT 1
+            """,
+            (f"%{normalize_phone(from_number)}%", f"%{normalize_phone(to_number)}%"),
+        ).fetchone()
+        if outbound:
+            property_id = outbound["property_id"]
+            if not person_id:
+                person_id = outbound["person_id"]
+
+    recording_url = ""
+    fetch_status = "Queued"
+    fetch_raw = {}
+    try:
+        lookup = fetch_smrtphone_recording_url(call_sid)
+        recording_url = (lookup.get("recording_url") or "").strip()
+        fetch_raw = lookup.get("raw") or {}
+        fetch_status = "Fetched" if recording_url else "No Recording URL"
+    except Exception as exc:
+        fetch_status = "Error"
+        fetch_raw = {"error": str(exc)}
+
+    cur = db.execute(
+        """
+        INSERT INTO call_recording_jobs
+        (call_sid, from_number, to_number, property_id, person_id, recording_url, fetch_status, analysis_status, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?)
+        """,
+        (call_sid, from_number, to_number, property_id, person_id, recording_url, fetch_status, json.dumps({"webhook": payload, "recording_lookup": fetch_raw})),
+    )
+
+    if property_id:
+        _upsert_lead_action(
+            db,
+            property_id,
+            person_id,
+            "ReviewCallOutcome",
+            "High",
+            "Call completed webhook received. Review recording summary and choose next lead action.",
+            {"call_sid": call_sid, "recording_url": recording_url, "fetch_status": fetch_status},
+        )
+
+    log_smrtphone_webhook_event(
+        db,
+        "call_completed",
+        payload,
+        processing_status="stored",
+        from_number=from_number,
+        to_number=to_number,
+    )
+    db.commit()
+    return jsonify({"ok": True, "job_id": cur.lastrowid, "call_sid": call_sid, "recording_url": recording_url, "fetch_status": fetch_status})
 
 
 @app.route("/api/notifications/sms-unread", methods=["GET"])

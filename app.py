@@ -4746,14 +4746,18 @@ def _build_website_lead_notes(payload, fields, source_label="webhook"):
 
 def process_website_lead_payload(db, payload, source_label="webhook"):
     if not isinstance(payload, dict):
-        return {"ok": False, "error": "Invalid payload object."}
+        return {"ok": False, "error": "Invalid payload object.", "error_type": "validation"}
     fields = _extract_website_lead_fields(payload)
     address = fields.get("address") or ""
     phone = fields.get("phone") or ""
     email = fields.get("email") or ""
     lead_key = _derive_website_lead_key(payload, address=address, phone=phone, email=email)
     if not lead_key:
-        return {"ok": False, "error": "Could not derive a stable lead key (lead_id/email/phone/address required)."}
+        return {
+            "ok": False,
+            "error": "Could not derive a stable lead key (lead_id/email/phone/address required).",
+            "error_type": "validation",
+        }
     raw_event_key = _payload_value_by_keys(payload, ["event_key", "submission_id", "event_id"])
     if raw_event_key:
         event_key = f"website:{raw_event_key}"
@@ -4815,6 +4819,14 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
 
     try:
         if not current:
+            if not address:
+                return {
+                    "ok": False,
+                    "event_key": event_key,
+                    "lead_key": lead_key,
+                    "error": "Address is required on first submission to create a new ReiSift property.",
+                    "error_type": "validation",
+                }
             mode = "create_first_submission"
             create_payload = {
                 "search": address,
@@ -4960,7 +4972,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             status_code=500,
         )
         db.commit()
-        return {"ok": False, "event_key": event_key, "lead_key": lead_key, "error": err}
+        return {"ok": False, "event_key": event_key, "lead_key": lead_key, "error": err, "error_type": "server"}
 
 
 def _get_google_service_account_info():
@@ -11410,15 +11422,33 @@ def integrations_google_sheets_row_added_api():
     return jsonify(result), status_code
 
 
-@app.route("/api/integrations/website/lead", methods=["POST"])
+@app.route("/api/integrations/website/lead", methods=["POST", "GET", "OPTIONS"])
 def integrations_website_lead_api():
     ensure_db()
     db = get_db()
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True, "method": "OPTIONS"}), 200
+    if request.method == "GET":
+        return jsonify(
+            {
+                "ok": True,
+                "endpoint": "/api/integrations/website/lead",
+                "method": "POST",
+                "auth": "X-Integration-Key or Authorization: Bearer <key>",
+                "status": "ready",
+            }
+        ), 200
     if not integration_auth_ok(db, request):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = dict(request.form or {})
     result = process_website_lead_payload(db, payload, source_label="webhook")
-    status_code = 500 if not result.get("ok") else 200
+    if result.get("ok"):
+        status_code = 200
+    else:
+        err_type = str(result.get("error_type") or "").strip().lower()
+        status_code = 400 if err_type == "validation" else 500
     return jsonify(result), status_code
 
 

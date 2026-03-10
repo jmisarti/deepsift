@@ -4675,13 +4675,13 @@ def _derive_website_lead_key(payload, address="", phone="", email=""):
 
 def _extract_website_lead_fields(payload):
     address = _payload_value_by_keys(payload, ["address", "property_address", "street_address", "property"])
+    # Gravity Forms compound Address field pieces (example field id 7).
+    street = _payload_value_by_keys(payload, ["7.1"])
+    street2 = _payload_value_by_keys(payload, ["7.2"])
+    city = _payload_value_by_keys(payload, ["7.3"])
+    state = _payload_value_by_keys(payload, ["7.4"])
+    postal_code = _payload_value_by_keys(payload, ["7.5"])
     if not address:
-        # Gravity Forms compound Address field pieces (example field id 7).
-        street = _payload_value_by_keys(payload, ["7.1"])
-        street2 = _payload_value_by_keys(payload, ["7.2"])
-        city = _payload_value_by_keys(payload, ["7.3"])
-        state = _payload_value_by_keys(payload, ["7.4"])
-        postal_code = _payload_value_by_keys(payload, ["7.5"])
         address_parts = [x for x in [street, street2, city, state, postal_code] if x]
         address = ", ".join(address_parts)
     phone = _payload_value_by_keys(payload, ["phone", "phone_number", "mobile", "3"])
@@ -4697,6 +4697,11 @@ def _extract_website_lead_fields(payload):
         seller_name = f"{first_name} {last_name}".strip()
     return {
         "address": address,
+        "street": street,
+        "street2": street2,
+        "city": city,
+        "state": state,
+        "postal_code": postal_code,
         "phone": phone,
         "email": email,
         "seller_name": seller_name,
@@ -4970,6 +4975,10 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 mode = "create_second_submission_fallback" if is_step2 else "create_first_submission"
                 create_payload = {
                     "search": address,
+                    "street": fields.get("street") or "",
+                    "city": fields.get("city") or "",
+                    "state": fields.get("state") or "",
+                    "postal_code": fields.get("postal_code") or "",
                     "status": "new_lead",
                     "lists": "Carrot",
                     "tags": f"website,webhook,carrot,{fields.get('stage') or 'stage_unknown'}",

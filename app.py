@@ -806,6 +806,24 @@ def migrate_db(db):
     )
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS external_contact_context (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone_norm TEXT NOT NULL UNIQUE,
+            property_id INTEGER,
+            person_id INTEGER,
+            classification TEXT NOT NULL DEFAULT 'unknown',
+            source TEXT,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            notes TEXT,
+            first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_external_contact_context_prop ON external_contact_context(property_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_external_contact_context_person ON external_contact_context(person_id)")
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS agent_advisor_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             log_type TEXT NOT NULL,
@@ -818,6 +836,23 @@ def migrate_db(db):
         """
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_agent_advisor_logs_type ON agent_advisor_logs(log_type, id DESC)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent3_lead_resolutions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_key TEXT NOT NULL UNIQUE,
+            classification_override TEXT,
+            ignore_agent2 INTEGER NOT NULL DEFAULT 0,
+            suggested_property_id INTEGER,
+            approved_property_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            notes TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_agent3_lead_resolutions_status ON agent3_lead_resolutions(status, updated_at)")
 
 
 def log_app_error(db, source, error_message, details="", route="", status_code=None):
@@ -1058,6 +1093,148 @@ def normalize_phone(value):
     return digits
 
 
+def est_day_start_utc(now_dt=None):
+    now_et = (now_dt or datetime.utcnow().replace(tzinfo=timezone.utc)).astimezone(EST_TZ)
+    day_start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    return day_start_et.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def get_cached_contact_context(db, phone_raw):
+    norm = normalize_phone(phone_raw)
+    if not norm:
+        return None
+    return db.execute(
+        """
+        SELECT *
+        FROM external_contact_context
+        WHERE phone_norm = ?
+        LIMIT 1
+        """,
+        (norm,),
+    ).fetchone()
+
+
+def upsert_cached_contact_context(
+    db,
+    phone_raw,
+    property_id=None,
+    person_id=None,
+    classification="unknown",
+    source="",
+    confidence=0.5,
+    notes="",
+):
+    norm = normalize_phone(phone_raw)
+    if not norm:
+        return None
+    row = get_cached_contact_context(db, norm)
+    if row:
+        next_property_id = property_id if property_id is not None else row["property_id"]
+        next_person_id = person_id if person_id is not None else row["person_id"]
+        next_classification = (classification or row["classification"] or "unknown").strip().lower()
+        next_source = (source or row["source"] or "").strip()
+        next_notes = (notes or row["notes"] or "").strip()
+        next_conf = max(float(confidence or 0.5), float(row["confidence"] or 0.0))
+        db.execute(
+            """
+            UPDATE external_contact_context
+            SET property_id = ?, person_id = ?, classification = ?, source = ?, confidence = ?, notes = ?, last_seen_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                next_property_id,
+                next_person_id,
+                next_classification,
+                next_source,
+                next_conf,
+                next_notes,
+                row["id"],
+            ),
+        )
+        return row["id"]
+    cur = db.execute(
+        """
+        INSERT INTO external_contact_context
+        (phone_norm, property_id, person_id, classification, source, confidence, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            norm,
+            property_id,
+            person_id,
+            (classification or "unknown").strip().lower(),
+            (source or "").strip(),
+            float(confidence or 0.5),
+            (notes or "").strip(),
+        ),
+    )
+    return cur.lastrowid
+
+
+def classify_unknown_contact_text(text):
+    raw = (text or "").strip()
+    low = raw.lower()
+    if not low:
+        return {"classification": "unknown", "intent": "Unknown Caller", "recommended": "Review and classify"}
+    spam_terms = [
+        "solar", "seo", "google listing", "credit card", "merchant services", "medicare",
+        "debt relief", "extended warranty", "insurance quote", "business loan", "telemarketing",
+        "press 1", "unsubscribe",
+    ]
+    buyer_terms = [
+        "looking to buy", "buy your house", "cash offer", "i buy houses", "investor",
+        "buyer", "purchase your property",
+    ]
+    seller_terms = [
+        "my property", "my house", "selling", "address:", "asking price", "tenant occupied",
+        "condition", "close timeline",
+    ]
+    solicitor_terms = [
+        "marketing", "ad service", "lead generation", "cold call", "sales call",
+        "solicitation", "vendor", "service package",
+    ]
+    if any(t in low for t in spam_terms):
+        return {"classification": "spam", "intent": "Spam", "recommended": "Mark as spam / block number"}
+    if any(t in low for t in solicitor_terms):
+        return {"classification": "solicitor", "intent": "Solicitor", "recommended": "Tag as solicitor and suppress outreach"}
+    if any(t in low for t in buyer_terms):
+        return {"classification": "potential_buyer", "intent": "Potential Buyer", "recommended": "Route to acquisitions for buyer intake"}
+    if any(t in low for t in seller_terms):
+        return {"classification": "potential_seller", "intent": "Potential Seller", "recommended": "Resolve lead and continue seller workflow"}
+    return {"classification": "unknown", "intent": "Unknown Caller", "recommended": "Review and classify"}
+
+
+_ADDRESS_LINE_PATTERN = re.compile(
+    r"(?im)(?:^|\b)(?:address\s*:\s*|property(?:\s+at)?\s+)([^\n\r]+)"
+)
+_ADDRESS_STREET_PATTERN = re.compile(
+    r"(?i)\b\d{1,6}\s+[A-Za-z0-9\.\-'\s]{2,80}\s(?:st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|boulevard|ct|court|pl|place|way|ter|terrace)\b[^\n\r,]*"
+)
+
+
+def extract_address_candidates(text):
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    values = []
+    for m in _ADDRESS_LINE_PATTERN.finditer(raw):
+        cand = re.sub(r"\s+", " ", (m.group(1) or "").strip(" ,.-"))
+        if cand:
+            values.append(cand)
+    for m in _ADDRESS_STREET_PATTERN.finditer(raw):
+        cand = re.sub(r"\s+", " ", (m.group(0) or "").strip(" ,.-"))
+        if cand:
+            values.append(cand)
+    deduped = []
+    seen = set()
+    for item in values:
+        key = re.sub(r"[^a-z0-9]+", " ", item.lower()).strip()
+        if key and key not in seen:
+            deduped.append(item)
+            seen.add(key)
+    return deduped[:5]
+
+
 def normalize_social_profile_url(platform, handle, url):
     raw_url = (url or "").strip()
     if raw_url:
@@ -1235,13 +1412,97 @@ def transcribe_recording_with_openai(audio_bytes, filename="call_recording.mp3",
     return {"transcript": transcript, "raw": payload}
 
 
-def analyze_call_transcript_with_openai(transcript_text, property_id=None, person_id=None):
+def _infer_call_direction_from_numbers(db, from_number, to_number):
+    system_numbers = _system_phone_numbers(db)
+    from_norm = normalize_phone(from_number)
+    to_norm = normalize_phone(to_number)
+    if from_norm and from_norm in system_numbers and (not to_norm or to_norm not in system_numbers):
+        return "Outbound"
+    if to_norm and to_norm in system_numbers and (not from_norm or from_norm not in system_numbers):
+        return "Inbound"
+    return "Unknown"
+
+
+def _word_count(text):
+    return len(re.findall(r"[A-Za-z0-9']+", text or ""))
+
+
+def _apply_call_analysis_guardrails(transcript_text, analysis, context):
+    transcript = (transcript_text or "").strip()
+    low = transcript.lower()
+    analysis = dict(analysis or {})
+    direction = (context.get("direction") or analysis.get("call_direction") or "Unknown").strip().title()
+    caller_name = (context.get("caller_name") or "").strip() or "Caller"
+    callee_name = (context.get("callee_name") or "").strip() or "recipient"
+    call_outcome = (context.get("call_outcome") or "").strip().lower()
+
+    voicemail_markers = [
+        "please leave your message",
+        "leave your message",
+        "at the tone",
+        "after the tone",
+        "mailbox",
+        "voicemail",
+        "voice mail",
+    ]
+    mailbox_full = "mailbox is full" in low or "mailbox full" in low
+    looks_voicemail = any(m in low for m in voicemail_markers)
+    short_audio = _word_count(transcript) <= 18
+
+    if mailbox_full:
+        analysis["call_outcome_type"] = "No Answer"
+        analysis["voicemail_left"] = "No"
+        analysis["call_stage"] = "Intro Outreach"
+        analysis["sentiment"] = "Neutral"
+        analysis["seller_interest"] = "Unknown"
+        analysis["next_best_step"] = "Follow Up"
+        analysis["next_step_reason"] = "Mailbox is full; voicemail channel is not currently usable."
+        analysis["line_diagnostics"] = list(
+            dict.fromkeys((analysis.get("line_diagnostics") or []) + ["Mailbox full. Prefer SMS or another channel."])
+        )
+        analysis["summary"] = (
+            f"{direction} call from {caller_name} to {callee_name} reached a full voicemail box; "
+            "no message could be left and no two-way conversation occurred."
+        )
+        return analysis
+
+    if looks_voicemail and short_audio:
+        analysis["call_outcome_type"] = "Voicemail"
+        if call_outcome in NO_ANSWER_OUTCOMES:
+            analysis["call_outcome_type"] = "No Answer"
+        if (analysis.get("voicemail_left") or "").strip() not in {"Yes", "No"}:
+            analysis["voicemail_left"] = "Unknown"
+        analysis["call_stage"] = "Intro Outreach"
+        analysis["seller_interest"] = "Unknown"
+        analysis["sentiment"] = "Neutral"
+        analysis["summary"] = (
+            f"{direction} call from {caller_name} to {callee_name} reached voicemail; "
+            "no clear two-way conversation was captured."
+        )
+        if not (analysis.get("next_step_reason") or "").strip():
+            analysis["next_step_reason"] = "Voicemail/no-answer call; continue follow-up cadence by channel fit."
+        if not (analysis.get("caller_intent") or "").strip():
+            analysis["caller_intent"] = "Initial outreach"
+        if not (analysis.get("next_best_step") or "").strip():
+            analysis["next_best_step"] = "Follow Up"
+        return analysis
+
+    # Avoid impossible phrasing when transcript is near-empty or highly uncertain.
+    if short_audio and "request a package" in (analysis.get("summary") or "").lower():
+        analysis["summary"] = (
+            f"{direction} call between {caller_name} and {callee_name} was too brief for reliable interpretation."
+        )
+    return analysis
+
+
+def analyze_call_transcript_with_openai(transcript_text, property_id=None, person_id=None, context=None):
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not set")
     transcript = (transcript_text or "").strip()
     if not transcript:
         raise ValueError("transcript_text is required")
+    context = context or {}
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
     schema = {
         "name": "call_analysis",
@@ -1259,8 +1520,19 @@ def analyze_call_transcript_with_openai(transcript_text, property_id=None, perso
                     "type": "string",
                     "enum": ["Positive", "Neutral", "Negative", "Mixed", "Unknown"],
                 },
+                "call_direction": {"type": "string", "enum": ["Outbound", "Inbound", "Unknown"]},
+                "call_outcome_type": {
+                    "type": "string",
+                    "enum": ["Answered", "Voicemail", "No Answer", "Busy", "Failed", "Solicitation", "Wrong Number", "Unknown"],
+                },
+                "voicemail_left": {"type": "string", "enum": ["Yes", "No", "Unknown", "Not Applicable"]},
+                "call_stage": {
+                    "type": "string",
+                    "enum": ["Intro Outreach", "Fact Finding", "Appointment Setting", "Follow Up", "Disposition", "Unknown"],
+                },
                 "key_facts": {"type": "array", "items": {"type": "string"}},
                 "objections": {"type": "array", "items": {"type": "string"}},
+                "line_diagnostics": {"type": "array", "items": {"type": "string"}},
                 "next_best_step": {
                     "type": "string",
                     "enum": [
@@ -1282,8 +1554,13 @@ def analyze_call_transcript_with_openai(transcript_text, property_id=None, perso
                 "caller_intent",
                 "seller_interest",
                 "sentiment",
+                "call_direction",
+                "call_outcome_type",
+                "voicemail_left",
+                "call_stage",
                 "key_facts",
                 "objections",
+                "line_diagnostics",
                 "next_best_step",
                 "next_step_reason",
                 "caller_improvement",
@@ -1292,10 +1569,22 @@ def analyze_call_transcript_with_openai(transcript_text, property_id=None, perso
         },
         "strict": True,
     }
+    meta = {
+        "direction": (context.get("direction") or "Unknown"),
+        "call_outcome": (context.get("call_outcome") or "Unknown"),
+        "from_number": (context.get("from_number") or ""),
+        "to_number": (context.get("to_number") or ""),
+        "caller_name": (context.get("caller_name") or ""),
+        "callee_name": (context.get("callee_name") or ""),
+        "timestamp": (context.get("timestamp") or ""),
+    }
     user_prompt = (
         "Analyze this call transcript for lead management.\n"
         f"Property ID: {property_id or '-'} | Person ID: {person_id or '-'}\n\n"
-        "Return concise, factual JSON only. Focus on intent, outcome, and practical next step.\n\n"
+        f"Call metadata: {json.dumps(meta, ensure_ascii=True)}\n\n"
+        "Return concise, factual JSON only. Focus on intent, call mechanics, and practical next step.\n"
+        "Use names from metadata only; do not invent person or company names.\n"
+        "If this appears to be voicemail/no-answer/short call, say so explicitly and avoid speculative interpretations.\n\n"
         f"Transcript:\n{transcript}"
     )
     response = requests.post(
@@ -1330,11 +1619,13 @@ def analyze_call_transcript_with_openai(transcript_text, property_id=None, perso
     data = response.json()
     output_text = (data.get("output_text") or "").strip()
     if output_text:
-        return json.loads(output_text)
+        parsed = json.loads(output_text)
+        return _apply_call_analysis_guardrails(transcript, parsed, meta)
     for item in data.get("output", []):
         for part in item.get("content", []):
             if part.get("type") in {"output_text", "text"} and part.get("text"):
-                return json.loads(part["text"])
+                parsed = json.loads(part["text"])
+                return _apply_call_analysis_guardrails(transcript, parsed, meta)
     raise ValueError("No JSON output returned by call analyzer")
 
 
@@ -6863,6 +7154,33 @@ def process_single_call_recording_job(db, job_row):
     to_number = (job_row["to_number"] or "").strip()
     property_id = job_row["property_id"]
     person_id = job_row["person_id"]
+    payload_obj = parse_json_object(job_row["payload_json"] or "{}")
+    webhook = payload_obj.get("webhook") if isinstance(payload_obj.get("webhook"), dict) else {}
+    call_outcome = str(
+        webhook.get("callOutcome")
+        or webhook.get("call_outcome")
+        or payload_obj.get("call_outcome")
+        or ""
+    ).strip()
+    caller_name = (
+        extract_first_string_by_keys(webhook, ["userName", "user_name", "agentName", "callerName"])
+        or extract_first_string_by_keys(webhook, ["callerIdName", "caller_id_name"])
+        or ""
+    ).strip()
+    callee_name = (
+        extract_first_string_by_keys(webhook, ["contactName", "contact_name"])
+        or ""
+    ).strip()
+    call_direction = _infer_call_direction_from_numbers(db, from_number, to_number)
+    analysis_context = {
+        "direction": call_direction,
+        "call_outcome": call_outcome,
+        "from_number": from_number,
+        "to_number": to_number,
+        "caller_name": caller_name or ("Team Caller" if call_direction == "Outbound" else "Inbound Caller"),
+        "callee_name": callee_name or ("Lead Contact" if call_direction == "Outbound" else "Team"),
+        "timestamp": extract_first_string_by_keys(webhook, ["date", "timestamp", "completed_at"]),
+    }
 
     # Retry recording-url lookup if not present yet.
     lookup_raw = {}
@@ -6881,21 +7199,23 @@ def process_single_call_recording_job(db, job_row):
             (
                 recording_url,
                 fetch_status,
-                json.dumps({"recording_lookup": lookup_raw}),
+                json.dumps({**payload_obj, "recording_lookup": lookup_raw}),
                 job_id,
             ),
         )
         if not recording_url:
-            payload_obj = parse_json_object(job_row["payload_json"] or "{}")
-            webhook = payload_obj.get("webhook") if isinstance(payload_obj.get("webhook"), dict) else {}
-            outcome = str(
-                webhook.get("callOutcome")
-                or webhook.get("call_outcome")
-                or payload_obj.get("call_outcome")
-                or ""
-            ).strip().lower()
+            outcome = (call_outcome or "").strip().lower()
             analysis_status = "No Recording"
+            no_recording_summary = ""
             if outcome in NO_ANSWER_OUTCOMES:
+                if outcome == "failed":
+                    no_recording_summary = (
+                        f"{call_direction} call failed before conversation started."
+                    )
+                else:
+                    no_recording_summary = (
+                        f"{call_direction} call resulted in no answer/voicemail; recording was not available."
+                    )
                 if property_id:
                     recommended_step, reason = _recommend_no_answer_next_step(db, int(property_id), person_id)
                     upsert_agent_signal(
@@ -6916,6 +7236,9 @@ def process_single_call_recording_job(db, job_row):
                     )
                     route_new_agent_signals_once(db, limit=25)
             else:
+                no_recording_summary = (
+                    f"{call_direction} call completed but no recording URL was returned by provider."
+                )
                 if property_id:
                     _create_agent_diagnosis_review_action(
                         db,
@@ -6929,8 +7252,8 @@ def process_single_call_recording_job(db, job_row):
                         extra={"fetch_status": fetch_status},
                     )
             db.execute(
-                "UPDATE call_recording_jobs SET analysis_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (analysis_status, job_id),
+                "UPDATE call_recording_jobs SET analysis_status = ?, summary_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (analysis_status, no_recording_summary, job_id),
             )
             return {"job_id": job_id, "status": "no_recording_url", "call_outcome": outcome}
 
@@ -6943,7 +7266,12 @@ def process_single_call_recording_job(db, job_row):
 
     transcription = transcribe_recording_with_openai(audio_bytes, filename=filename, mime_type=mime_type)
     transcript = (transcription.get("transcript") or "").strip()
-    analysis = analyze_call_transcript_with_openai(transcript, property_id=property_id, person_id=person_id)
+    analysis = analyze_call_transcript_with_openai(
+        transcript,
+        property_id=property_id,
+        person_id=person_id,
+        context=analysis_context,
+    )
     summary_text = (analysis.get("summary") or "").strip()
 
     db.execute(
@@ -6964,6 +7292,7 @@ def process_single_call_recording_job(db, job_row):
             json.dumps(analysis),
             json.dumps(
                 {
+                    **payload_obj,
                     "recording_url": recording_url,
                     "transcription_raw": transcription.get("raw") or {},
                     "analysis": analysis,
@@ -6975,6 +7304,8 @@ def process_single_call_recording_job(db, job_row):
     if person_id:
         note_body = (
             f"Call analyzed for SID {call_sid}.\n"
+            f"Direction: {analysis.get('call_direction') or call_direction}\n"
+            f"Outcome: {analysis.get('call_outcome_type') or (call_outcome or '-')}\n"
             f"Summary: {summary_text or '-'}\n"
             f"Intent: {analysis.get('caller_intent') or '-'}\n"
             f"Recommended Next Step: {analysis.get('next_best_step') or '-'}\n"
@@ -7303,6 +7634,38 @@ def _thread_counterpart(system_numbers, direction, from_number, to_number):
     return from_norm or to_norm
 
 
+def _apply_sms_analysis_guardrails(messages, analysis):
+    analysis = dict(analysis or {})
+    msgs = list(messages or [])
+    if not msgs:
+        return analysis
+    latest = msgs[-1]
+    latest_dir = (latest.get("direction") or "").strip().lower()
+    latest_body = (latest.get("body") or "").strip().lower()
+    inbound_count = sum(1 for m in msgs if (m.get("direction") or "").strip().lower() == "inbound")
+
+    intro_markers = [
+        "we received your",
+        "let us know when",
+        "when you are available",
+        "when you're available",
+        "best time to call",
+    ]
+    if latest_dir == "outbound" and inbound_count <= 1 and any(x in latest_body for x in intro_markers):
+        analysis["intent"] = "Initial outreach and availability check"
+        analysis["sentiment"] = "Neutral"
+        analysis["conversation_type"] = "Business"
+        analysis["recommended_next_step"] = "Follow Up"
+        analysis["summary"] = (
+            "Outbound introductory outreach asking for availability; no clear seller disposition yet."
+        )
+        facts = list(analysis.get("key_facts") or [])
+        facts.append("Latest outbound SMS is an introductory availability check.")
+        analysis["key_facts"] = list(dict.fromkeys(facts))[:8]
+        analysis["confidence"] = max(float(analysis.get("confidence") or 0.0), 0.85)
+    return analysis
+
+
 def analyze_sms_thread_with_openai(messages, property_id=None, person_id=None, counterpart=""):
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -7351,7 +7714,9 @@ def analyze_sms_thread_with_openai(messages, property_id=None, person_id=None, c
     prompt = (
         "Analyze this SMS thread for lead management.\n"
         f"Property ID: {property_id or '-'} | Person ID: {person_id or '-'} | Counterpart: {counterpart or '-'}\n"
-        "Return only valid JSON."
+        "Return only valid JSON.\n"
+        "If the latest message is an outbound intro/availability check from our team (for example: we received your SMS, let us know when available), "
+        "treat intent as initial outreach and sentiment as neutral unless a clear inbound response indicates otherwise."
         f"\n\nThread:\n{transcript}"
     )
     response = requests.post(
@@ -7371,11 +7736,13 @@ def analyze_sms_thread_with_openai(messages, property_id=None, person_id=None, c
     data = response.json()
     output_text = (data.get("output_text") or "").strip()
     if output_text:
-        return json.loads(output_text)
+        analysis = json.loads(output_text)
+        return _apply_sms_analysis_guardrails(messages, analysis)
     for item in data.get("output", []):
         for part in item.get("content", []):
             if part.get("type") in {"output_text", "text"} and part.get("text"):
-                return json.loads(part["text"])
+                analysis = json.loads(part["text"])
+                return _apply_sms_analysis_guardrails(messages, analysis)
     raise ValueError("No JSON output returned by sms analyzer")
 
 
@@ -7526,6 +7893,270 @@ def start_sms_analysis_worker():
     thread.start()
 
 
+def build_today_lead_watch_snapshot(db, limit=60):
+    cutoff_dt = est_day_start_utc()
+    cutoff = format_db_time(cutoff_dt)
+    leads = {}
+    resolution_rows = db.execute(
+        """
+        SELECT lead_key, classification_override, ignore_agent2, suggested_property_id, approved_property_id, status, notes, updated_at
+        FROM agent3_lead_resolutions
+        """
+    ).fetchall()
+    resolution_map = {str(r["lead_key"]): dict(r) for r in resolution_rows}
+
+    def _touch(
+        key,
+        label,
+        occurred_at,
+        property_id=None,
+        person_id=None,
+        direction="",
+        event_type="",
+        source="",
+        classification="",
+        address_hint="",
+    ):
+        if not key:
+            return
+        row = leads.get(key)
+        if not row:
+            row = {
+                "lead_key": key,
+                "label": label or key,
+                "property_id": property_id,
+                "person_id": person_id,
+                "classification": (classification or "unknown").strip().lower(),
+                "sources": set(),
+                "address_hints": set(),
+                "sms_inbound": 0,
+                "sms_outbound": 0,
+                "calls": 0,
+                "events": 0,
+                "last_activity_at": occurred_at or "",
+            }
+            leads[key] = row
+        if property_id and not row.get("property_id"):
+            row["property_id"] = property_id
+        if person_id and not row.get("person_id"):
+            row["person_id"] = person_id
+        if classification and row.get("classification") in {"", "unknown"}:
+            row["classification"] = classification.strip().lower()
+        if source:
+            row["sources"].add(source)
+        if address_hint:
+            row["address_hints"].add(address_hint)
+        if (event_type or "").upper() == "CALL":
+            row["calls"] += 1
+        elif (event_type or "").upper() == "SMS":
+            if (direction or "").lower() == "inbound":
+                row["sms_inbound"] += 1
+            else:
+                row["sms_outbound"] += 1
+        row["events"] += 1
+        if occurred_at and (not row["last_activity_at"] or occurred_at > row["last_activity_at"]):
+            row["last_activity_at"] = occurred_at
+
+    prop_rows = db.execute(
+        """
+        SELECT p.id, p.created_at, a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.created_at >= ?
+        ORDER BY p.created_at DESC
+        LIMIT 500
+        """,
+        (cutoff,),
+    ).fetchall()
+    for p in prop_rows:
+        label = f"{p['street']}, {p['city']}, {p['state']} {p['postal_code']}".strip(", ")
+        _touch(
+            key=f"property:{int(p['id'])}",
+            label=label,
+            occurred_at=str(p["created_at"] or ""),
+            property_id=int(p["id"]),
+            event_type="SYSTEM",
+            source="property",
+            classification="potential_seller",
+            address_hint=label,
+        )
+
+    comm_rows = db.execute(
+        """
+        SELECT c.id, c.property_id, c.person_id, c.channel, c.direction, c.body, c.sent_at
+        FROM communications c
+        WHERE c.sent_at >= ?
+          AND upper(c.channel) = 'SMS'
+        ORDER BY c.sent_at DESC
+        LIMIT 1500
+        """,
+        (cutoff,),
+    ).fetchall()
+    for c in comm_rows:
+        body = str(c["body"] or "")
+        candidates = extract_address_candidates(body)
+        lead_key = f"property:{int(c['property_id'])}" if c["property_id"] else ""
+        if not lead_key and candidates:
+            addr_norm = re.sub(r"[^a-z0-9]+", " ", candidates[0].lower()).strip()
+            if addr_norm:
+                lead_key = f"address:{addr_norm}"
+        if not lead_key:
+            continue
+        signal = classify_unknown_contact_text(body)
+        _touch(
+            key=lead_key,
+            label=(candidates[0] if candidates else lead_key),
+            occurred_at=str(c["sent_at"] or ""),
+            property_id=c["property_id"],
+            person_id=c["person_id"],
+            direction=str(c["direction"] or ""),
+            event_type="SMS",
+            source="communications",
+            classification=signal["classification"],
+            address_hint=(candidates[0] if candidates else ""),
+        )
+
+    event_rows = db.execute(
+        """
+        SELECT id, event_type, from_number, to_number, processing_status, payload_json, received_at
+        FROM smrtphone_webhook_events
+        WHERE received_at >= ?
+        ORDER BY id DESC
+        LIMIT 2500
+        """,
+        (cutoff,),
+    ).fetchall()
+    for e in event_rows:
+        payload = parse_json_object(e["payload_json"])
+        msg = extract_first_string_by_keys(payload, ["message", "body", "text"])
+        event_name = extract_first_string_by_keys(payload, ["event", "eventType"])
+        direction = "inbound"
+        if "outgoing" in (event_name or "").lower() or (str(e["event_type"] or "").lower() == "outbound"):
+            direction = "outbound"
+        candidates = extract_address_candidates(msg)
+        classification_info = classify_unknown_contact_text(msg)
+        phone_norm = normalize_phone(e["from_number"] if direction == "inbound" else e["to_number"])
+        ctx = get_cached_contact_context(db, phone_norm) if phone_norm else None
+        lead_key = ""
+        label = ""
+        prop_id = None
+        person_id = None
+        if ctx and ctx["property_id"]:
+            prop_id = int(ctx["property_id"])
+            person_id = ctx["person_id"]
+            lead_key = f"property:{prop_id}"
+            label = f"Property {prop_id}"
+        elif candidates:
+            addr_norm = re.sub(r"[^a-z0-9]+", " ", candidates[0].lower()).strip()
+            if addr_norm:
+                lead_key = f"address:{addr_norm}"
+                label = candidates[0]
+        elif phone_norm:
+            lead_key = f"phone:{phone_norm}"
+            label = f"Phone {phone_norm}"
+        if not lead_key:
+            continue
+        _touch(
+            key=lead_key,
+            label=label or lead_key,
+            occurred_at=str(e["received_at"] or ""),
+            property_id=prop_id,
+            person_id=person_id,
+            direction=direction,
+            event_type="SMS" if str(e["event_type"] or "").lower() in {"inbound", "outbound", "status"} else "CALL",
+            source=f"smrtphone:{str(e['event_type'] or '').lower()}",
+            classification=(ctx["classification"] if ctx else classification_info["classification"]),
+            address_hint=(candidates[0] if candidates else ""),
+        )
+
+    call_rows = db.execute(
+        """
+        SELECT id, property_id, person_id, from_number, to_number, summary_text, created_at
+        FROM call_recording_jobs
+        WHERE created_at >= ?
+        ORDER BY id DESC
+        LIMIT 1000
+        """,
+        (cutoff,),
+    ).fetchall()
+    for c in call_rows:
+        summary = str(c["summary_text"] or "")
+        candidates = extract_address_candidates(summary)
+        lead_key = f"property:{int(c['property_id'])}" if c["property_id"] else ""
+        if not lead_key:
+            for num in [c["from_number"], c["to_number"]]:
+                ctx = get_cached_contact_context(db, num)
+                if ctx and ctx["property_id"]:
+                    lead_key = f"property:{int(ctx['property_id'])}"
+                    break
+        if not lead_key and candidates:
+            addr_norm = re.sub(r"[^a-z0-9]+", " ", candidates[0].lower()).strip()
+            if addr_norm:
+                lead_key = f"address:{addr_norm}"
+        if not lead_key:
+            continue
+        signal = classify_unknown_contact_text(summary)
+        _touch(
+            key=lead_key,
+            label=(candidates[0] if candidates else lead_key),
+            occurred_at=str(c["created_at"] or ""),
+            property_id=c["property_id"],
+            person_id=c["person_id"],
+            event_type="CALL",
+            source="call_recording_jobs",
+            classification=signal["classification"],
+            address_hint=(candidates[0] if candidates else ""),
+        )
+
+    rows = []
+    for v in leads.values():
+        resolution = resolution_map.get(v["lead_key"]) or {}
+        approved_property_id = int(resolution.get("approved_property_id") or 0)
+        effective_property_id = approved_property_id or int(v["property_id"] or 0)
+        effective_classification = (
+            (resolution.get("classification_override") or "").strip().lower()
+            or (v["classification"] or "unknown")
+        )
+        ignore_agent2 = int(resolution.get("ignore_agent2") or 0)
+        rows.append(
+            {
+                "lead_key": v["lead_key"],
+                "label": v["label"],
+                "property_id": effective_property_id,
+                "person_id": v["person_id"] or 0,
+                "classification": effective_classification,
+                "sources": sorted(list(v["sources"]))[:6],
+                "address_hints": sorted(list(v["address_hints"]))[:4],
+                "sms_inbound": int(v["sms_inbound"]),
+                "sms_outbound": int(v["sms_outbound"]),
+                "calls": int(v["calls"]),
+                "events": int(v["events"]),
+                "last_activity_at": v["last_activity_at"] or "",
+                "unresolved": 0 if effective_property_id else 1,
+                "ignore_agent2": 1 if ignore_agent2 else 0,
+                "resolution_status": str(resolution.get("status") or ""),
+                "suggested_property_id": int(resolution.get("suggested_property_id") or 0),
+                "resolution_updated_at": str(resolution.get("updated_at") or ""),
+                "resolution_notes": str(resolution.get("notes") or ""),
+            }
+        )
+    rows.sort(key=lambda r: ((r["last_activity_at"] or ""), r["events"]), reverse=True)
+    rows = rows[: max(1, min(200, int(limit or 60)))]
+    unresolved_count = sum(1 for r in rows if r["unresolved"])
+    unresolved_active_count = sum(
+        1
+        for r in rows
+        if r["unresolved"] and not r["ignore_agent2"] and r["classification"] not in {"spam", "solicitor"}
+    )
+    return {
+        "cutoff_utc": cutoff,
+        "count": len(rows),
+        "unresolved_count": unresolved_count,
+        "unresolved_active_count": unresolved_active_count,
+        "items": rows,
+    }
+
+
 def build_agent_advisor_snapshot(db, window_hours=72):
     cutoff_dt = datetime.utcnow() - timedelta(hours=max(1, int(window_hours or 72)))
     cutoff = format_db_time(cutoff_dt)
@@ -7638,6 +8269,7 @@ def build_agent_advisor_snapshot(db, window_hours=72):
         }
         for r in pending_actions
     ]
+    snapshot["lead_watch_today"] = build_today_lead_watch_snapshot(db, limit=80)
     return snapshot
 
 
@@ -7645,6 +8277,7 @@ def build_agent_advisor_recommendations(snapshot):
     signals = snapshot.get("signals", {})
     actions = snapshot.get("actions", {})
     calls = snapshot.get("calls", {})
+    lead_watch = snapshot.get("lead_watch_today", {})
     recs = []
     if int(actions.get("high_pending_total", 0)) > 0:
         recs.append(
@@ -7691,6 +8324,16 @@ def build_agent_advisor_recommendations(snapshot):
                 "next_step": "Confirm no outbound actions are queued for these leads.",
             }
         )
+    unresolved_active = int(lead_watch.get("unresolved_active_count", 0) or 0)
+    if unresolved_active > 0:
+        recs.append(
+            {
+                "priority": "High" if unresolved_active >= 3 else "Medium",
+                "title": "Resolve unresolved leads from today's intake",
+                "reason": f"{unresolved_active} unresolved lead(s) still need property linkage or classification.",
+                "next_step": "Use Agent 3 lead-watch resolution to connect by partial address or suppress spam/solicitors.",
+            }
+        )
     if not recs:
         recs.append(
             {
@@ -7707,6 +8350,7 @@ def fallback_agent_advisor_summary(snapshot, recommendations):
     signals = snapshot.get("signals", {})
     actions = snapshot.get("actions", {})
     calls = snapshot.get("calls", {})
+    lead_watch = snapshot.get("lead_watch_today", {})
     lines = [
         f"Window: last {snapshot.get('window_hours', 72)}h",
         (
@@ -7720,6 +8364,11 @@ def fallback_agent_advisor_summary(snapshot, recommendations):
         (
             f"Call Analysis - Pending: {calls.get('pending_total', 0)}, "
             f"Completed (window): {calls.get('completed_recent', 0)}, Failed: {calls.get('failed_total', 0)}"
+        ),
+        (
+            f"Lead Watch (Today ET) - Total: {lead_watch.get('count', 0)}, "
+            f"Unresolved: {lead_watch.get('unresolved_count', 0)}, "
+            f"Actionable Unresolved: {lead_watch.get('unresolved_active_count', 0)}"
         ),
         "Top Recommendations:",
     ]
@@ -10835,6 +11484,61 @@ def coming_soon():
     return render_template("coming_soon.html")
 
 
+def run_agent3_lead_watch_reconcile(db, limit=80):
+    snapshot = build_today_lead_watch_snapshot(db, limit=limit)
+    suggested = 0
+    touched = 0
+    for item in snapshot.get("items", []):
+        lead_key = (item.get("lead_key") or "").strip()
+        if not lead_key:
+            continue
+        if int(item.get("property_id") or 0):
+            continue
+        hints = item.get("address_hints") or []
+        if not hints:
+            continue
+        hint = str(hints[0]).strip()
+        if not hint:
+            continue
+        like = f"%{hint.lower()}%"
+        match = db.execute(
+            """
+            SELECT p.id
+            FROM properties p
+            JOIN addresses a ON a.id = p.property_address_id
+            WHERE lower(a.street || ' ' || a.city || ' ' || a.state || ' ' || a.postal_code) LIKE ?
+            ORDER BY p.id DESC
+            LIMIT 1
+            """,
+            (like,),
+        ).fetchone()
+        if not match:
+            continue
+        touched += 1
+        db.execute(
+            """
+            INSERT INTO agent3_lead_resolutions
+            (lead_key, suggested_property_id, status, notes, updated_at)
+            VALUES (?, ?, 'Pending', ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(lead_key) DO UPDATE SET
+                suggested_property_id = excluded.suggested_property_id,
+                status = CASE
+                    WHEN agent3_lead_resolutions.status IN ('Approved', 'Rejected') THEN agent3_lead_resolutions.status
+                    ELSE 'Pending'
+                END,
+                notes = excluded.notes,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                lead_key,
+                int(match["id"]),
+                f"Agent 3 suggested property match from address hint: {hint}",
+            ),
+        )
+        suggested += 1
+    return {"inspected": int(snapshot.get("count") or 0), "suggested": suggested, "touched": touched}
+
+
 @app.route("/agents")
 def agents_page():
     ensure_db()
@@ -11121,6 +11825,105 @@ def run_agent_advisor_question_route():
     except Exception as exc:
         db.rollback()
         return redirect(url_for("agents_page", notice=f"Agent 3 Q&A failed: {exc}"))
+
+
+@app.route("/agents/advisor/lead-watch/reconcile", methods=["POST"])
+def run_agent3_lead_watch_reconcile_route():
+    ensure_db()
+    db = get_db()
+    try:
+        stats = run_agent3_lead_watch_reconcile(db, limit=120)
+        db.commit()
+        return redirect(
+            url_for(
+                "agents_page",
+                notice=(
+                    f"Agent 3 reconciliation complete. Inspected {stats['inspected']} lead(s), "
+                    f"suggested {stats['suggested']} property link(s)."
+                ),
+            )
+        )
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("agents_page", notice=f"Agent 3 reconciliation failed: {exc}"))
+
+
+@app.route("/agents/advisor/lead-watch/resolve", methods=["POST"])
+def run_agent3_lead_watch_resolve_route():
+    ensure_db()
+    db = get_db()
+    lead_key = (request.form.get("lead_key") or "").strip()
+    if not lead_key:
+        return redirect(url_for("agents_page", notice="Lead key is required for resolution."))
+    classification = (request.form.get("classification_override") or "").strip().lower()
+    status = (request.form.get("status") or "Pending").strip().title()
+    approved_property_raw = (request.form.get("approved_property_id") or "").strip()
+    suggested_property_raw = (request.form.get("suggested_property_id") or "").strip()
+    ignore_agent2 = 1 if (request.form.get("ignore_agent2") or "").strip().lower() in {"1", "true", "on", "yes"} else 0
+    notes = (request.form.get("notes") or "").strip()
+    approved_property_id = int(approved_property_raw) if approved_property_raw.isdigit() else None
+    suggested_property_id = int(suggested_property_raw) if suggested_property_raw.isdigit() else None
+    if status not in {"Pending", "Approved", "Rejected"}:
+        status = "Pending"
+    db.execute(
+        """
+        INSERT INTO agent3_lead_resolutions
+        (lead_key, classification_override, ignore_agent2, suggested_property_id, approved_property_id, status, notes, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(lead_key) DO UPDATE SET
+            classification_override = excluded.classification_override,
+            ignore_agent2 = excluded.ignore_agent2,
+            suggested_property_id = excluded.suggested_property_id,
+            approved_property_id = excluded.approved_property_id,
+            status = excluded.status,
+            notes = excluded.notes,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            lead_key,
+            classification,
+            ignore_agent2,
+            suggested_property_id,
+            approved_property_id,
+            status,
+            notes,
+        ),
+    )
+    # If user approved a property, persist phone->property context from today's webhook events.
+    if approved_property_id:
+        cutoff = format_db_time(est_day_start_utc())
+        rows = db.execute(
+            """
+            SELECT from_number, to_number, payload_json
+            FROM smrtphone_webhook_events
+            WHERE received_at >= ?
+            ORDER BY id DESC
+            LIMIT 500
+            """,
+            (cutoff,),
+        ).fetchall()
+        for r in rows:
+            payload = parse_json_object(r["payload_json"])
+            msg = extract_first_string_by_keys(payload, ["message", "body", "text"])
+            candidates = extract_address_candidates(msg)
+            joined = " | ".join(candidates).lower()
+            if lead_key.startswith("address:"):
+                target = lead_key.split("address:", 1)[1]
+                if target and target not in re.sub(r"[^a-z0-9]+", " ", joined):
+                    continue
+            for num in [r["from_number"], r["to_number"]]:
+                upsert_cached_contact_context(
+                    db,
+                    num,
+                    property_id=approved_property_id,
+                    person_id=None,
+                    classification=classification or "potential_seller",
+                    source="agent3_manual_resolution",
+                    confidence=0.95,
+                    notes=f"lead_key={lead_key}",
+                )
+    db.commit()
+    return redirect(url_for("agents_page", notice=f"Lead resolution saved for {lead_key}."))
 
 
 @app.route("/referral")
@@ -15269,20 +16072,68 @@ def smrtphone_inbound_webhook():
             if not person_id:
                 person_id = recent_link["person_id"]
     if not property_id:
+        ctx = get_cached_contact_context(db, counterparty_number) or get_cached_contact_context(db, from_number) or get_cached_contact_context(db, to_number)
+        if ctx and ctx["property_id"]:
+            property_id = int(ctx["property_id"])
+            if not person_id and ctx["person_id"]:
+                person_id = int(ctx["person_id"])
+    if not property_id:
+        signal = classify_unknown_contact_text(message)
+        source_key_basis = sms_id or hashlib.sha1(
+            f"{event_type}|{from_number}|{to_number}|{message}|{event_name}".encode("utf-8", errors="ignore")
+        ).hexdigest()[:20]
+        source_key = f"sms-unresolved:{source_key_basis}"
+        upsert_cached_contact_context(
+            db,
+            counterparty_number,
+            property_id=None,
+            person_id=None,
+            classification=signal["classification"],
+            source="smrtphone_webhook_unresolved",
+            confidence=0.55,
+            notes=f"direction={direction}; event={event_name or event_type}",
+        )
+        upsert_agent_signal(
+            db,
+            source_type="sms",
+            source_key=source_key,
+            property_id=None,
+            person_id=None,
+            channel="SMS",
+            intent=signal["intent"],
+            sentiment="Unknown",
+            confidence=0.55,
+            recommended_next_step=signal["recommended"],
+            summary_text=f"Unresolved {direction.lower()} SMS: {message[:240]}",
+            is_spam=(signal["classification"] in {"spam", "solicitor"}),
+            do_not_contact=(signal["classification"] in {"spam", "solicitor"}),
+            payload={"event": event_name, "from": from_number, "to": to_number, "message": message, "classification": signal["classification"]},
+        )
+        route_new_agent_signals_once(db, limit=10)
         log_smrtphone_webhook_event(
             db,
             event_type,
             payload,
-            processing_status="ignored",
+            processing_status="stored_unresolved",
             sms_id=sms_id,
             from_number=from_number,
             to_number=to_number,
-            error_text=f"Unable to resolve property_id for {direction.lower()} message (event={event_name or 'unknown'})",
+            error_text=f"Unresolved property_id for {direction.lower()} message (event={event_name or 'unknown'}); classified={signal['classification']}",
         )
         db.commit()
-        return jsonify({"ok": True, "ignored": True, "reason": "unresolved property"}), 200
+        return jsonify({"ok": True, "stored_unresolved": True, "classification": signal["classification"]}), 200
     if not person_id:
         person_id = find_person_id_by_recent_outbound_to_number(db, property_id, counterparty_number)
+    upsert_cached_contact_context(
+        db,
+        counterparty_number,
+        property_id=property_id,
+        person_id=person_id,
+        classification="potential_seller",
+        source="smrtphone_webhook_resolved",
+        confidence=0.9,
+        notes=f"direction={direction}; event={event_name or event_type}",
+    )
 
     existing = None
     if sms_id:
@@ -15498,7 +16349,12 @@ def smrtphone_status_webhook():
         db.commit()
         return jsonify({"ok": True, "communication_id": recent_outbound["id"], "backfilled": True})
 
-    if not str(payload.get("property_id", "")).isdigit():
+    cached_ctx = get_cached_contact_context(db, to_number) or get_cached_contact_context(db, from_number)
+    if str(payload.get("property_id", "")).isdigit():
+        property_id = int(payload["property_id"])
+    elif cached_ctx and cached_ctx["property_id"]:
+        property_id = int(cached_ctx["property_id"])
+    else:
         log_smrtphone_webhook_event(
             db,
             "status",
@@ -15511,13 +16367,23 @@ def smrtphone_status_webhook():
         )
         db.commit()
         return jsonify({"ok": True, "ignored": True, "reason": "unknown smsId"}), 200
-
-    property_id = int(payload["property_id"])
     person_id = None
     if str(payload.get("person_id", "")).isdigit():
         person_id = int(payload["person_id"])
+    elif cached_ctx and cached_ctx["person_id"]:
+        person_id = int(cached_ctx["person_id"])
     elif to_number:
         person_id = find_person_id_by_phone(db, to_number)
+    upsert_cached_contact_context(
+        db,
+        to_number or from_number,
+        property_id=property_id,
+        person_id=person_id,
+        classification="potential_seller",
+        source="smrtphone_status",
+        confidence=0.8,
+        notes=f"sms_status={status}",
+    )
 
     cur = db.execute(
         """
@@ -15594,6 +16460,14 @@ def smrtphone_call_completed_webhook():
                 _property_id = outbound["property_id"]
                 if not _person_id:
                     _person_id = outbound["person_id"]
+        if not _property_id:
+            for candidate in [from_number, to_number]:
+                ctx = get_cached_contact_context(db, candidate)
+                if ctx and ctx["property_id"]:
+                    _property_id = int(ctx["property_id"])
+                    if not _person_id and ctx["person_id"]:
+                        _person_id = int(ctx["person_id"])
+                    break
         return _property_id, _person_id
 
     if not call_sid:
@@ -15637,6 +16511,18 @@ def smrtphone_call_completed_webhook():
         return jsonify({"ok": True, "deduped": True, "job_id": existing["id"]}), 200
 
     property_id, person_id = _resolve_property_person()
+    if property_id:
+        counterparty_number = from_number or to_number
+        upsert_cached_contact_context(
+            db,
+            counterparty_number,
+            property_id=property_id,
+            person_id=person_id,
+            classification="potential_seller",
+            source="smrtphone_call_completed",
+            confidence=0.9,
+            notes=f"call_sid={call_sid}",
+        )
 
     recording_url = (direct_recording_url or "").strip()
     fetch_status = "Queued"

@@ -359,10 +359,23 @@
             <h3>Pending Call Analysis</h3>
             <p>{{ advisor_snapshot.calls.pending_total }}</p>
         </article>
+        <article>
+            <h3>Lead Watch (Today)</h3>
+            <p>{{ advisor_snapshot.lead_watch_today.count }}</p>
+        </article>
+        <article>
+            <h3>Unresolved (Actionable)</h3>
+            <p>{{ advisor_snapshot.lead_watch_today.unresolved_active_count }}</p>
+        </article>
     </div>
-    <form method="post" action="{{ url_for('run_agent_advisor_refresh_route') }}" style="margin-top:0.75rem;">
-        <button type="submit">Refresh Agent 3 Summary</button>
-    </form>
+    <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-top:0.75rem;">
+        <form method="post" action="{{ url_for('run_agent_advisor_refresh_route') }}">
+            <button type="submit">Refresh Agent 3 Summary</button>
+        </form>
+        <form method="post" action="{{ url_for('run_agent3_lead_watch_reconcile_route') }}">
+            <button type="submit">Run Lead Reconciliation</button>
+        </form>
+    </div>
     {% if advisor_summary_row %}
     <div style="margin-top:0.75rem;">
         <p><strong>Latest Summary:</strong> {{ advisor_summary_row.created_at|fmt_est_datetime }}</p>
@@ -381,6 +394,71 @@
         </li>
         {% endfor %}
     </ul>
+    <h4 style="margin-top:1rem;">Lead Watch (Today ET)</h4>
+    {% if advisor_snapshot.lead_watch_today.items %}
+    <table style="margin-top:0.75rem;">
+        <thead>
+            <tr>
+                <th>Lead</th>
+                <th>Touchpoints</th>
+                <th>Classification</th>
+                <th>Status</th>
+                <th>Resolve</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in advisor_snapshot.lead_watch_today.items[:30] %}
+            <tr>
+                <td>
+                    <strong>{{ row.label }}</strong><br>
+                    <small>{{ row.lead_key }}</small>
+                    {% if row.property_id %}
+                    <br><a href="{{ url_for('property_detail', property_id=row.property_id) }}">Property {{ row.property_id }}</a>
+                    {% endif %}
+                    {% if row.address_hints %}
+                    <br><small>Hints: {{ row.address_hints|join(' | ') }}</small>
+                    {% endif %}
+                </td>
+                <td>
+                    SMS In: {{ row.sms_inbound }}<br>
+                    SMS Out: {{ row.sms_outbound }}<br>
+                    Calls: {{ row.calls }}<br>
+                    <small>Last: {{ row.last_activity_at|fmt_est_datetime }}</small>
+                </td>
+                <td>{{ row.classification }}</td>
+                <td>
+                    {% if row.unresolved %}<span class="pill">Unresolved</span>{% else %}<span class="pill">Linked</span>{% endif %}
+                    {% if row.ignore_agent2 %}<br><span class="pill">Ignore Agent 2</span>{% endif %}
+                    {% if row.resolution_status %}<br><small>{{ row.resolution_status }}</small>{% endif %}
+                </td>
+                <td>
+                    <form method="post" action="{{ url_for('run_agent3_lead_watch_resolve_route') }}" style="display:flex; flex-direction:column; gap:0.3rem;">
+                        <input type="hidden" name="lead_key" value="{{ row.lead_key }}">
+                        <input type="hidden" name="suggested_property_id" value="{{ row.suggested_property_id or '' }}">
+                        <select name="classification_override">
+                            <option value="">(Keep)</option>
+                            {% for c in ['potential_seller','potential_buyer','spam','solicitor','unknown'] %}
+                            <option value="{{ c }}" {% if c == row.classification %}selected{% endif %}>{{ c }}</option>
+                            {% endfor %}
+                        </select>
+                        <input type="number" name="approved_property_id" min="1" placeholder="Property ID" value="{{ row.property_id or row.suggested_property_id or '' }}">
+                        <label><input type="checkbox" name="ignore_agent2" {% if row.ignore_agent2 %}checked{% endif %}> Ignore Agent 2</label>
+                        <select name="status">
+                            {% for s in ['Pending','Approved','Rejected'] %}
+                            <option value="{{ s }}" {% if s == row.resolution_status %}selected{% endif %}>{{ s }}</option>
+                            {% endfor %}
+                        </select>
+                        <input type="text" name="notes" placeholder="Notes" value="{{ row.resolution_notes or '' }}">
+                        <button type="submit">Save</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="margin-top:0.75rem;">No leads observed yet for today.</p>
+    {% endif %}
     <h4 style="margin-top:1rem;">Ask Agent 3</h4>
     <form method="post" action="{{ url_for('run_agent_advisor_question_route') }}" style="display:flex; gap:0.5rem; align-items:flex-end; flex-wrap:wrap;">
         <label style="min-width:420px; flex:1;">

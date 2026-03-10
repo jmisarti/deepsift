@@ -6515,21 +6515,6 @@ def process_single_call_recording_job(db, job_row):
         payload={"call_sid": call_sid, "analysis": analysis, "recording_url": recording_url},
     )
     route_new_agent_signals_once(db, limit=25)
-    try:
-        send_slack_notification(
-            db,
-            "\n".join(
-                [
-                    "Call Analysis Complete",
-                    f"Call SID: {call_sid}",
-                    f"Property ID: {property_id or '-'}",
-                    f"Person ID: {person_id or '-'}",
-                    f"Next Step: {analysis.get('next_best_step') or '-'}",
-                ]
-            ),
-        )
-    except Exception:
-        pass
     return {"job_id": job_id, "status": "completed", "call_sid": call_sid, "next_step": analysis.get("next_best_step")}
 
 

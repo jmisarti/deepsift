@@ -1446,7 +1446,11 @@ def transcribe_recording_with_openai(audio_bytes, filename="call_recording.mp3",
 
 
 def _infer_call_direction_from_numbers(db, from_number, to_number):
-    system_numbers = _system_phone_numbers(db)
+    system_numbers = set(_system_phone_numbers(db))
+    try:
+        system_numbers.update(_infer_system_numbers_from_smrt_events(db))
+    except Exception:
+        pass
     from_norm = normalize_phone(from_number)
     to_norm = normalize_phone(to_number)
     if from_norm and from_norm in system_numbers and (not to_norm or to_norm not in system_numbers):
@@ -7265,8 +7269,8 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
         "call_outcome": call_outcome,
         "from_number": from_number,
         "to_number": to_number,
-        "caller_name": caller_name or ("Team Caller" if call_direction == "Outbound" else "Inbound Caller"),
-        "callee_name": callee_name or ("Lead Contact" if call_direction == "Outbound" else "Team"),
+        "caller_name": caller_name or ("Our Team" if call_direction == "Outbound" else "Lead Caller"),
+        "callee_name": callee_name or ("Lead Contact" if call_direction == "Outbound" else "Our Team"),
         "timestamp": extract_first_string_by_keys(webhook, ["date", "timestamp", "completed_at"]),
     }
 
@@ -17305,6 +17309,7 @@ def integrations_agents_rerun_today_api():
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     # Agent 1: force rerun all today's calls for direction-aware summaries.
     call_rerun = rerun_call_analysis_for_today(db, limit=800)
+    db.commit()
     # Agent 1 SMS pass for last day.
     sms_res = run_sms_analysis_once(lookback_days=1, limit_threads=250)
     # Agent 3 reconciliation + snapshot.

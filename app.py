@@ -453,6 +453,8 @@ def require_login_if_enabled():
         "/api/call-recording-jobs",
         "/api/integrations/agent-trace/search",
         "/api/integrations/agent-trace/property",
+        "/api/integrations/agents/lead-watch",
+        "/api/integrations/agents/rerun-today",
     }
     if request.path in integration_api_allowlist:
         try:
@@ -844,7 +846,9 @@ def migrate_db(db):
             classification_override TEXT,
             ignore_agent2 INTEGER NOT NULL DEFAULT 0,
             suggested_property_id INTEGER,
+            suggested_property_uuid TEXT,
             approved_property_id INTEGER,
+            approved_property_uuid TEXT,
             status TEXT NOT NULL DEFAULT 'Pending',
             notes TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -852,6 +856,8 @@ def migrate_db(db):
         )
         """
     )
+    ensure_column(db, "agent3_lead_resolutions", "suggested_property_uuid", "suggested_property_uuid TEXT")
+    ensure_column(db, "agent3_lead_resolutions", "approved_property_uuid", "approved_property_uuid TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS idx_agent3_lead_resolutions_status ON agent3_lead_resolutions(status, updated_at)")
 
 
@@ -1233,6 +1239,24 @@ def extract_address_candidates(text):
             deduped.append(item)
             seen.add(key)
     return deduped[:5]
+
+
+def normalize_address_key(text):
+    raw = (text or "").strip().lower()
+    raw = raw.replace("new jersey", "nj")
+    raw = re.sub(r"[^a-z0-9]+", " ", raw)
+    raw = re.sub(r"\b(united states|usa|us)\b", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw
+
+
+def normalize_uuid(value):
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", text):
+        return text
+    return ""
 
 
 def normalize_social_profile_url(platform, handle, url):
@@ -7897,13 +7921,46 @@ def build_today_lead_watch_snapshot(db, limit=60):
     cutoff_dt = est_day_start_utc()
     cutoff = format_db_time(cutoff_dt)
     leads = {}
+    system_numbers = _system_phone_numbers(db)
+    phone_to_key = {}
+    addr_to_key = {}
     resolution_rows = db.execute(
         """
-        SELECT lead_key, classification_override, ignore_agent2, suggested_property_id, approved_property_id, status, notes, updated_at
+        SELECT lead_key, classification_override, ignore_agent2,
+               suggested_property_id, suggested_property_uuid,
+               approved_property_id, approved_property_uuid,
+               status, notes, updated_at
         FROM agent3_lead_resolutions
         """
     ).fetchall()
     resolution_map = {str(r["lead_key"]): dict(r) for r in resolution_rows}
+    referrals = db.execute(
+        """
+        SELECT rr.property_uuid, rr.status, rr.full_address, rr.owner_names, rr.referral_status, rr.referral_notes, rr.last_synced_at
+        FROM reisift_referrals rr
+        WHERE rr.is_active = 1
+        """
+    ).fetchall()
+    referral_push_rows = db.execute(
+        """
+        SELECT p.property_uuid, p.status AS push_status, p.to_number, p.created_at, r.first_name, r.last_name, r.brokerage
+        FROM referral_push_activity p
+        LEFT JOIN referral_realtors r ON r.id = p.realtor_id
+        ORDER BY p.id DESC
+        LIMIT 2000
+        """
+    ).fetchall()
+    referral_by_addr = {}
+    for rr in referrals:
+        key = normalize_address_key(rr["full_address"])
+        if key:
+            referral_by_addr[key] = dict(rr)
+    referral_push_by_uuid = {}
+    for pr in referral_push_rows:
+        pu = str(pr["property_uuid"] or "").strip()
+        if not pu:
+            continue
+        referral_push_by_uuid.setdefault(pu, []).append(dict(pr))
 
     def _touch(
         key,
@@ -7916,9 +7973,18 @@ def build_today_lead_watch_snapshot(db, limit=60):
         source="",
         classification="",
         address_hint="",
+        phone_norm="",
+        clever_related=False,
     ):
         if not key:
             return
+        key = str(key).strip()
+        if phone_norm:
+            phone_to_key[phone_norm] = key
+        if address_hint:
+            addr_key = normalize_address_key(address_hint)
+            if addr_key:
+                addr_to_key[addr_key] = key
         row = leads.get(key)
         if not row:
             row = {
@@ -7934,6 +8000,11 @@ def build_today_lead_watch_snapshot(db, limit=60):
                 "calls": 0,
                 "events": 0,
                 "last_activity_at": occurred_at or "",
+                "phones": set(),
+                "clever_related": bool(clever_related),
+                "referral": {},
+                "agent_summary": "",
+                "recommended": "",
             }
             leads[key] = row
         if property_id and not row.get("property_id"):
@@ -7946,6 +8017,10 @@ def build_today_lead_watch_snapshot(db, limit=60):
             row["sources"].add(source)
         if address_hint:
             row["address_hints"].add(address_hint)
+        if phone_norm:
+            row["phones"].add(phone_norm)
+        if clever_related:
+            row["clever_related"] = True
         if (event_type or "").upper() == "CALL":
             row["calls"] += 1
         elif (event_type or "").upper() == "SMS":
@@ -7970,8 +8045,12 @@ def build_today_lead_watch_snapshot(db, limit=60):
     ).fetchall()
     for p in prop_rows:
         label = f"{p['street']}, {p['city']}, {p['state']} {p['postal_code']}".strip(", ")
+        addr_key = normalize_address_key(label)
+        lead_key = f"property:{int(p['id'])}"
+        if addr_key:
+            addr_to_key[addr_key] = lead_key
         _touch(
-            key=f"property:{int(p['id'])}",
+            key=lead_key,
             label=label,
             occurred_at=str(p["created_at"] or ""),
             property_id=int(p["id"]),
@@ -7983,7 +8062,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
 
     comm_rows = db.execute(
         """
-        SELECT c.id, c.property_id, c.person_id, c.channel, c.direction, c.body, c.sent_at
+        SELECT c.id, c.property_id, c.person_id, c.channel, c.direction, c.from_number, c.to_number, c.body, c.sent_at
         FROM communications c
         WHERE c.sent_at >= ?
           AND upper(c.channel) = 'SMS'
@@ -7995,14 +8074,24 @@ def build_today_lead_watch_snapshot(db, limit=60):
     for c in comm_rows:
         body = str(c["body"] or "")
         candidates = extract_address_candidates(body)
+        from_num = normalize_phone(c["from_number"] if "from_number" in c.keys() else "")
+        to_num = normalize_phone(c["to_number"] if "to_number" in c.keys() else "")
+        counterpart_num = to_num if str(c["direction"] or "").lower() == "outbound" else from_num
+        if counterpart_num in system_numbers:
+            counterpart_num = ""
         lead_key = f"property:{int(c['property_id'])}" if c["property_id"] else ""
+        if not lead_key and counterpart_num and phone_to_key.get(counterpart_num):
+            lead_key = phone_to_key.get(counterpart_num, "")
         if not lead_key and candidates:
-            addr_norm = re.sub(r"[^a-z0-9]+", " ", candidates[0].lower()).strip()
+            addr_norm = normalize_address_key(candidates[0])
             if addr_norm:
-                lead_key = f"address:{addr_norm}"
+                lead_key = addr_to_key.get(addr_norm, f"address:{addr_norm}")
+        if not lead_key and counterpart_num:
+            lead_key = phone_to_key.get(counterpart_num, f"phone:{counterpart_num}")
         if not lead_key:
             continue
         signal = classify_unknown_contact_text(body)
+        clever_related = "clever" in body.lower()
         _touch(
             key=lead_key,
             label=(candidates[0] if candidates else lead_key),
@@ -8014,6 +8103,8 @@ def build_today_lead_watch_snapshot(db, limit=60):
             source="communications",
             classification=signal["classification"],
             address_hint=(candidates[0] if candidates else ""),
+            phone_norm=counterpart_num,
+            clever_related=clever_related,
         )
 
     event_rows = db.execute(
@@ -8036,6 +8127,8 @@ def build_today_lead_watch_snapshot(db, limit=60):
         candidates = extract_address_candidates(msg)
         classification_info = classify_unknown_contact_text(msg)
         phone_norm = normalize_phone(e["from_number"] if direction == "inbound" else e["to_number"])
+        if phone_norm in system_numbers:
+            phone_norm = ""
         ctx = get_cached_contact_context(db, phone_norm) if phone_norm else None
         lead_key = ""
         label = ""
@@ -8046,16 +8139,20 @@ def build_today_lead_watch_snapshot(db, limit=60):
             person_id = ctx["person_id"]
             lead_key = f"property:{prop_id}"
             label = f"Property {prop_id}"
+        elif phone_norm and phone_to_key.get(phone_norm):
+            lead_key = phone_to_key.get(phone_norm, "")
+            label = lead_key
         elif candidates:
-            addr_norm = re.sub(r"[^a-z0-9]+", " ", candidates[0].lower()).strip()
+            addr_norm = normalize_address_key(candidates[0])
             if addr_norm:
-                lead_key = f"address:{addr_norm}"
+                lead_key = addr_to_key.get(addr_norm, f"address:{addr_norm}")
                 label = candidates[0]
         elif phone_norm:
             lead_key = f"phone:{phone_norm}"
             label = f"Phone {phone_norm}"
         if not lead_key:
             continue
+        clever_related = "clever" in msg.lower()
         _touch(
             key=lead_key,
             label=label or lead_key,
@@ -8067,6 +8164,8 @@ def build_today_lead_watch_snapshot(db, limit=60):
             source=f"smrtphone:{str(e['event_type'] or '').lower()}",
             classification=(ctx["classification"] if ctx else classification_info["classification"]),
             address_hint=(candidates[0] if candidates else ""),
+            phone_norm=phone_norm,
+            clever_related=clever_related,
         )
 
     call_rows = db.execute(
@@ -8083,6 +8182,16 @@ def build_today_lead_watch_snapshot(db, limit=60):
         summary = str(c["summary_text"] or "")
         candidates = extract_address_candidates(summary)
         lead_key = f"property:{int(c['property_id'])}" if c["property_id"] else ""
+        phone_candidates = []
+        for raw in [c["from_number"], c["to_number"]]:
+            n = normalize_phone(raw)
+            if n and n not in system_numbers:
+                phone_candidates.append(n)
+        if not lead_key:
+            for pn in phone_candidates:
+                if pn in phone_to_key:
+                    lead_key = phone_to_key[pn]
+                    break
         if not lead_key:
             for num in [c["from_number"], c["to_number"]]:
                 ctx = get_cached_contact_context(db, num)
@@ -8090,9 +8199,9 @@ def build_today_lead_watch_snapshot(db, limit=60):
                     lead_key = f"property:{int(ctx['property_id'])}"
                     break
         if not lead_key and candidates:
-            addr_norm = re.sub(r"[^a-z0-9]+", " ", candidates[0].lower()).strip()
+            addr_norm = normalize_address_key(candidates[0])
             if addr_norm:
-                lead_key = f"address:{addr_norm}"
+                lead_key = addr_to_key.get(addr_norm, f"address:{addr_norm}")
         if not lead_key:
             continue
         signal = classify_unknown_contact_text(summary)
@@ -8106,38 +8215,109 @@ def build_today_lead_watch_snapshot(db, limit=60):
             source="call_recording_jobs",
             classification=signal["classification"],
             address_hint=(candidates[0] if candidates else ""),
+            phone_norm=(phone_candidates[0] if phone_candidates else ""),
+            clever_related=("clever" in summary.lower()),
         )
+
+    # Merge fragmented keys that resolve to the same property into a single canonical row.
+    merged = {}
+    for key, row in list(leads.items()):
+        pid = int(row.get("property_id") or 0)
+        canonical = f"property:{pid}" if pid else key
+        tgt = merged.get(canonical)
+        if not tgt:
+            merged[canonical] = row
+            if canonical != key:
+                row["lead_key"] = canonical
+            continue
+        tgt["person_id"] = tgt.get("person_id") or row.get("person_id")
+        if row.get("classification") and tgt.get("classification") in {"", "unknown"}:
+            tgt["classification"] = row.get("classification")
+        tgt["sources"] = set(list(tgt.get("sources") or set()) + list(row.get("sources") or set()))
+        tgt["address_hints"] = set(list(tgt.get("address_hints") or set()) + list(row.get("address_hints") or set()))
+        tgt["phones"] = set(list(tgt.get("phones") or set()) + list(row.get("phones") or set()))
+        tgt["sms_inbound"] = int(tgt.get("sms_inbound") or 0) + int(row.get("sms_inbound") or 0)
+        tgt["sms_outbound"] = int(tgt.get("sms_outbound") or 0) + int(row.get("sms_outbound") or 0)
+        tgt["calls"] = int(tgt.get("calls") or 0) + int(row.get("calls") or 0)
+        tgt["events"] = int(tgt.get("events") or 0) + int(row.get("events") or 0)
+        tgt["clever_related"] = bool(tgt.get("clever_related") or row.get("clever_related"))
+        if (row.get("last_activity_at") or "") > (tgt.get("last_activity_at") or ""):
+            tgt["last_activity_at"] = row.get("last_activity_at")
+        if not tgt.get("label") and row.get("label"):
+            tgt["label"] = row.get("label")
+    leads = merged
 
     rows = []
     for v in leads.values():
         resolution = resolution_map.get(v["lead_key"]) or {}
         approved_property_id = int(resolution.get("approved_property_id") or 0)
+        approved_property_uuid = normalize_uuid(resolution.get("approved_property_uuid") or "")
         effective_property_id = approved_property_id or int(v["property_id"] or 0)
+        effective_property_uuid = approved_property_uuid
         effective_classification = (
             (resolution.get("classification_override") or "").strip().lower()
             or (v["classification"] or "unknown")
         )
         ignore_agent2 = int(resolution.get("ignore_agent2") or 0)
+        referral_data = {}
+        for hint in list(v["address_hints"]):
+            rk = normalize_address_key(hint)
+            if rk and rk in referral_by_addr:
+                referral_data = dict(referral_by_addr[rk])
+                break
+        if not referral_data:
+            # fallback by row label/address-ish
+            rk = normalize_address_key(v["label"])
+            if rk and rk in referral_by_addr:
+                referral_data = dict(referral_by_addr[rk])
+        if not effective_property_uuid and referral_data:
+            effective_property_uuid = normalize_uuid(referral_data.get("property_uuid") or "")
+        pushes = []
+        if referral_data:
+            pushes = referral_push_by_uuid.get(str(referral_data.get("property_uuid") or "").strip(), [])[:5]
+        summary_bits = []
+        summary_bits.append(f"SMS out {int(v['sms_outbound'])}, SMS in {int(v['sms_inbound'])}, calls {int(v['calls'])}.")
+        if v["clever_related"] or referral_data:
+            summary_bits.append("Lead appears to be Clever/referral sourced.")
+        if effective_classification in {"spam", "solicitor"}:
+            summary_bits.append("Current classification suggests suppressing Agent 2 escalation.")
+        if ignore_agent2:
+            summary_bits.append("Manually flagged to ignore Agent 2.")
+        recommended = "Continue monitoring"
+        if effective_classification in {"spam", "solicitor"} or ignore_agent2:
+            recommended = "No Agent 2 action (monitor only)"
+        elif effective_property_id:
+            recommended = "Route to Agent 2 playbook for next touchpoint"
+        else:
+            recommended = "Resolve property link (address/phone) before Agent 2 action"
         rows.append(
             {
                 "lead_key": v["lead_key"],
                 "label": v["label"],
                 "property_id": effective_property_id,
+                "reisift_property_uuid": effective_property_uuid,
                 "person_id": v["person_id"] or 0,
                 "classification": effective_classification,
                 "sources": sorted(list(v["sources"]))[:6],
                 "address_hints": sorted(list(v["address_hints"]))[:4],
+                "phones": sorted(list(v["phones"]))[:4],
                 "sms_inbound": int(v["sms_inbound"]),
                 "sms_outbound": int(v["sms_outbound"]),
                 "calls": int(v["calls"]),
                 "events": int(v["events"]),
                 "last_activity_at": v["last_activity_at"] or "",
-                "unresolved": 0 if effective_property_id else 1,
+                "unresolved": 0 if (effective_property_id or effective_property_uuid) else 1,
                 "ignore_agent2": 1 if ignore_agent2 else 0,
                 "resolution_status": str(resolution.get("status") or ""),
                 "suggested_property_id": int(resolution.get("suggested_property_id") or 0),
+                "suggested_property_uuid": normalize_uuid(resolution.get("suggested_property_uuid") or ""),
                 "resolution_updated_at": str(resolution.get("updated_at") or ""),
                 "resolution_notes": str(resolution.get("notes") or ""),
+                "clever_related": bool(v["clever_related"] or bool(referral_data)),
+                "referral": referral_data,
+                "referral_pushes": pushes,
+                "agent_summary": " ".join(summary_bits),
+                "recommended": recommended,
             }
         )
     rows.sort(key=lambda r: ((r["last_activity_at"] or ""), r["events"]), reverse=True)
@@ -11500,6 +11680,31 @@ def run_agent3_lead_watch_reconcile(db, limit=80):
         hint = str(hints[0]).strip()
         if not hint:
             continue
+        hinted_uuid = normalize_uuid(item.get("reisift_property_uuid") or "")
+        if hinted_uuid:
+            touched += 1
+            db.execute(
+                """
+                INSERT INTO agent3_lead_resolutions
+                (lead_key, suggested_property_uuid, status, notes, updated_at)
+                VALUES (?, ?, 'Pending', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(lead_key) DO UPDATE SET
+                    suggested_property_uuid = excluded.suggested_property_uuid,
+                    status = CASE
+                        WHEN agent3_lead_resolutions.status IN ('Approved', 'Rejected') THEN agent3_lead_resolutions.status
+                        ELSE 'Pending'
+                    END,
+                    notes = excluded.notes,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    lead_key,
+                    hinted_uuid,
+                    f"Agent 3 suggested ReiSIFT UUID from referral match: {hinted_uuid}",
+                ),
+            )
+            suggested += 1
+            continue
         like = f"%{hint.lower()}%"
         match = db.execute(
             """
@@ -11518,10 +11723,11 @@ def run_agent3_lead_watch_reconcile(db, limit=80):
         db.execute(
             """
             INSERT INTO agent3_lead_resolutions
-            (lead_key, suggested_property_id, status, notes, updated_at)
-            VALUES (?, ?, 'Pending', ?, CURRENT_TIMESTAMP)
+            (lead_key, suggested_property_id, suggested_property_uuid, status, notes, updated_at)
+            VALUES (?, ?, NULL, 'Pending', ?, CURRENT_TIMESTAMP)
             ON CONFLICT(lead_key) DO UPDATE SET
                 suggested_property_id = excluded.suggested_property_id,
+                suggested_property_uuid = NULL,
                 status = CASE
                     WHEN agent3_lead_resolutions.status IN ('Approved', 'Rejected') THEN agent3_lead_resolutions.status
                     ELSE 'Pending'
@@ -11858,23 +12064,32 @@ def run_agent3_lead_watch_resolve_route():
     classification = (request.form.get("classification_override") or "").strip().lower()
     status = (request.form.get("status") or "Pending").strip().title()
     approved_property_raw = (request.form.get("approved_property_id") or "").strip()
+    approved_property_uuid_raw = (request.form.get("approved_property_uuid") or "").strip()
     suggested_property_raw = (request.form.get("suggested_property_id") or "").strip()
+    suggested_property_uuid_raw = (request.form.get("suggested_property_uuid") or "").strip()
     ignore_agent2 = 1 if (request.form.get("ignore_agent2") or "").strip().lower() in {"1", "true", "on", "yes"} else 0
     notes = (request.form.get("notes") or "").strip()
     approved_property_id = int(approved_property_raw) if approved_property_raw.isdigit() else None
+    approved_property_uuid = normalize_uuid(approved_property_uuid_raw)
     suggested_property_id = int(suggested_property_raw) if suggested_property_raw.isdigit() else None
+    suggested_property_uuid = normalize_uuid(suggested_property_uuid_raw)
     if status not in {"Pending", "Approved", "Rejected"}:
         status = "Pending"
     db.execute(
         """
         INSERT INTO agent3_lead_resolutions
-        (lead_key, classification_override, ignore_agent2, suggested_property_id, approved_property_id, status, notes, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        (lead_key, classification_override, ignore_agent2,
+         suggested_property_id, suggested_property_uuid,
+         approved_property_id, approved_property_uuid,
+         status, notes, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(lead_key) DO UPDATE SET
             classification_override = excluded.classification_override,
             ignore_agent2 = excluded.ignore_agent2,
             suggested_property_id = excluded.suggested_property_id,
+            suggested_property_uuid = excluded.suggested_property_uuid,
             approved_property_id = excluded.approved_property_id,
+            approved_property_uuid = excluded.approved_property_uuid,
             status = excluded.status,
             notes = excluded.notes,
             updated_at = CURRENT_TIMESTAMP
@@ -11884,7 +12099,9 @@ def run_agent3_lead_watch_resolve_route():
             classification,
             ignore_agent2,
             suggested_property_id,
+            suggested_property_uuid,
             approved_property_id,
+            approved_property_uuid,
             status,
             notes,
         ),
@@ -16800,6 +17017,53 @@ def call_recording_jobs_api():
         (limit,),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/integrations/agents/lead-watch", methods=["GET"])
+def integrations_agents_lead_watch_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    limit_raw = (request.args.get("limit") or "80").strip()
+    try:
+        limit = max(1, min(300, int(limit_raw)))
+    except ValueError:
+        limit = 80
+    snapshot = build_today_lead_watch_snapshot(db, limit=limit)
+    return jsonify({"ok": True, "snapshot": snapshot})
+
+
+@app.route("/api/integrations/agents/rerun-today", methods=["POST"])
+def integrations_agents_rerun_today_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    # Agent 1: rerun call analysis in bounded batches.
+    call_runs = []
+    for _ in range(5):
+        res = run_call_recording_analysis_once(limit=25)
+        call_runs.append(res)
+        if not res.get("ok"):
+            break
+        if int(res.get("processed", 0) or 0) == 0:
+            break
+    # Agent 1 SMS pass for last day.
+    sms_res = run_sms_analysis_once(lookback_days=1, limit_threads=250)
+    # Agent 3 reconciliation + snapshot.
+    recon = run_agent3_lead_watch_reconcile(db, limit=200)
+    snapshot = build_today_lead_watch_snapshot(db, limit=200)
+    db.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "call_runs": call_runs,
+            "sms": sms_res,
+            "reconcile": recon,
+            "snapshot": snapshot,
+        }
+    )
 
 
 def _agent_trace_for_property(db, property_id, limit=20):

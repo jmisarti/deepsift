@@ -401,6 +401,7 @@
             <tr>
                 <th>Lead</th>
                 <th>Touchpoints</th>
+                <th>Agent Summary</th>
                 <th>Classification</th>
                 <th>Status</th>
                 <th>Resolve</th>
@@ -415,8 +416,24 @@
                     {% if row.property_id %}
                     <br><a href="{{ url_for('property_detail', property_id=row.property_id) }}">Property {{ row.property_id }}</a>
                     {% endif %}
+                    {% if row.phones %}
+                    <br><small>Phone(s): {{ row.phones|join(', ') }}</small>
+                    {% endif %}
                     {% if row.address_hints %}
                     <br><small>Hints: {{ row.address_hints|join(' | ') }}</small>
+                    {% endif %}
+                    {% if row.referral and row.referral.property_uuid %}
+                    <br><small><strong>Referral:</strong> {{ row.referral.referral_status or '-' }} | Listing: {{ row.referral.status or '-' }}</small>
+                    <br><small><a href="https://app.reisift.io/records/properties/{{ row.referral.property_uuid }}/details?page=1" target="_blank">Open in Sift</a></small>
+                    {% endif %}
+                    {% if row.reisift_property_uuid %}
+                    <br><small>UUID: {{ row.reisift_property_uuid }}</small>
+                    {% endif %}
+                    {% if row.referral_pushes %}
+                    <br><small>Realtor push:</small>
+                    {% for p in row.referral_pushes[:2] %}
+                    <br><small>- {{ p.first_name or '' }} {{ p.last_name or '' }} {{ p.brokerage or '' }} ({{ p.push_status or '-' }})</small>
+                    {% endfor %}
                     {% endif %}
                 </td>
                 <td>
@@ -424,6 +441,10 @@
                     SMS Out: {{ row.sms_outbound }}<br>
                     Calls: {{ row.calls }}<br>
                     <small>Last: {{ row.last_activity_at|fmt_est_datetime }}</small>
+                </td>
+                <td>
+                    {{ row.agent_summary }}<br>
+                    <small><strong>Next:</strong> {{ row.recommended }}</small>
                 </td>
                 <td>{{ row.classification }}</td>
                 <td>
@@ -435,13 +456,15 @@
                     <form method="post" action="{{ url_for('run_agent3_lead_watch_resolve_route') }}" style="display:flex; flex-direction:column; gap:0.3rem;">
                         <input type="hidden" name="lead_key" value="{{ row.lead_key }}">
                         <input type="hidden" name="suggested_property_id" value="{{ row.suggested_property_id or '' }}">
+                        <input type="hidden" name="suggested_property_uuid" value="{{ row.suggested_property_uuid or row.reisift_property_uuid or '' }}">
                         <select name="classification_override">
                             <option value="">(Keep)</option>
                             {% for c in ['potential_seller','potential_buyer','spam','solicitor','unknown'] %}
                             <option value="{{ c }}" {% if c == row.classification %}selected{% endif %}>{{ c }}</option>
                             {% endfor %}
                         </select>
-                        <input type="number" name="approved_property_id" min="1" placeholder="Property ID" value="{{ row.property_id or row.suggested_property_id or '' }}">
+                        <input type="number" name="approved_property_id" min="1" placeholder="DeepSift property_id (optional)" value="{{ row.property_id or row.suggested_property_id or '' }}">
+                        <input type="text" name="approved_property_uuid" placeholder="ReiSIFT UUID (optional)" value="{{ row.reisift_property_uuid or row.suggested_property_uuid or '' }}">
                         <label><input type="checkbox" name="ignore_agent2" {% if row.ignore_agent2 %}checked{% endif %}> Ignore Agent 2</label>
                         <select name="status">
                             {% for s in ['Pending','Approved','Rejected'] %}
@@ -456,6 +479,12 @@
             {% endfor %}
         </tbody>
     </table>
+    <p style="margin-top:0.75rem;">
+        <small>
+            Resolution behavior: <strong>status</strong> stores your decision state; <strong>approved property id</strong> or <strong>approved UUID</strong> links future logs to a lead;
+            <strong>ignore Agent 2</strong> suppresses escalation/task routing for that lead; <strong>notes</strong> stores operator context.
+        </small>
+    </p>
     {% else %}
     <p style="margin-top:0.75rem;">No leads observed yet for today.</p>
     {% endif %}

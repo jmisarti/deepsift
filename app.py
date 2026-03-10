@@ -4748,6 +4748,13 @@ def _find_existing_website_submission(db, fields):
     return None
 
 
+def _sift_record_url(property_uuid):
+    pu = str(property_uuid or "").strip()
+    if not pu:
+        return ""
+    return f"https://app.reisift.io/records/properties/{pu}/details?page=1"
+
+
 def _website_additional_field_pairs(payload):
     field_defs = [
         ("Garage", ["11"]),
@@ -4842,7 +4849,7 @@ def _build_website_lead_notes(payload, fields, source_label="webhook"):
 
 def process_website_lead_payload(db, payload, source_label="webhook"):
     if not isinstance(payload, dict):
-        return {"ok": False, "error": "Invalid payload object.", "error_type": "validation"}
+        return {"ok": False, "error": "Invalid payload object.", "error_type": "validation", "slack_sent": False}
     fields = _extract_website_lead_fields(payload)
     address = fields.get("address") or ""
     phone = fields.get("phone") or ""
@@ -4878,7 +4885,18 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
     )
     db.commit()
     if not is_new:
-        return {"ok": True, "duplicate": True, "event_key": event_key, "lead_key": lead_key}
+        existing_uuid = ""
+        existing = db.execute("SELECT reisift_property_uuid FROM website_lead_submissions WHERE lead_key = ? LIMIT 1", (lead_key,)).fetchone()
+        if existing:
+            existing_uuid = str(existing["reisift_property_uuid"] or "").strip()
+        return {
+            "ok": True,
+            "duplicate": True,
+            "event_key": event_key,
+            "lead_key": lead_key,
+            "created_uuid": existing_uuid,
+            "slack_sent": False,
+        }
 
     is_step2 = _website_submission_is_step2(payload)
     form_payload = _website_payload_data(payload)
@@ -4922,6 +4940,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
         if current and not is_step2:
             # Step-1 is idempotent: if we already have this lead in system, no-op.
             mode = "step1_exists_noop"
+            sift_link = _sift_record_url(current["reisift_property_uuid"] if current else "")
             slack_lines = [
                 "Website Lead SIFT Handling",
                 f"Stage: {fields.get('stage') or '-'}",
@@ -4933,6 +4952,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 f"Phone: {phone or '-'}",
                 f"Email: {email or '-'}",
                 f"Lead Key: {lead_key or '-'}",
+                f"SIFT Record: {sift_link or '-'}",
             ]
             send_slack_notification(db, "\n".join(slack_lines))
             add_website_webhook_note(
@@ -4943,7 +4963,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 {"lead_key": lead_key},
             )
             db.commit()
-            return {"ok": True, "event_key": event_key, "lead_key": lead_key, "mode": mode}
+            return {"ok": True, "event_key": event_key, "lead_key": lead_key, "mode": mode, "created_uuid": str(current["reisift_property_uuid"] or "").strip(), "slack_sent": True}
 
         if not current:
             if address:
@@ -5088,9 +5108,11 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             "created_uuid": created_uuid,
             "owner_uuid": owner_uuid,
             "address_changed": address_changed,
+            "slack_sent": True,
         }
     except Exception as exc:
         err = str(exc)
+        sift_link = _sift_record_url(created_uuid or (current["reisift_property_uuid"] if current else ""))
         add_website_webhook_note(
             db,
             event_key,
@@ -5106,8 +5128,33 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             route="/api/integrations/website/lead",
             status_code=500,
         )
+        try:
+            slack_lines = [
+                "Website Lead SIFT Handling",
+                f"Stage: {fields.get('stage') or '-'}",
+                f"Form ID: {form_id or '-'}",
+                f"Step Type: {'step2' if is_step2 else 'step1'}",
+                "Mode: failed",
+                f"Address: {address or '-'}",
+                f"Name: {fields.get('seller_name') or '-'}",
+                f"Phone: {phone or '-'}",
+                f"Email: {email or '-'}",
+                f"SIFT Record: {sift_link or '-'}",
+                f"Error: {err}",
+            ]
+            send_slack_notification(db, "\n".join(slack_lines))
+        except Exception:
+            pass
         db.commit()
-        return {"ok": False, "event_key": event_key, "lead_key": lead_key, "error": err, "error_type": "server"}
+        return {
+            "ok": False,
+            "event_key": event_key,
+            "lead_key": lead_key,
+            "created_uuid": created_uuid or (str(current["reisift_property_uuid"] or "").strip() if current else ""),
+            "error": err,
+            "error_type": "server",
+            "slack_sent": True,
+        }
 
 
 def _get_google_service_account_info():
@@ -11648,7 +11695,50 @@ def integrations_website_lead_api():
             db.commit()
         except Exception:
             pass
+        if not result.get("slack_sent"):
+            try:
+                fields = _extract_website_lead_fields(payload if isinstance(payload, dict) else {})
+                sift_link = _sift_record_url(result.get("created_uuid") or "")
+                send_slack_notification(
+                    db,
+                    "\n".join(
+                        [
+                            "Website Lead SIFT Handling",
+                            f"Stage: {fields.get('stage') or '-'}",
+                            f"Mode: failed",
+                            f"Address: {fields.get('address') or '-'}",
+                            f"Name: {fields.get('seller_name') or '-'}",
+                            f"Phone: {fields.get('phone') or '-'}",
+                            f"Email: {fields.get('email') or '-'}",
+                            f"SIFT Record: {sift_link or '-'}",
+                            f"Error: {result.get('error') or 'Unknown'}",
+                        ]
+                    ),
+                )
+            except Exception:
+                pass
     if result.get("ok"):
+        if not result.get("slack_sent"):
+            try:
+                fields = _extract_website_lead_fields(payload if isinstance(payload, dict) else {})
+                sift_link = _sift_record_url(result.get("created_uuid") or "")
+                send_slack_notification(
+                    db,
+                    "\n".join(
+                        [
+                            "Website Lead SIFT Handling",
+                            f"Stage: {fields.get('stage') or '-'}",
+                            f"Mode: {result.get('mode') or ('duplicate' if result.get('duplicate') else 'success')}",
+                            f"Address: {fields.get('address') or '-'}",
+                            f"Name: {fields.get('seller_name') or '-'}",
+                            f"Phone: {fields.get('phone') or '-'}",
+                            f"Email: {fields.get('email') or '-'}",
+                            f"SIFT Record: {sift_link or '-'}",
+                        ]
+                    ),
+                )
+            except Exception:
+                pass
         status_code = 200
     else:
         err_type = str(result.get("error_type") or "").strip().lower()

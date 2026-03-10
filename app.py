@@ -11530,6 +11530,37 @@ def integrations_website_lead_logs_api():
     return jsonify({"ok": True, "count": len(items), "items": items})
 
 
+@app.route("/api/integrations/website/lead/latest", methods=["GET"])
+def integrations_website_lead_latest_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    row = db.execute(
+        """
+        SELECT id, event_key, lead_key, note_body, payload_json, created_at
+        FROM website_lead_webhook_notes
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return jsonify({"ok": True, "item": None})
+    return jsonify(
+        {
+            "ok": True,
+            "item": {
+                "id": int(row["id"]),
+                "event_key": row["event_key"],
+                "lead_key": row["lead_key"],
+                "note_body": row["note_body"],
+                "payload_json_raw": row["payload_json"] or "{}",
+                "created_at": row["created_at"],
+            },
+        }
+    )
+
+
 @app.route("/api/admin/import-referral-bundle", methods=["POST"])
 def import_referral_bundle_api():
     ensure_db()

@@ -105,6 +105,8 @@ OPENLETTERCONNECT_BASE_URL = os.getenv("OPENLETTERCONNECT_BASE_URL", "https://ap
 OPENLETTERCONNECT_TEMPLATE_ID = int(os.getenv("OPENLETTERCONNECT_TEMPLATE_ID", "9256"))
 CALL_RECORDING_WORKER_ENABLED = env_flag("CALL_RECORDING_WORKER_ENABLED", True)
 CALL_RECORDING_POLL_SECONDS = max(int((os.getenv("CALL_RECORDING_POLL_SECONDS") or "60").strip() or "60"), 15)
+SMS_ANALYSIS_WORKER_ENABLED = env_flag("SMS_ANALYSIS_WORKER_ENABLED", True)
+SMS_ANALYSIS_POLL_SECONDS = max(int((os.getenv("SMS_ANALYSIS_POLL_SECONDS") or "180").strip() or "180"), 30)
 APP_AUTH_ENABLED = env_flag("APP_AUTH_ENABLED", False)
 APP_AUTH_USERNAME = os.getenv("APP_AUTH_USERNAME", "").strip()
 APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD", "")
@@ -124,6 +126,7 @@ EMAIL_POLL_WORKER_STARTED = False
 CLEVER_LEADS_WORKER_STARTED = False
 REFERRAL_MARKET_WORKER_STARTED = False
 CALL_RECORDING_WORKER_STARTED = False
+SMS_ANALYSIS_WORKER_STARTED = False
 NJ_COUNTIES = [
     "Atlantic",
     "Bergen",
@@ -201,6 +204,16 @@ LEAD_NEGATIVE_INTENT_TOKENS = [
     "do not contact",
     "wrong person",
 ]
+ACTIVE_LEAD_STATUSES = {
+    "new lead",
+    "new_lead",
+    "ghosting lead",
+    "hot lead",
+    "warm lead",
+    "cold lead",
+    "no contact new lead",
+    "nurture new lead",
+}
 
 
 def format_phone_display(value):
@@ -338,6 +351,7 @@ def require_login_if_enabled():
         start_clever_leads_worker()
         start_referral_on_market_worker()
         start_call_recording_worker()
+        start_sms_analysis_worker()
     if not APP_AUTH_ENABLED:
         return None
     endpoint = request.endpoint or ""
@@ -603,6 +617,46 @@ def migrate_db(db):
         """
     )
     ensure_column(db, "call_recording_jobs", "analysis_json", "analysis_json TEXT")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type TEXT NOT NULL,
+            source_key TEXT NOT NULL UNIQUE,
+            property_id INTEGER,
+            person_id INTEGER,
+            channel TEXT,
+            intent TEXT,
+            sentiment TEXT,
+            confidence REAL,
+            recommended_next_step TEXT,
+            summary_text TEXT,
+            is_spam INTEGER NOT NULL DEFAULT 0,
+            do_not_contact INTEGER NOT NULL DEFAULT 0,
+            routing_status TEXT NOT NULL DEFAULT 'new',
+            payload_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_agent_signals_routing ON agent_signals(routing_status, source_type)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_agent_signals_prop_person ON agent_signals(property_id, person_id)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sms_thread_state (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_key TEXT NOT NULL UNIQUE,
+            property_id INTEGER,
+            person_id INTEGER,
+            counterpart_number TEXT,
+            last_message_at TEXT,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            transcript_hash TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
 
 def log_app_error(db, source, error_message, details="", route="", status_code=None):
@@ -5861,7 +5915,23 @@ def process_single_call_recording_job(db, job_row):
         )
         add_person_note(db, person_id, "Call Recording Analysis", note_body, analysis)
 
-    _queue_call_analysis_lead_action(db, job_row, analysis)
+    upsert_agent_signal(
+        db,
+        source_type="call",
+        source_key=f"call:{call_sid}",
+        property_id=property_id,
+        person_id=person_id,
+        channel="CALL",
+        intent=(analysis.get("caller_intent") or "").strip(),
+        sentiment=(analysis.get("sentiment") or "Unknown").strip(),
+        confidence=float(analysis.get("confidence") or 0.0),
+        recommended_next_step=(analysis.get("next_best_step") or "").strip(),
+        summary_text=summary_text,
+        is_spam=False,
+        do_not_contact=(analysis.get("next_best_step") in {"Mark Not Interested", "Mark Opt Out"}),
+        payload={"call_sid": call_sid, "analysis": analysis, "recording_url": recording_url},
+    )
+    route_new_agent_signals_once(db, limit=25)
     try:
         send_slack_notification(
             db,
@@ -5958,6 +6028,388 @@ def start_call_recording_worker():
             except Exception:
                 pass
             time.sleep(CALL_RECORDING_POLL_SECONDS)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
+def upsert_agent_signal(
+    db,
+    source_type,
+    source_key,
+    property_id=None,
+    person_id=None,
+    channel="",
+    intent="",
+    sentiment="",
+    confidence=0.0,
+    recommended_next_step="",
+    summary_text="",
+    is_spam=False,
+    do_not_contact=False,
+    payload=None,
+):
+    row = db.execute("SELECT id FROM agent_signals WHERE source_key = ?", ((source_key or "").strip(),)).fetchone()
+    payload_json = json.dumps(payload or {})
+    args = (
+        (source_type or "").strip() or "unknown",
+        (source_key or "").strip(),
+        property_id,
+        person_id,
+        (channel or "").strip(),
+        (intent or "").strip(),
+        (sentiment or "").strip(),
+        float(confidence or 0.0),
+        (recommended_next_step or "").strip(),
+        (summary_text or "").strip(),
+        1 if is_spam else 0,
+        1 if do_not_contact else 0,
+        payload_json,
+    )
+    if row:
+        db.execute(
+            """
+            UPDATE agent_signals
+            SET source_type = ?, property_id = ?, person_id = ?, channel = ?, intent = ?, sentiment = ?,
+                confidence = ?, recommended_next_step = ?, summary_text = ?, is_spam = ?, do_not_contact = ?,
+                payload_json = ?, routing_status = 'new', updated_at = CURRENT_TIMESTAMP
+            WHERE source_key = ?
+            """,
+            args + ((source_key or "").strip(),),
+        )
+        return row["id"]
+    cur = db.execute(
+        """
+        INSERT INTO agent_signals
+        (source_type, source_key, property_id, person_id, channel, intent, sentiment, confidence, recommended_next_step, summary_text, is_spam, do_not_contact, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        args,
+    )
+    return cur.lastrowid
+
+
+def _map_signal_to_action(signal_row):
+    next_step = (signal_row["recommended_next_step"] or "").strip()
+    mapping = {
+        "Schedule Appointment": ("ScheduleAppointment", "High"),
+        "Follow Up": ("FollowUpTouchDue", "Medium"),
+        "Escalate To Relative": ("EscalateToRelativeOutreach", "High"),
+        "Deep Dive": ("EscalateToDeepDiveResearch", "High"),
+        "Mark Not Interested": ("HumanReviewDisposition", "High"),
+        "Mark Opt Out": ("HumanReviewDisposition", "High"),
+        "No Action": ("ReviewInboundAndNextBestAction", "Low"),
+    }
+    return mapping.get(next_step, ("ReviewInboundAndNextBestAction", "Medium"))
+
+
+def route_new_agent_signals_once(db, limit=50):
+    rows = db.execute(
+        """
+        SELECT *
+        FROM agent_signals
+        WHERE routing_status = 'new'
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    ).fetchall()
+    routed = 0
+    skipped = 0
+    for row in rows:
+        property_id = row["property_id"]
+        person_id = row["person_id"]
+        payload = parse_json_object(row["payload_json"] or "{}")
+        if not property_id:
+            db.execute(
+                "UPDATE agent_signals SET routing_status = 'unmapped', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (row["id"],),
+            )
+            skipped += 1
+            continue
+        prop = db.execute("SELECT status FROM properties WHERE id = ?", (property_id,)).fetchone()
+        prop_status = str((prop["status"] if prop else "") or "").strip().lower()
+        is_conflict = bool(row["do_not_contact"]) and prop_status in ACTIVE_LEAD_STATUSES
+        if is_conflict:
+            _upsert_lead_action(
+                db,
+                int(property_id),
+                person_id,
+                "HumanReviewDisposition",
+                "High",
+                "Conflict detected: do-not-contact signal conflicts with active lead status. Human review required.",
+                {"signal_id": row["id"], "property_status": prop_status, "signal": payload},
+            )
+        elif row["is_spam"]:
+            _upsert_lead_action(
+                db,
+                int(property_id),
+                person_id,
+                "ReviewInboundAndNextBestAction",
+                "Low",
+                "Signal classified as spam/solicitation. Verify and dismiss if not business related.",
+                {"signal_id": row["id"], "signal": payload},
+            )
+        else:
+            action_type, priority = _map_signal_to_action(row)
+            _upsert_lead_action(
+                db,
+                int(property_id),
+                person_id,
+                action_type,
+                priority,
+                f"Agent signal ({row['source_type']}) recommends: {(row['recommended_next_step'] or 'review')}.",
+                {"signal_id": row["id"], "signal": payload},
+            )
+        db.execute(
+            "UPDATE agent_signals SET routing_status = 'routed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (row["id"],),
+        )
+        routed += 1
+    return {"processed": len(rows), "routed": routed, "skipped": skipped}
+
+
+def _system_phone_numbers(db):
+    vals = set()
+    for raw in [SMRTPHONE_FROM_NUMBER, get_setting(db, "deep_dive_smrtphone_from", ""), get_setting(db, "referral_smrtphone_from", "")]:
+        n = normalize_phone(raw)
+        if n:
+            vals.add(n)
+    return vals
+
+
+def _thread_counterpart(system_numbers, direction, from_number, to_number):
+    from_norm = normalize_phone(from_number)
+    to_norm = normalize_phone(to_number)
+    if direction == "outbound":
+        return to_norm or from_norm
+    if direction == "inbound":
+        return from_norm or to_norm
+    if from_norm and from_norm not in system_numbers:
+        return from_norm
+    if to_norm and to_norm not in system_numbers:
+        return to_norm
+    return from_norm or to_norm
+
+
+def analyze_sms_thread_with_openai(messages, property_id=None, person_id=None, counterpart=""):
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set")
+    if not messages:
+        raise ValueError("messages required")
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    text_lines = []
+    for m in messages:
+        ts = m.get("sent_at") or m.get("created_at") or ""
+        direction = (m.get("direction") or "").strip().title()
+        body = (m.get("body") or "").strip()
+        if not body:
+            continue
+        text_lines.append(f"[{ts}] {direction}: {body}")
+    transcript = "\n".join(text_lines)[:16000]
+    schema = {
+        "name": "sms_thread_analysis",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {"type": "string"},
+                "intent": {"type": "string"},
+                "sentiment": {"type": "string", "enum": ["Positive", "Neutral", "Negative", "Mixed", "Unknown"]},
+                "conversation_type": {"type": "string", "enum": ["Business", "Spam", "Wrong Number", "Unknown"]},
+                "recommended_next_step": {
+                    "type": "string",
+                    "enum": [
+                        "Schedule Appointment",
+                        "Follow Up",
+                        "Escalate To Relative",
+                        "Deep Dive",
+                        "Mark Not Interested",
+                        "Mark Opt Out",
+                        "No Action",
+                    ],
+                },
+                "confidence": {"type": "number"},
+                "key_facts": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["summary", "intent", "sentiment", "conversation_type", "recommended_next_step", "confidence", "key_facts"],
+        },
+        "strict": True,
+    }
+    prompt = (
+        "Analyze this SMS thread for lead management.\n"
+        f"Property ID: {property_id or '-'} | Person ID: {person_id or '-'} | Counterpart: {counterpart or '-'}\n"
+        "Return only valid JSON."
+        f"\n\nThread:\n{transcript}"
+    )
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": "You are an SMS conversation analyst for a real estate CRM."}]},
+                {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+            ],
+            "text": {"format": {"type": "json_schema", "name": schema["name"], "schema": schema["schema"], "strict": True}},
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    output_text = (data.get("output_text") or "").strip()
+    if output_text:
+        return json.loads(output_text)
+    for item in data.get("output", []):
+        for part in item.get("content", []):
+            if part.get("type") in {"output_text", "text"} and part.get("text"):
+                return json.loads(part["text"])
+    raise ValueError("No JSON output returned by sms analyzer")
+
+
+def run_sms_analysis_once(lookback_days=14, limit_threads=30):
+    ensure_db()
+    db = open_sqlite_connection()
+    try:
+        cutoff = format_db_time(datetime.utcnow() - timedelta(days=max(1, int(lookback_days))))
+        rows = db.execute(
+            """
+            SELECT id, property_id, person_id, direction, from_number, to_number, body, status, sent_at, created_at
+            FROM communications
+            WHERE upper(channel) = 'SMS'
+              AND COALESCE(sent_at, created_at) >= ?
+            ORDER BY COALESCE(sent_at, created_at) ASC, id ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        system_numbers = _system_phone_numbers(db)
+        threads = {}
+        for r in rows:
+            direction = str(r["direction"] or "").strip().lower()
+            counterpart = _thread_counterpart(system_numbers, direction, r["from_number"], r["to_number"])
+            if not counterpart:
+                continue
+            key = f"{int(r['property_id'] or 0)}:{int(r['person_id'] or 0)}:{counterpart}"
+            t = threads.setdefault(
+                key,
+                {
+                    "thread_key": key,
+                    "property_id": r["property_id"],
+                    "person_id": r["person_id"],
+                    "counterpart": counterpart,
+                    "messages": [],
+                },
+            )
+            t["messages"].append(dict(r))
+        thread_list = sorted(threads.values(), key=lambda x: (x["messages"][-1].get("sent_at") or x["messages"][-1].get("created_at") or ""), reverse=True)
+        processed = 0
+        analyzed = 0
+        failed = 0
+        details = []
+        for t in thread_list[: max(1, int(limit_threads))]:
+            processed += 1
+            msgs = t["messages"]
+            hash_input = "\n".join([f"{m.get('direction','')}|{m.get('from_number','')}|{m.get('to_number','')}|{m.get('body','')}" for m in msgs])
+            transcript_hash = hashlib.sha1(hash_input.encode("utf-8", errors="ignore")).hexdigest()
+            state = db.execute("SELECT transcript_hash FROM sms_thread_state WHERE thread_key = ?", (t["thread_key"],)).fetchone()
+            last_at = msgs[-1].get("sent_at") or msgs[-1].get("created_at") or format_db_time(datetime.utcnow())
+            if state and (state["transcript_hash"] or "") == transcript_hash:
+                db.execute(
+                    "UPDATE sms_thread_state SET last_message_at = ?, message_count = ?, updated_at = CURRENT_TIMESTAMP WHERE thread_key = ?",
+                    (last_at, len(msgs), t["thread_key"]),
+                )
+                details.append({"thread_key": t["thread_key"], "status": "unchanged"})
+                continue
+            try:
+                analysis = analyze_sms_thread_with_openai(
+                    msgs,
+                    property_id=t["property_id"],
+                    person_id=t["person_id"],
+                    counterpart=t["counterpart"],
+                )
+                sentiment = (analysis.get("sentiment") or "Unknown").strip()
+                intent = (analysis.get("intent") or "").strip()
+                recommended = (analysis.get("recommended_next_step") or "").strip()
+                conv_type = (analysis.get("conversation_type") or "Unknown").strip()
+                is_spam = conv_type.lower() in {"spam", "wrong number"}
+                dnc = recommended in {"Mark Opt Out", "Mark Not Interested"}
+                upsert_agent_signal(
+                    db,
+                    source_type="sms",
+                    source_key=f"sms_thread:{t['thread_key']}:{transcript_hash}",
+                    property_id=t["property_id"],
+                    person_id=t["person_id"],
+                    channel="SMS",
+                    intent=intent,
+                    sentiment=sentiment,
+                    confidence=float(analysis.get("confidence") or 0.0),
+                    recommended_next_step=recommended,
+                    summary_text=(analysis.get("summary") or "").strip(),
+                    is_spam=is_spam,
+                    do_not_contact=dnc,
+                    payload={"thread_key": t["thread_key"], "counterpart": t["counterpart"], "analysis": analysis, "messages": msgs[-30:]},
+                )
+                analyzed += 1
+                details.append({"thread_key": t["thread_key"], "status": "analyzed", "recommended_next_step": recommended})
+            except Exception as exc:
+                failed += 1
+                details.append({"thread_key": t["thread_key"], "status": "error", "error": str(exc)})
+                log_app_error(
+                    db,
+                    source="sms_analysis_worker",
+                    error_message=str(exc),
+                    details=traceback.format_exc(),
+                    route="run_sms_analysis_once",
+                    status_code=500,
+                )
+            db.execute(
+                """
+                INSERT INTO sms_thread_state (thread_key, property_id, person_id, counterpart_number, last_message_at, message_count, transcript_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(thread_key) DO UPDATE SET
+                    property_id = excluded.property_id,
+                    person_id = excluded.person_id,
+                    counterpart_number = excluded.counterpart_number,
+                    last_message_at = excluded.last_message_at,
+                    message_count = excluded.message_count,
+                    transcript_hash = excluded.transcript_hash,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (t["thread_key"], t["property_id"], t["person_id"], t["counterpart"], last_at, len(msgs), transcript_hash),
+            )
+        route_summary = route_new_agent_signals_once(db, limit=200)
+        db.commit()
+        return {"ok": True, "processed": processed, "analyzed": analyzed, "failed": failed, "routed": route_summary.get("routed", 0), "details": details[:50]}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="sms_analysis_worker",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="run_sms_analysis_once",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+def start_sms_analysis_worker():
+    global SMS_ANALYSIS_WORKER_STARTED
+    if SMS_ANALYSIS_WORKER_STARTED or not SMS_ANALYSIS_WORKER_ENABLED:
+        return
+    SMS_ANALYSIS_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                run_sms_analysis_once(lookback_days=14, limit_threads=20)
+            except Exception:
+                pass
+            time.sleep(SMS_ANALYSIS_POLL_SECONDS)
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
@@ -8957,6 +9409,30 @@ def agents_page():
         LIMIT 100
         """
     ).fetchall()
+    signal_counts = db.execute(
+        """
+        SELECT
+            SUM(CASE WHEN routing_status = 'new' THEN 1 ELSE 0 END) AS new_count,
+            SUM(CASE WHEN routing_status = 'routed' THEN 1 ELSE 0 END) AS routed_count,
+            SUM(CASE WHEN source_type = 'sms' THEN 1 ELSE 0 END) AS sms_count,
+            SUM(CASE WHEN source_type = 'call' THEN 1 ELSE 0 END) AS call_count
+        FROM agent_signals
+        """
+    ).fetchone()
+    signal_summary = {
+        "new_count": int((signal_counts["new_count"] if signal_counts else 0) or 0),
+        "routed_count": int((signal_counts["routed_count"] if signal_counts else 0) or 0),
+        "sms_count": int((signal_counts["sms_count"] if signal_counts else 0) or 0),
+        "call_count": int((signal_counts["call_count"] if signal_counts else 0) or 0),
+    }
+    signals = db.execute(
+        """
+        SELECT id, source_type, source_key, property_id, person_id, intent, sentiment, confidence, recommended_next_step, routing_status, summary_text, updated_at
+        FROM agent_signals
+        ORDER BY id DESC
+        LIMIT 100
+        """
+    ).fetchall()
     return render_template(
         "agents.html",
         agents=AGENT_DEFINITIONS,
@@ -8968,6 +9444,8 @@ def agents_page():
         latest_run_summary=latest_run_summary,
         call_job_summary=call_job_summary,
         call_jobs=call_jobs,
+        signal_summary=signal_summary,
+        signals=signals,
         notice=notice,
     )
 
@@ -9025,6 +9503,27 @@ def run_call_recordings_route():
             )
         )
     return redirect(url_for("agents_page", notice=f"Call analysis run failed: {result.get('error', 'Unknown error')}"))
+
+
+@app.route("/agents/sms-analysis/run", methods=["POST"])
+def run_sms_analysis_route():
+    lookback_raw = (request.form.get("lookback_days") or "").strip()
+    limit_raw = (request.form.get("limit_threads") or "").strip()
+    lookback = int(lookback_raw) if lookback_raw.isdigit() else 14
+    limit = int(limit_raw) if limit_raw.isdigit() else 30
+    result = run_sms_analysis_once(lookback_days=max(1, min(90, lookback)), limit_threads=max(1, min(100, limit)))
+    if result.get("ok"):
+        return redirect(
+            url_for(
+                "agents_page",
+                notice=(
+                    f"SMS analysis complete. Processed {result.get('processed', 0)}, "
+                    f"analyzed {result.get('analyzed', 0)}, failed {result.get('failed', 0)}, "
+                    f"routed {result.get('routed', 0)}."
+                ),
+            )
+        )
+    return redirect(url_for("agents_page", notice=f"SMS analysis failed: {result.get('error', 'Unknown error')}"))
 
 
 @app.route("/referral")
@@ -13725,6 +14224,32 @@ def integrations_call_recordings_run_once_api():
     return jsonify(result), status
 
 
+@app.route("/api/integrations/sms-analysis/run-once", methods=["POST"])
+def integrations_sms_analysis_run_once_api():
+    ensure_db()
+    db = get_db()
+    token = request.headers.get("X-Integration-Key", "").strip()
+    expected = get_integration_api_key(db)
+    if not expected:
+        return jsonify({"ok": False, "error": "Integration API key is not configured"}), 503
+    if not token or token != expected:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    lookback_raw = str(payload.get("lookback_days") or request.args.get("lookback_days") or "14").strip()
+    limit_raw = str(payload.get("limit_threads") or request.args.get("limit_threads") or "30").strip()
+    try:
+        lookback = max(1, min(90, int(lookback_raw)))
+    except ValueError:
+        lookback = 14
+    try:
+        limit = max(1, min(100, int(limit_raw)))
+    except ValueError:
+        limit = 30
+    result = run_sms_analysis_once(lookback_days=lookback, limit_threads=limit)
+    status = 200 if result.get("ok") else 500
+    return jsonify(result), status
+
+
 @app.route("/api/app-errors", methods=["GET"])
 def api_app_errors():
     ensure_db()
@@ -13785,6 +14310,7 @@ if __name__ == "__main__":
         start_clever_leads_worker()
         start_referral_on_market_worker()
         start_call_recording_worker()
+        start_sms_analysis_worker()
     app.run(host=host, port=port, debug=debug_mode)
 
 

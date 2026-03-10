@@ -200,6 +200,82 @@
 </section>
 
 <section class="panel">
+    <h3>SMS Transcript Analysis</h3>
+    <p>Analyzes inbound/outbound SMS threads and routes recommendations to the Lead Management queue.</p>
+    <form method="post" action="{{ url_for('run_sms_analysis_route') }}" style="display:flex; gap:0.5rem; align-items:flex-end; flex-wrap:wrap;">
+        <label>
+            Lookback Days
+            <input type="number" name="lookback_days" min="1" max="90" value="14">
+        </label>
+        <label>
+            Thread Limit
+            <input type="number" name="limit_threads" min="1" max="100" value="30">
+        </label>
+        <button type="submit">Run SMS Analysis</button>
+    </form>
+    <div class="cards" style="margin-top:0.75rem;">
+        <article>
+            <h3>Signals New</h3>
+            <p>{{ signal_summary.new_count }}</p>
+        </article>
+        <article>
+            <h3>Signals Routed</h3>
+            <p>{{ signal_summary.routed_count }}</p>
+        </article>
+        <article>
+            <h3>SMS Signals</h3>
+            <p>{{ signal_summary.sms_count }}</p>
+        </article>
+        <article>
+            <h3>Call Signals</h3>
+            <p>{{ signal_summary.call_count }}</p>
+        </article>
+    </div>
+    {% if signals %}
+    <table style="margin-top:0.75rem;">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Source</th>
+                <th>Link</th>
+                <th>Intent</th>
+                <th>Sentiment</th>
+                <th>Confidence</th>
+                <th>Recommended Step</th>
+                <th>Routing</th>
+                <th>Updated</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in signals %}
+            <tr>
+                <td>#{{ row.id }}</td>
+                <td>{{ row.source_type }}</td>
+                <td>
+                    {% if row.person_id %}
+                    <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">Person {{ row.person_id }}</a>
+                    {% elif row.property_id %}
+                    <a href="{{ url_for('property_detail', property_id=row.property_id) }}">Property {{ row.property_id }}</a>
+                    {% else %}
+                    -
+                    {% endif %}
+                </td>
+                <td>{{ row.intent or '-' }}</td>
+                <td>{{ row.sentiment or '-' }}</td>
+                <td>{{ row.confidence or 0 }}</td>
+                <td>{{ row.recommended_next_step or '-' }}</td>
+                <td>{{ row.routing_status }}</td>
+                <td>{{ row.updated_at }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="margin-top:0.75rem;">No agent signals yet.</p>
+    {% endif %}
+</section>
+
+<section class="panel">
     <h3>Build Notes</h3>
     <ul>
         <li>Each agent will run as an isolated workflow with dedicated prompts, tools, and safety constraints.</li>

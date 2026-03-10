@@ -11488,6 +11488,31 @@ def integrations_website_lead_api():
     if not isinstance(payload, dict):
         payload = dict(request.form or {})
     result = process_website_lead_payload(db, payload, source_label="webhook")
+    if not result.get("ok"):
+        try:
+            ek = (
+                _payload_value_by_keys(payload, ["event_key", "submission_id", "event_id"])
+                or f"validation:{int(time.time())}"
+            )
+            lk = (
+                _derive_website_lead_key(
+                    payload,
+                    address=_payload_value_by_keys(payload, ["address", "property_address", "street_address"]),
+                    phone=_payload_value_by_keys(payload, ["phone", "phone_number", "mobile"]),
+                    email=_payload_value_by_keys(payload, ["email", "email_address"]),
+                )
+                or "unknown"
+            )
+            add_website_webhook_note(
+                db,
+                f"website:{ek}",
+                lk,
+                f"Website lead processing validation/server failure\nError: {result.get('error') or 'Unknown'}",
+                {"payload": payload, "result": result},
+            )
+            db.commit()
+        except Exception:
+            pass
     if result.get("ok"):
         status_code = 200
     else:

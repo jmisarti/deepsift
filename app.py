@@ -107,6 +107,7 @@ CALL_RECORDING_WORKER_ENABLED = env_flag("CALL_RECORDING_WORKER_ENABLED", True)
 CALL_RECORDING_POLL_SECONDS = max(int((os.getenv("CALL_RECORDING_POLL_SECONDS") or "60").strip() or "60"), 15)
 SMS_ANALYSIS_WORKER_ENABLED = env_flag("SMS_ANALYSIS_WORKER_ENABLED", True)
 SMS_ANALYSIS_POLL_SECONDS = max(int((os.getenv("SMS_ANALYSIS_POLL_SECONDS") or "180").strip() or "180"), 30)
+CALL_ANALYSIS_MAX_RETRIES = max(int((os.getenv("CALL_ANALYSIS_MAX_RETRIES") or "3").strip() or "3"), 1)
 APP_AUTH_ENABLED = env_flag("APP_AUTH_ENABLED", False)
 APP_AUTH_USERNAME = os.getenv("APP_AUTH_USERNAME", "").strip()
 APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD", "")
@@ -222,6 +223,7 @@ ACTIVE_LEAD_STATUSES = {
     "no contact new lead",
     "nurture new lead",
 }
+NO_ANSWER_OUTCOMES = {"missed", "no_answer", "failed", "busy", "no answer"}
 
 
 def format_phone_display(value):
@@ -5858,6 +5860,65 @@ def _queue_call_analysis_lead_action(db, job_row, analysis):
     )
 
 
+def _create_agent_diagnosis_review_action(db, property_id, person_id, call_sid, diagnosis, attempted_fix, proposed_resolution, priority="Medium", extra=None):
+    if not property_id:
+        return False
+    reason = (
+        f"Agent diagnosis for call {call_sid or '-'}: {diagnosis}. "
+        f"Attempted: {attempted_fix}. Proposed: {proposed_resolution}."
+    )
+    payload = {
+        "source": "agent_call_issue_handler",
+        "call_sid": call_sid,
+        "diagnosis": diagnosis,
+        "attempted_fix": attempted_fix,
+        "proposed_resolution": proposed_resolution,
+    }
+    if extra:
+        payload["extra"] = extra
+    return _upsert_lead_action(
+        db,
+        int(property_id),
+        person_id,
+        "AgentDiagnosisReview",
+        priority,
+        reason,
+        payload,
+    )
+
+
+def _recommend_no_answer_next_step(db, property_id, person_id):
+    prop = db.execute("SELECT status FROM properties WHERE id = ?", (property_id,)).fetchone()
+    status = str((prop["status"] if prop else "") or "").strip().lower()
+    if status in {"not interested", "not_interested", "opt-out", "opt_out", "dead lead", "dead"}:
+        return "No Action", "Lead status is dispositioned; no-answer call should not trigger additional outreach."
+
+    row = db.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM call_recording_jobs
+        WHERE property_id = ?
+          AND COALESCE(person_id, 0) = COALESCE(?, 0)
+          AND (
+                lower(payload_json) LIKE '%\"call_outcome\": \"missed\"%'
+             OR lower(payload_json) LIKE '%\"call_outcome\": \"no_answer\"%'
+             OR lower(payload_json) LIKE '%\"call_outcome\": \"failed\"%'
+             OR lower(payload_json) LIKE '%\"calloutcome\": \"missed\"%'
+             OR lower(payload_json) LIKE '%\"calloutcome\": \"no_answer\"%'
+             OR lower(payload_json) LIKE '%\"calloutcome\": \"failed\"%'
+          )
+        """,
+        (property_id, person_id),
+    ).fetchone()
+    no_answer_attempts = int((row["c"] if row else 0) or 0)
+
+    if no_answer_attempts >= 3:
+        return "Escalate To Relative", "Three or more no-answer outcomes detected; escalate outreach path."
+    if status in {"new lead", "new_lead", "no contact new lead"}:
+        return "Follow Up", "New lead with no answer; retry follow-up cadence."
+    return "Follow Up", "No-answer outcome; keep lead in follow-up workflow."
+
+
 def _detect_audio_extension(content_type, fallback_url=""):
     ctype = (content_type or "").split(";")[0].strip().lower()
     guessed_ext = mimetypes.guess_extension(ctype) if ctype else None
@@ -5902,7 +5963,53 @@ def process_single_call_recording_job(db, job_row):
             ),
         )
         if not recording_url:
-            return {"job_id": job_id, "status": "no_recording_url"}
+            payload_obj = parse_json_object(job_row["payload_json"] or "{}")
+            webhook = payload_obj.get("webhook") if isinstance(payload_obj.get("webhook"), dict) else {}
+            outcome = str(
+                webhook.get("callOutcome")
+                or webhook.get("call_outcome")
+                or payload_obj.get("call_outcome")
+                or ""
+            ).strip().lower()
+            analysis_status = "No Recording"
+            if outcome in NO_ANSWER_OUTCOMES:
+                if property_id:
+                    recommended_step, reason = _recommend_no_answer_next_step(db, int(property_id), person_id)
+                    upsert_agent_signal(
+                        db,
+                        source_type="call",
+                        source_key=f"call-no-answer:{call_sid}",
+                        property_id=property_id,
+                        person_id=person_id,
+                        channel="CALL",
+                        intent="No Answer",
+                        sentiment="Unknown",
+                        confidence=0.85,
+                        recommended_next_step=recommended_step,
+                        summary_text=f"No-answer call outcome. {reason}",
+                        is_spam=False,
+                        do_not_contact=False,
+                        payload={"call_sid": call_sid, "call_outcome": outcome, "reason": reason},
+                    )
+                    route_new_agent_signals_once(db, limit=25)
+            else:
+                if property_id:
+                    _create_agent_diagnosis_review_action(
+                        db,
+                        property_id=int(property_id),
+                        person_id=person_id,
+                        call_sid=call_sid,
+                        diagnosis="Recording URL unavailable for completed call",
+                        attempted_fix="Attempted smrtPhone recording lookup using call SID",
+                        proposed_resolution="Monitor for delayed recording availability or validate provider recording configuration.",
+                        priority="Medium",
+                        extra={"fetch_status": fetch_status},
+                    )
+            db.execute(
+                "UPDATE call_recording_jobs SET analysis_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (analysis_status, job_id),
+            )
+            return {"job_id": job_id, "status": "no_recording_url", "call_outcome": outcome}
 
     audio_res = requests.get(recording_url, timeout=60)
     audio_res.raise_for_status()
@@ -6014,17 +6121,41 @@ def run_call_recording_analysis_once(limit=2):
                     completed += 1
             except Exception as exc:
                 failed += 1
+                payload = parse_json_object(row["payload_json"] or "{}")
+                retry_count = int(payload.get("retry_count", 0) or 0) + 1
+                payload["retry_count"] = retry_count
+                payload["error"] = str(exc)
                 db.execute(
                     """
                     UPDATE call_recording_jobs
-                    SET analysis_status = 'Retry',
+                    SET analysis_status = ?,
                         fetch_status = CASE WHEN fetch_status = 'Queued' THEN 'Error' ELSE fetch_status END,
                         payload_json = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (json.dumps({"error": str(exc), "trace": traceback.format_exc()}), row["id"]),
+                    (
+                        "Retry" if retry_count < CALL_ANALYSIS_MAX_RETRIES else "Failed",
+                        json.dumps(payload),
+                        row["id"],
+                    ),
                 )
+                if row["property_id"]:
+                    _create_agent_diagnosis_review_action(
+                        db,
+                        property_id=int(row["property_id"]),
+                        person_id=row["person_id"],
+                        call_sid=row["call_sid"],
+                        diagnosis="Call analysis failed",
+                        attempted_fix=f"Automatic retry {retry_count}/{CALL_ANALYSIS_MAX_RETRIES}",
+                        proposed_resolution=(
+                            "Retry analysis automatically."
+                            if retry_count < CALL_ANALYSIS_MAX_RETRIES
+                            else "Retries exhausted; review payload/provider recording quality."
+                        ),
+                        priority="Medium" if retry_count < CALL_ANALYSIS_MAX_RETRIES else "High",
+                        extra={"error": str(exc)},
+                    )
                 details.append({"job_id": row["id"], "status": "error", "error": str(exc)})
                 log_app_error(
                     db,
@@ -14241,7 +14372,51 @@ def smrtphone_call_completed_webhook():
     to_number = extract_first_string_by_keys(payload, ["to", "to_number", "toNumber", "callee", "destination", "dnis"])
     call_outcome = extract_first_string_by_keys(payload, ["callOutcome", "call_outcome", "outcome", "status"])
     direct_recording_url = extract_first_string_by_keys(payload, ["recordingUrl", "recording_url", "recording", "url"])
+    normalized_outcome = (call_outcome or "").strip().lower()
+
+    def _resolve_property_person():
+        _person_id = find_person_id_by_phone(db, from_number) or find_person_id_by_phone(db, to_number)
+        _property_id = None
+        if str(payload.get("property_id") or "").isdigit():
+            _property_id = int(payload.get("property_id"))
+        elif _person_id:
+            _property_id = find_property_id_for_person(db, _person_id)
+        if not _property_id:
+            outbound = db.execute(
+                """
+                SELECT property_id, person_id
+                FROM communications
+                WHERE upper(channel) = 'SMS'
+                  AND lower(direction) = 'outbound'
+                  AND (
+                        replace(replace(replace(replace(replace(COALESCE(to_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+                     OR replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+                  )
+                ORDER BY sent_at DESC, id DESC
+                LIMIT 1
+                """,
+                (f"%{normalize_phone(from_number)}%", f"%{normalize_phone(to_number)}%"),
+            ).fetchone()
+            if outbound:
+                _property_id = outbound["property_id"]
+                if not _person_id:
+                    _person_id = outbound["person_id"]
+        return _property_id, _person_id
+
     if not call_sid:
+        property_id, person_id = _resolve_property_person()
+        if property_id:
+            _create_agent_diagnosis_review_action(
+                db,
+                property_id=int(property_id),
+                person_id=person_id,
+                call_sid="(missing)",
+                diagnosis="Call webhook missing call SID",
+                attempted_fix="Tried resolving context by from/to numbers and recent outbound thread",
+                proposed_resolution="Validate provider webhook payload includes callId/call_sid and resend failed event if possible.",
+                priority="High",
+                extra={"payload": payload},
+            )
         log_smrtphone_webhook_event(
             db,
             "call_completed",
@@ -14268,32 +14443,7 @@ def smrtphone_call_completed_webhook():
         db.commit()
         return jsonify({"ok": True, "deduped": True, "job_id": existing["id"]}), 200
 
-    person_id = find_person_id_by_phone(db, from_number) or find_person_id_by_phone(db, to_number)
-    property_id = None
-    if str(payload.get("property_id") or "").isdigit():
-        property_id = int(payload.get("property_id"))
-    elif person_id:
-        property_id = find_property_id_for_person(db, person_id)
-    if not property_id:
-        outbound = db.execute(
-            """
-            SELECT property_id, person_id
-            FROM communications
-            WHERE upper(channel) = 'SMS'
-              AND lower(direction) = 'outbound'
-              AND (
-                    replace(replace(replace(replace(replace(COALESCE(to_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
-                 OR replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
-              )
-            ORDER BY sent_at DESC, id DESC
-            LIMIT 1
-            """,
-            (f"%{normalize_phone(from_number)}%", f"%{normalize_phone(to_number)}%"),
-        ).fetchone()
-        if outbound:
-            property_id = outbound["property_id"]
-            if not person_id:
-                person_id = outbound["person_id"]
+    property_id, person_id = _resolve_property_person()
 
     recording_url = (direct_recording_url or "").strip()
     fetch_status = "Queued"
@@ -14332,16 +14482,25 @@ def smrtphone_call_completed_webhook():
         ),
     )
 
-    if property_id:
-        _upsert_lead_action(
+    if property_id and normalized_outcome in NO_ANSWER_OUTCOMES:
+        recommended_step, reason = _recommend_no_answer_next_step(db, int(property_id), person_id)
+        upsert_agent_signal(
             db,
-            property_id,
-            person_id,
-            "ReviewCallOutcome",
-            "High",
-            "Call completed webhook received. Review recording summary and choose next lead action.",
-            {"call_sid": call_sid, "recording_url": recording_url, "fetch_status": fetch_status},
+            source_type="call",
+            source_key=f"call-no-answer:{call_sid}",
+            property_id=property_id,
+            person_id=person_id,
+            channel="CALL",
+            intent="No Answer",
+            sentiment="Unknown",
+            confidence=0.85,
+            recommended_next_step=recommended_step,
+            summary_text=f"No-answer call outcome. {reason}",
+            is_spam=False,
+            do_not_contact=False,
+            payload={"call_sid": call_sid, "call_outcome": normalized_outcome, "reason": reason},
         )
+        route_new_agent_signals_once(db, limit=25)
 
     log_smrtphone_webhook_event(
         db,

@@ -4674,7 +4674,11 @@ def _derive_website_lead_key(payload, address="", phone="", email=""):
 
 
 def _extract_website_lead_fields(payload):
+    form_id = _payload_value_by_keys(payload, ["form_id"])
     address = _payload_value_by_keys(payload, ["address", "property_address", "street_address", "property"])
+    if not address:
+        # Step-1 form often sends the address in field "1".
+        address = _payload_value_by_keys(payload, ["1"])
     # Gravity Forms compound Address field pieces (example field id 7).
     street = _payload_value_by_keys(payload, ["7.1"])
     street2 = _payload_value_by_keys(payload, ["7.2"])
@@ -4684,8 +4688,16 @@ def _extract_website_lead_fields(payload):
     if not address:
         address_parts = [x for x in [street, street2, city, state, postal_code] if x]
         address = ", ".join(address_parts)
-    phone = _payload_value_by_keys(payload, ["phone", "phone_number", "mobile", "3"])
-    email = _payload_value_by_keys(payload, ["email", "email_address", "2"])
+    raw_phone_2 = _payload_value_by_keys(payload, ["2"])
+    raw_phone_3 = _payload_value_by_keys(payload, ["3"])
+    if str(form_id or "").strip() == "1":
+        # Step-1 schema: 2=phone, 3=email
+        phone = _payload_value_by_keys(payload, ["phone", "phone_number", "mobile"]) or raw_phone_2
+        email = _payload_value_by_keys(payload, ["email", "email_address"]) or raw_phone_3
+    else:
+        # Step-2 schema currently uses: 2=email, 3=phone
+        phone = _payload_value_by_keys(payload, ["phone", "phone_number", "mobile"]) or raw_phone_3
+        email = _payload_value_by_keys(payload, ["email", "email_address"]) or raw_phone_2
     seller_name = _payload_value_by_keys(payload, ["seller_name", "name", "full_name", "owner_name"])
     first_name = _payload_value_by_keys(payload, ["first_name", "firstname", "1.3"])
     last_name = _payload_value_by_keys(payload, ["last_name", "lastname", "1.6"])

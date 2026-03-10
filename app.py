@@ -7644,6 +7644,40 @@ def _system_phone_numbers(db):
     return vals
 
 
+def _infer_system_numbers_from_smrt_events(db, cutoff=None):
+    vals = set()
+    rows = db.execute(
+        """
+        SELECT event_type, from_number, to_number, payload_json, received_at
+        FROM smrtphone_webhook_events
+        WHERE (? IS NULL OR received_at >= ?)
+        ORDER BY id DESC
+        LIMIT 4000
+        """,
+        (cutoff, cutoff),
+    ).fetchall()
+    for r in rows:
+        payload = parse_json_object(r["payload_json"])
+        event_name = extract_first_string_by_keys(payload, ["event", "eventType"]).lower()
+        user_name = extract_first_string_by_keys(payload, ["userName", "user_name"]).strip()
+        from_n = normalize_phone(r["from_number"])
+        to_n = normalize_phone(r["to_number"])
+        if event_name == "smsoutgoing":
+            if from_n:
+                vals.add(from_n)
+        elif event_name == "smsincoming":
+            if to_n:
+                vals.add(to_n)
+        elif str(r["event_type"] or "").lower() == "call_completed":
+            # Outbound calls usually carry userName and originate from owned number.
+            if user_name and from_n:
+                vals.add(from_n)
+            # Inbound calls terminate at owned number.
+            if (not user_name) and to_n:
+                vals.add(to_n)
+    return vals
+
+
 def _thread_counterpart(system_numbers, direction, from_number, to_number):
     from_norm = normalize_phone(from_number)
     to_norm = normalize_phone(to_number)
@@ -7921,7 +7955,8 @@ def build_today_lead_watch_snapshot(db, limit=60):
     cutoff_dt = est_day_start_utc()
     cutoff = format_db_time(cutoff_dt)
     leads = {}
-    system_numbers = _system_phone_numbers(db)
+    system_numbers = set(_system_phone_numbers(db))
+    system_numbers.update(_infer_system_numbers_from_smrt_events(db, cutoff=cutoff))
     phone_to_key = {}
     addr_to_key = {}
     resolution_rows = db.execute(

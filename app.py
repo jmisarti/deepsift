@@ -11452,6 +11452,40 @@ def integrations_website_lead_api():
     return jsonify(result), status_code
 
 
+@app.route("/api/integrations/website/lead/logs", methods=["GET"])
+def integrations_website_lead_logs_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    limit_raw = (request.args.get("limit") or "20").strip()
+    limit = int(limit_raw) if limit_raw.isdigit() else 20
+    limit = max(1, min(100, limit))
+    rows = db.execute(
+        """
+        SELECT id, event_key, lead_key, note_body, payload_json, created_at
+        FROM website_lead_webhook_notes
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    items = []
+    for r in rows:
+        payload = parse_json_object(r["payload_json"] or "{}")
+        items.append(
+            {
+                "id": int(r["id"]),
+                "event_key": r["event_key"],
+                "lead_key": r["lead_key"],
+                "note_body": r["note_body"],
+                "payload": payload,
+                "created_at": r["created_at"],
+            }
+        )
+    return jsonify({"ok": True, "count": len(items), "items": items})
+
+
 @app.route("/api/admin/import-referral-bundle", methods=["POST"])
 def import_referral_bundle_api():
     ensure_db()

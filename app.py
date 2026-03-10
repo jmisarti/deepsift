@@ -7482,9 +7482,23 @@ def upsert_agent_signal(
 ):
     row = db.execute("SELECT id FROM agent_signals WHERE source_key = ?", ((source_key or "").strip(),)).fetchone()
     payload_json = json.dumps(payload or {})
-    args = (
+    insert_args = (
         (source_type or "").strip() or "unknown",
         (source_key or "").strip(),
+        property_id,
+        person_id,
+        (channel or "").strip(),
+        (intent or "").strip(),
+        (sentiment or "").strip(),
+        float(confidence or 0.0),
+        (recommended_next_step or "").strip(),
+        (summary_text or "").strip(),
+        1 if is_spam else 0,
+        1 if do_not_contact else 0,
+        payload_json,
+    )
+    update_args = (
+        (source_type or "").strip() or "unknown",
         property_id,
         person_id,
         (channel or "").strip(),
@@ -7506,7 +7520,7 @@ def upsert_agent_signal(
                 payload_json = ?, routing_status = 'new', updated_at = CURRENT_TIMESTAMP
             WHERE source_key = ?
             """,
-            args + ((source_key or "").strip(),),
+            update_args + ((source_key or "").strip(),),
         )
         return row["id"]
     cur = db.execute(
@@ -7515,7 +7529,7 @@ def upsert_agent_signal(
         (source_type, source_key, property_id, person_id, channel, intent, sentiment, confidence, recommended_next_step, summary_text, is_spam, do_not_contact, payload_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        args,
+        insert_args,
     )
     return cur.lastrowid
 

@@ -5851,6 +5851,7 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
         or f"{spreadsheet_id}:{sheet_name}:{row_index}"
     )
     address = _row_value_by_keys(row_data, ["Address", "address", "Property Address"])
+    parsed_address = _parse_search_address_simple(address)
     seller_name = _row_value_by_keys(row_data, ["Seller Name", "seller_name", "owner", "Owner Name"])
     phone = _row_value_by_keys(row_data, ["Phone Number", "phone", "Phone"])
     email = _row_value_by_keys(row_data, ["Email", "email"])
@@ -5898,6 +5899,10 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
             clever_notes = _build_clever_lead_notes(row_data)
             create_payload = {
                 "search": address,
+                "street": parsed_address.get("street") or "",
+                "city": parsed_address.get("city") or "",
+                "state": parsed_address.get("state") or "",
+                "postal_code": parsed_address.get("postal_code") or "",
                 "status": "new_lead",
                 "lists": "Clever",
                 "tags": "clever,google_sheet",
@@ -10289,13 +10294,24 @@ def _parse_search_address_simple(search):
     text = (search or "").strip()
     text = re.sub(r"\s*,\s*United States\s*$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
+    # Clever lead format can include: "7 Jessica Lane in Dover, NJ 07801"
+    text = re.sub(
+        r"^(.*?)\s+in\s+([^,]+,\s*(?:[A-Za-z]{2}|[A-Za-z ]+)\s+\d{5}(?:-\d{4})?)$",
+        r"\1, \2",
+        text,
+        flags=re.IGNORECASE,
+    )
     street = city = state = postal_code = ""
 
     m = re.match(r"^(.*?),\s*([^,]+),\s*([A-Za-z]{2}|[A-Za-z ]+),?\s+(\d{5}(?:-\d{4})?)\s*$", text)
     if m:
         street, city, state, postal_code = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
     else:
-        m2 = re.match(r"^(.*?)\s+([^,]+),?\s+([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)\s*$", text)
+        m2 = re.match(
+            r"^(.*?\b(?:st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|boulevard|ct|court|pl|place|way|pkwy|parkway|cir|circle|trl|trail|ter|terrace|hwy|highway)\b)\s+([^,]+),?\s+([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
         if m2:
             street, city, state, postal_code = m2.group(1).strip(), m2.group(2).strip(), m2.group(3).strip(), m2.group(4).strip()
     if len(state) > 2:

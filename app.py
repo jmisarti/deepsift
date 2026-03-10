@@ -8215,8 +8215,11 @@ def build_today_lead_watch_snapshot(db, limit=60):
     resolution_map = {str(r["lead_key"]): dict(r) for r in resolution_rows}
     referrals = db.execute(
         """
-        SELECT rr.property_uuid, rr.status, rr.full_address, rr.owner_names, rr.referral_status, rr.referral_notes, rr.last_synced_at
+        SELECT rr.property_uuid, rr.status, rr.full_address, rr.owner_names, rr.referral_status, rr.referral_notes,
+               rr.last_synced_at, rr.on_market_status, rr.winning_realtor_id,
+               wr.first_name AS winning_realtor_first_name, wr.last_name AS winning_realtor_last_name
         FROM reisift_referrals rr
+        LEFT JOIN referral_realtors wr ON wr.id = rr.winning_realtor_id
         WHERE rr.is_active = 1
         """
     ).fetchall()
@@ -8550,6 +8553,125 @@ def build_today_lead_watch_snapshot(db, limit=60):
             tgt["label"] = row.get("label")
     leads = merged
 
+    def _elapsed_label(dt_value):
+        dt = parse_db_time(dt_value)
+        if not dt:
+            return "unknown elapsed time"
+        delta = datetime.utcnow() - dt
+        total_minutes = max(0, int(delta.total_seconds() // 60))
+        if total_minutes < 60:
+            return f"{total_minutes} minute(s)"
+        hours = total_minutes // 60
+        if hours < 48:
+            return f"{hours} hour(s)"
+        days = hours // 24
+        return f"{days} day(s)"
+
+    def _agent2_resolution_for_lead(row_dict):
+        property_id = int(row_dict.get("property_id") or 0)
+        phones = row_dict.get("phones") or []
+        referral = row_dict.get("referral") if isinstance(row_dict.get("referral"), dict) else {}
+        action_rows = []
+        if property_id > 0:
+            action_rows = db.execute(
+                """
+                SELECT id, action_type, priority, status, reason, updated_at, created_at
+                FROM lead_management_actions
+                WHERE property_id = ?
+                ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+                LIMIT 30
+                """,
+                (property_id,),
+            ).fetchall()
+        elif phones:
+            found = {}
+            for ph in phones[:4]:
+                token = normalize_phone(ph)
+                if not token:
+                    continue
+                for r in db.execute(
+                    """
+                    SELECT id, action_type, priority, status, reason, updated_at, created_at
+                    FROM lead_management_actions
+                    WHERE property_id = 0
+                      AND payload_json LIKE ?
+                    ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+                    LIMIT 20
+                    """,
+                    (f"%{token}%",),
+                ).fetchall():
+                    found[int(r["id"])] = dict(r)
+            action_rows = [found[k] for k in sorted(found.keys(), reverse=True)]
+        pending = [dict(r) for r in action_rows if str(r["status"] or "").strip().lower() == "pending"]
+        all_rows = [dict(r) for r in action_rows]
+        latest = pending[0] if pending else (all_rows[0] if all_rows else {})
+        last_action = str(latest.get("action_type") or "No Agent 2 action yet")
+        last_when = str(latest.get("updated_at") or latest.get("created_at") or "")
+        elapsed = _elapsed_label(last_when)
+
+        rec = "No Agent 2 action needed right now."
+        reason = "No pending action is currently due."
+        elapsed_days = 0.0
+        dt = parse_db_time(last_when)
+        if dt:
+            elapsed_days = max(0.0, (datetime.utcnow() - dt).total_seconds() / 86400.0)
+        action_type = str(latest.get("action_type") or "")
+        if pending:
+            if action_type == "ScheduleAppointment":
+                rec = "Schedule/confirm a call today."
+                reason = f"It has been {elapsed} since scheduling action was last touched."
+            elif action_type == "FollowUpTouchDue":
+                rec = "Send follow-up SMS now, then place a call if no reply."
+                reason = f"It has been {elapsed} since the follow-up action update."
+            elif action_type == "ReviewInboundAndNextBestAction":
+                rec = "Review inbound context and send a targeted reply."
+                reason = f"It has been {elapsed} since this review action was updated."
+            elif action_type == "EscalateToRelativeOutreach":
+                rec = "Escalate outreach to relatives/neighbors and log outcome."
+                reason = f"It has been {elapsed} since escalation became pending."
+            elif action_type == "EscalateToDeepDiveResearch":
+                rec = "Move lead into Deep Dive workflow and start alternate contact attempts."
+                reason = f"It has been {elapsed} since deep-dive escalation was queued."
+            elif action_type == "HumanReviewDisposition":
+                rec = "Update disposition/status and align ReiSift status."
+                reason = f"It has been {elapsed} since disposition review was queued."
+            elif action_type == "AgentDiagnosisReview":
+                rec = "Resolve agent diagnosis issue, then continue outreach cadence."
+                reason = f"It has been {elapsed} since diagnosis review was queued."
+            if elapsed_days >= 3:
+                rec = rec + " Escalate priority due to age."
+                reason = reason + " Action is stale (>3 days)."
+        else:
+            if row_dict.get("classification") in {"potential_seller", "unknown"} and not row_dict.get("unresolved"):
+                rec = "Create next-touch action: call or SMS based on prior response."
+                reason = "Lead is mapped but has no active Agent 2 pending action."
+
+        on_market = str(referral.get("on_market_status") or "").strip().lower()
+        referral_status = str(referral.get("referral_status") or "").strip()
+        winning_name = " ".join(
+            x for x in [str(referral.get("winning_realtor_first_name") or "").strip(), str(referral.get("winning_realtor_last_name") or "").strip()] if x
+        ).strip()
+        if on_market in {"listed", "on market", "active", "coming soon"}:
+            if winning_name:
+                rec = f"Follow up with listing realtor ({winning_name}) and update ReiSift referral status."
+            else:
+                rec = "Identify listing realtor, then update ReiSift referral status and notes."
+            reason = (
+                f"Referral appears on-market ({on_market or 'listed'})"
+                + (f" with status '{referral_status}'." if referral_status else ".")
+            )
+
+        timeline = f"It's been {elapsed} since {last_action}."
+        return {
+            "timeline": timeline,
+            "recommendation": rec,
+            "reason": reason,
+            "last_action": last_action,
+            "elapsed": elapsed,
+            "pending_count": len(pending),
+            "total_count": len(all_rows),
+        }
+
     rows = []
     for v in leads.values():
         resolution = resolution_map.get(v["lead_key"]) or {}
@@ -8643,6 +8765,15 @@ def build_today_lead_watch_snapshot(db, limit=60):
                 "referral_pushes": pushes,
                 "agent_summary": " ".join(summary_bits),
                 "recommended": recommended,
+                "agent2_resolution": _agent2_resolution_for_lead(
+                    {
+                        "property_id": effective_property_id,
+                        "phones": sorted(list(v["phones"]))[:4],
+                        "classification": effective_classification,
+                        "unresolved": 0 if (effective_property_id or effective_property_uuid) else 1,
+                        "referral": referral_data,
+                    }
+                ),
             }
         )
     rows.sort(key=lambda r: ((r["last_activity_at"] or ""), r["events"]), reverse=True)
@@ -8989,6 +9120,37 @@ def answer_agent_advisor_question(question, snapshot, recommendations, qa_histor
             if part.get("type") in {"output_text", "text"} and part.get("text"):
                 return str(part["text"]).strip()
     raise ValueError("No output returned by advisor Q&A")
+
+
+def maybe_run_agent3_end_of_day_refresh(db):
+    now_est = datetime.now(EST_TZ)
+    # Run nightly closeout near end of day ET.
+    if now_est.hour < 23:
+        return {"ran": False, "reason": "before_eod_window"}
+    eod_key = now_est.strftime("%Y-%m-%d")
+    exists = db.execute(
+        "SELECT id FROM agent_advisor_logs WHERE log_type = 'eod' AND question = ? LIMIT 1",
+        (eod_key,),
+    ).fetchone()
+    if exists:
+        return {"ran": False, "reason": "already_recorded", "eod_key": eod_key}
+    snapshot = build_agent_advisor_snapshot(db, window_hours=24)
+    recommendations = build_agent_advisor_recommendations(snapshot)
+    summary_result = generate_agent_advisor_summary_with_openai(snapshot, recommendations)
+    db.execute(
+        """
+        INSERT INTO agent_advisor_logs (log_type, question, response_text, response_json, snapshot_json)
+        VALUES ('eod', ?, ?, ?, ?)
+        """,
+        (
+            eod_key,
+            summary_result.get("summary_text") or "",
+            json.dumps(summary_result.get("json") or {}),
+            json.dumps(snapshot),
+        ),
+    )
+    db.commit()
+    return {"ran": True, "eod_key": eod_key}
 
 
 def run_bulk_sms_tick():
@@ -12156,6 +12318,11 @@ def run_agent3_lead_watch_reconcile(db, limit=80):
 def agents_page():
     ensure_db()
     db = get_db()
+    try:
+        maybe_run_agent3_end_of_day_refresh(db)
+    except Exception:
+        # Never block the agents page if nightly closeout generation fails.
+        pass
     notice = (request.args.get("notice") or "").strip()
     queue_counts = db.execute(
         """

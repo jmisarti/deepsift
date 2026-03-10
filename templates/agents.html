@@ -494,6 +494,22 @@
                         </form>
                     </td>
                 </tr>
+                <tr>
+                    <td colspan="7" style="background:#f8fafc;">
+                        <strong>Agent 2 Resolution (Live):</strong>
+                        {% if row.agent2_resolution %}
+                        {{ row.agent2_resolution.timeline }} Recommendation: {{ row.agent2_resolution.recommendation }}
+                        <br>
+                        <small>
+                            Why: {{ row.agent2_resolution.reason }}
+                            | Pending Actions: {{ row.agent2_resolution.pending_count }}
+                            | Total Actions: {{ row.agent2_resolution.total_count }}
+                        </small>
+                        {% else %}
+                        No Agent 2 resolution data yet.
+                        {% endif %}
+                    </td>
+                </tr>
                 {% endfor %}
             </tbody>
         </table>

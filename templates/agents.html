@@ -140,6 +140,66 @@
 </section>
 
 <section class="panel">
+    <h3>Call Recording Analysis</h3>
+    <p>Runs transcription and AI call analysis, then queues recommended lead-management action for review.</p>
+    <form method="post" action="{{ url_for('run_call_recordings_route') }}" style="display:flex; gap:0.5rem; align-items:flex-end; flex-wrap:wrap;">
+        <label>
+            Jobs to process
+            <input type="number" name="limit" min="1" max="10" value="2">
+        </label>
+        <button type="submit">Run Call Analysis</button>
+    </form>
+    <div class="cards" style="margin-top:0.75rem;">
+        <article>
+            <h3>Pending Calls</h3>
+            <p>{{ call_job_summary.pending_count }}</p>
+        </article>
+        <article>
+            <h3>Completed Calls</h3>
+            <p>{{ call_job_summary.completed_count }}</p>
+        </article>
+    </div>
+    {% if call_jobs %}
+    <table style="margin-top:0.75rem;">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Call SID</th>
+                <th>Link</th>
+                <th>Fetch</th>
+                <th>Analysis</th>
+                <th>Summary</th>
+                <th>Updated</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in call_jobs %}
+            <tr>
+                <td>#{{ row.id }}</td>
+                <td>{{ row.call_sid }}</td>
+                <td>
+                    {% if row.person_id %}
+                    <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">Person {{ row.person_id }}</a>
+                    {% elif row.property_id %}
+                    <a href="{{ url_for('property_detail', property_id=row.property_id) }}">Property {{ row.property_id }}</a>
+                    {% else %}
+                    -
+                    {% endif %}
+                </td>
+                <td>{{ row.fetch_status }}</td>
+                <td>{{ row.analysis_status }}</td>
+                <td>{{ row.summary_text or '-' }}</td>
+                <td>{{ row.updated_at }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="margin-top:0.75rem;">No call recording jobs yet.</p>
+    {% endif %}
+</section>
+
+<section class="panel">
     <h3>Build Notes</h3>
     <ul>
         <li>Each agent will run as an isolated workflow with dedicated prompts, tools, and safety constraints.</li>
@@ -147,6 +207,7 @@
         <li>Cross-model routing (OpenAI + Claude) will be implemented per task type with confidence thresholds.</li>
         <li>Every run should log an audit trail: trigger, model, decision, confidence, action taken, and fallback reason.</li>
         <li>Lead Monitor Phase 1 is deterministic and manual-triggered only to prevent uncontrolled automation.</li>
+        <li>Lead cadence here follows baseline status expectations; additional calendared tasks from SIFT remain supported as separate inputs.</li>
     </ul>
 </section>
 {% endblock %}

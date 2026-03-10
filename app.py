@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import imaplib
+import mimetypes
 import os
 import random
 import re
@@ -102,6 +103,8 @@ REISIFT_FOLLOWUPS_EXCLUDE_TAG = os.getenv("REISIFT_FOLLOWUPS_EXCLUDE_TAG", "3cf5
 REISIFT_DISABLE_MAP_LOOKUP = env_flag("REISIFT_DISABLE_MAP_LOOKUP", True)
 OPENLETTERCONNECT_BASE_URL = os.getenv("OPENLETTERCONNECT_BASE_URL", "https://api.openletterconnect.com/api/v1")
 OPENLETTERCONNECT_TEMPLATE_ID = int(os.getenv("OPENLETTERCONNECT_TEMPLATE_ID", "9256"))
+CALL_RECORDING_WORKER_ENABLED = env_flag("CALL_RECORDING_WORKER_ENABLED", True)
+CALL_RECORDING_POLL_SECONDS = max(int((os.getenv("CALL_RECORDING_POLL_SECONDS") or "60").strip() or "60"), 15)
 APP_AUTH_ENABLED = env_flag("APP_AUTH_ENABLED", False)
 APP_AUTH_USERNAME = os.getenv("APP_AUTH_USERNAME", "").strip()
 APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD", "")
@@ -120,6 +123,7 @@ BULK_SMS_WORKER_STARTED = False
 EMAIL_POLL_WORKER_STARTED = False
 CLEVER_LEADS_WORKER_STARTED = False
 REFERRAL_MARKET_WORKER_STARTED = False
+CALL_RECORDING_WORKER_STARTED = False
 NJ_COUNTIES = [
     "Atlantic",
     "Bergen",
@@ -333,6 +337,7 @@ def require_login_if_enabled():
         start_email_poll_worker()
         start_clever_leads_worker()
         start_referral_on_market_worker()
+        start_call_recording_worker()
     if not APP_AUTH_ENABLED:
         return None
     endpoint = request.endpoint or ""
@@ -597,6 +602,7 @@ def migrate_db(db):
         )
         """
     )
+    ensure_column(db, "call_recording_jobs", "analysis_json", "analysis_json TEXT")
 
 
 def log_app_error(db, source, error_message, details="", route="", status_code=None):
@@ -960,6 +966,135 @@ def fetch_smrtphone_recording_url(call_sid):
                         recording_url = val.strip()
                         break
     return {"call_sid": clean_sid, "recording_url": recording_url, "raw": body}
+
+
+def transcribe_recording_with_openai(audio_bytes, filename="call_recording.mp3", mime_type="audio/mpeg"):
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set")
+    if not audio_bytes:
+        raise ValueError("audio_bytes is empty")
+    model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
+    files = {
+        "file": (filename, io.BytesIO(audio_bytes), mime_type or "application/octet-stream"),
+    }
+    data = {"model": model}
+    response = requests.post(
+        "https://api.openai.com/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        data=data,
+        files=files,
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    transcript = str(payload.get("text") or "").strip()
+    if not transcript:
+        raise ValueError("No transcript text returned")
+    return {"transcript": transcript, "raw": payload}
+
+
+def analyze_call_transcript_with_openai(transcript_text, property_id=None, person_id=None):
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set")
+    transcript = (transcript_text or "").strip()
+    if not transcript:
+        raise ValueError("transcript_text is required")
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    schema = {
+        "name": "call_analysis",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {"type": "string"},
+                "caller_intent": {"type": "string"},
+                "seller_interest": {
+                    "type": "string",
+                    "enum": ["High", "Medium", "Low", "Not Interested", "Unknown"],
+                },
+                "sentiment": {
+                    "type": "string",
+                    "enum": ["Positive", "Neutral", "Negative", "Mixed", "Unknown"],
+                },
+                "key_facts": {"type": "array", "items": {"type": "string"}},
+                "objections": {"type": "array", "items": {"type": "string"}},
+                "next_best_step": {
+                    "type": "string",
+                    "enum": [
+                        "Schedule Appointment",
+                        "Follow Up",
+                        "Escalate To Relative",
+                        "Deep Dive",
+                        "Mark Not Interested",
+                        "Mark Opt Out",
+                        "No Action",
+                    ],
+                },
+                "next_step_reason": {"type": "string"},
+                "caller_improvement": {"type": "array", "items": {"type": "string"}},
+                "confidence": {"type": "number"},
+            },
+            "required": [
+                "summary",
+                "caller_intent",
+                "seller_interest",
+                "sentiment",
+                "key_facts",
+                "objections",
+                "next_best_step",
+                "next_step_reason",
+                "caller_improvement",
+                "confidence",
+            ],
+        },
+        "strict": True,
+    }
+    user_prompt = (
+        "Analyze this call transcript for lead management.\n"
+        f"Property ID: {property_id or '-'} | Person ID: {person_id or '-'}\n\n"
+        "Return concise, factual JSON only. Focus on intent, outcome, and practical next step.\n\n"
+        f"Transcript:\n{transcript}"
+    )
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "You are a call QA and lead-management analyst for a real estate CRM.",
+                        }
+                    ],
+                },
+                {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": schema["name"],
+                    "schema": schema["schema"],
+                    "strict": True,
+                }
+            },
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    output_text = (data.get("output_text") or "").strip()
+    if output_text:
+        return json.loads(output_text)
+    for item in data.get("output", []):
+        for part in item.get("content", []):
+            if part.get("type") in {"output_text", "text"} and part.get("text"):
+                return json.loads(part["text"])
+    raise ValueError("No JSON output returned by call analyzer")
 
 
 def call_skipsherpa_person_lookup(first_name, last_name, street, city="", state="", zipcode="", middle_name=""):
@@ -5569,6 +5704,239 @@ def start_clever_leads_worker():
     thread.start()
 
 
+def _queue_call_analysis_lead_action(db, job_row, analysis):
+    property_id = job_row["property_id"]
+    person_id = job_row["person_id"]
+    if not property_id:
+        return
+    next_step = (analysis.get("next_best_step") or "Follow Up").strip()
+    mapping = {
+        "Schedule Appointment": ("ScheduleAppointment", "High"),
+        "Follow Up": ("FollowUpTouchDue", "Medium"),
+        "Escalate To Relative": ("EscalateToRelativeOutreach", "High"),
+        "Deep Dive": ("EscalateToDeepDiveResearch", "High"),
+        "Mark Not Interested": ("HumanReviewDisposition", "High"),
+        "Mark Opt Out": ("HumanReviewDisposition", "High"),
+        "No Action": ("ReviewInboundAndNextBestAction", "Low"),
+    }
+    action_type, priority = mapping.get(next_step, ("ReviewInboundAndNextBestAction", "Medium"))
+    reason = (
+        f"Call analysis recommends: {next_step}. "
+        f"Intent: {(analysis.get('caller_intent') or 'Unknown')}. "
+        f"Sentiment: {(analysis.get('sentiment') or 'Unknown')}."
+    )
+    _upsert_lead_action(
+        db,
+        int(property_id),
+        person_id,
+        action_type,
+        priority,
+        reason,
+        {
+            "source": "call_recording_analysis",
+            "call_sid": job_row["call_sid"],
+            "recording_url": job_row["recording_url"],
+            "analysis": analysis,
+        },
+    )
+
+
+def _detect_audio_extension(content_type, fallback_url=""):
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    guessed_ext = mimetypes.guess_extension(ctype) if ctype else None
+    if guessed_ext:
+        return guessed_ext
+    path = urlsplit(fallback_url or "").path or ""
+    if "." in path:
+        ext = "." + path.rsplit(".", 1)[-1].lower()
+        if len(ext) <= 6:
+            return ext
+    return ".mp3"
+
+
+def process_single_call_recording_job(db, job_row):
+    job_id = int(job_row["id"])
+    call_sid = (job_row["call_sid"] or "").strip()
+    recording_url = (job_row["recording_url"] or "").strip()
+    from_number = (job_row["from_number"] or "").strip()
+    to_number = (job_row["to_number"] or "").strip()
+    property_id = job_row["property_id"]
+    person_id = job_row["person_id"]
+
+    # Retry recording-url lookup if not present yet.
+    lookup_raw = {}
+    fetch_status = (job_row["fetch_status"] or "Queued").strip()
+    if not recording_url:
+        lookup = fetch_smrtphone_recording_url(call_sid)
+        lookup_raw = lookup.get("raw") or {}
+        recording_url = (lookup.get("recording_url") or "").strip()
+        fetch_status = "Fetched" if recording_url else "No Recording URL"
+        db.execute(
+            """
+            UPDATE call_recording_jobs
+            SET recording_url = ?, fetch_status = ?, payload_json = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                recording_url,
+                fetch_status,
+                json.dumps({"recording_lookup": lookup_raw}),
+                job_id,
+            ),
+        )
+        if not recording_url:
+            return {"job_id": job_id, "status": "no_recording_url"}
+
+    audio_res = requests.get(recording_url, timeout=60)
+    audio_res.raise_for_status()
+    audio_bytes = audio_res.content
+    ext = _detect_audio_extension(audio_res.headers.get("content-type"), recording_url)
+    filename = f"{call_sid or f'call_{job_id}'}{ext}"
+    mime_type = (audio_res.headers.get("content-type") or "").split(";")[0].strip() or "application/octet-stream"
+
+    transcription = transcribe_recording_with_openai(audio_bytes, filename=filename, mime_type=mime_type)
+    transcript = (transcription.get("transcript") or "").strip()
+    analysis = analyze_call_transcript_with_openai(transcript, property_id=property_id, person_id=person_id)
+    summary_text = (analysis.get("summary") or "").strip()
+
+    db.execute(
+        """
+        UPDATE call_recording_jobs
+        SET fetch_status = 'Fetched',
+            analysis_status = 'Completed',
+            transcript_text = ?,
+            summary_text = ?,
+            analysis_json = ?,
+            payload_json = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            transcript,
+            summary_text,
+            json.dumps(analysis),
+            json.dumps(
+                {
+                    "recording_url": recording_url,
+                    "transcription_raw": transcription.get("raw") or {},
+                    "analysis": analysis,
+                }
+            ),
+            job_id,
+        ),
+    )
+    if person_id:
+        note_body = (
+            f"Call analyzed for SID {call_sid}.\n"
+            f"Summary: {summary_text or '-'}\n"
+            f"Intent: {analysis.get('caller_intent') or '-'}\n"
+            f"Recommended Next Step: {analysis.get('next_best_step') or '-'}\n"
+            f"Coaching: {', '.join(analysis.get('caller_improvement') or []) or '-'}"
+        )
+        add_person_note(db, person_id, "Call Recording Analysis", note_body, analysis)
+
+    _queue_call_analysis_lead_action(db, job_row, analysis)
+    try:
+        send_slack_notification(
+            db,
+            "\n".join(
+                [
+                    "Call Analysis Complete",
+                    f"Call SID: {call_sid}",
+                    f"Property ID: {property_id or '-'}",
+                    f"Person ID: {person_id or '-'}",
+                    f"Next Step: {analysis.get('next_best_step') or '-'}",
+                ]
+            ),
+        )
+    except Exception:
+        pass
+    return {"job_id": job_id, "status": "completed", "call_sid": call_sid, "next_step": analysis.get("next_best_step")}
+
+
+def run_call_recording_analysis_once(limit=2):
+    ensure_db()
+    db = open_sqlite_connection()
+    try:
+        rows = db.execute(
+            """
+            SELECT *
+            FROM call_recording_jobs
+            WHERE analysis_status IN ('Pending', 'Retry')
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        processed = 0
+        completed = 0
+        failed = 0
+        details = []
+        for row in rows:
+            processed += 1
+            try:
+                out = process_single_call_recording_job(db, row)
+                details.append(out)
+                if out.get("status") == "completed":
+                    completed += 1
+            except Exception as exc:
+                failed += 1
+                db.execute(
+                    """
+                    UPDATE call_recording_jobs
+                    SET analysis_status = 'Retry',
+                        fetch_status = CASE WHEN fetch_status = 'Queued' THEN 'Error' ELSE fetch_status END,
+                        payload_json = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (json.dumps({"error": str(exc), "trace": traceback.format_exc()}), row["id"]),
+                )
+                details.append({"job_id": row["id"], "status": "error", "error": str(exc)})
+                log_app_error(
+                    db,
+                    source="call_recording_worker",
+                    error_message=str(exc),
+                    details=traceback.format_exc(),
+                    route="run_call_recording_analysis_once",
+                    status_code=500,
+                )
+        db.commit()
+        return {"ok": True, "processed": processed, "completed": completed, "failed": failed, "details": details}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="call_recording_worker",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="run_call_recording_analysis_once",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+def start_call_recording_worker():
+    global CALL_RECORDING_WORKER_STARTED
+    if CALL_RECORDING_WORKER_STARTED or not CALL_RECORDING_WORKER_ENABLED:
+        return
+    CALL_RECORDING_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                run_call_recording_analysis_once(limit=2)
+            except Exception:
+                pass
+            time.sleep(CALL_RECORDING_POLL_SECONDS)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
 def run_bulk_sms_tick():
     run_sequence_tick()
     ensure_db()
@@ -8543,6 +8911,26 @@ def agents_page():
     latest_run_summary = {}
     if latest_run and latest_run["summary_json"]:
         latest_run_summary = parse_json_object(latest_run["summary_json"])
+    call_job_counts = db.execute(
+        """
+        SELECT
+            SUM(CASE WHEN analysis_status IN ('Pending', 'Retry') THEN 1 ELSE 0 END) AS pending_count,
+            SUM(CASE WHEN analysis_status = 'Completed' THEN 1 ELSE 0 END) AS completed_count
+        FROM call_recording_jobs
+        """
+    ).fetchone()
+    call_job_summary = {
+        "pending_count": int((call_job_counts["pending_count"] if call_job_counts else 0) or 0),
+        "completed_count": int((call_job_counts["completed_count"] if call_job_counts else 0) or 0),
+    }
+    call_jobs = db.execute(
+        """
+        SELECT id, call_sid, property_id, person_id, from_number, to_number, fetch_status, analysis_status, summary_text, created_at, updated_at
+        FROM call_recording_jobs
+        ORDER BY id DESC
+        LIMIT 100
+        """
+    ).fetchall()
     return render_template(
         "agents.html",
         agents=AGENT_DEFINITIONS,
@@ -8552,6 +8940,8 @@ def agents_page():
         lead_action_statuses=LEAD_ACTION_STATUSES,
         latest_run=latest_run,
         latest_run_summary=latest_run_summary,
+        call_job_summary=call_job_summary,
+        call_jobs=call_jobs,
         notice=notice,
     )
 
@@ -8591,6 +8981,24 @@ def update_lead_action_status_route(action_id):
     )
     db.commit()
     return redirect(url_for("agents_page", notice=f"Lead action #{action_id} updated to {status}."))
+
+
+@app.route("/agents/call-recordings/run", methods=["POST"])
+def run_call_recordings_route():
+    limit_raw = (request.form.get("limit") or "").strip()
+    limit = int(limit_raw) if limit_raw.isdigit() else 2
+    result = run_call_recording_analysis_once(limit=max(1, min(10, limit)))
+    if result.get("ok"):
+        return redirect(
+            url_for(
+                "agents_page",
+                notice=(
+                    f"Call analysis run complete. Processed {result.get('processed', 0)}, "
+                    f"completed {result.get('completed', 0)}, failed {result.get('failed', 0)}."
+                ),
+            )
+        )
+    return redirect(url_for("agents_page", notice=f"Call analysis run failed: {result.get('error', 'Unknown error')}"))
 
 
 @app.route("/referral")
@@ -13286,6 +13694,7 @@ if __name__ == "__main__":
         start_email_poll_worker()
         start_clever_leads_worker()
         start_referral_on_market_worker()
+        start_call_recording_worker()
     app.run(host=host, port=port, debug=debug_mode)
 
 

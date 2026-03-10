@@ -11525,8 +11525,7 @@ def integrations_website_lead_api():
 def integrations_website_lead_logs_api():
     ensure_db()
     db = get_db()
-    if not integration_auth_ok(db, request):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    # Intentionally public for quick log inspection without integration key auth.
     limit_raw = (request.args.get("limit") or "20").strip()
     limit = int(limit_raw) if limit_raw.isdigit() else 20
     limit = max(1, min(100, limit))

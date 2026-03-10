@@ -1,12 +1,40 @@
 {% extends "base.html" %}
 {% block content %}
+<style>
+.agent-block {
+    border-left: 6px solid #111;
+}
+.agent-1 {
+    border-left-color: #0f766e;
+    background: linear-gradient(180deg, #ecfeff 0%, #ffffff 100%);
+}
+.agent-2 {
+    border-left-color: #1d4ed8;
+    background: linear-gradient(180deg, #eff6ff 0%, #ffffff 100%);
+}
+.agent-3 {
+    border-left-color: #7c3aed;
+    background: linear-gradient(180deg, #f5f3ff 0%, #ffffff 100%);
+}
+.agent-ops {
+    border-left-color: #475569;
+    background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
+}
+.agent-kicker {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #475569;
+    margin: 0 0 0.4rem 0;
+}
+</style>
 {% if notice %}
 <section class="panel">
     <p><strong>{{ notice }}</strong></p>
 </section>
 {% endif %}
 
-<section class="panel">
+<section class="panel agent-block agent-ops">
     <h2>Agent Framework</h2>
     <p>This is the orchestration layer for specialized AI workers. The modules below are scaffolded and ready for iterative implementation.</p>
     <div class="cards">
@@ -21,7 +49,7 @@
     </div>
 </section>
 
-<section class="panel">
+<section class="panel agent-block agent-ops">
     <h3>Configured Agents</h3>
     <table>
         <thead>
@@ -47,8 +75,35 @@
     </table>
 </section>
 
-<section class="panel">
-    <h3>Lead Monitor (Phase 1)</h3>
+<section class="panel agent-block agent-ops">
+    <h3>Agent Responsibilities</h3>
+    <div class="cards">
+        <article>
+            <h3>Agent 1: Communication Intelligence</h3>
+            <p>Reads call recordings + SMS threads, classifies intent/sentiment, and emits structured signals.</p>
+        </article>
+        <article>
+            <h3>Agent 2: Lead Management Engine</h3>
+            <p>Turns signals into prioritized lead actions, including escalation and next-step routing.</p>
+        </article>
+        <article>
+            <h3>Agent 3: Advisor Synthesizer</h3>
+            <p>Consolidates Agent 1/2 output into operator summaries, risks, and Q&A guidance.</p>
+        </article>
+        <article>
+            <h3>Agent 4: Underwriting (Planned)</h3>
+            <p>Will estimate value/offer ranges and confidence from property data and comparables.</p>
+        </article>
+        <article>
+            <h3>Agent 5: Intake + Referral Ops (In Progress)</h3>
+            <p>Handles inbound lead ingestion and referral pipeline continuity.</p>
+        </article>
+    </div>
+</section>
+
+<section class="panel agent-block agent-2">
+    <p class="agent-kicker">Agent 2</p>
+    <h3>Agent 2: Lead Management Decision Engine</h3>
     <p>Manual run only. This evaluates lead flow, touchpoint outcomes, and escalation rules to build a human review queue.</p>
     <form method="post" action="{{ url_for('run_lead_monitor_route') }}" class="inline-form" style="display:flex; gap:0.5rem; align-items:flex-end; flex-wrap:wrap;">
         <label>
@@ -81,8 +136,9 @@
     {% endif %}
 </section>
 
-<section class="panel">
-    <h3>Lead Action Queue</h3>
+<section class="panel agent-block agent-2">
+    <p class="agent-kicker">Agent 2</p>
+    <h3>Agent 2: Lead Action Queue</h3>
     {% if lead_actions %}
     <table>
         <thead>
@@ -139,8 +195,9 @@
     {% endif %}
 </section>
 
-<section class="panel">
-    <h3>Call Recording Analysis</h3>
+<section class="panel agent-block agent-1">
+    <p class="agent-kicker">Agent 1</p>
+    <h3>Agent 1: Call Recording Intelligence</h3>
     <p>Runs transcription and AI call analysis, then queues recommended lead-management action for review.</p>
     <form method="post" action="{{ url_for('run_call_recordings_route') }}" style="display:flex; gap:0.5rem; align-items:flex-end; flex-wrap:wrap;">
         <label>
@@ -199,8 +256,9 @@
     {% endif %}
 </section>
 
-<section class="panel">
-    <h3>SMS Transcript Analysis</h3>
+<section class="panel agent-block agent-1">
+    <p class="agent-kicker">Agent 1</p>
+    <h3>Agent 1: SMS Transcript Intelligence</h3>
     <p>Analyzes inbound/outbound SMS threads and routes recommendations to the Lead Management queue.</p>
     <form method="post" action="{{ url_for('run_sms_analysis_route') }}" style="display:flex; gap:0.5rem; align-items:flex-end; flex-wrap:wrap;">
         <label>
@@ -275,7 +333,82 @@
     {% endif %}
 </section>
 
-<section class="panel">
+<section class="panel agent-block agent-3">
+    <p class="agent-kicker">Agent 3</p>
+    <h3>Advisor Synthesizer (Agent 3)</h3>
+    <p>Consolidates Agent 1/2 output into priority guidance and answers on-demand lead-management questions.</p>
+    <div class="cards">
+        <article>
+            <h3>Signals New</h3>
+            <p>{{ advisor_snapshot.signals.new_total }}</p>
+        </article>
+        <article>
+            <h3>Actions Pending</h3>
+            <p>{{ advisor_snapshot.actions.pending_total }}</p>
+        </article>
+        <article>
+            <h3>High Priority Pending</h3>
+            <p>{{ advisor_snapshot.actions.high_pending_total }}</p>
+        </article>
+        <article>
+            <h3>Pending Call Analysis</h3>
+            <p>{{ advisor_snapshot.calls.pending_total }}</p>
+        </article>
+    </div>
+    <form method="post" action="{{ url_for('run_agent_advisor_refresh_route') }}" style="margin-top:0.75rem;">
+        <button type="submit">Refresh Agent 3 Summary</button>
+    </form>
+    {% if advisor_summary_row %}
+    <div style="margin-top:0.75rem;">
+        <p><strong>Latest Summary:</strong> {{ advisor_summary_row.created_at }}</p>
+        <pre style="white-space:pre-wrap;">{{ advisor_summary_row.response_text }}</pre>
+    </div>
+    {% else %}
+    <p style="margin-top:0.75rem;">No summary generated yet.</p>
+    {% endif %}
+    <h4 style="margin-top:1rem;">Current Deterministic Recommendations</h4>
+    <ul>
+        {% for rec in advisor_recommendations %}
+        <li>
+            <strong>[{{ rec.priority }}] {{ rec.title }}</strong><br>
+            {{ rec.reason }}<br>
+            Next: {{ rec.next_step }}
+        </li>
+        {% endfor %}
+    </ul>
+    <h4 style="margin-top:1rem;">Ask Agent 3</h4>
+    <form method="post" action="{{ url_for('run_agent_advisor_question_route') }}" style="display:flex; gap:0.5rem; align-items:flex-end; flex-wrap:wrap;">
+        <label style="min-width:420px; flex:1;">
+            Question
+            <input type="text" name="question" placeholder="Example: What are my top 3 actions for the next 12 hours?" required>
+        </label>
+        <button type="submit">Ask</button>
+    </form>
+    {% if advisor_qa_rows %}
+    <table style="margin-top:0.75rem;">
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Question</th>
+                <th>Answer</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in advisor_qa_rows %}
+            <tr>
+                <td>{{ row.created_at }}</td>
+                <td>{{ row.question }}</td>
+                <td style="white-space:pre-wrap;">{{ row.response_text }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="margin-top:0.75rem;">No Agent 3 Q&A history yet.</p>
+    {% endif %}
+</section>
+
+<section class="panel agent-block agent-ops">
     <h3>Build Notes</h3>
     <ul>
         <li>Each agent will run as an isolated workflow with dedicated prompts, tools, and safety constraints.</li>

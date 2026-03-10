@@ -182,7 +182,15 @@ AGENT_DEFINITIONS = [
         "objective": "Track lead lifecycle and identify stalled steps: missing offers, pending deadlines, and follow-up gaps.",
         "inputs": "ReiSift statuses, communication activity, tasks, and timelines.",
         "outputs": "Alerts, action queue, and recommended owner/relative escalation.",
-        "status": "Planned",
+        "status": "In Progress",
+    },
+    {
+        "key": "advisor_synthesizer",
+        "name": "Advisor Synthesizer Agent",
+        "objective": "Consolidate call/SMS analysis and lead-management actions into ranked recommendations with on-demand Q&A.",
+        "inputs": "Agent signals, call jobs, lead action queue, and recent run history.",
+        "outputs": "Executive summary, top priorities, risks, and question-driven guidance.",
+        "status": "In Progress",
     },
     {
         "key": "referral_orchestrator",
@@ -227,6 +235,21 @@ def format_phone_display(value):
 
 
 app.jinja_env.filters["fmt_phone"] = format_phone_display
+
+
+def parse_json_object(raw, default=None):
+    if isinstance(raw, dict):
+        return raw
+    if raw is None:
+        return {} if default is None else default
+    text = str(raw).strip()
+    if not text:
+        return {} if default is None else default
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else ({} if default is None else default)
+    except Exception:
+        return {} if default is None else default
 
 
 def parse_flexible_datetime(value):
@@ -657,6 +680,20 @@ def migrate_db(db):
         )
         """
     )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_advisor_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            log_type TEXT NOT NULL,
+            question TEXT,
+            response_text TEXT,
+            response_json TEXT,
+            snapshot_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_agent_advisor_logs_type ON agent_advisor_logs(log_type, id DESC)")
 
 
 def log_app_error(db, source, error_message, details="", route="", status_code=None):
@@ -6415,6 +6452,317 @@ def start_sms_analysis_worker():
     thread.start()
 
 
+def build_agent_advisor_snapshot(db, window_hours=72):
+    cutoff_dt = datetime.utcnow() - timedelta(hours=max(1, int(window_hours or 72)))
+    cutoff = format_db_time(cutoff_dt)
+    snapshot = {
+        "window_hours": int(window_hours or 72),
+        "window_cutoff": cutoff,
+        "generated_at": format_db_time(datetime.utcnow()),
+    }
+
+    signal_counts = db.execute(
+        """
+        SELECT
+            SUM(CASE WHEN source_type = 'sms' THEN 1 ELSE 0 END) AS sms_total,
+            SUM(CASE WHEN source_type = 'call' THEN 1 ELSE 0 END) AS call_total,
+            SUM(CASE WHEN routing_status = 'new' THEN 1 ELSE 0 END) AS new_total,
+            SUM(CASE WHEN routing_status = 'routed' THEN 1 ELSE 0 END) AS routed_total,
+            SUM(CASE WHEN do_not_contact = 1 THEN 1 ELSE 0 END) AS dnc_total,
+            SUM(CASE WHEN is_spam = 1 THEN 1 ELSE 0 END) AS spam_total
+        FROM agent_signals
+        WHERE updated_at >= ?
+        """,
+        (cutoff,),
+    ).fetchone()
+    snapshot["signals"] = {
+        "sms_total": int((signal_counts["sms_total"] if signal_counts else 0) or 0),
+        "call_total": int((signal_counts["call_total"] if signal_counts else 0) or 0),
+        "new_total": int((signal_counts["new_total"] if signal_counts else 0) or 0),
+        "routed_total": int((signal_counts["routed_total"] if signal_counts else 0) or 0),
+        "dnc_total": int((signal_counts["dnc_total"] if signal_counts else 0) or 0),
+        "spam_total": int((signal_counts["spam_total"] if signal_counts else 0) or 0),
+    }
+
+    action_counts = db.execute(
+        """
+        SELECT
+            SUM(CASE WHEN status = 'Pending' THEN 1 ELSE 0 END) AS pending_total,
+            SUM(CASE WHEN status = 'Pending' AND priority = 'High' THEN 1 ELSE 0 END) AS high_pending_total,
+            SUM(CASE WHEN status = 'Completed' AND updated_at >= ? THEN 1 ELSE 0 END) AS completed_recent
+        FROM lead_management_actions
+        """,
+        (cutoff,),
+    ).fetchone()
+    stale_counts = db.execute(
+        """
+        SELECT
+            SUM(CASE WHEN status = 'Pending' AND datetime(updated_at) <= datetime('now', '-2 day') THEN 1 ELSE 0 END) AS stale_pending_2d
+        FROM lead_management_actions
+        """
+    ).fetchone()
+    snapshot["actions"] = {
+        "pending_total": int((action_counts["pending_total"] if action_counts else 0) or 0),
+        "high_pending_total": int((action_counts["high_pending_total"] if action_counts else 0) or 0),
+        "completed_recent": int((action_counts["completed_recent"] if action_counts else 0) or 0),
+        "stale_pending_2d": int((stale_counts["stale_pending_2d"] if stale_counts else 0) or 0),
+    }
+
+    call_counts = db.execute(
+        """
+        SELECT
+            SUM(CASE WHEN analysis_status = 'Completed' AND updated_at >= ? THEN 1 ELSE 0 END) AS completed_recent,
+            SUM(CASE WHEN analysis_status IN ('Pending', 'Retry') THEN 1 ELSE 0 END) AS pending_total,
+            SUM(CASE WHEN analysis_status = 'Failed' THEN 1 ELSE 0 END) AS failed_total
+        FROM call_recording_jobs
+        """,
+        (cutoff,),
+    ).fetchone()
+    snapshot["calls"] = {
+        "completed_recent": int((call_counts["completed_recent"] if call_counts else 0) or 0),
+        "pending_total": int((call_counts["pending_total"] if call_counts else 0) or 0),
+        "failed_total": int((call_counts["failed_total"] if call_counts else 0) or 0),
+    }
+
+    latest_run = db.execute(
+        """
+        SELECT id, status, created_at, completed_at, summary_json
+        FROM lead_monitor_runs
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    snapshot["latest_run"] = {
+        "id": int(latest_run["id"]) if latest_run else 0,
+        "status": str(latest_run["status"]) if latest_run else "",
+        "created_at": str(latest_run["created_at"]) if latest_run else "",
+        "completed_at": str(latest_run["completed_at"]) if latest_run else "",
+        "summary": parse_json_object(latest_run["summary_json"]) if latest_run else {},
+    }
+
+    pending_actions = db.execute(
+        """
+        SELECT id, property_id, person_id, action_type, priority, status, reason, updated_at
+        FROM lead_management_actions
+        WHERE status = 'Pending'
+        ORDER BY
+            CASE priority WHEN 'High' THEN 0 WHEN 'Medium' THEN 1 ELSE 2 END,
+            updated_at ASC,
+            id ASC
+        LIMIT 8
+        """
+    ).fetchall()
+    snapshot["top_pending_actions"] = [
+        {
+            "id": int(r["id"]),
+            "property_id": int(r["property_id"] or 0),
+            "person_id": int(r["person_id"] or 0),
+            "action_type": str(r["action_type"] or ""),
+            "priority": str(r["priority"] or ""),
+            "reason": str(r["reason"] or ""),
+            "updated_at": str(r["updated_at"] or ""),
+        }
+        for r in pending_actions
+    ]
+    return snapshot
+
+
+def build_agent_advisor_recommendations(snapshot):
+    signals = snapshot.get("signals", {})
+    actions = snapshot.get("actions", {})
+    calls = snapshot.get("calls", {})
+    recs = []
+    if int(actions.get("high_pending_total", 0)) > 0:
+        recs.append(
+            {
+                "priority": "High",
+                "title": "Clear high-priority lead actions",
+                "reason": f"{actions.get('high_pending_total', 0)} high-priority items are pending.",
+                "next_step": "Review and approve/dismiss high-priority items first.",
+            }
+        )
+    if int(signals.get("new_total", 0)) > 0:
+        recs.append(
+            {
+                "priority": "High" if int(signals.get("new_total", 0)) >= 5 else "Medium",
+                "title": "Route new communication signals",
+                "reason": f"{signals.get('new_total', 0)} signals remain unrouted.",
+                "next_step": "Run SMS/call analysis routing and confirm resulting actions.",
+            }
+        )
+    if int(calls.get("pending_total", 0)) > 0:
+        recs.append(
+            {
+                "priority": "Medium",
+                "title": "Process pending call analysis",
+                "reason": f"{calls.get('pending_total', 0)} call recordings are waiting.",
+                "next_step": "Run call analysis to keep lead intent current.",
+            }
+        )
+    if int(actions.get("stale_pending_2d", 0)) > 0:
+        recs.append(
+            {
+                "priority": "Medium",
+                "title": "Resolve stale pending actions",
+                "reason": f"{actions.get('stale_pending_2d', 0)} pending actions are older than 2 days.",
+                "next_step": "Escalate stale items to explicit owner decisions.",
+            }
+        )
+    if int(signals.get("dnc_total", 0)) > 0:
+        recs.append(
+            {
+                "priority": "High",
+                "title": "Validate do-not-contact constraints",
+                "reason": f"{signals.get('dnc_total', 0)} recent signals indicate do-not-contact risk.",
+                "next_step": "Confirm no outbound actions are queued for these leads.",
+            }
+        )
+    if not recs:
+        recs.append(
+            {
+                "priority": "Low",
+                "title": "Pipeline stable",
+                "reason": "No high-risk backlog was detected.",
+                "next_step": "Continue normal monitoring cadence.",
+            }
+        )
+    return recs[:6]
+
+
+def fallback_agent_advisor_summary(snapshot, recommendations):
+    signals = snapshot.get("signals", {})
+    actions = snapshot.get("actions", {})
+    calls = snapshot.get("calls", {})
+    lines = [
+        f"Window: last {snapshot.get('window_hours', 72)}h",
+        (
+            f"Signals - SMS: {signals.get('sms_total', 0)}, Calls: {signals.get('call_total', 0)}, "
+            f"New: {signals.get('new_total', 0)}, Routed: {signals.get('routed_total', 0)}"
+        ),
+        (
+            f"Actions - Pending: {actions.get('pending_total', 0)}, High Priority: {actions.get('high_pending_total', 0)}, "
+            f"Stale >2d: {actions.get('stale_pending_2d', 0)}"
+        ),
+        (
+            f"Call Analysis - Pending: {calls.get('pending_total', 0)}, "
+            f"Completed (window): {calls.get('completed_recent', 0)}, Failed: {calls.get('failed_total', 0)}"
+        ),
+        "Top Recommendations:",
+    ]
+    for idx, rec in enumerate(recommendations[:4], start=1):
+        lines.append(f"{idx}. [{rec['priority']}] {rec['title']} - {rec['next_step']}")
+    return "\n".join(lines)
+
+
+def generate_agent_advisor_summary_with_openai(snapshot, recommendations):
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return {"mode": "fallback", "summary_text": fallback_agent_advisor_summary(snapshot, recommendations), "json": {}}
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    schema = {
+        "name": "agent_advisor_summary",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "executive_summary": {"type": "string"},
+                "top_priorities": {"type": "array", "items": {"type": "string"}},
+                "risks": {"type": "array", "items": {"type": "string"}},
+                "next_12h_plan": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["executive_summary", "top_priorities", "risks", "next_12h_plan"],
+        },
+    }
+    prompt = (
+        "You are Agent 3 (Advisor Synthesizer) for a real-estate CRM.\n"
+        "Create a concise operator brief from the snapshot and deterministic recommendations.\n"
+        "Focus on actionability and risk control.\n\n"
+        f"Snapshot JSON:\n{json.dumps(snapshot, ensure_ascii=True)}\n\n"
+        f"Recommendations JSON:\n{json.dumps(recommendations, ensure_ascii=True)}"
+    )
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "You synthesize CRM agent outputs into prioritized, practical briefings."}],
+                },
+                {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+            ],
+            "text": {"format": {"type": "json_schema", "name": schema["name"], "schema": schema["schema"], "strict": True}},
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    output_text = (data.get("output_text") or "").strip()
+    payload = json.loads(output_text) if output_text else {}
+    if not payload:
+        for item in data.get("output", []):
+            for part in item.get("content", []):
+                if part.get("type") in {"output_text", "text"} and part.get("text"):
+                    payload = json.loads(part["text"])
+                    break
+            if payload:
+                break
+    if not payload:
+        raise ValueError("No JSON output returned by advisor summary")
+    summary_text = (
+        f"{payload.get('executive_summary', '').strip()}\n\n"
+        f"Top priorities:\n- " + "\n- ".join(payload.get("top_priorities", [])[:5]) + "\n\n"
+        f"Risks:\n- " + "\n- ".join(payload.get("risks", [])[:5]) + "\n\n"
+        f"Next 12h plan:\n- " + "\n- ".join(payload.get("next_12h_plan", [])[:6])
+    ).strip()
+    return {"mode": "openai", "summary_text": summary_text, "json": payload}
+
+
+def answer_agent_advisor_question(question, snapshot, recommendations, qa_history):
+    q = (question or "").strip()
+    if not q:
+        raise ValueError("Question is required.")
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return (
+            "OPENAI_API_KEY is not configured, so this is deterministic guidance.\n"
+            + fallback_agent_advisor_summary(snapshot, recommendations)
+        )
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    compact_history = [{"q": (h.get("question") or "")[:300], "a": (h.get("response_text") or "")[:500]} for h in qa_history[:6]]
+    prompt = (
+        "You are Agent 3 (Advisor Synthesizer). Answer the operator's question using only provided context.\n"
+        "If context is insufficient, state exactly what is missing.\n\n"
+        f"Question: {q}\n\n"
+        f"Snapshot: {json.dumps(snapshot, ensure_ascii=True)}\n\n"
+        f"Deterministic recommendations: {json.dumps(recommendations, ensure_ascii=True)}\n\n"
+        f"Recent Q&A: {json.dumps(compact_history, ensure_ascii=True)}"
+    )
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": "Answer operational CRM questions clearly and directly."}]},
+                {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+            ],
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    text = (data.get("output_text") or "").strip()
+    if text:
+        return text
+    for item in data.get("output", []):
+        for part in item.get("content", []):
+            if part.get("type") in {"output_text", "text"} and part.get("text"):
+                return str(part["text"]).strip()
+    raise ValueError("No output returned by advisor Q&A")
+
+
 def run_bulk_sms_tick():
     run_sequence_tick()
     ensure_db()
@@ -9433,6 +9781,26 @@ def agents_page():
         LIMIT 100
         """
     ).fetchall()
+    advisor_snapshot = build_agent_advisor_snapshot(db, window_hours=72)
+    advisor_recommendations = build_agent_advisor_recommendations(advisor_snapshot)
+    advisor_summary_row = db.execute(
+        """
+        SELECT id, response_text, response_json, snapshot_json, created_at
+        FROM agent_advisor_logs
+        WHERE log_type = 'summary'
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    advisor_qa_rows = db.execute(
+        """
+        SELECT id, question, response_text, created_at
+        FROM agent_advisor_logs
+        WHERE log_type = 'qa'
+        ORDER BY id DESC
+        LIMIT 12
+        """
+    ).fetchall()
     return render_template(
         "agents.html",
         agents=AGENT_DEFINITIONS,
@@ -9446,6 +9814,10 @@ def agents_page():
         call_jobs=call_jobs,
         signal_summary=signal_summary,
         signals=signals,
+        advisor_snapshot=advisor_snapshot,
+        advisor_recommendations=advisor_recommendations,
+        advisor_summary_row=advisor_summary_row,
+        advisor_qa_rows=advisor_qa_rows,
         notice=notice,
     )
 
@@ -9524,6 +9896,74 @@ def run_sms_analysis_route():
             )
         )
     return redirect(url_for("agents_page", notice=f"SMS analysis failed: {result.get('error', 'Unknown error')}"))
+
+
+@app.route("/agents/advisor/refresh", methods=["POST"])
+def run_agent_advisor_refresh_route():
+    ensure_db()
+    db = get_db()
+    try:
+        snapshot = build_agent_advisor_snapshot(db, window_hours=72)
+        recommendations = build_agent_advisor_recommendations(snapshot)
+        summary_result = generate_agent_advisor_summary_with_openai(snapshot, recommendations)
+        db.execute(
+            """
+            INSERT INTO agent_advisor_logs (log_type, response_text, response_json, snapshot_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                "summary",
+                summary_result.get("summary_text", ""),
+                json.dumps(summary_result.get("json", {})),
+                json.dumps({"snapshot": snapshot, "recommendations": recommendations}),
+            ),
+        )
+        db.commit()
+        mode = summary_result.get("mode", "fallback")
+        return redirect(url_for("agents_page", notice=f"Agent 3 summary refreshed ({mode})."))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("agents_page", notice=f"Agent 3 summary failed: {exc}"))
+
+
+@app.route("/agents/advisor/ask", methods=["POST"])
+def run_agent_advisor_question_route():
+    ensure_db()
+    db = get_db()
+    question = (request.form.get("question") or "").strip()
+    if not question:
+        return redirect(url_for("agents_page", notice="Agent 3 question is required."))
+    try:
+        snapshot = build_agent_advisor_snapshot(db, window_hours=72)
+        recommendations = build_agent_advisor_recommendations(snapshot)
+        history_rows = db.execute(
+            """
+            SELECT question, response_text, created_at
+            FROM agent_advisor_logs
+            WHERE log_type = 'qa'
+            ORDER BY id DESC
+            LIMIT 8
+            """
+        ).fetchall()
+        history = [dict(row) for row in history_rows]
+        answer = answer_agent_advisor_question(question, snapshot, recommendations, history)
+        db.execute(
+            """
+            INSERT INTO agent_advisor_logs (log_type, question, response_text, snapshot_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                "qa",
+                question,
+                answer,
+                json.dumps({"snapshot": snapshot, "recommendations": recommendations}),
+            ),
+        )
+        db.commit()
+        return redirect(url_for("agents_page", notice="Agent 3 answered your question."))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("agents_page", notice=f"Agent 3 Q&A failed: {exc}"))
 
 
 @app.route("/referral")

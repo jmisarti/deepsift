@@ -448,6 +448,20 @@ def require_login_if_enabled():
         start_sms_analysis_worker()
     if not APP_AUTH_ENABLED:
         return None
+    integration_api_allowlist = {
+        "/api/webhooks/smrtphone/events",
+        "/api/call-recording-jobs",
+        "/api/integrations/agent-trace/search",
+        "/api/integrations/agent-trace/property",
+    }
+    if request.path in integration_api_allowlist:
+        try:
+            ensure_db()
+            db = get_db()
+            if integration_auth_ok(db, request):
+                return None
+        except Exception:
+            pass
     endpoint = request.endpoint or ""
     if endpoint in {"login", "logout", "static"}:
         return None
@@ -13070,6 +13084,7 @@ def property_detail(property_id):
         """,
         (property_id,),
     ).fetchall()
+    agent_trace = _agent_trace_for_property(db, property_id, limit=25) or {}
 
     return render_template(
         "property_detail.html",
@@ -13096,6 +13111,7 @@ def property_detail(property_id):
         sequence_campaigns=sequence_campaigns,
         sequence_targets=sequence_targets,
         sequence_enrollments=sequence_enrollments,
+        agent_trace=agent_trace,
         seq_notice=(request.args.get("seq_notice") or "").strip(),
     )
 
@@ -15898,6 +15914,171 @@ def call_recording_jobs_api():
         (limit,),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+def _agent_trace_for_property(db, property_id, limit=20):
+    try:
+        n = max(1, min(200, int(limit)))
+    except (TypeError, ValueError):
+        n = 20
+    prop = db.execute(
+        """
+        SELECT p.id, p.status, p.notes, p.created_at,
+               a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        """,
+        (property_id,),
+    ).fetchone()
+    if not prop:
+        return None
+    comms = []
+    signals = []
+    actions = []
+    calls = []
+    try:
+        comm_rows = db.execute(
+            """
+            SELECT c.id, c.person_id, c.channel, c.direction, c.body, c.status, c.sent_at, c.created_at,
+                   c.from_number, c.to_number,
+                   p.first_name, p.middle_name, p.last_name
+            FROM communications c
+            LEFT JOIN people p ON p.id = c.person_id
+            WHERE c.property_id = ?
+            ORDER BY COALESCE(c.sent_at, c.created_at) DESC, c.id DESC
+            LIMIT ?
+            """,
+            (property_id, n),
+        ).fetchall()
+        for r in comm_rows:
+            d = dict(r)
+            d["person_name"] = person_display_name(d.get("first_name"), d.get("middle_name"), d.get("last_name"))
+            comms.append(d)
+    except Exception:
+        pass
+    try:
+        sig_rows = db.execute(
+            """
+            SELECT id, source_type, source_key, person_id, channel, intent, sentiment, confidence,
+                   recommended_next_step, summary_text, routing_status, created_at, updated_at
+            FROM agent_signals
+            WHERE property_id = ?
+            ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+            LIMIT ?
+            """,
+            (property_id, n),
+        ).fetchall()
+        signals = [dict(r) for r in sig_rows]
+    except Exception:
+        pass
+    try:
+        action_rows = db.execute(
+            """
+            SELECT id, person_id, action_type, priority, status, reason, created_at, updated_at
+            FROM lead_management_actions
+            WHERE property_id = ?
+            ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+            LIMIT ?
+            """,
+            (property_id, n),
+        ).fetchall()
+        actions = [dict(r) for r in action_rows]
+    except Exception:
+        pass
+    try:
+        call_rows = db.execute(
+            """
+            SELECT id, call_sid, person_id, from_number, to_number, recording_url, fetch_status, analysis_status,
+                   summary_text, created_at, updated_at
+            FROM call_recording_jobs
+            WHERE property_id = ?
+            ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+            LIMIT ?
+            """,
+            (property_id, n),
+        ).fetchall()
+        calls = [dict(r) for r in call_rows]
+    except Exception:
+        pass
+    return {
+        "property": dict(prop),
+        "communications": comms,
+        "signals": signals,
+        "actions": actions,
+        "calls": calls,
+        "counts": {
+            "communications": len(comms),
+            "signals": len(signals),
+            "actions": len(actions),
+            "calls": len(calls),
+        },
+    }
+
+
+@app.route("/api/integrations/agent-trace/search", methods=["GET"])
+def integrations_agent_trace_search_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    q = (request.args.get("q") or "").strip()
+    limit_raw = (request.args.get("limit") or "10").strip()
+    trace_limit_raw = (request.args.get("trace_limit") or "20").strip()
+    try:
+        limit = max(1, min(50, int(limit_raw)))
+    except ValueError:
+        limit = 10
+    try:
+        trace_limit = max(1, min(200, int(trace_limit_raw)))
+    except ValueError:
+        trace_limit = 20
+    if not q:
+        return jsonify({"ok": False, "error": "q is required"}), 400
+    like = f"%{q.lower()}%"
+    rows = db.execute(
+        """
+        SELECT p.id
+        FROM properties p
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        LEFT JOIN people op ON op.id = p.owner_person_id
+        WHERE lower(COALESCE(a.street, '')) LIKE ?
+           OR lower(COALESCE(a.city, '')) LIKE ?
+           OR lower(COALESCE(a.state, '')) LIKE ?
+           OR lower(COALESCE(a.postal_code, '')) LIKE ?
+           OR lower(COALESCE(p.notes, '')) LIKE ?
+           OR lower(COALESCE(op.first_name, '') || ' ' || COALESCE(op.last_name, '')) LIKE ?
+        ORDER BY p.id DESC
+        LIMIT ?
+        """,
+        (like, like, like, like, like, like, limit),
+    ).fetchall()
+    results = []
+    for r in rows:
+        trace = _agent_trace_for_property(db, int(r["id"]), trace_limit)
+        if trace:
+            results.append(trace)
+    return jsonify({"ok": True, "query": q, "count": len(results), "results": results})
+
+
+@app.route("/api/integrations/agent-trace/property", methods=["GET"])
+def integrations_agent_trace_property_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    pid_raw = (request.args.get("property_id") or "").strip()
+    trace_limit_raw = (request.args.get("trace_limit") or "30").strip()
+    if not pid_raw.isdigit():
+        return jsonify({"ok": False, "error": "property_id is required"}), 400
+    try:
+        trace_limit = max(1, min(300, int(trace_limit_raw)))
+    except ValueError:
+        trace_limit = 30
+    trace = _agent_trace_for_property(db, int(pid_raw), trace_limit)
+    if not trace:
+        return jsonify({"ok": False, "error": "Property not found"}), 404
+    return jsonify({"ok": True, "trace": trace})
 
 
 @app.route("/webhooks/gmail/pubsub", methods=["POST"])

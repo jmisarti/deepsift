@@ -129,6 +129,92 @@
     </table>
 </section>
 
+<section class="panel">
+    <details>
+        <summary><strong>Agent Trace (Communication -> Signal -> Action)</strong></summary>
+        {% set t = agent_trace or {} %}
+        {% set tc = t.counts or {} %}
+        <p><strong>Counts:</strong> Communications {{ tc.communications or 0 }}, Signals {{ tc.signals or 0 }}, Actions {{ tc.actions or 0 }}, Calls {{ tc.calls or 0 }}</p>
+        <h4>Recent Communications</h4>
+        <table class="crm-table">
+            <thead><tr><th>When</th><th>Channel</th><th>Direction</th><th>Person</th><th>Status</th><th>Body</th></tr></thead>
+            <tbody>
+                {% for c in t.communications or [] %}
+                <tr>
+                    <td>{{ (c.sent_at or c.created_at)|fmt_est_datetime }}</td>
+                    <td>{{ c.channel or '-' }}</td>
+                    <td>{{ c.direction or '-' }}</td>
+                    <td>
+                        {% if c.person_id %}
+                        <a href="{{ url_for('person_detail', person_id=c.person_id, property_id=prop.id) }}">{{ c.person_name or ('Person ' ~ c.person_id) }}</a>
+                        {% else %}
+                        -
+                        {% endif %}
+                    </td>
+                    <td>{{ c.status or '-' }}</td>
+                    <td>{{ c.body or '-' }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="6">No communication records found.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <h4>Recent Agent Signals</h4>
+        <table class="crm-table">
+            <thead><tr><th>When</th><th>Source</th><th>Intent</th><th>Sentiment</th><th>Confidence</th><th>Recommended</th><th>Routing</th></tr></thead>
+            <tbody>
+                {% for s in t.signals or [] %}
+                <tr>
+                    <td>{{ (s.updated_at or s.created_at)|fmt_est_datetime }}</td>
+                    <td>{{ s.source_type or '-' }}</td>
+                    <td>{{ s.intent or '-' }}</td>
+                    <td>{{ s.sentiment or '-' }}</td>
+                    <td>{{ s.confidence or 0 }}</td>
+                    <td>{{ s.recommended_next_step or '-' }}</td>
+                    <td>{{ s.routing_status or '-' }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="7">No agent signals found.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <h4>Recent Lead Actions</h4>
+        <table class="crm-table">
+            <thead><tr><th>When</th><th>Action</th><th>Priority</th><th>Status</th><th>Reason</th></tr></thead>
+            <tbody>
+                {% for a in t.actions or [] %}
+                <tr>
+                    <td>{{ (a.updated_at or a.created_at)|fmt_est_datetime }}</td>
+                    <td>{{ a.action_type or '-' }}</td>
+                    <td>{{ a.priority or '-' }}</td>
+                    <td>{{ a.status or '-' }}</td>
+                    <td>{{ a.reason or '-' }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="5">No lead actions found.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <h4>Recent Call Analysis Jobs</h4>
+        <table class="crm-table">
+            <thead><tr><th>When</th><th>Call SID</th><th>Fetch</th><th>Analysis</th><th>Summary</th></tr></thead>
+            <tbody>
+                {% for j in t.calls or [] %}
+                <tr>
+                    <td>{{ (j.updated_at or j.created_at)|fmt_est_datetime }}</td>
+                    <td>{{ j.call_sid or '-' }}</td>
+                    <td>{{ j.fetch_status or '-' }}</td>
+                    <td>{{ j.analysis_status or '-' }}</td>
+                    <td>{{ j.summary_text or '-' }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="5">No call analysis jobs found.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </details>
+</section>
+
 <section class="panel"><details><summary><strong>Activity Log</strong></summary><table><thead><tr><th>Date</th><th>Person ID</th><th>Type</th><th>Outcome</th><th>Note</th></tr></thead><tbody>{% for a in activities %}<tr><td>{{ a.created_at }}</td><td>{{ a.person_id }}</td><td>{{ a.activity_type }}</td><td>{{ a.outcome }}</td><td>{{ a.note }}</td></tr>{% endfor %}</tbody></table></details></section>
 
 <section class="panel"><details><summary><strong>Obituary Import</strong></summary><div class="split"><div><form id="obitAiImportForm" method="post" action="{{ url_for('import_obituary_ai_route', property_id=prop.id) }}" class="grid-form compact"><input type="hidden" name="subject_person_id" value="{{ prop.owner_person_id }}"><label class="span2">Subject Person <input value="{{ prop.owner_first }} {{ prop.owner_middle or '' }} {{ prop.owner_last }}" readonly></label><label class="span2">Obituary URL <input name="obituary_url" placeholder="https://www.legacy.com/..." required></label><button type="submit">AI Import Relationships</button></form></div><div><table><thead><tr><th>Date</th><th>Source</th><th>Excerpt</th></tr></thead><tbody>{% for row in obituary_imports %}<tr><td>{{ row.created_at }}</td><td><a href="{{ row.source_url }}" target="_blank">Source</a></td><td>{{ row.raw_text[:160] }}...</td></tr>{% endfor %}</tbody></table></div></div></details></section>

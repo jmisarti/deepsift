@@ -119,6 +119,7 @@ GOOGLE_SHEETS_WORKSHEET_NAME = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "List o
 GOOGLE_SHEETS_POLL_SECONDS = max(int((os.getenv("GOOGLE_SHEETS_POLL_SECONDS") or "300").strip() or "300"), 60)
 GOOGLE_SHEETS_POLL_MODE = (os.getenv("GOOGLE_SHEETS_POLL_MODE") or "latest_only").strip().lower()
 CLEVER_LEADS_EVENT_SOURCE = "clever_leads_ingest"
+WEBSITE_LEADS_EVENT_SOURCE = "website_leads_ingest"
 try:
     EST_TZ = ZoneInfo("America/New_York")
 except ZoneInfoNotFoundError:
@@ -650,6 +651,36 @@ def migrate_db(db):
             note_body TEXT NOT NULL,
             payload_json TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS website_lead_webhook_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT,
+            lead_key TEXT,
+            note_body TEXT NOT NULL,
+            payload_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS website_lead_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_key TEXT NOT NULL UNIQUE,
+            reisift_property_uuid TEXT,
+            reisift_owner_uuid TEXT,
+            latest_address TEXT,
+            latest_phone TEXT,
+            latest_email TEXT,
+            latest_name TEXT,
+            latest_stage TEXT,
+            latest_payload_json TEXT,
+            first_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
@@ -4586,6 +4617,350 @@ def add_clever_webhook_note(db, event_key, note_body, payload=None):
             json.dumps(payload or {}),
         ),
     )
+
+
+def add_website_webhook_note(db, event_key, lead_key, note_body, payload=None):
+    db.execute(
+        """
+        INSERT INTO website_lead_webhook_notes (event_key, lead_key, note_body, payload_json)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            (event_key or "").strip() or None,
+            (lead_key or "").strip() or None,
+            (note_body or "").strip(),
+            json.dumps(payload or {}),
+        ),
+    )
+
+
+def _payload_value_by_keys(payload, keys):
+    if not isinstance(payload, dict):
+        return ""
+    lowered = {str(k).strip().lower(): v for k, v in payload.items()}
+    for key in keys:
+        val = lowered.get(str(key).strip().lower())
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return ""
+
+
+def _normalize_address_key(address):
+    return re.sub(r"[^a-z0-9]+", " ", str(address or "").lower()).strip()
+
+
+def _derive_website_lead_key(payload, address="", phone="", email=""):
+    explicit = _payload_value_by_keys(payload, ["lead_key", "lead_id", "submission_group_id", "session_id", "contact_id"])
+    if explicit:
+        return f"id:{explicit}"
+    clean_email = str(email or "").strip().lower()
+    clean_phone = normalize_phone(phone)
+    if clean_email:
+        return f"email:{clean_email}"
+    if clean_phone:
+        return f"phone:{clean_phone}"
+    addr_key = _normalize_address_key(address)
+    if addr_key:
+        return f"address:{addr_key}"
+    return ""
+
+
+def _extract_website_lead_fields(payload):
+    address = _payload_value_by_keys(payload, ["address", "property_address", "street_address", "property"])
+    phone = _payload_value_by_keys(payload, ["phone", "phone_number", "mobile"])
+    email = _payload_value_by_keys(payload, ["email", "email_address"])
+    seller_name = _payload_value_by_keys(payload, ["seller_name", "name", "full_name", "owner_name"])
+    first_name = _payload_value_by_keys(payload, ["first_name", "firstname"])
+    last_name = _payload_value_by_keys(payload, ["last_name", "lastname"])
+    stage = (
+        _payload_value_by_keys(payload, ["stage", "page", "form_step", "submission_type", "form_name"])
+        or "website_submission"
+    )
+    if not seller_name and (first_name or last_name):
+        seller_name = f"{first_name} {last_name}".strip()
+    return {
+        "address": address,
+        "phone": phone,
+        "email": email,
+        "seller_name": seller_name,
+        "first_name": first_name,
+        "last_name": last_name,
+        "stage": stage,
+    }
+
+
+def _build_website_lead_notes(payload, fields, source_label="webhook"):
+    lines = [
+        "Source: Website Lead Form",
+        f"Submission Stage: {fields.get('stage') or '-'}",
+        f"Ingest Source: {source_label}",
+    ]
+    standard = [
+        ("Name", fields.get("seller_name")),
+        ("Address", fields.get("address")),
+        ("Phone", fields.get("phone")),
+        ("Email", fields.get("email")),
+    ]
+    for label, value in standard:
+        if value:
+            lines.append(f"{label}: {value}")
+    excluded = {
+        "lead_key",
+        "lead_id",
+        "submission_group_id",
+        "session_id",
+        "contact_id",
+        "address",
+        "property_address",
+        "street_address",
+        "property",
+        "phone",
+        "phone_number",
+        "mobile",
+        "email",
+        "email_address",
+        "seller_name",
+        "name",
+        "full_name",
+        "owner_name",
+        "first_name",
+        "firstname",
+        "last_name",
+        "lastname",
+        "stage",
+        "page",
+        "form_step",
+        "submission_type",
+        "form_name",
+        "event_key",
+        "submission_id",
+    }
+    for key in sorted(payload.keys()):
+        if str(key).strip().lower() in excluded:
+            continue
+        val = str(payload.get(key) or "").strip()
+        if val:
+            lines.append(f"{key}: {val}")
+    return "\n".join(lines)
+
+
+def process_website_lead_payload(db, payload, source_label="webhook"):
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "Invalid payload object."}
+    fields = _extract_website_lead_fields(payload)
+    address = fields.get("address") or ""
+    phone = fields.get("phone") or ""
+    email = fields.get("email") or ""
+    lead_key = _derive_website_lead_key(payload, address=address, phone=phone, email=email)
+    if not lead_key:
+        return {"ok": False, "error": "Could not derive a stable lead key (lead_id/email/phone/address required)."}
+    raw_event_key = _payload_value_by_keys(payload, ["event_key", "submission_id", "event_id"])
+    if raw_event_key:
+        event_key = f"website:{raw_event_key}"
+    else:
+        payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
+        event_key = f"website:{lead_key}:{payload_hash}"
+
+    is_new = upsert_integration_event(db, WEBSITE_LEADS_EVENT_SOURCE, event_key, payload)
+    add_website_webhook_note(
+        db,
+        event_key,
+        lead_key,
+        "\n".join(
+            [
+                f"Website lead payload received ({source_label})",
+                f"Lead Key: {lead_key}",
+                f"Stage: {fields.get('stage') or '-'}",
+                f"Address: {address or '-'}",
+                f"Phone: {phone or '-'}",
+                f"Email: {email or '-'}",
+                f"Event Key: {event_key}",
+            ]
+        ),
+        payload,
+    )
+    db.commit()
+    if not is_new:
+        return {"ok": True, "duplicate": True, "event_key": event_key, "lead_key": lead_key}
+
+    owner_name_split = _parse_seller_name_for_owner(fields.get("seller_name") or "")
+    if not owner_name_split.get("first_name") and fields.get("first_name"):
+        owner_name_split["first_name"] = fields.get("first_name")
+    if not owner_name_split.get("last_name") and fields.get("last_name"):
+        owner_name_split["last_name"] = fields.get("last_name")
+    owner_payload = {}
+    if owner_name_split.get("first_name") or owner_name_split.get("last_name"):
+        owner_payload["first_name"] = owner_name_split.get("first_name") or "Unknown"
+        owner_payload["last_name"] = owner_name_split.get("last_name") or "Owner"
+    if email:
+        owner_payload["emails"] = [email]
+    if phone:
+        owner_payload["phones"] = [{"number": phone, "type": "UNKNOWN", "status": "UNKNOWN"}]
+
+    notes = _build_website_lead_notes(payload, fields, source_label=source_label)
+    current = db.execute(
+        """
+        SELECT *
+        FROM website_lead_submissions
+        WHERE lead_key = ?
+        LIMIT 1
+        """,
+        (lead_key,),
+    ).fetchone()
+
+    created_uuid = ""
+    owner_uuid = ""
+    mode = "update_existing"
+    address_changed = False
+
+    try:
+        if not current:
+            mode = "create_first_submission"
+            create_payload = {
+                "search": address,
+                "status": "new_lead",
+                "lists": "Carrot",
+                "tags": f"website,webhook,{fields.get('stage') or 'stage_unknown'}",
+                "notes": notes,
+                "owner": owner_payload,
+            }
+            result = create_reisift_property_from_search(create_payload)
+            created_uuid = (result.get("created_uuid") or "").strip()
+            owner_uuid = (result.get("owner_uuid") or "").strip()
+        else:
+            created_uuid = str(current["reisift_property_uuid"] or "").strip()
+            owner_uuid = str(current["reisift_owner_uuid"] or "").strip()
+            last_address = str(current["latest_address"] or "").strip()
+            if address and last_address and _normalize_address_key(address) != _normalize_address_key(last_address):
+                # Address changed between steps: create a new SIFT lead and retarget the lead-key mapping.
+                address_changed = True
+                mode = "create_address_changed_submission"
+                create_payload = {
+                    "search": address,
+                    "status": "new_lead",
+                    "lists": "Carrot",
+                    "tags": f"website,webhook,address_changed,{fields.get('stage') or 'stage_unknown'}",
+                    "notes": f"{notes}\n\nAddress changed from prior submission for lead_key={lead_key}.",
+                    "owner": owner_payload,
+                }
+                result = create_reisift_property_from_search(create_payload)
+                created_uuid = (result.get("created_uuid") or "").strip() or created_uuid
+                owner_uuid = (result.get("owner_uuid") or "").strip() or owner_uuid
+
+        contact_sync = None
+        if owner_uuid and (email or phone):
+            token = reisift_get_access_token()
+            contact_sync = reisift_upsert_owner_contacts(
+                token,
+                owner_uuid,
+                [{"number": phone, "type": "UNKNOWN"}] if phone else [],
+                [email] if email else [],
+            )
+
+        if current:
+            db.execute(
+                """
+                UPDATE website_lead_submissions
+                SET reisift_property_uuid = ?,
+                    reisift_owner_uuid = ?,
+                    latest_address = ?,
+                    latest_phone = ?,
+                    latest_email = ?,
+                    latest_name = ?,
+                    latest_stage = ?,
+                    latest_payload_json = ?,
+                    last_received_at = CURRENT_TIMESTAMP
+                WHERE lead_key = ?
+                """,
+                (
+                    created_uuid or str(current["reisift_property_uuid"] or "").strip(),
+                    owner_uuid or str(current["reisift_owner_uuid"] or "").strip(),
+                    address,
+                    phone,
+                    email,
+                    fields.get("seller_name") or "",
+                    fields.get("stage") or "",
+                    json.dumps(payload),
+                    lead_key,
+                ),
+            )
+        else:
+            db.execute(
+                """
+                INSERT INTO website_lead_submissions
+                (lead_key, reisift_property_uuid, reisift_owner_uuid, latest_address, latest_phone, latest_email, latest_name, latest_stage, latest_payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lead_key,
+                    created_uuid,
+                    owner_uuid,
+                    address,
+                    phone,
+                    email,
+                    fields.get("seller_name") or "",
+                    fields.get("stage") or "",
+                    json.dumps(payload),
+                ),
+            )
+
+        sift_link = f"https://app.reisift.io/records/properties/{created_uuid}/details?page=1" if created_uuid else ""
+        slack_lines = [
+            "New Website Lead Received",
+            f"Stage: {fields.get('stage') or '-'}",
+            f"Mode: {mode}",
+            f"Address: {address or '-'}",
+            f"Name: {fields.get('seller_name') or '-'}",
+            f"Phone: {phone or '-'}",
+            f"Email: {email or '-'}",
+            f"SIFT Record: {sift_link or '-'}",
+        ]
+        if address_changed:
+            slack_lines.append("Address changed from prior submission: created/retargeted lead mapping.")
+        send_slack_notification(db, "\n".join(slack_lines))
+        add_website_webhook_note(
+            db,
+            event_key,
+            lead_key,
+            "\n".join(
+                [
+                    "Website lead processing result",
+                    "Result: success",
+                    f"Mode: {mode}",
+                    f"SIFT UUID: {created_uuid or '-'}",
+                ]
+            ),
+            {"lead_key": lead_key, "created_uuid": created_uuid, "owner_uuid": owner_uuid, "contact_sync": contact_sync},
+        )
+        db.commit()
+        return {
+            "ok": True,
+            "event_key": event_key,
+            "lead_key": lead_key,
+            "mode": mode,
+            "created_uuid": created_uuid,
+            "owner_uuid": owner_uuid,
+            "address_changed": address_changed,
+        }
+    except Exception as exc:
+        err = str(exc)
+        add_website_webhook_note(
+            db,
+            event_key,
+            lead_key,
+            f"Website lead processing result\nResult: failed\nError: {err}",
+            {"payload": payload},
+        )
+        log_app_error(
+            db,
+            source="website_lead_ingest",
+            error_message=err,
+            details=traceback.format_exc(),
+            route="/api/integrations/website/lead",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "event_key": event_key, "lead_key": lead_key, "error": err}
 
 
 def _get_google_service_account_info():
@@ -11046,6 +11421,18 @@ def integrations_google_sheets_row_added_api():
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     payload = request.get_json(force=True) or {}
     result = process_clever_lead_payload(db, payload, source_label="webhook")
+    status_code = 500 if not result.get("ok") else 200
+    return jsonify(result), status_code
+
+
+@app.route("/api/integrations/website/lead", methods=["POST"])
+def integrations_website_lead_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(force=True, silent=True) or {}
+    result = process_website_lead_payload(db, payload, source_label="webhook")
     status_code = 500 if not result.get("ok") else 200
     return jsonify(result), status_code
 

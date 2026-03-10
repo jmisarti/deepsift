@@ -13469,14 +13469,14 @@ def smrtphone_inbound_webhook():
             db,
             event_type,
             payload,
-            processing_status="error",
+            processing_status="ignored",
             sms_id=sms_id,
             from_number=from_number,
             to_number=to_number,
             error_text="message/body/text is required",
         )
         db.commit()
-        return jsonify({"error": "message/body/text is required"}), 400
+        return jsonify({"ok": True, "ignored": True, "reason": "message/body/text is required"}), 200
 
     counterparty_number = from_number if direction == "Inbound" else to_number
     person_id = find_person_id_by_phone(db, counterparty_number)
@@ -13509,11 +13509,11 @@ def smrtphone_inbound_webhook():
             db,
             event_type,
             payload,
-            processing_status="error",
+            processing_status="ignored",
             sms_id=sms_id,
             from_number=from_number,
             to_number=to_number,
-            error_text=f"Unable to resolve property_id for {direction.lower()} message",
+            error_text=f"Unable to resolve property_id for {direction.lower()} message (event={event_name or 'unknown'})",
         )
         db.commit()
         return jsonify({"ok": True, "ignored": True, "reason": "unresolved property"}), 200

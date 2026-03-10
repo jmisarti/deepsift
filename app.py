@@ -210,6 +210,15 @@ AGENT_DEFINITIONS = [
 REFERRAL_STATUSES = ["Untouched", "Referred", "Under Contract", "Dead", "Other"]
 LEAD_ACTION_STATUSES = ["Pending", "Approved", "Completed", "Dismissed"]
 LEAD_ACTION_PRIORITIES = ["Low", "Medium", "High"]
+LEAD_ACTION_TYPES = [
+    "ScheduleAppointment",
+    "FollowUpTouchDue",
+    "EscalateToRelativeOutreach",
+    "EscalateToDeepDiveResearch",
+    "HumanReviewDisposition",
+    "ReviewInboundAndNextBestAction",
+    "AgentDiagnosisReview",
+]
 LEAD_STOP_STATUSES = {"not interested", "dnc", "opt out", "dead"}
 LEAD_NEGATIVE_INTENT_TOKENS = [
     "not interested",
@@ -1517,6 +1526,61 @@ def _apply_call_analysis_guardrails(transcript_text, analysis, context):
             f"{direction} call between {caller_name} and {callee_name} was too brief for reliable interpretation."
         )
     return analysis
+
+
+def _short_text(value, max_len=180):
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "..."
+
+
+def compose_call_summary(context, analysis, transcript_text):
+    direction = (analysis.get("call_direction") or context.get("direction") or "Unknown").strip().title()
+    outcome = (analysis.get("call_outcome_type") or "").strip().title()
+    voicemail_left = (analysis.get("voicemail_left") or "").strip().title()
+    caller = (context.get("caller_name") or "").strip() or ("Team" if direction == "Outbound" else "Lead")
+    callee = (context.get("callee_name") or "").strip() or ("Lead" if direction == "Outbound" else "Team")
+    from_number = format_phone_display(context.get("from_number") or "")
+    to_number = format_phone_display(context.get("to_number") or "")
+    transcript = (transcript_text or "").strip()
+    model_summary = _short_text(analysis.get("summary") or "")
+    key_fact = _short_text((analysis.get("key_facts") or [""])[0] if isinstance(analysis.get("key_facts"), list) else "")
+
+    if direction == "Outbound":
+        intro = f"Outbound call by {caller} to {callee or to_number or 'lead'}."
+    elif direction == "Inbound":
+        intro = f"Inbound call from {caller or from_number or 'lead'} to {callee or 'team'}."
+    else:
+        intro = "Call direction could not be determined with confidence."
+
+    if outcome in {"Voicemail", "No Answer", "Busy", "Failed"}:
+        msg_state = "no voicemail details available"
+        if voicemail_left == "Yes":
+            msg_state = "voicemail was left"
+        elif voicemail_left == "No":
+            msg_state = "no voicemail was left"
+        elif voicemail_left == "Not Applicable":
+            msg_state = "voicemail not applicable"
+        detail = f" Outcome: {outcome}; {msg_state}."
+        if transcript and voicemail_left == "Yes":
+            detail += f" Message summary: {_short_text(model_summary or key_fact or transcript, 220)}"
+        elif model_summary:
+            detail += f" Notes: {_short_text(model_summary, 220)}"
+        return (intro + detail).strip()
+
+    if outcome == "Answered":
+        detail = f" Outcome: Answered conversation between {caller} and {callee or 'the lead'}."
+        if model_summary:
+            detail += f" Summary: {_short_text(model_summary, 240)}"
+        elif key_fact:
+            detail += f" Key point: {key_fact}"
+        return (intro + detail).strip()
+
+    detail = f" Outcome: {outcome or 'Unknown'}."
+    if model_summary:
+        detail += f" Summary: {_short_text(model_summary, 220)}"
+    return (intro + detail).strip()
 
 
 def analyze_call_transcript_with_openai(transcript_text, property_id=None, person_id=None, context=None):
@@ -7170,7 +7234,7 @@ def _detect_audio_extension(content_type, fallback_url=""):
     return ".mp3"
 
 
-def process_single_call_recording_job(db, job_row):
+def process_single_call_recording_job(db, job_row, force_reanalyze=False):
     job_id = int(job_row["id"])
     call_sid = (job_row["call_sid"] or "").strip()
     recording_url = (job_row["recording_url"] or "").strip()
@@ -7206,10 +7270,11 @@ def process_single_call_recording_job(db, job_row):
         "timestamp": extract_first_string_by_keys(webhook, ["date", "timestamp", "completed_at"]),
     }
 
+    existing_transcript = (job_row["transcript_text"] or "").strip()
     # Retry recording-url lookup if not present yet.
     lookup_raw = {}
     fetch_status = (job_row["fetch_status"] or "Queued").strip()
-    if not recording_url:
+    if not recording_url and not (force_reanalyze and existing_transcript):
         lookup = fetch_smrtphone_recording_url(call_sid)
         lookup_raw = lookup.get("raw") or {}
         recording_url = (lookup.get("recording_url") or "").strip()
@@ -7281,22 +7346,25 @@ def process_single_call_recording_job(db, job_row):
             )
             return {"job_id": job_id, "status": "no_recording_url", "call_outcome": outcome}
 
-    audio_res = requests.get(recording_url, timeout=60)
-    audio_res.raise_for_status()
-    audio_bytes = audio_res.content
-    ext = _detect_audio_extension(audio_res.headers.get("content-type"), recording_url)
-    filename = f"{call_sid or f'call_{job_id}'}{ext}"
-    mime_type = (audio_res.headers.get("content-type") or "").split(";")[0].strip() or "application/octet-stream"
-
-    transcription = transcribe_recording_with_openai(audio_bytes, filename=filename, mime_type=mime_type)
-    transcript = (transcription.get("transcript") or "").strip()
+    if force_reanalyze and existing_transcript:
+        transcription = {"transcript": existing_transcript, "raw": {"source": "existing_transcript"}}
+        transcript = existing_transcript
+    else:
+        audio_res = requests.get(recording_url, timeout=60)
+        audio_res.raise_for_status()
+        audio_bytes = audio_res.content
+        ext = _detect_audio_extension(audio_res.headers.get("content-type"), recording_url)
+        filename = f"{call_sid or f'call_{job_id}'}{ext}"
+        mime_type = (audio_res.headers.get("content-type") or "").split(";")[0].strip() or "application/octet-stream"
+        transcription = transcribe_recording_with_openai(audio_bytes, filename=filename, mime_type=mime_type)
+        transcript = (transcription.get("transcript") or "").strip()
     analysis = analyze_call_transcript_with_openai(
         transcript,
         property_id=property_id,
         person_id=person_id,
         context=analysis_context,
     )
-    summary_text = (analysis.get("summary") or "").strip()
+    summary_text = compose_call_summary(analysis_context, analysis, transcript)
 
     db.execute(
         """
@@ -7320,6 +7388,7 @@ def process_single_call_recording_job(db, job_row):
                     "recording_url": recording_url,
                     "transcription_raw": transcription.get("raw") or {},
                     "analysis": analysis,
+                    "analysis_context": analysis_context,
                 }
             ),
             job_id,
@@ -7357,19 +7426,30 @@ def process_single_call_recording_job(db, job_row):
     return {"job_id": job_id, "status": "completed", "call_sid": call_sid, "next_step": analysis.get("next_best_step")}
 
 
-def run_call_recording_analysis_once(limit=2):
+def run_call_recording_analysis_once(limit=2, statuses=None, created_after=None, force_reanalyze=False):
     ensure_db()
     db = open_sqlite_connection()
     try:
+        where = []
+        params = []
+        use_statuses = statuses or ["Pending", "Retry"]
+        if use_statuses:
+            placeholders = ",".join(["?"] * len(use_statuses))
+            where.append(f"analysis_status IN ({placeholders})")
+            params.extend(use_statuses)
+        if created_after:
+            where.append("created_at >= ?")
+            params.append(created_after)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         rows = db.execute(
-            """
+            f"""
             SELECT *
             FROM call_recording_jobs
-            WHERE analysis_status IN ('Pending', 'Retry')
+            {where_sql}
             ORDER BY id ASC
             LIMIT ?
             """,
-            (max(1, int(limit)),),
+            tuple(params + [max(1, int(limit))]),
         ).fetchall()
         processed = 0
         completed = 0
@@ -7378,7 +7458,7 @@ def run_call_recording_analysis_once(limit=2):
         for row in rows:
             processed += 1
             try:
-                out = process_single_call_recording_job(db, row)
+                out = process_single_call_recording_job(db, row, force_reanalyze=force_reanalyze)
                 details.append(out)
                 if out.get("status") == "completed":
                     completed += 1
@@ -7462,6 +7542,55 @@ def start_call_recording_worker():
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
+
+
+def rerun_call_analysis_for_today(db, limit=600):
+    cutoff = format_db_time(est_day_start_utc())
+    rows = db.execute(
+        """
+        SELECT *
+        FROM call_recording_jobs
+        WHERE created_at >= ?
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (cutoff, max(1, int(limit))),
+    ).fetchall()
+    processed = 0
+    completed = 0
+    failed = 0
+    details = []
+    for row in rows:
+        processed += 1
+        try:
+            out = process_single_call_recording_job(db, row, force_reanalyze=True)
+            details.append(out)
+            if out.get("status") == "completed":
+                completed += 1
+        except Exception as exc:
+            failed += 1
+            payload = parse_json_object(row["payload_json"] or "{}")
+            payload["force_rerun_error"] = str(exc)
+            db.execute(
+                """
+                UPDATE call_recording_jobs
+                SET analysis_status = 'Retry',
+                    payload_json = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (json.dumps(payload), row["id"]),
+            )
+            details.append({"job_id": row["id"], "status": "error", "error": str(exc)})
+            log_app_error(
+                db,
+                source="call_recording_worker",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="rerun_call_analysis_for_today",
+                status_code=500,
+            )
+    return {"ok": True, "cutoff": cutoff, "processed": processed, "completed": completed, "failed": failed, "details": details[:150]}
 
 
 def upsert_agent_signal(
@@ -8081,6 +8210,30 @@ def build_today_lead_watch_snapshot(db, limit=60):
         if occurred_at and (not row["last_activity_at"] or occurred_at > row["last_activity_at"]):
             row["last_activity_at"] = occurred_at
 
+    # Seed today's referral leads even if no call/SMS has happened yet.
+    for rr in referrals:
+        synced_at = str(rr["last_synced_at"] or "")
+        if synced_at and synced_at < cutoff:
+            continue
+        uuid = normalize_uuid(rr["property_uuid"] or "")
+        if not uuid:
+            continue
+        addr = str(rr["full_address"] or "").strip()
+        addr_key = normalize_address_key(addr) if addr else ""
+        existing_key = addr_to_key.get(addr_key, "") if addr_key else ""
+        lead_key = existing_key or f"uuid:{uuid}"
+        _touch(
+            key=lead_key,
+            label=(addr or f"ReiSIFT {uuid}"),
+            occurred_at=(synced_at or cutoff),
+            property_id=None,
+            person_id=None,
+            source="reisift_referral",
+            classification="potential_seller",
+            address_hint=addr,
+            clever_related=True,
+        )
+
     prop_rows = db.execute(
         """
         SELECT p.id, p.created_at, a.street, a.city, a.state, a.postal_code
@@ -8321,6 +8474,28 @@ def build_today_lead_watch_snapshot(db, limit=60):
                 referral_data = dict(referral_by_addr[rk])
         if not effective_property_uuid and referral_data:
             effective_property_uuid = normalize_uuid(referral_data.get("property_uuid") or "")
+        effective_label = v["label"]
+        if effective_property_id:
+            prow = db.execute(
+                """
+                SELECT a.street, a.city, a.state, a.postal_code
+                FROM properties p
+                LEFT JOIN addresses a ON a.id = p.property_address_id
+                WHERE p.id = ?
+                """,
+                (effective_property_id,),
+            ).fetchone()
+            if prow:
+                addr_lbl = " ".join(
+                    [
+                        str(prow["street"] or "").strip(),
+                        str(prow["city"] or "").strip(),
+                        str(prow["state"] or "").strip(),
+                        str(prow["postal_code"] or "").strip(),
+                    ]
+                ).strip()
+                if addr_lbl:
+                    effective_label = re.sub(r"\s+", " ", addr_lbl)
         pushes = []
         if referral_data:
             pushes = referral_push_by_uuid.get(str(referral_data.get("property_uuid") or "").strip(), [])[:5]
@@ -8342,7 +8517,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
         rows.append(
             {
                 "lead_key": v["lead_key"],
-                "label": v["label"],
+                "label": effective_label,
                 "property_id": effective_property_id,
                 "reisift_property_uuid": effective_property_uuid,
                 "person_id": v["person_id"] or 0,
@@ -11827,7 +12002,7 @@ def agents_page():
     }
     lead_actions = db.execute(
         """
-        SELECT a.id, a.property_id, a.person_id, a.action_type, a.priority, a.status, a.reason, a.created_at, a.updated_at,
+        SELECT a.id, a.property_id, a.person_id, a.action_type, a.priority, a.status, a.reason, a.payload_json, a.created_at, a.updated_at,
                adr.street, adr.city, adr.state, adr.postal_code,
                pe.first_name, pe.middle_name, pe.last_name
         FROM lead_management_actions a
@@ -11924,6 +12099,8 @@ def agents_page():
         lead_summary=lead_summary,
         lead_actions=lead_actions,
         lead_action_statuses=LEAD_ACTION_STATUSES,
+        lead_action_types=LEAD_ACTION_TYPES,
+        lead_action_priorities=LEAD_ACTION_PRIORITIES,
         latest_run=latest_run,
         latest_run_summary=latest_run_summary,
         call_job_summary=call_job_summary,
@@ -11973,6 +12150,43 @@ def update_lead_action_status_route(action_id):
     )
     db.commit()
     return redirect(url_for("agents_page", notice=f"Lead action #{action_id} updated to {status}."))
+
+
+@app.route("/agents/lead-actions/<int:action_id>/override", methods=["POST"])
+def update_lead_action_override_route(action_id):
+    ensure_db()
+    db = get_db()
+    row = db.execute(
+        "SELECT id, payload_json, action_type, priority, reason FROM lead_management_actions WHERE id = ?",
+        (action_id,),
+    ).fetchone()
+    if not row:
+        return redirect(url_for("agents_page", notice="Lead action not found."))
+    action_type = (request.form.get("action_type") or "").strip()
+    priority = (request.form.get("priority") or "").strip().title()
+    reason = (request.form.get("reason") or "").strip()
+    if action_type not in LEAD_ACTION_TYPES:
+        action_type = row["action_type"]
+    if priority not in LEAD_ACTION_PRIORITIES:
+        priority = row["priority"]
+    if not reason:
+        reason = row["reason"]
+    payload = parse_json_object(row["payload_json"] or "{}")
+    payload["manual_override"] = {
+        "at": format_db_time(datetime.utcnow()),
+        "action_type": action_type,
+        "priority": priority,
+    }
+    db.execute(
+        """
+        UPDATE lead_management_actions
+        SET action_type = ?, priority = ?, reason = ?, payload_json = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (action_type, priority, reason, json.dumps(payload), action_id),
+    )
+    db.commit()
+    return redirect(url_for("agents_page", notice=f"Lead action #{action_id} recommendation updated."))
 
 
 @app.route("/agents/call-recordings/run", methods=["POST"])
@@ -17089,15 +17303,8 @@ def integrations_agents_rerun_today_api():
     db = get_db()
     if not integration_auth_ok(db, request):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    # Agent 1: rerun call analysis in bounded batches.
-    call_runs = []
-    for _ in range(5):
-        res = run_call_recording_analysis_once(limit=25)
-        call_runs.append(res)
-        if not res.get("ok"):
-            break
-        if int(res.get("processed", 0) or 0) == 0:
-            break
+    # Agent 1: force rerun all today's calls for direction-aware summaries.
+    call_rerun = rerun_call_analysis_for_today(db, limit=800)
     # Agent 1 SMS pass for last day.
     sms_res = run_sms_analysis_once(lookback_days=1, limit_threads=250)
     # Agent 3 reconciliation + snapshot.
@@ -17107,7 +17314,8 @@ def integrations_agents_rerun_today_api():
     return jsonify(
         {
             "ok": True,
-            "call_runs": call_runs,
+            "call_cutoff": call_rerun.get("cutoff", ""),
+            "call_rerun": call_rerun,
             "sms": sms_res,
             "reconcile": recon,
             "snapshot": snapshot,

@@ -13453,11 +13453,21 @@ def smrtphone_inbound_webhook():
     to_number = str(payload.get("to") or payload.get("to_number") or "").strip()
     message = str(payload.get("message") or payload.get("body") or payload.get("text") or "").strip()
     status = str(payload.get("status") or "Received").strip().title()
+    event_name = str(payload.get("event") or payload.get("eventType") or "").strip().lower()
+
+    if "incoming" in event_name:
+        direction = "Inbound"
+    elif "outgoing" in event_name:
+        direction = "Outbound"
+    else:
+        # When event is missing, infer from known SMS flow defaults.
+        direction = "Inbound"
+    event_type = "outbound" if direction == "Outbound" else "inbound"
 
     if not message:
         log_smrtphone_webhook_event(
             db,
-            "inbound",
+            event_type,
             payload,
             processing_status="error",
             sms_id=sms_id,
@@ -13468,36 +13478,59 @@ def smrtphone_inbound_webhook():
         db.commit()
         return jsonify({"error": "message/body/text is required"}), 400
 
-    person_id = find_person_id_by_phone(db, from_number)
+    counterparty_number = from_number if direction == "Inbound" else to_number
+    person_id = find_person_id_by_phone(db, counterparty_number)
     property_id = None
     if str(payload.get("property_id", "")).isdigit():
         property_id = int(payload["property_id"])
     elif person_id:
         property_id = find_property_id_for_person(db, person_id)
     if not property_id:
+        recent_link = db.execute(
+            """
+            SELECT property_id, person_id
+            FROM communications
+            WHERE upper(channel) = 'SMS'
+              AND (
+                    replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+                 OR replace(replace(replace(replace(replace(COALESCE(to_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+              )
+            ORDER BY sent_at DESC, id DESC
+            LIMIT 1
+            """,
+            (f"%{normalize_phone(from_number)}%", f"%{normalize_phone(to_number)}%"),
+        ).fetchone()
+        if recent_link:
+            property_id = recent_link["property_id"]
+            if not person_id:
+                person_id = recent_link["person_id"]
+    if not property_id:
         log_smrtphone_webhook_event(
             db,
-            "inbound",
+            event_type,
             payload,
             processing_status="error",
             sms_id=sms_id,
             from_number=from_number,
             to_number=to_number,
-            error_text="Unable to resolve property_id for inbound message",
+            error_text=f"Unable to resolve property_id for {direction.lower()} message",
         )
         db.commit()
-        return jsonify({"error": "Unable to resolve property_id for inbound message"}), 400
+        return jsonify({"ok": True, "ignored": True, "reason": "unresolved property"}), 200
     if not person_id:
-        person_id = find_person_id_by_recent_outbound_to_number(db, property_id, from_number)
+        person_id = find_person_id_by_recent_outbound_to_number(db, property_id, counterparty_number)
 
     existing = None
     if sms_id:
         existing = db.execute("SELECT id FROM communications WHERE external_id = ?", (sms_id,)).fetchone()
     if existing:
-        update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+        if direction == "Inbound":
+            update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+        else:
+            update_person_outreach_status_for_sms(db, person_id, "outbound_success")
         log_smrtphone_webhook_event(
             db,
-            "inbound",
+            event_type,
             payload,
             processing_status="deduped",
             sms_id=sms_id,
@@ -13508,12 +13541,33 @@ def smrtphone_inbound_webhook():
         db.commit()
         return jsonify({"ok": True, "deduped": True, "communication_id": existing["id"]})
 
-    # Handle provider behavior where one callback arrives without smsId and a second with smsId.
-    recent = find_recent_inbound_match(
-        db, property_id, person_id, from_number, to_number, message, seconds=150
-    )
+    # Handle provider behavior where one callback arrives without smsId and a second with smsId,
+    # and dedupe provider outbound callbacks against locally-sent outbound rows.
+    if direction == "Inbound":
+        recent = find_recent_inbound_match(
+            db, property_id, person_id, from_number, to_number, message, seconds=150
+        )
+    else:
+        recent = db.execute(
+            """
+            SELECT id, external_id
+            FROM communications
+            WHERE property_id = ?
+              AND upper(channel) = 'SMS'
+              AND lower(direction) = 'outbound'
+              AND COALESCE(to_number, '') = COALESCE(?, '')
+              AND COALESCE(body, '') = COALESCE(?, '')
+              AND sent_at >= ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (property_id, to_number, message, format_db_time(datetime.utcnow() - timedelta(minutes=30))),
+        ).fetchone()
     if recent:
-        update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+        if direction == "Inbound":
+            update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+        else:
+            update_person_outreach_status_for_sms(db, person_id, "outbound_success")
         if sms_id and not (recent["external_id"] or "").strip():
             db.execute(
                 "UPDATE communications SET external_id = ?, status = ? WHERE id = ?",
@@ -13521,7 +13575,7 @@ def smrtphone_inbound_webhook():
             )
         log_smrtphone_webhook_event(
             db,
-            "inbound",
+            event_type,
             payload,
             processing_status="deduped",
             sms_id=sms_id,
@@ -13535,24 +13589,28 @@ def smrtphone_inbound_webhook():
     cur = db.execute(
         """
         INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id)
-        VALUES (?, ?, 'SMS', 'Inbound', ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'SMS', ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             property_id,
             person_id,
+            direction,
             from_number,
             to_number,
             message,
             status,
-            0,
+            0 if direction == "Inbound" else 1,
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             sms_id,
         ),
     )
-    update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+    if direction == "Inbound":
+        update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+    else:
+        update_person_outreach_status_for_sms(db, person_id, "outbound_success")
     log_smrtphone_webhook_event(
         db,
-        "inbound",
+        event_type,
         payload,
         processing_status="stored",
         sms_id=sms_id,

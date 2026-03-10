@@ -7865,6 +7865,7 @@ def route_new_agent_signals_once(db, limit=50):
                 ),
                 {"signal_id": row["id"], "signal": payload},
             )
+            _close_unmapped_actions_for_source_key(db, row["source_key"], int(property_id))
         db.execute(
             "UPDATE agent_signals SET routing_status = 'routed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (row["id"],),
@@ -11720,6 +11721,76 @@ def _upsert_lead_action(db, property_id, person_id, action_type, priority, reaso
     return True
 
 
+def _close_unmapped_actions_for_source_key(db, source_key, property_id):
+    src = (source_key or "").strip()
+    if not src:
+        return 0
+    pattern = f'%\"source_key\": \"{src}\"%'
+    row = db.execute(
+        """
+        UPDATE lead_management_actions
+        SET status = CASE WHEN status = 'Pending' THEN 'Completed' ELSE status END,
+            reason = CASE
+                WHEN COALESCE(reason, '') LIKE '%Auto-clustered to property %' THEN reason
+                ELSE TRIM(COALESCE(reason, '') || ' [Auto-clustered to property ' || ? || ']')
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE property_id = 0
+          AND payload_json LIKE ?
+        """,
+        (int(property_id or 0), pattern),
+    )
+    return int(row.rowcount or 0)
+
+
+def _retarget_unmapped_signals_for_lead_key(db, lead_key, approved_property_id):
+    property_id = int(approved_property_id or 0)
+    if property_id <= 0:
+        return {"retargeted_signals": 0, "closed_actions": 0}
+    lead_key = (lead_key or "").strip().lower()
+    phones = set()
+    if lead_key.startswith("phone:"):
+        num = normalize_phone(lead_key.split("phone:", 1)[1])
+        if num:
+            phones.add(num)
+    matched_source_keys = set()
+    rows = db.execute(
+        """
+        SELECT id, source_key, payload_json
+        FROM agent_signals
+        WHERE COALESCE(property_id, 0) = 0
+        ORDER BY id DESC
+        LIMIT 1000
+        """
+    ).fetchall()
+    retargeted = 0
+    for r in rows:
+        src = str(r["source_key"] or "")
+        payload_json = str(r["payload_json"] or "")
+        is_match = False
+        for p in phones:
+            if p and (p in src or p in payload_json):
+                is_match = True
+                break
+        if not is_match:
+            continue
+        db.execute(
+            """
+            UPDATE agent_signals
+            SET property_id = ?, routing_status = 'new', updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (property_id, int(r["id"])),
+        )
+        retargeted += 1
+        if src:
+            matched_source_keys.add(src)
+    closed = 0
+    for src in matched_source_keys:
+        closed += _close_unmapped_actions_for_source_key(db, src, property_id)
+    return {"retargeted_signals": retargeted, "closed_actions": closed}
+
+
 def _property_comm_snapshot(db, property_id):
     row = db.execute(
         """
@@ -12498,6 +12569,8 @@ def run_agent3_lead_watch_resolve_route():
                     confidence=0.95,
                     notes=f"lead_key={lead_key}",
                 )
+        remap = _retarget_unmapped_signals_for_lead_key(db, lead_key, approved_property_id)
+        route_new_agent_signals_once(db, limit=100)
     db.commit()
     return redirect(url_for("agents_page", notice=f"Lead resolution saved for {lead_key}."))
 

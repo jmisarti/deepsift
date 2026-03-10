@@ -1524,6 +1524,23 @@ def _apply_call_analysis_guardrails(transcript_text, analysis, context):
             analysis["next_best_step"] = "Follow Up"
         return analysis
 
+    # Keep "wholesaler" inquiries grounded and consistent for inbound calls.
+    if direction == "Inbound" and "wholesaler" in low:
+        analysis["call_outcome_type"] = "Answered"
+        if not (analysis.get("summary") or "").strip():
+            analysis["summary"] = (
+                f"Inbound lead call from {caller_name} to {callee_name}. "
+                "Caller asked whether the team is a wholesaler."
+            )
+        if not (analysis.get("caller_intent") or "").strip():
+            analysis["caller_intent"] = "Verify investor/wholesaler identity"
+        if not (analysis.get("next_best_step") or "").strip():
+            analysis["next_best_step"] = "Follow Up"
+        if not (analysis.get("next_step_reason") or "").strip():
+            analysis["next_step_reason"] = "Clarify fit and continue qualification if lead remains engaged."
+        if (analysis.get("voicemail_left") or "").strip() not in {"Yes", "No", "Not Applicable"}:
+            analysis["voicemail_left"] = "Not Applicable"
+
     # Avoid impossible phrasing when transcript is near-empty or highly uncertain.
     if short_audio and "request a package" in (analysis.get("summary") or "").lower():
         analysis["summary"] = (
@@ -1547,6 +1564,11 @@ def compose_call_summary(context, analysis, transcript_text):
     callee = (context.get("callee_name") or "").strip() or ("Lead" if direction == "Outbound" else "Team")
     from_number = format_phone_display(context.get("from_number") or "")
     to_number = format_phone_display(context.get("to_number") or "")
+    generic_labels = {"our team", "lead contact", "lead caller", "team", "lead", "recipient"}
+    if caller.strip().lower() in generic_labels:
+        caller = from_number or caller
+    if callee.strip().lower() in generic_labels:
+        callee = to_number or callee
     transcript = (transcript_text or "").strip()
     model_summary = _short_text(analysis.get("summary") or "")
     key_fact = _short_text((analysis.get("key_facts") or [""])[0] if isinstance(analysis.get("key_facts"), list) else "")

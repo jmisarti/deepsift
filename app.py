@@ -4954,37 +4954,14 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
     address_changed = False
 
     try:
-        if current and not is_step2:
-            # Step-1 is idempotent: if we already have this lead in system, no-op.
-            mode = "step1_exists_noop"
-            sift_link = _sift_record_url(current["reisift_property_uuid"] if current else "")
-            slack_lines = [
-                "Website Lead SIFT Handling",
-                f"Stage: {fields.get('stage') or '-'}",
-                f"Form ID: {form_id or '-'}",
-                "Step Type: step1",
-                f"Mode: {mode}",
-                f"Address: {address or '-'}",
-                f"Name: {fields.get('seller_name') or '-'}",
-                f"Phone: {phone or '-'}",
-                f"Email: {email or '-'}",
-                f"Lead Key: {lead_key or '-'}",
-                f"SIFT Record: {sift_link or '-'}",
-            ]
-            send_slack_notification(db, "\n".join(slack_lines))
-            add_website_webhook_note(
-                db,
-                event_key,
-                lead_key,
-                "Website lead processing result\nResult: success\nMode: step1_exists_noop",
-                {"lead_key": lead_key},
-            )
-            db.commit()
-            return {"ok": True, "event_key": event_key, "lead_key": lead_key, "mode": mode, "created_uuid": str(current["reisift_property_uuid"] or "").strip(), "slack_sent": True}
-
-        if not current:
+        if (not current) or (not is_step2 and bool(address)):
             if address:
-                mode = "create_second_submission_fallback" if is_step2 else "create_first_submission"
+                if is_step2:
+                    mode = "create_second_submission_fallback"
+                elif current:
+                    mode = "create_first_submission_existing_local"
+                else:
+                    mode = "create_first_submission"
                 create_payload = {
                     "search": address,
                     "street": fields.get("street") or "",

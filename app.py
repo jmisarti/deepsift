@@ -900,8 +900,13 @@ def extract_first_string_by_keys(payload, keys):
         current = queue.pop(0)
         if isinstance(current, dict):
             for k, v in current.items():
-                if str(k).strip().lower() in keyset and isinstance(v, str) and v.strip():
-                    return v.strip()
+                if str(k).strip().lower() in keyset:
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+                    if v is not None and not isinstance(v, (dict, list)):
+                        text = str(v).strip()
+                        if text:
+                            return text
             for v in current.values():
                 if isinstance(v, (dict, list)):
                     queue.append(v)
@@ -13231,7 +13236,7 @@ def smrtphone_call_completed_webhook():
     ensure_db()
     db = get_db()
     payload = request.get_json(silent=True) or request.form.to_dict() or {}
-    call_sid = extract_first_string_by_keys(payload, ["call_sid", "callSid", "CallSid", "callsid", "sid"])
+    call_sid = extract_first_string_by_keys(payload, ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "id"])
     from_number = extract_first_string_by_keys(payload, ["from", "from_number", "fromNumber", "caller", "source", "ani"])
     to_number = extract_first_string_by_keys(payload, ["to", "to_number", "toNumber", "callee", "destination", "dnis"])
     if not call_sid:
@@ -13511,6 +13516,28 @@ def smrtphone_webhook_events_api():
         LIMIT ?
         """,
         (n,),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/call-recording-jobs", methods=["GET"])
+def call_recording_jobs_api():
+    ensure_db()
+    db = get_db()
+    limit_raw = (request.args.get("limit") or "100").strip()
+    try:
+        limit = max(1, min(500, int(limit_raw)))
+    except ValueError:
+        limit = 100
+    rows = db.execute(
+        """
+        SELECT id, call_sid, from_number, to_number, property_id, person_id, recording_url,
+               fetch_status, analysis_status, summary_text, created_at, updated_at
+        FROM call_recording_jobs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 

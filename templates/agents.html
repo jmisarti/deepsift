@@ -32,6 +32,23 @@
     font-weight: 400;
     line-height: 1.35;
 }
+.agent-expandable-row {
+    cursor: pointer;
+}
+.agent-expandable-row:hover {
+    background: #f8fafc;
+}
+.agent-detail-row {
+    display: none;
+}
+.agent-detail-row td {
+    background: #f8fafc;
+    white-space: pre-wrap;
+}
+.agent-detail-label {
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+}
 </style>
 {% if notice %}
 <section class="panel">
@@ -142,7 +159,7 @@
         </thead>
         <tbody>
             {% for row in call_jobs %}
-            <tr>
+            <tr class="agent-expandable-row" data-detail-row="call-detail-{{ row.id }}">
                 <td>#{{ row.id }}</td>
                 <td>{{ (row.updated_at or row.created_at)|fmt_est_datetime }}</td>
                 <td>{{ row.call_sid }}</td>
@@ -155,11 +172,12 @@
                 </td>
                 <td>{{ row.fetch_status }}</td>
                 <td>{{ row.analysis_status }}</td>
-                <td>
-                    <details>
-                        <summary>View</summary>
-                        <div style="margin-top:0.4rem; white-space:pre-wrap;">{{ row.detail_summary or row.summary_text or '-' }}</div>
-                    </details>
+                <td>Click row to expand</td>
+            </tr>
+            <tr id="call-detail-{{ row.id }}" class="agent-detail-row">
+                <td colspan="7">
+                    <div class="agent-detail-label">Call Detail</div>
+                    {{ row.detail_summary or row.summary_text or '-' }}
                 </td>
             </tr>
             {% endfor %}
@@ -221,7 +239,7 @@
         </thead>
         <tbody>
             {% for row in signals %}
-            <tr>
+            <tr class="agent-expandable-row" data-detail-row="signal-detail-{{ row.id }}">
                 <td>#{{ row.id }}</td>
                 <td>{{ row.updated_at|fmt_est_datetime }}</td>
                 <td>{{ row.source_type }}</td>
@@ -237,11 +255,12 @@
                 <td>{{ row.sentiment or '-' }}</td>
                 <td>{{ row.confidence or 0 }}</td>
                 <td>{{ row.recommended_next_step or '-' }}</td>
-                <td>
-                    <details>
-                        <summary>View</summary>
-                        <div style="margin-top:0.4rem; white-space:pre-wrap;">{{ row.detail_summary or row.summary_text or '-' }}</div>
-                    </details>
+                <td>Click row to expand</td>
+            </tr>
+            <tr id="signal-detail-{{ row.id }}" class="agent-detail-row">
+                <td colspan="10">
+                    <div class="agent-detail-label">SMS/Signal Detail</div>
+                    {{ row.detail_summary or row.summary_text or '-' }}
                 </td>
             </tr>
             {% endfor %}
@@ -580,4 +599,16 @@
         <li>Lead cadence here follows baseline status expectations; additional calendared tasks from SIFT remain supported as separate inputs.</li>
     </ul>
 </section>
+<script>
+document.addEventListener("click", function (event) {
+    const row = event.target.closest(".agent-expandable-row");
+    if (!row) return;
+    if (event.target.closest("a, button, input, select, textarea, label, form")) return;
+    const detailId = row.getAttribute("data-detail-row");
+    if (!detailId) return;
+    const detailRow = document.getElementById(detailId);
+    if (!detailRow) return;
+    detailRow.style.display = detailRow.style.display === "table-row" ? "none" : "table-row";
+});
+</script>
 {% endblock %}

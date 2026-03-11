@@ -132,40 +132,35 @@
         <thead>
             <tr>
                 <th>ID</th>
+                <th>Date/Time</th>
                 <th>Call SID</th>
-                <th>Link</th>
-                <th>Open Record</th>
+                <th>ReiSift</th>
                 <th>Fetch</th>
                 <th>Analysis</th>
-                <th>Summary</th>
-                <th>Updated</th>
+                <th>Details</th>
             </tr>
         </thead>
         <tbody>
             {% for row in call_jobs %}
             <tr>
                 <td>#{{ row.id }}</td>
+                <td>{{ (row.updated_at or row.created_at)|fmt_est_datetime }}</td>
                 <td>{{ row.call_sid }}</td>
                 <td>
-                    {% if row.person_id %}
-                    <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">Person {{ row.person_id }}</a>
-                    {% elif row.property_id %}
-                    <a href="{{ url_for('property_detail', property_id=row.property_id) }}">Property {{ row.property_id }}</a>
-                    {% else %}
-                    -
-                    {% endif %}
-                </td>
-                <td>
                     {% if row.open_record_url %}
-                    <a href="{{ row.open_record_url }}" target="_blank">Open in Sift</a>
+                    <a href="{{ row.open_record_url }}" target="_blank">ReiSift</a>
                     {% else %}
                     -
                     {% endif %}
                 </td>
                 <td>{{ row.fetch_status }}</td>
                 <td>{{ row.analysis_status }}</td>
-                <td>{{ row.summary_text or '-' }}</td>
-                <td>{{ row.updated_at|fmt_est_datetime }}</td>
+                <td>
+                    <details>
+                        <summary>View</summary>
+                        <div style="margin-top:0.4rem; white-space:pre-wrap;">{{ row.detail_summary or row.summary_text or '-' }}</div>
+                    </details>
+                </td>
             </tr>
             {% endfor %}
         </tbody>
@@ -213,44 +208,41 @@
         <thead>
             <tr>
                 <th>ID</th>
+                <th>Date/Time</th>
                 <th>Source</th>
-                <th>Link</th>
-                <th>Open Record</th>
+                <th>ReiSift</th>
+                <th>Fetch</th>
                 <th>Intent</th>
                 <th>Sentiment</th>
                 <th>Confidence</th>
-                <th>Recommended Step</th>
-                <th>Routing</th>
-                <th>Updated</th>
+                <th>Analysis</th>
+                <th>Details</th>
             </tr>
         </thead>
         <tbody>
             {% for row in signals %}
             <tr>
                 <td>#{{ row.id }}</td>
+                <td>{{ row.updated_at|fmt_est_datetime }}</td>
                 <td>{{ row.source_type }}</td>
                 <td>
-                    {% if row.person_id %}
-                    <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">Person {{ row.person_id }}</a>
-                    {% elif row.property_id %}
-                    <a href="{{ url_for('property_detail', property_id=row.property_id) }}">Property {{ row.property_id }}</a>
-                    {% else %}
-                    -
-                    {% endif %}
-                </td>
-                <td>
                     {% if row.open_record_url %}
-                    <a href="{{ row.open_record_url }}" target="_blank">Open in Sift</a>
+                    <a href="{{ row.open_record_url }}" target="_blank">ReiSift</a>
                     {% else %}
                     -
                     {% endif %}
                 </td>
+                <td>{{ row.routing_status }}</td>
                 <td>{{ row.intent or '-' }}</td>
                 <td>{{ row.sentiment or '-' }}</td>
                 <td>{{ row.confidence or 0 }}</td>
                 <td>{{ row.recommended_next_step or '-' }}</td>
-                <td>{{ row.routing_status }}</td>
-                <td>{{ row.updated_at|fmt_est_datetime }}</td>
+                <td>
+                    <details>
+                        <summary>View</summary>
+                        <div style="margin-top:0.4rem; white-space:pre-wrap;">{{ row.detail_summary or row.summary_text or '-' }}</div>
+                    </details>
+                </td>
             </tr>
             {% endfor %}
         </tbody>

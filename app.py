@@ -847,6 +847,7 @@ def migrate_db(db):
     )
     ensure_column(db, "external_contact_context", "reisift_property_uuid", "reisift_property_uuid TEXT")
     ensure_column(db, "external_contact_context", "reisift_full_address", "reisift_full_address TEXT")
+    ensure_column(db, "external_contact_context", "reisift_owner_name", "reisift_owner_name TEXT")
     ensure_column(db, "external_contact_context", "reisift_property_status", "reisift_property_status TEXT")
     ensure_column(db, "external_contact_context", "last_reisift_lookup_at", "last_reisift_lookup_at TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS idx_external_contact_context_prop ON external_contact_context(property_id)")
@@ -1179,6 +1180,7 @@ def upsert_cached_contact_context(
     notes="",
     reisift_property_uuid=None,
     reisift_full_address=None,
+    reisift_owner_name=None,
     reisift_property_status=None,
     last_reisift_lookup_at=None,
 ):
@@ -1195,13 +1197,14 @@ def upsert_cached_contact_context(
         next_conf = max(float(confidence or 0.5), float(row["confidence"] or 0.0))
         next_reisift_uuid = (reisift_property_uuid or row["reisift_property_uuid"] or "").strip()
         next_reisift_address = (reisift_full_address or row["reisift_full_address"] or "").strip()
+        next_reisift_owner = (reisift_owner_name or row["reisift_owner_name"] or "").strip()
         next_reisift_status = (reisift_property_status or row["reisift_property_status"] or "").strip()
         next_reisift_lookup = (last_reisift_lookup_at or row["last_reisift_lookup_at"] or "").strip()
         db.execute(
             """
             UPDATE external_contact_context
             SET property_id = ?, person_id = ?, classification = ?, source = ?, confidence = ?, notes = ?,
-                reisift_property_uuid = ?, reisift_full_address = ?, reisift_property_status = ?, last_reisift_lookup_at = ?,
+                reisift_property_uuid = ?, reisift_full_address = ?, reisift_owner_name = ?, reisift_property_status = ?, last_reisift_lookup_at = ?,
                 last_seen_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
@@ -1214,6 +1217,7 @@ def upsert_cached_contact_context(
                 next_notes,
                 next_reisift_uuid,
                 next_reisift_address,
+                next_reisift_owner,
                 next_reisift_status,
                 next_reisift_lookup,
                 row["id"],
@@ -1223,8 +1227,8 @@ def upsert_cached_contact_context(
     cur = db.execute(
         """
         INSERT INTO external_contact_context
-        (phone_norm, property_id, person_id, classification, source, confidence, notes, reisift_property_uuid, reisift_full_address, reisift_property_status, last_reisift_lookup_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (phone_norm, property_id, person_id, classification, source, confidence, notes, reisift_property_uuid, reisift_full_address, reisift_owner_name, reisift_property_status, last_reisift_lookup_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             norm,
@@ -1236,6 +1240,7 @@ def upsert_cached_contact_context(
             (notes or "").strip(),
             (reisift_property_uuid or "").strip(),
             (reisift_full_address or "").strip(),
+            (reisift_owner_name or "").strip(),
             (reisift_property_status or "").strip(),
             (last_reisift_lookup_at or "").strip(),
         ),
@@ -1291,6 +1296,7 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
         "person_id": None,
         "reisift_property_uuid": "",
         "reisift_full_address": "",
+        "reisift_owner_name": "",
         "reisift_property_status": "",
         "source": "",
     }
@@ -1300,9 +1306,13 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
         out["person_id"] = cached["person_id"]
         out["reisift_property_uuid"] = str(cached["reisift_property_uuid"] or "").strip()
         out["reisift_full_address"] = str(cached["reisift_full_address"] or "").strip()
+        out["reisift_owner_name"] = str(cached["reisift_owner_name"] or "").strip()
         out["reisift_property_status"] = str(cached["reisift_property_status"] or "").strip()
         out["source"] = "cache"
         if out["property_id"] or out["reisift_property_uuid"]:
+            return out
+        # One-time ReiSift fallback behavior: if this number was looked up before, do not re-query.
+        if str(cached["last_reisift_lookup_at"] or "").strip():
             return out
 
     person_id = find_person_id_by_phone(db, norm)
@@ -1313,9 +1323,11 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
         out["source"] = "local"
         local_row = db.execute(
             """
-            SELECT p.reisift_property_uuid, a.street, a.city, a.state, a.postal_code, p.status
+            SELECT p.reisift_property_uuid, a.street, a.city, a.state, a.postal_code, p.status,
+                   op.first_name AS owner_first_name, op.last_name AS owner_last_name
             FROM properties p
             LEFT JOIN addresses a ON a.id = p.property_address_id
+            LEFT JOIN people op ON op.id = p.owner_person_id
             WHERE p.id = ?
             """,
             (property_id,),
@@ -1325,6 +1337,9 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
             out["reisift_full_address"] = ", ".join(
                 [x for x in [local_row["street"], local_row["city"], local_row["state"], local_row["postal_code"]] if x]
             )
+            out["reisift_owner_name"] = " ".join(
+                [x for x in [str(local_row["owner_first_name"] or "").strip(), str(local_row["owner_last_name"] or "").strip()] if x]
+            ).strip()
             out["reisift_property_status"] = str(local_row["status"] or "").strip()
         upsert_cached_contact_context(
             db,
@@ -1337,6 +1352,7 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
             notes="Resolved from local person/property linkage.",
             reisift_property_uuid=out["reisift_property_uuid"],
             reisift_full_address=out["reisift_full_address"],
+            reisift_owner_name=out["reisift_owner_name"],
             reisift_property_status=out["reisift_property_status"],
             last_reisift_lookup_at=format_db_time(datetime.utcnow()),
         )
@@ -1351,6 +1367,8 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
         if best:
             out["reisift_property_uuid"] = normalize_uuid(best.get("uuid") or "")
             out["reisift_full_address"] = str(best.get("full_address") or "").strip()
+            owner_names = best.get("owner_names") if isinstance(best.get("owner_names"), list) else []
+            out["reisift_owner_name"] = str(owner_names[0] if owner_names else "").strip()
             out["reisift_property_status"] = str(best.get("status") or "").strip()
             out["source"] = "reisift_phone_search"
             if out["reisift_property_uuid"]:
@@ -1371,11 +1389,35 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
                 notes="Resolved via ReiSift phone search.",
                 reisift_property_uuid=out["reisift_property_uuid"],
                 reisift_full_address=out["reisift_full_address"],
+                reisift_owner_name=out["reisift_owner_name"],
                 reisift_property_status=out["reisift_property_status"],
                 last_reisift_lookup_at=format_db_time(datetime.utcnow()),
             )
+        else:
+            upsert_cached_contact_context(
+                db,
+                norm,
+                property_id=None,
+                person_id=None,
+                classification="unknown",
+                source="reisift_phone_search",
+                confidence=0.65,
+                notes="No ReiSift phone match found.",
+                last_reisift_lookup_at=format_db_time(datetime.utcnow()),
+            )
     except Exception:
-        pass
+        # Mark lookup attempt timestamp so we do not hammer ReiSift repeatedly for the same number.
+        upsert_cached_contact_context(
+            db,
+            norm,
+            property_id=out["property_id"],
+            person_id=out["person_id"],
+            classification="unknown",
+            source="reisift_phone_search_error",
+            confidence=0.55,
+            notes="ReiSift phone lookup failed.",
+            last_reisift_lookup_at=format_db_time(datetime.utcnow()),
+        )
     return out
 
 
@@ -1840,6 +1882,31 @@ def compose_call_summary(context, analysis, transcript_text):
     if model_summary:
         detail += f" Summary: {_short_text(model_summary, 220)}"
     return (intro + detail).strip()
+
+
+def compose_sms_signal_detail(signal_row):
+    row = dict(signal_row or {})
+    payload_obj = parse_json_object(row.get("payload_json") or "{}")
+    messages = payload_obj.get("messages") if isinstance(payload_obj.get("messages"), list) else []
+    last_msg = messages[-1] if messages else {}
+    direction = str(last_msg.get("direction") or "").strip().title()
+    from_number = format_phone_display(last_msg.get("from_number") or "")
+    to_number = format_phone_display(last_msg.get("to_number") or "")
+    from_label = from_number or "Unknown Sender"
+    to_label = to_number or "Unknown Recipient"
+    if direction not in {"Inbound", "Outbound"}:
+        direction = "Unknown"
+    intro = f"{direction} SMS from {from_label} to {to_label}."
+    thread_summary = _short_text(row.get("summary_text") or payload_obj.get("summary") or "", 240)
+    important = _short_text(payload_obj.get("analysis", {}).get("key_point") if isinstance(payload_obj.get("analysis"), dict) else "", 180)
+    if thread_summary:
+        intro += f" Summary: {thread_summary}"
+    if important:
+        intro += f" Important detail: {important}"
+    msg_count = len(messages)
+    if msg_count:
+        intro += f" Thread messages analyzed: {msg_count}."
+    return intro.strip()
 
 
 def analyze_call_transcript_with_openai(transcript_text, property_id=None, person_id=None, context=None):
@@ -8466,8 +8533,13 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30, start_utc=None):
                 (t["thread_key"], t["property_id"], t["person_id"], t["counterpart"], last_at, len(msgs), transcript_hash),
             )
         route_summary = route_new_agent_signals_once(db, limit=200)
-        for pid in list(sorted(touched_property_ids))[:25]:
-            trigger_agent_pipeline_refresh(db, property_id=pid, reason="sms_analysis")
+        for pid in list(sorted(touched_property_ids))[:50]:
+            enqueue_agent_refresh(
+                db,
+                property_id=int(pid),
+                reason="sms_analysis_complete",
+                delay_seconds=SMS_DECISION_DELAY_SECONDS,
+            )
         db.commit()
         return {"ok": True, "processed": processed, "analyzed": analyzed, "failed": failed, "routed": route_summary.get("routed", 0), "details": details[:50]}
     except Exception as exc:
@@ -13302,7 +13374,7 @@ def agents_page():
     }
     call_jobs = db.execute(
         """
-        SELECT id, call_sid, property_id, person_id, from_number, to_number, fetch_status, analysis_status, summary_text, created_at, updated_at
+        SELECT id, call_sid, property_id, person_id, from_number, to_number, recording_url, fetch_status, analysis_status, summary_text, analysis_json, payload_json, created_at, updated_at
         FROM call_recording_jobs
         ORDER BY id DESC
         LIMIT 100
@@ -13384,6 +13456,13 @@ def agents_page():
         uuid = _resolve_uuid_from_numbers(phone_candidates, fallback_property_id=item.get("property_id"))
         item["reisift_property_uuid"] = uuid
         item["open_record_url"] = _sift_record_url(uuid)
+        payload_obj = parse_json_object(item.get("payload_json") or "{}")
+        analysis_obj = parse_json_object(item.get("analysis_json") or "{}")
+        context = payload_obj.get("analysis_context") if isinstance(payload_obj.get("analysis_context"), dict) else {}
+        detail = compose_call_summary(context, analysis_obj, "")
+        if not detail:
+            detail = str(item.get("summary_text") or "").strip()
+        item["detail_summary"] = detail
         call_jobs_enriched.append(item)
 
     signals_enriched = []
@@ -13403,6 +13482,7 @@ def agents_page():
         uuid = _resolve_uuid_from_numbers(phone_candidates, fallback_property_id=item.get("property_id"))
         item["reisift_property_uuid"] = uuid
         item["open_record_url"] = _sift_record_url(uuid)
+        item["detail_summary"] = compose_sms_signal_detail(item) if str(item.get("source_type") or "").lower() == "sms" else str(item.get("summary_text") or "").strip()
         signals_enriched.append(item)
 
     advisor_snapshot = build_agent_advisor_snapshot(db, window_hours=72)
@@ -17963,31 +18043,6 @@ def smrtphone_inbound_webhook():
             if not person_id and int(reisift_context.get("person_id") or 0):
                 person_id = int(reisift_context.get("person_id") or 0)
     if not property_id:
-        recent_link = db.execute(
-            """
-            SELECT property_id, person_id
-            FROM communications
-            WHERE upper(channel) = 'SMS'
-              AND (
-                    replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
-                 OR replace(replace(replace(replace(replace(COALESCE(to_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
-              )
-            ORDER BY sent_at DESC, id DESC
-            LIMIT 1
-            """,
-            (f"%{normalize_phone(from_number)}%", f"%{normalize_phone(to_number)}%"),
-        ).fetchone()
-        if recent_link:
-            property_id = recent_link["property_id"]
-            if not person_id:
-                person_id = recent_link["person_id"]
-    if not property_id:
-        ctx = get_cached_contact_context(db, counterparty_number) or get_cached_contact_context(db, from_number) or get_cached_contact_context(db, to_number)
-        if ctx and ctx["property_id"]:
-            property_id = int(ctx["property_id"])
-            if not person_id and ctx["person_id"]:
-                person_id = int(ctx["person_id"])
-    if not property_id:
         signal = classify_unknown_contact_text(message)
         source_key_basis = sms_id or hashlib.sha1(
             f"{event_type}|{from_number}|{to_number}|{message}|{event_name}".encode("utf-8", errors="ignore")
@@ -18045,6 +18100,7 @@ def smrtphone_inbound_webhook():
         notes=f"direction={direction}; event={event_name or event_type}",
         reisift_property_uuid=normalize_uuid(reisift_context.get("reisift_property_uuid") or ""),
         reisift_full_address=str(reisift_context.get("reisift_full_address") or "").strip(),
+        reisift_owner_name=str(reisift_context.get("reisift_owner_name") or "").strip(),
         reisift_property_status=str(reisift_context.get("reisift_property_status") or "").strip(),
         last_reisift_lookup_at=format_db_time(datetime.utcnow()),
     )
@@ -18147,13 +18203,6 @@ def smrtphone_inbound_webhook():
         to_number=to_number,
         communication_id=cur.lastrowid,
     )
-    if property_id:
-        enqueue_agent_refresh(
-            db,
-            property_id=int(property_id),
-            reason=f"smrtphone_{event_type}",
-            delay_seconds=SMS_DECISION_DELAY_SECONDS,
-        )
     db.commit()
     return jsonify({"ok": True, "communication_id": cur.lastrowid}), 201
 
@@ -18373,26 +18422,6 @@ def smrtphone_call_completed_webhook():
                         resolved_reisift_context.update(ctx)
                     break
         if not _property_id:
-            outbound = db.execute(
-                """
-                SELECT property_id, person_id
-                FROM communications
-                WHERE upper(channel) = 'SMS'
-                  AND lower(direction) = 'outbound'
-                  AND (
-                        replace(replace(replace(replace(replace(COALESCE(to_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
-                     OR replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
-                  )
-                ORDER BY sent_at DESC, id DESC
-                LIMIT 1
-                """,
-                (f"%{normalize_phone(from_number)}%", f"%{normalize_phone(to_number)}%"),
-            ).fetchone()
-            if outbound:
-                _property_id = outbound["property_id"]
-                if not _person_id:
-                    _person_id = outbound["person_id"]
-        if not _property_id:
             for candidate in [from_number, to_number]:
                 ctx = get_cached_contact_context(db, candidate)
                 if ctx and ctx["property_id"]:
@@ -18456,6 +18485,7 @@ def smrtphone_call_completed_webhook():
             notes=f"call_sid={call_sid}",
             reisift_property_uuid=normalize_uuid(resolved_reisift_context.get("reisift_property_uuid") or ""),
             reisift_full_address=str(resolved_reisift_context.get("reisift_full_address") or "").strip(),
+            reisift_owner_name=str(resolved_reisift_context.get("reisift_owner_name") or "").strip(),
             reisift_property_status=str(resolved_reisift_context.get("reisift_property_status") or "").strip(),
             last_reisift_lookup_at=format_db_time(datetime.utcnow()),
         )

@@ -26,6 +26,7 @@
                             <input type="checkbox" name="target_markets" value="{{ county }}">
                             <span class="toggle-slider"></span>
                         </span>
+                        <span class="county-toggle-state">Off</span>
                     </span>
                 </label>
                 {% endfor %}
@@ -51,6 +52,7 @@
                             <input type="checkbox" name="target_markets" value="{{ county }}">
                             <span class="toggle-slider"></span>
                         </span>
+                        <span class="county-toggle-state">Off</span>
                     </span>
                 </label>
                 {% endfor %}
@@ -121,6 +123,7 @@
                                             <input type="checkbox" name="target_markets" value="{{ county }}" {% if county in r.target_markets_list %}checked{% endif %}>
                                             <span class="toggle-slider"></span>
                                         </span>
+                                        <span class="county-toggle-state">{% if county in r.target_markets_list %}On{% else %}Off{% endif %}</span>
                                     </span>
                                 </label>
                                 {% endfor %}
@@ -136,4 +139,22 @@
         </tbody>
     </table>
 </section>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+    const boxes = document.querySelectorAll('.county-toggle-item input[type="checkbox"][name="target_markets"]');
+    boxes.forEach(function (box) {
+        const wrapper = box.closest(".county-toggle-item");
+        if (!wrapper) return;
+        const state = wrapper.querySelector(".county-toggle-state");
+        const apply = function () {
+            if (!state) return;
+            state.textContent = box.checked ? "On" : "Off";
+            state.classList.toggle("on", box.checked);
+            state.classList.toggle("off", !box.checked);
+        };
+        box.addEventListener("change", apply);
+        apply();
+    });
+});
+</script>
 {% endblock %}

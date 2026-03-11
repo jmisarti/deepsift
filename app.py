@@ -13050,10 +13050,68 @@ def referral_dashboard():
     queue_rows = db.execute(
         queue_sql,
     ).fetchall()
+    realtor_push_rows = db.execute(
+        """
+        SELECT
+            rr.id AS realtor_id,
+            rr.first_name,
+            rr.last_name,
+            rr.brokerage,
+            rpa.property_uuid,
+            rpa.status AS push_status,
+            rpa.created_at AS push_created_at,
+            COALESCE(rf.full_address, rpa.property_uuid) AS full_address
+        FROM referral_realtors rr
+        LEFT JOIN referral_push_activity rpa ON rpa.realtor_id = rr.id
+        LEFT JOIN reisift_referrals rf ON rf.property_uuid = rpa.property_uuid
+        ORDER BY lower(rr.last_name), lower(rr.first_name), datetime(rpa.created_at) DESC, rpa.id DESC
+        """
+    ).fetchall()
+    realtor_activity = []
+    activity_by_realtor = {}
+    for row in realtor_push_rows:
+        realtor_id = int(row["realtor_id"])
+        bucket = activity_by_realtor.get(realtor_id)
+        if not bucket:
+            name = " ".join(
+                x for x in [str(row["first_name"] or "").strip(), str(row["last_name"] or "").strip()] if x
+            ).strip() or f"Realtor #{realtor_id}"
+            bucket = {
+                "realtor_id": realtor_id,
+                "name": name,
+                "brokerage": str(row["brokerage"] or "").strip(),
+                "total_sent": 0,
+                "unique_properties": 0,
+                "last_sent_at": "",
+                "properties": [],
+                "_seen_props": set(),
+            }
+            activity_by_realtor[realtor_id] = bucket
+            realtor_activity.append(bucket)
+        if not row["property_uuid"]:
+            continue
+        prop_uuid = str(row["property_uuid"] or "").strip()
+        bucket["total_sent"] += 1
+        if not bucket["last_sent_at"]:
+            bucket["last_sent_at"] = str(row["push_created_at"] or "")
+        if prop_uuid not in bucket["_seen_props"]:
+            bucket["_seen_props"].add(prop_uuid)
+            bucket["properties"].append(
+                {
+                    "property_uuid": prop_uuid,
+                    "full_address": str(row["full_address"] or prop_uuid).strip(),
+                    "last_push_status": str(row["push_status"] or "").strip() or "unknown",
+                    "last_sent_at": str(row["push_created_at"] or "").strip(),
+                }
+            )
+    for bucket in realtor_activity:
+        bucket["unique_properties"] = len(bucket["_seen_props"])
+        del bucket["_seen_props"]
     return render_template(
         "referral.html",
         referrals=referrals,
         queue_rows=queue_rows,
+        realtor_activity=realtor_activity,
         queue_filter=queue_filter,
         total_count=total_count,
         status_slug=status_slug,
@@ -14143,15 +14201,25 @@ def settings_page():
             else:
                 notice = "Email settings saved."
         elif active_tab == "integrations":
-            fields = {
-                "integration_api_key": request.form.get("integration_api_key", ""),
-                "slack_webhook_url": request.form.get("slack_webhook_url", ""),
-                "slack_signing_secret": request.form.get("slack_signing_secret", ""),
-                "slack_default_channel": request.form.get("slack_default_channel", ""),
-            }
-            for key, value in fields.items():
-                set_setting(db, key, value)
             test_action = (request.form.get("integration_action") or "").strip().lower()
+            if test_action == "clear_notifications":
+                cur = db.execute(
+                    """
+                    UPDATE communications
+                    SET is_read = 1
+                    WHERE lower(direction) = 'inbound' AND COALESCE(is_read, 1) = 0
+                    """
+                )
+                notice = f"Notification bar cleared. {int(cur.rowcount or 0)} unread item(s) marked as read."
+            else:
+                fields = {
+                    "integration_api_key": request.form.get("integration_api_key", ""),
+                    "slack_webhook_url": request.form.get("slack_webhook_url", ""),
+                    "slack_signing_secret": request.form.get("slack_signing_secret", ""),
+                    "slack_default_channel": request.form.get("slack_default_channel", ""),
+                }
+                for key, value in fields.items():
+                    set_setting(db, key, value)
             if test_action == "test_slack":
                 try:
                     send_slack_notification(db, "DeepSift test notification: Slack integration is configured.")
@@ -14167,7 +14235,8 @@ def settings_page():
                         status_code=400,
                     )
             else:
-                notice = "Integrations settings saved."
+                if test_action != "clear_notifications":
+                    notice = "Integrations settings saved."
         elif active_tab == "automations":
             automation_key = (request.form.get("automation_key") or "").strip().lower()
             if automation_key == "clever_leads":
@@ -17850,6 +17919,21 @@ def mark_notification_read(communication_id):
     db.execute("UPDATE communications SET is_read = 1 WHERE id = ?", (communication_id,))
     db.commit()
     return jsonify({"ok": True})
+
+
+@app.route("/api/notifications/unread/clear", methods=["POST"])
+def clear_unread_notifications():
+    ensure_db()
+    db = get_db()
+    cur = db.execute(
+        """
+        UPDATE communications
+        SET is_read = 1
+        WHERE lower(direction) = 'inbound' AND COALESCE(is_read, 1) = 0
+        """
+    )
+    db.commit()
+    return jsonify({"ok": True, "cleared": int(cur.rowcount or 0)})
 
 
 @app.route("/api/webhooks/smrtphone/events", methods=["GET"])

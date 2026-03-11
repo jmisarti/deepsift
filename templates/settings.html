@@ -118,6 +118,11 @@
                 <button type="submit" name="integration_action" value="test_slack">Save + Test Slack</button>
             </div>
         </form>
+        <form method="post" class="inline-form" onsubmit="return confirm('Clear all unread items from the notification bar?');" style="margin-top:0.5rem;">
+            <input type="hidden" name="settings_tab" value="integrations">
+            <input type="hidden" name="integration_action" value="clear_notifications">
+            <button type="submit">Clear Notification Bar</button>
+        </form>
         <p><strong>External endpoints (Bearer or X-Integration-Key):</strong></p>
         <p><code>POST /api/integrations/reisift/create-property</code></p>
         <p><code>POST /api/integrations/google-sheets/row-added</code></p>

@@ -982,6 +982,26 @@ button:hover { filter: brightness(1.05); }
     display: inline-flex;
     align-items: center;
     justify-content: flex-end;
+    gap: 0.4rem;
+}
+
+.county-toggle-state {
+    min-width: 2rem;
+    text-align: right;
+    font-size: 0.82rem;
+    font-weight: 700;
+}
+
+.county-toggle-state.on {
+    color: #1f4fd5;
+}
+
+.county-toggle-state.off {
+    color: #7b8596;
+}
+
+.expand-row-trigger:hover {
+    background: #f3f7ff;
 }
 
 .automation-table td {

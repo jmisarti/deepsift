@@ -8858,6 +8858,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
     def _agent2_resolution_for_lead(row_dict):
         property_id = int(row_dict.get("property_id") or 0)
         phones = row_dict.get("phones") or []
+        lead_key = str(row_dict.get("lead_key") or "").strip()
         referral = row_dict.get("referral") if isinstance(row_dict.get("referral"), dict) else {}
         action_rows = []
         if property_id > 0:
@@ -8887,6 +8888,19 @@ def build_today_lead_watch_snapshot(db, limit=60):
                     LIMIT 20
                     """,
                     (f"%{token}%",),
+                ).fetchall():
+                    found[int(r["id"])] = dict(r)
+            if lead_key:
+                for r in db.execute(
+                    """
+                    SELECT id, action_type, priority, status, reason, updated_at, created_at
+                    FROM lead_management_actions
+                    WHERE property_id = 0
+                      AND payload_json LIKE ?
+                    ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+                    LIMIT 20
+                    """,
+                    (f"%{lead_key}%",),
                 ).fetchall():
                     found[int(r["id"])] = dict(r)
             action_rows = [found[k] for k in sorted(found.keys(), reverse=True)]
@@ -9069,6 +9083,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
                 "recommended": recommended,
                 "agent2_resolution": _agent2_resolution_for_lead(
                     {
+                        "lead_key": v["lead_key"],
                         "property_id": effective_property_id,
                         "phones": sorted(list(v["phones"]))[:4],
                         "classification": effective_classification,
@@ -12607,6 +12622,162 @@ def _owner_relative_contact_count(db, owner_person_id):
     return int((row["c"] if row else 0) or 0)
 
 
+def _latest_inbound_text_for_lead_watch_item(db, item):
+    property_id = int(item.get("property_id") or 0)
+    phones = [normalize_phone(x) for x in (item.get("phones") or []) if normalize_phone(x)]
+    if property_id > 0:
+        row = db.execute(
+            """
+            SELECT lower(COALESCE(body, '')) AS body
+            FROM communications
+            WHERE property_id = ?
+              AND lower(direction) = 'inbound'
+            ORDER BY COALESCE(sent_at, created_at) DESC, id DESC
+            LIMIT 1
+            """,
+            (property_id,),
+        ).fetchone()
+        if row:
+            return str(row["body"] or "")
+    if not phones:
+        return ""
+    conds = []
+    args = []
+    for p in phones[:4]:
+        like = f"%{p}%"
+        conds.append(
+            """
+            (
+                replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+                OR replace(replace(replace(replace(replace(COALESCE(to_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+            )
+            """
+        )
+        args.extend([like, like])
+    query = f"""
+        SELECT lower(COALESCE(body, '')) AS body
+        FROM communications
+        WHERE lower(direction) = 'inbound'
+          AND ({' OR '.join(conds)})
+        ORDER BY COALESCE(sent_at, created_at) DESC, id DESC
+        LIMIT 1
+    """
+    row = db.execute(query, tuple(args)).fetchone()
+    return str(row["body"] or "") if row else ""
+
+
+def evaluate_lead_watch_item_lead_management(db, item):
+    lead_key = str(item.get("lead_key") or "").strip()
+    if not lead_key:
+        return {"lead_key": "", "skipped": True, "created_actions": 0, "snapshot": {}}
+    property_id = int(item.get("property_id") or 0)
+    person_id = int(item.get("person_id") or 0) or None
+    classification = str(item.get("classification") or "unknown").strip().lower()
+    ignore_agent2 = int(item.get("ignore_agent2") or 0) == 1
+    sms_outbound = int(item.get("sms_outbound") or 0)
+    sms_inbound = int(item.get("sms_inbound") or 0)
+    calls = int(item.get("calls") or 0)
+    outbound_total = sms_outbound + calls
+    inbound_total = sms_inbound
+    referral = item.get("referral") if isinstance(item.get("referral"), dict) else {}
+    reisift_status = _normalize_reisift_status(
+        str(referral.get("status") or "") or str(item.get("reisift_property_status") or "")
+    )
+    on_market_status = str(referral.get("on_market_status") or "").strip().lower()
+    snapshot = {
+        "outbound_total": outbound_total,
+        "inbound_total": inbound_total,
+        "sms_outbound": sms_outbound,
+        "sms_inbound": sms_inbound,
+        "calls": calls,
+        "classification": classification,
+        "reisift_status": reisift_status,
+        "on_market_status": on_market_status,
+        "lead_key": lead_key,
+        "label": str(item.get("label") or ""),
+        "reisift_property_uuid": str(item.get("reisift_property_uuid") or ""),
+        "phones": list(item.get("phones") or []),
+    }
+    created_actions = 0
+    if ignore_agent2 or classification in {"spam", "solicitor"}:
+        return {"lead_key": lead_key, "skipped": True, "created_actions": 0, "snapshot": snapshot}
+    if reisift_status in LEAD_STOP_STATUSES:
+        return {"lead_key": lead_key, "skipped": True, "created_actions": 0, "snapshot": snapshot}
+    if on_market_status in {"for sale", "for_sale", "coming soon", "listed", "active", "for sale by owner", "fsbo"}:
+        created_actions += int(
+            _upsert_lead_action(
+                db,
+                property_id,
+                person_id,
+                "ReviewInboundAndNextBestAction",
+                "Medium",
+                "Lead is listed/on-market. Coordinate listing-side follow-up while maintaining cash-offer lane.",
+                {"snapshot": snapshot, "source": "agent2_lead_watch"},
+                dedupe_key_override=f"leadwatch:{lead_key}:ReviewInboundAndNextBestAction",
+            )
+        )
+        return {"lead_key": lead_key, "skipped": False, "created_actions": created_actions, "snapshot": snapshot}
+
+    latest_inbound = _latest_inbound_text_for_lead_watch_item(db, item)
+    has_negative_intent = any(token in latest_inbound for token in LEAD_NEGATIVE_INTENT_TOKENS)
+    if has_negative_intent:
+        created_actions += int(
+            _upsert_lead_action(
+                db,
+                property_id,
+                person_id,
+                "HumanReviewDisposition",
+                "High",
+                "Inbound response appears negative and requires disposition decision before further outreach.",
+                {"snapshot": snapshot, "source": "agent2_lead_watch", "reason": "negative_intent_detected"},
+                dedupe_key_override=f"leadwatch:{lead_key}:HumanReviewDisposition",
+            )
+        )
+        return {"lead_key": lead_key, "skipped": False, "created_actions": created_actions, "snapshot": snapshot}
+
+    if outbound_total >= 3 and inbound_total == 0:
+        created_actions += int(
+            _upsert_lead_action(
+                db,
+                property_id,
+                person_id,
+                "EscalateToRelativeOutreach",
+                "High",
+                "No inbound responses after 3+ outbound touches. Escalate outreach path.",
+                {"snapshot": snapshot, "source": "agent2_lead_watch"},
+                dedupe_key_override=f"leadwatch:{lead_key}:EscalateToRelativeOutreach",
+            )
+        )
+    elif outbound_total >= 1 and inbound_total == 0:
+        created_actions += int(
+            _upsert_lead_action(
+                db,
+                property_id,
+                person_id,
+                "FollowUpTouchDue",
+                "Medium",
+                "Outreach exists with no inbound response yet. Schedule next compliant touchpoint.",
+                {"snapshot": snapshot, "source": "agent2_lead_watch"},
+                dedupe_key_override=f"leadwatch:{lead_key}:FollowUpTouchDue",
+            )
+        )
+
+    if inbound_total > 0:
+        created_actions += int(
+            _upsert_lead_action(
+                db,
+                property_id,
+                person_id,
+                "ReviewInboundAndNextBestAction",
+                "Medium",
+                "Inbound activity exists. Confirm intent and set next best action.",
+                {"snapshot": snapshot, "source": "agent2_lead_watch"},
+                dedupe_key_override=f"leadwatch:{lead_key}:ReviewInboundAndNextBestAction",
+            )
+        )
+    return {"lead_key": lead_key, "skipped": False, "created_actions": created_actions, "snapshot": snapshot}
+
+
 def evaluate_property_lead_management(db, property_row):
     property_id = int(property_row["id"])
     owner_person_id = property_row["owner_person_id"]
@@ -12698,34 +12869,26 @@ def run_lead_monitor_once(db, source="manual", property_id=None):
         ((source or "manual")[:40], property_id, "{}"),
     )
     run_id = run_cur.lastrowid
-    where = []
-    params = []
+    snapshot = build_today_lead_watch_snapshot(db, limit=300)
+    rows = snapshot.get("items") or []
     if property_id:
-        where.append("p.id = ?")
-        params.append(int(property_id))
-    rows = db.execute(
-        f"""
-        SELECT p.id, p.owner_person_id, p.status
-        FROM properties p
-        {'WHERE ' + ' AND '.join(where) if where else ''}
-        ORDER BY p.id DESC
-        """,
-        tuple(params),
-    ).fetchall()
+        rows = [r for r in rows if int(r.get("property_id") or 0) == int(property_id)]
     inspected = 0
     skipped = 0
     created_actions = 0
     details = []
     for row in rows:
         inspected += 1
-        result = evaluate_property_lead_management(db, row)
+        result = evaluate_lead_watch_item_lead_management(db, row)
         created_actions += int(result.get("created_actions") or 0)
         if result.get("skipped"):
             skipped += 1
         if len(details) < 25:
             details.append(
                 {
-                    "property_id": result["property_id"],
+                    "lead_key": result.get("lead_key") or "",
+                    "property_id": int(row.get("property_id") or 0),
+                    "label": str(row.get("label") or ""),
                     "created_actions": result["created_actions"],
                     "skipped": bool(result.get("skipped")),
                     "outbound_total": (result.get("snapshot") or {}).get("outbound_total", 0),
@@ -12754,10 +12917,11 @@ def run_lead_monitor_once(db, source="manual", property_id=None):
 def trigger_agent_pipeline_refresh(db, property_id=None, reason=""):
     result = {"lead_monitor": {}, "reconcile": {}, "reason": (reason or "").strip()}
     try:
-        if property_id:
-            result["lead_monitor"] = run_lead_monitor_once(db, source="agent1_event", property_id=int(property_id))
-        else:
-            result["lead_monitor"] = {"skipped": True}
+        result["lead_monitor"] = run_lead_monitor_once(
+            db,
+            source="agent1_event",
+            property_id=(int(property_id) if int(property_id or 0) > 0 else None),
+        )
     except Exception as exc:
         result["lead_monitor"] = {"error": str(exc)}
         log_app_error(
@@ -18532,23 +18696,8 @@ def integrations_agents_rerun_today_api():
     db.commit()
     # Agent 1 SMS pass for last day.
     sms_res = run_sms_analysis_once(lookback_days=1, limit_threads=250)
-    # Agent 2 refresh across today's affected lead set only.
-    pre_snapshot = build_today_lead_watch_snapshot(db, limit=250)
-    touched_property_ids = sorted(
-        {
-            int(item.get("property_id") or 0)
-            for item in (pre_snapshot.get("items") or [])
-            if int(item.get("property_id") or 0) > 0
-        }
-    )
-    lead_monitor_runs = []
-    for pid in touched_property_ids[:120]:
-        lead_monitor_runs.append(run_lead_monitor_once(db, source="rerun_today", property_id=pid))
-    lead_monitor_res = {
-        "run_count": len(lead_monitor_runs),
-        "property_ids": touched_property_ids[:120],
-        "runs": lead_monitor_runs[:30],
-    }
+    # Agent 2 refresh across today's full touched lead set (UUID-only + local property leads).
+    lead_monitor_res = run_lead_monitor_once(db, source="rerun_today", property_id=None)
     # Agent 3 reconciliation + snapshot.
     recon = run_agent3_lead_watch_reconcile(db, limit=200)
     snapshot = build_today_lead_watch_snapshot(db, limit=200)

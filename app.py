@@ -8595,6 +8595,33 @@ def build_today_lead_watch_snapshot(db, limit=60):
         """
     ).fetchall()
     resolution_map = {str(r["lead_key"]): dict(r) for r in resolution_rows}
+
+    def _best_cached_context_for_phones(phone_values):
+        norms = []
+        for raw in phone_values or []:
+            n = normalize_phone(raw)
+            if n:
+                norms.append(n)
+        norms = list(dict.fromkeys(norms))
+        if not norms:
+            return None
+        placeholders = ",".join(["?"] * len(norms))
+        try:
+            return db.execute(
+                f"""
+                SELECT *
+                FROM external_contact_context
+                WHERE phone_norm IN ({placeholders})
+                ORDER BY
+                    CASE WHEN COALESCE(reisift_property_uuid, '') <> '' THEN 0 ELSE 1 END,
+                    datetime(COALESCE(last_seen_at, first_seen_at)) DESC,
+                    id DESC
+                LIMIT 1
+                """,
+                tuple(norms),
+            ).fetchone()
+        except Exception:
+            return None
     referrals = db.execute(
         """
         SELECT rr.property_uuid, rr.status, rr.full_address, rr.owner_names, rr.referral_status, rr.referral_notes,
@@ -9090,18 +9117,19 @@ def build_today_lead_watch_snapshot(db, limit=60):
         )
         ignore_agent2 = int(resolution.get("ignore_agent2") or 0)
         if not effective_property_uuid:
-            for ph in list(v.get("phones") or [])[:4]:
-                ctx = get_cached_contact_context(db, ph)
-                if not ctx:
-                    continue
+            ctx = _best_cached_context_for_phones(list(v.get("phones") or []))
+            if not ctx and str(v.get("lead_key") or "").startswith("phone:"):
+                lead_phone = normalize_phone(str(v.get("lead_key") or "").split(":", 1)[1])
+                if lead_phone:
+                    ctx = get_cached_contact_context(db, lead_phone)
+            if ctx:
                 cached_uuid = normalize_uuid(ctx["reisift_property_uuid"] or "")
                 if cached_uuid:
                     effective_property_uuid = cached_uuid
-                    if not effective_property_id and int(ctx["property_id"] or 0):
-                        effective_property_id = int(ctx["property_id"] or 0)
-                    if not v["label"] and str(ctx["reisift_full_address"] or "").strip():
-                        v["label"] = str(ctx["reisift_full_address"] or "").strip()
-                    break
+                if not effective_property_id and int(ctx["property_id"] or 0):
+                    effective_property_id = int(ctx["property_id"] or 0)
+                if not v["label"] and str(ctx["reisift_full_address"] or "").strip():
+                    v["label"] = str(ctx["reisift_full_address"] or "").strip()
         referral_data = {}
         for hint in list(v["address_hints"]):
             rk = normalize_address_key(hint)

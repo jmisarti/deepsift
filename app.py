@@ -111,6 +111,9 @@ CALL_RECORDING_WORKER_ENABLED = env_flag("CALL_RECORDING_WORKER_ENABLED", True)
 CALL_RECORDING_POLL_SECONDS = max(int((os.getenv("CALL_RECORDING_POLL_SECONDS") or "60").strip() or "60"), 15)
 SMS_ANALYSIS_WORKER_ENABLED = env_flag("SMS_ANALYSIS_WORKER_ENABLED", True)
 SMS_ANALYSIS_POLL_SECONDS = max(int((os.getenv("SMS_ANALYSIS_POLL_SECONDS") or "180").strip() or "180"), 30)
+AGENT_REFRESH_WORKER_ENABLED = env_flag("AGENT_REFRESH_WORKER_ENABLED", True)
+AGENT_REFRESH_POLL_SECONDS = max(int((os.getenv("AGENT_REFRESH_POLL_SECONDS") or "30").strip() or "30"), 10)
+SMS_DECISION_DELAY_SECONDS = max(int((os.getenv("SMS_DECISION_DELAY_SECONDS") or "300").strip() or "300"), 30)
 WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or "600").strip() or "600"), 60)
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
 MARKET_STATUS_REMOTE_URL = (os.getenv("MARKET_STATUS_REMOTE_URL") or "").strip()
@@ -140,6 +143,7 @@ REFERRAL_MARKET_WORKER_STARTED = False
 CALL_RECORDING_WORKER_STARTED = False
 SMS_ANALYSIS_WORKER_STARTED = False
 WEBSITE_LEADS_HOLD_WORKER_STARTED = False
+AGENT_REFRESH_WORKER_STARTED = False
 NJ_COUNTIES = [
     "Atlantic",
     "Bergen",
@@ -463,6 +467,7 @@ def require_login_if_enabled():
             start_referral_on_market_worker()
         start_call_recording_worker()
         start_sms_analysis_worker()
+        start_agent_refresh_worker()
     if not APP_AUTH_ENABLED:
         return None
     integration_api_allowlist = {
@@ -472,6 +477,7 @@ def require_login_if_enabled():
         "/api/integrations/agent-trace/property",
         "/api/integrations/agents/lead-watch",
         "/api/integrations/agents/rerun-today",
+        "/api/integrations/agents/reset-associations",
     }
     if request.path in integration_api_allowlist:
         try:
@@ -880,6 +886,21 @@ def migrate_db(db):
     ensure_column(db, "agent3_lead_resolutions", "suggested_property_uuid", "suggested_property_uuid TEXT")
     ensure_column(db, "agent3_lead_resolutions", "approved_property_uuid", "approved_property_uuid TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS idx_agent3_lead_resolutions_status ON agent3_lead_resolutions(status, updated_at)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_refresh_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            property_id INTEGER,
+            reason TEXT,
+            run_after TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Queued',
+            summary_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_agent_refresh_queue_due ON agent_refresh_queue(status, run_after, id)")
 
 
 def log_app_error(db, source, error_message, details="", route="", status_code=None):
@@ -12956,6 +12977,110 @@ def trigger_agent_pipeline_refresh(db, property_id=None, reason=""):
     return result
 
 
+def enqueue_agent_refresh(db, property_id, reason="", delay_seconds=0):
+    pid = int(property_id or 0)
+    if pid <= 0:
+        return None
+    # Debounce repeated events for the same property by resetting to latest run_after.
+    db.execute(
+        """
+        DELETE FROM agent_refresh_queue
+        WHERE property_id = ?
+          AND status = 'Queued'
+        """,
+        (pid,),
+    )
+    run_after_dt = datetime.utcnow() + timedelta(seconds=max(0, int(delay_seconds or 0)))
+    cur = db.execute(
+        """
+        INSERT INTO agent_refresh_queue (property_id, reason, run_after, status, summary_json, updated_at)
+        VALUES (?, ?, ?, 'Queued', '{}', CURRENT_TIMESTAMP)
+        """,
+        (pid, (reason or "").strip()[:120], format_db_time(run_after_dt)),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def run_agent_refresh_queue_once(limit=25):
+    ensure_db()
+    db = open_sqlite_connection()
+    try:
+        now_utc = format_db_time(datetime.utcnow())
+        rows = db.execute(
+            """
+            SELECT id, property_id, reason
+            FROM agent_refresh_queue
+            WHERE status = 'Queued'
+              AND run_after <= ?
+            ORDER BY run_after ASC, id ASC
+            LIMIT ?
+            """,
+            (now_utc, max(1, int(limit))),
+        ).fetchall()
+        processed = 0
+        for row in rows:
+            qid = int(row["id"])
+            pid = int(row["property_id"] or 0)
+            db.execute(
+                "UPDATE agent_refresh_queue SET status = 'Running', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (qid,),
+            )
+            try:
+                result = trigger_agent_pipeline_refresh(db, property_id=pid, reason=str(row["reason"] or "queued_refresh"))
+                db.execute(
+                    """
+                    UPDATE agent_refresh_queue
+                    SET status = 'Completed', summary_json = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (json.dumps(result), qid),
+                )
+            except Exception as exc:
+                db.execute(
+                    """
+                    UPDATE agent_refresh_queue
+                    SET status = 'Error', summary_json = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (json.dumps({"error": str(exc)}), qid),
+                )
+            processed += 1
+        db.commit()
+        return {"ok": True, "processed": processed}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="agent_refresh_queue",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="run_agent_refresh_queue_once",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+def start_agent_refresh_worker():
+    global AGENT_REFRESH_WORKER_STARTED
+    if AGENT_REFRESH_WORKER_STARTED or not AGENT_REFRESH_WORKER_ENABLED:
+        return
+    AGENT_REFRESH_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                run_agent_refresh_queue_once(limit=30)
+            except Exception:
+                pass
+            time.sleep(AGENT_REFRESH_POLL_SECONDS)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
 @app.route("/")
 def dashboard():
     ensure_db()
@@ -18023,7 +18148,12 @@ def smrtphone_inbound_webhook():
         communication_id=cur.lastrowid,
     )
     if property_id:
-        trigger_agent_pipeline_refresh(db, property_id=int(property_id), reason=f"smrtphone_{event_type}")
+        enqueue_agent_refresh(
+            db,
+            property_id=int(property_id),
+            reason=f"smrtphone_{event_type}",
+            delay_seconds=SMS_DECISION_DELAY_SECONDS,
+        )
     db.commit()
     return jsonify({"ok": True, "communication_id": cur.lastrowid}), 201
 
@@ -18724,6 +18854,104 @@ def integrations_agents_rerun_today_api():
     )
 
 
+@app.route("/api/integrations/agents/reset-associations", methods=["POST"])
+def integrations_agents_reset_associations_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    property_id = int(payload.get("property_id") or 2)
+    person_id = int(payload.get("person_id") or 4)
+    rerun = bool(payload.get("rerun", True))
+    counts = {}
+
+    def _count_update(sql, params):
+        cur = db.execute(sql, params)
+        return int(cur.rowcount or 0)
+
+    # Remove hard links that were collapsing many leads into Property 2 / Person 4.
+    counts["communications_property_null"] = _count_update(
+        "UPDATE communications SET property_id = NULL WHERE property_id = ?",
+        (property_id,),
+    )
+    counts["communications_person_null"] = _count_update(
+        "UPDATE communications SET person_id = NULL WHERE person_id = ?",
+        (person_id,),
+    )
+    counts["call_jobs_property_null"] = _count_update(
+        "UPDATE call_recording_jobs SET property_id = NULL WHERE property_id = ?",
+        (property_id,),
+    )
+    counts["call_jobs_person_null"] = _count_update(
+        "UPDATE call_recording_jobs SET person_id = NULL WHERE person_id = ?",
+        (person_id,),
+    )
+    counts["signals_unlink"] = _count_update(
+        """
+        UPDATE agent_signals
+        SET property_id = NULL, person_id = NULL, routing_status = 'new', updated_at = CURRENT_TIMESTAMP
+        WHERE property_id = ? OR person_id = ?
+        """,
+        (property_id, person_id),
+    )
+    counts["thread_state_unlink"] = _count_update(
+        "UPDATE sms_thread_state SET property_id = NULL, person_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE property_id = ? OR person_id = ?",
+        (property_id, person_id),
+    )
+    counts["contact_context_unlink"] = _count_update(
+        """
+        UPDATE external_contact_context
+        SET property_id = NULL,
+            person_id = NULL,
+            reisift_property_uuid = NULL,
+            reisift_full_address = NULL,
+            reisift_property_status = NULL,
+            last_reisift_lookup_at = NULL,
+            source = 'agent_reset_associations',
+            notes = 'Association reset by integration endpoint',
+            last_seen_at = CURRENT_TIMESTAMP
+        WHERE property_id = ? OR person_id = ?
+        """,
+        (property_id, person_id),
+    )
+    counts["lead_actions_deleted"] = _count_update(
+        """
+        DELETE FROM lead_management_actions
+        WHERE property_id = ? OR person_id = ? OR dedupe_key LIKE ?
+        """,
+        (property_id, person_id, f"leadwatch:property:{property_id}:%"),
+    )
+    counts["agent3_resolutions_deleted"] = _count_update(
+        """
+        DELETE FROM agent3_lead_resolutions
+        WHERE approved_property_id = ? OR suggested_property_id = ? OR lead_key = ?
+        """,
+        (property_id, property_id, f"property:{property_id}"),
+    )
+    counts["refresh_queue_deleted"] = _count_update(
+        "DELETE FROM agent_refresh_queue WHERE property_id = ?",
+        (property_id,),
+    )
+
+    result = {"ok": True, "property_id": property_id, "person_id": person_id, "counts": counts}
+    if rerun:
+        call_rerun = rerun_call_analysis_for_today(db, limit=1200)
+        sms_res = run_sms_analysis_once(lookback_days=2, limit_threads=350, start_utc=est_yesterday_start_utc())
+        lead_monitor = run_lead_monitor_once(db, source="reset_associations", property_id=None)
+        reconcile = run_agent3_lead_watch_reconcile(db, limit=300)
+        snapshot = build_today_lead_watch_snapshot(db, limit=250)
+        result["rerun"] = {
+            "call_rerun": call_rerun,
+            "sms": sms_res,
+            "lead_monitor": lead_monitor,
+            "reconcile": reconcile,
+            "snapshot_count": int(snapshot.get("count") or 0),
+        }
+    db.commit()
+    return jsonify(result)
+
+
 def _agent_trace_for_property(db, property_id, limit=20):
     try:
         n = max(1, min(200, int(limit)))
@@ -19139,6 +19367,7 @@ if __name__ == "__main__":
             start_referral_on_market_worker()
         start_call_recording_worker()
         start_sms_analysis_worker()
+        start_agent_refresh_worker()
     app.run(host=host, port=port, debug=debug_mode)
 
 

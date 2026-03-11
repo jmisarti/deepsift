@@ -1898,8 +1898,12 @@ def compose_sms_signal_detail(signal_row):
     if direction not in {"Inbound", "Outbound"}:
         direction = "Unknown"
     intro = f"{direction} SMS from {from_label} to {to_label}."
-    thread_summary = _short_text(row.get("summary_text") or payload_obj.get("summary") or "", 240)
-    important = _short_text(payload_obj.get("analysis", {}).get("key_point") if isinstance(payload_obj.get("analysis"), dict) else "", 180)
+    thread_summary = re.sub(r"\s+", " ", str(row.get("summary_text") or payload_obj.get("summary") or "").strip())
+    important = re.sub(
+        r"\s+",
+        " ",
+        str(payload_obj.get("analysis", {}).get("key_point") if isinstance(payload_obj.get("analysis"), dict) else "").strip(),
+    )
     if thread_summary:
         intro += f" Summary: {thread_summary}"
     if important:

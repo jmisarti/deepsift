@@ -478,6 +478,7 @@ def require_login_if_enabled():
         "/api/integrations/agents/lead-watch",
         "/api/integrations/agents/rerun-today",
         "/api/integrations/agents/reset-associations",
+        "/api/integrations/contact-context/upsert",
     }
     if request.path in integration_api_allowlist:
         try:
@@ -19167,6 +19168,48 @@ def integrations_agent_trace_property_api():
     if not trace:
         return jsonify({"ok": False, "error": "Property not found"}), 404
     return jsonify({"ok": True, "trace": trace})
+
+
+@app.route("/api/integrations/contact-context/upsert", methods=["POST"])
+def integrations_contact_context_upsert_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    phone = normalize_phone(payload.get("phone") or payload.get("phone_number") or "")
+    if not phone:
+        return jsonify({"ok": False, "error": "phone is required"}), 400
+    property_id = int(payload.get("property_id") or 0) or None
+    person_id = int(payload.get("person_id") or 0) or None
+    reisift_property_uuid = normalize_uuid(payload.get("reisift_property_uuid") or payload.get("uuid") or "")
+    reisift_full_address = str(payload.get("reisift_full_address") or payload.get("full_address") or "").strip()
+    reisift_owner_name = str(payload.get("reisift_owner_name") or payload.get("owner_name") or "").strip()
+    reisift_property_status = str(payload.get("reisift_property_status") or payload.get("status") or "").strip()
+    classification = str(payload.get("classification") or "potential_seller").strip().lower()
+    source = str(payload.get("source") or "integration_contact_context_upsert").strip()[:60]
+    notes = str(payload.get("notes") or "Manual phone-to-ReiSift context upsert.").strip()
+
+    upsert_cached_contact_context(
+        db,
+        phone,
+        property_id=property_id,
+        person_id=person_id,
+        classification=classification,
+        source=source,
+        confidence=0.99,
+        notes=notes,
+        reisift_property_uuid=reisift_property_uuid,
+        reisift_full_address=reisift_full_address,
+        reisift_owner_name=reisift_owner_name,
+        reisift_property_status=reisift_property_status,
+        last_reisift_lookup_at=format_db_time(datetime.utcnow()),
+    )
+    db.commit()
+    row = get_cached_contact_context(db, phone)
+    out = dict(row) if row else {}
+    out["open_record_url"] = _sift_record_url(out.get("reisift_property_uuid") or "")
+    return jsonify({"ok": True, "context": out})
 
 
 @app.route("/webhooks/gmail/pubsub", methods=["POST"])

@@ -17700,6 +17700,61 @@ def call_recording_jobs_api():
     return jsonify([dict(r) for r in rows])
 
 
+@app.route("/api/integrations/referrals/refresh", methods=["POST"])
+def integrations_referrals_refresh_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    before_rows = db.execute(
+        """
+        SELECT property_uuid, COALESCE(on_market_status, 'Unknown') AS on_market_status
+        FROM reisift_referrals
+        WHERE is_active = 1
+        """
+    ).fetchall()
+    before_map = {str(r["property_uuid"] or "").strip(): str(r["on_market_status"] or "Unknown").strip() for r in before_rows}
+    data = refresh_reisift_referrals_cache(db)
+    snapshot = build_today_lead_watch_snapshot(db, limit=200)
+    after_rows = db.execute(
+        """
+        SELECT property_uuid, full_address, COALESCE(on_market_status, 'Unknown') AS on_market_status, last_synced_at
+        FROM reisift_referrals
+        WHERE is_active = 1
+        ORDER BY datetime(last_synced_at) DESC
+        LIMIT 200
+        """
+    ).fetchall()
+    status_counts = {}
+    changed = []
+    for r in after_rows:
+        pu = str(r["property_uuid"] or "").strip()
+        status = str(r["on_market_status"] or "Unknown").strip() or "Unknown"
+        status_counts[status] = int(status_counts.get(status, 0)) + 1
+        prev = before_map.get(pu, "")
+        if prev != status:
+            changed.append(
+                {
+                    "property_uuid": pu,
+                    "full_address": str(r["full_address"] or "").strip(),
+                    "before": prev or "(new)",
+                    "after": status,
+                    "last_synced_at": str(r["last_synced_at"] or ""),
+                }
+            )
+    db.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "referral_refresh": data,
+            "status_counts": status_counts,
+            "changed": changed[:100],
+            "agent3_lead_watch_count": int(snapshot.get("count") or 0),
+            "agent3_unresolved_active_count": int(snapshot.get("unresolved_active_count") or 0),
+        }
+    )
+
+
 @app.route("/api/integrations/agents/lead-watch", methods=["GET"])
 def integrations_agents_lead_watch_api():
     ensure_db()

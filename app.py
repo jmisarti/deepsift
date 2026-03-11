@@ -11132,10 +11132,76 @@ def infer_on_market_status_from_payload(payload):
     return "Unknown"
 
 
+def infer_on_market_status_from_web_listing(full_address):
+    address = re.sub(r"\s+", " ", str(full_address or "").strip())
+    if not address:
+        return {"status": "Unknown", "evidence": []}
+    evidence = []
+    snippets = []
+    queries = [
+        f'site:zillow.com "{address}"',
+        f'site:realtor.com "{address}"',
+    ]
+    for q in queries:
+        try:
+            results = fetch_search_results_duckduckgo(q, max_results=5)
+        except Exception:
+            results = []
+        for r in results:
+            url = str(r.get("url") or "")
+            title = str(r.get("title") or "")
+            snippet = str(r.get("snippet") or "")
+            if ("zillow.com" not in url.lower()) and ("realtor.com" not in url.lower()):
+                continue
+            text = f"{title} {snippet}".strip()
+            if not text:
+                continue
+            snippets.append(text.lower())
+            evidence.append({"url": url, "title": title, "snippet": snippet})
+
+    combined = " \n ".join(snippets)
+    # Priority order requested by operator.
+    if "coming soon" in combined:
+        return {"status": "Coming Soon", "evidence": evidence[:5]}
+    if "for sale by owner" in combined or "fsbo" in combined:
+        return {"status": "For Sale by Owner", "evidence": evidence[:5]}
+    if "for rent" in combined or "for lease" in combined:
+        return {"status": "For Rent", "evidence": evidence[:5]}
+    if "just sold" in combined or "recently sold" in combined:
+        return {"status": "Sold", "evidence": evidence[:5]}
+    if (
+        " sold " in f" {combined} "
+        or "sold on" in combined
+        or "last sold" in combined
+    ):
+        return {"status": "Sold", "evidence": evidence[:5]}
+    if "for sale" in combined or "active" in combined:
+        return {"status": "For Sale", "evidence": evidence[:5]}
+    if (
+        "off market" in combined
+        or "not currently for sale" in combined
+        or "listing removed" in combined
+        or "sold" in combined
+    ):
+        return {"status": "Off Market", "evidence": evidence[:5]}
+    return {"status": "Unknown", "evidence": evidence[:5]}
+
+
 def upsert_reisift_referral(db, property_uuid, payload, is_active=1):
     summary = summarize_reisift_property(payload)
     county = infer_county_from_reisift_payload(payload)
-    on_market_status = infer_on_market_status_from_payload(payload)
+    payload_market_status = infer_on_market_status_from_payload(payload)
+    web_market = infer_on_market_status_from_web_listing(summary["full_address"])
+    on_market_status = web_market.get("status") or payload_market_status
+    if on_market_status == "Unknown":
+        on_market_status = payload_market_status
+    merged_payload = dict(payload or {})
+    merged_payload["market_status_inference"] = {
+        "payload_status": payload_market_status,
+        "web_status": web_market.get("status"),
+        "web_evidence": web_market.get("evidence") or [],
+        "resolved_status": on_market_status,
+    }
     db.execute(
         """
         INSERT INTO reisift_referrals
@@ -11158,7 +11224,7 @@ def upsert_reisift_referral(db, property_uuid, payload, is_active=1):
             summary["owner_names"],
             county,
             on_market_status,
-            json.dumps(payload),
+            json.dumps(merged_payload),
             int(bool(is_active)),
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         ),

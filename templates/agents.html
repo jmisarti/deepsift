@@ -391,7 +391,7 @@
             <p>{{ advisor_snapshot.calls.pending_total }}</p>
         </article>
         <article>
-            <h3>Lead Watch (Today)</h3>
+            <h3>Lead Watch (Since Yesterday AM ET)</h3>
             <p>{{ advisor_snapshot.lead_watch_today.count }}</p>
         </article>
         <article>
@@ -425,7 +425,7 @@
         </li>
         {% endfor %}
     </ul>
-    <h4 style="margin-top:1rem;">Lead Watch (Today ET)</h4>
+    <h4 style="margin-top:1rem;">Lead Watch (Since Yesterday 12:00 AM ET)</h4>
     {% if advisor_snapshot.lead_watch_today['items'] %}
     <div style="overflow-x:auto; margin-top:0.75rem;">
         <table>

@@ -1126,6 +1126,12 @@ def est_day_start_utc(now_dt=None):
     return day_start_et.astimezone(timezone.utc).replace(tzinfo=None)
 
 
+def est_yesterday_start_utc(now_dt=None):
+    now_et = (now_dt or datetime.utcnow().replace(tzinfo=timezone.utc)).astimezone(EST_TZ)
+    day_start_et = (now_et - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return day_start_et.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def get_cached_contact_context(db, phone_raw):
     norm = normalize_phone(phone_raw)
     if not norm:
@@ -7890,7 +7896,7 @@ def start_call_recording_worker():
 
 
 def rerun_call_analysis_for_today(db, limit=600):
-    cutoff = format_db_time(est_day_start_utc())
+    cutoff = format_db_time(est_yesterday_start_utc())
     rows = db.execute(
         """
         SELECT *
@@ -8310,11 +8316,14 @@ def analyze_sms_thread_with_openai(messages, property_id=None, person_id=None, c
     raise ValueError("No JSON output returned by sms analyzer")
 
 
-def run_sms_analysis_once(lookback_days=14, limit_threads=30):
+def run_sms_analysis_once(lookback_days=14, limit_threads=30, start_utc=None):
     ensure_db()
     db = open_sqlite_connection()
     try:
-        cutoff = format_db_time(datetime.utcnow() - timedelta(days=max(1, int(lookback_days))))
+        if start_utc is not None:
+            cutoff = format_db_time(start_utc)
+        else:
+            cutoff = format_db_time(datetime.utcnow() - timedelta(days=max(1, int(lookback_days))))
         rows = db.execute(
             """
             SELECT id, property_id, person_id, direction, from_number, to_number, body, status, sent_at, created_at
@@ -8475,7 +8484,7 @@ def start_sms_analysis_worker():
 
 
 def build_today_lead_watch_snapshot(db, limit=60):
-    cutoff_dt = est_day_start_utc()
+    cutoff_dt = est_yesterday_start_utc()
     cutoff = format_db_time(cutoff_dt)
     leads = {}
     system_numbers = set(_system_phone_numbers(db))
@@ -8593,7 +8602,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
         if occurred_at and (not row["last_activity_at"] or occurred_at > row["last_activity_at"]):
             row["last_activity_at"] = occurred_at
 
-    # Seed today's referral leads even if no call/SMS has happened yet.
+    # Seed window leads even if no call/SMS has happened yet.
     for rr in referrals:
         synced_at = str(rr["last_synced_at"] or "")
         if synced_at and synced_at < cutoff:
@@ -13568,9 +13577,9 @@ def run_agent3_lead_watch_resolve_route():
             notes,
         ),
     )
-    # If user approved a property, persist phone->property context from today's webhook events.
+    # If user approved a property, persist phone->property context from current lead-watch window events.
     if approved_property_id:
-        cutoff = format_db_time(est_day_start_utc())
+        cutoff = format_db_time(est_yesterday_start_utc())
         rows = db.execute(
             """
             SELECT from_number, to_number, payload_json
@@ -18691,12 +18700,12 @@ def integrations_agents_rerun_today_api():
     db = get_db()
     if not integration_auth_ok(db, request):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    # Agent 1: force rerun all today's calls for direction-aware summaries.
+    # Agent 1: force rerun calls in the lead-watch window (yesterday 12:00 AM ET onward).
     call_rerun = rerun_call_analysis_for_today(db, limit=800)
     db.commit()
-    # Agent 1 SMS pass for last day.
-    sms_res = run_sms_analysis_once(lookback_days=1, limit_threads=250)
-    # Agent 2 refresh across today's full touched lead set (UUID-only + local property leads).
+    # Agent 1 SMS pass for the same lead-watch window.
+    sms_res = run_sms_analysis_once(lookback_days=2, limit_threads=250, start_utc=est_yesterday_start_utc())
+    # Agent 2 refresh across full touched lead set (UUID-only + local property leads).
     lead_monitor_res = run_lead_monitor_once(db, source="rerun_today", property_id=None)
     # Agent 3 reconciliation + snapshot.
     recon = run_agent3_lead_watch_reconcile(db, limit=200)

@@ -29,6 +29,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
 from flask import Flask, g, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
@@ -109,12 +113,15 @@ SMS_ANALYSIS_WORKER_ENABLED = env_flag("SMS_ANALYSIS_WORKER_ENABLED", True)
 SMS_ANALYSIS_POLL_SECONDS = max(int((os.getenv("SMS_ANALYSIS_POLL_SECONDS") or "180").strip() or "180"), 30)
 WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or "600").strip() or "600"), 60)
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
+MARKET_STATUS_REMOTE_URL = (os.getenv("MARKET_STATUS_REMOTE_URL") or "").strip()
+MARKET_STATUS_REMOTE_TOKEN = (os.getenv("MARKET_STATUS_REMOTE_TOKEN") or "").strip()
 CALL_ANALYSIS_MAX_RETRIES = max(int((os.getenv("CALL_ANALYSIS_MAX_RETRIES") or "3").strip() or "3"), 1)
 APP_AUTH_ENABLED = env_flag("APP_AUTH_ENABLED", False)
 APP_AUTH_USERNAME = os.getenv("APP_AUTH_USERNAME", "").strip()
 APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD", "")
 APP_AUTH_PASSWORD_HASH = os.getenv("APP_AUTH_PASSWORD_HASH", "").strip()
 RUN_BACKGROUND_WORKERS = env_flag("RUN_BACKGROUND_WORKERS", True)
+REFERRAL_MARKET_AUTO_REFRESH_ENABLED = env_flag("REFERRAL_MARKET_AUTO_REFRESH_ENABLED", False)
 REISIFT_TASK_WRITE_ENABLED = env_flag("REISIFT_TASK_WRITE_ENABLED", False)
 GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
 GOOGLE_SHEETS_WORKSHEET_NAME = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "List of Customers").strip() or "List of Customers"
@@ -452,7 +459,8 @@ def require_login_if_enabled():
         start_email_poll_worker()
         start_clever_leads_worker()
         start_website_leads_hold_worker()
-        start_referral_on_market_worker()
+        if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
+            start_referral_on_market_worker()
         start_call_recording_worker()
         start_sms_analysis_worker()
     if not APP_AUTH_ENABLED:
@@ -3595,6 +3603,31 @@ def fetch_search_results_duckduckgo(query, max_results=8):
         snippet = re.sub(r"(?is)<[^>]+>", " ", snip_match.group(1) if snip_match else "")
         title = re.sub(r"\s+", " ", unescape(title)).strip()
         snippet = re.sub(r"\s+", " ", unescape(snippet)).strip()
+        out.append({"title": title, "url": link, "snippet": snippet})
+        if len(out) >= max_results:
+            break
+    return out
+
+
+def fetch_search_results_bing(query, max_results=8):
+    if BeautifulSoup is None:
+        return []
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DeepProspectCRM/1.0)"}
+    url = "https://www.bing.com/search"
+    resp = requests.get(url, params={"q": query}, headers=headers, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    out = []
+    for li in soup.select("li.b_algo"):
+        a = li.select_one("h2 a")
+        if not a:
+            continue
+        link = (a.get("href") or "").strip()
+        if not link:
+            continue
+        title = re.sub(r"\s+", " ", a.get_text(" ", strip=True)).strip()
+        p = li.select_one("p")
+        snippet = re.sub(r"\s+", " ", p.get_text(" ", strip=True)).strip() if p else ""
         out.append({"title": title, "url": link, "snippet": snippet})
         if len(out) >= max_results:
             break
@@ -11132,58 +11165,215 @@ def infer_on_market_status_from_payload(payload):
     return "Unknown"
 
 
-def infer_on_market_status_from_web_listing(full_address):
+def _normalize_listing_address_variants(full_address):
     address = re.sub(r"\s+", " ", str(full_address or "").strip())
     if not address:
+        return []
+    variants = [address]
+    no_zip4 = re.sub(r"(\d{5})-\d{4}\b", r"\1", address)
+    if no_zip4 not in variants:
+        variants.append(no_zip4)
+    no_quotes_noise = re.sub(r"\s*,\s*", ", ", no_zip4).strip(" ,")
+    if no_quotes_noise not in variants:
+        variants.append(no_quotes_noise)
+    collapsed = re.sub(r"\s+", " ", no_zip4.replace(",", " ")).strip()
+    if collapsed and collapsed not in variants:
+        variants.append(collapsed)
+    return [v for v in variants if v]
+
+
+def _is_supported_listing_url(url):
+    u = str(url or "").lower()
+    return ("zillow.com" in u) or ("realtor.com" in u)
+
+
+def _is_supported_listing_result(url, title, snippet):
+    joined = " ".join([str(url or ""), str(title or ""), str(snippet or "")]).lower()
+    return ("zillow" in joined) or ("realtor" in joined)
+
+
+def _fetch_listing_page_text(url):
+    target = str(url or "").strip()
+    if not target:
+        return ""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DeepProspectCRM/1.0)"}
+    attempts = [target]
+    try:
+        parts = urlsplit(target)
+        if parts.scheme and parts.netloc:
+            path = parts.path or "/"
+            query = f"?{parts.query}" if parts.query else ""
+            attempts.append(f"https://r.jina.ai/http://{parts.netloc}{path}{query}")
+            attempts.append(f"https://r.jina.ai/https://{parts.netloc}{path}{query}")
+    except Exception:
+        pass
+    for attempt in attempts:
+        try:
+            resp = requests.get(attempt, headers=headers, timeout=20)
+            if resp.status_code >= 400:
+                continue
+            text = re.sub(r"(?is)<[^>]+>", " ", resp.text)
+            text = re.sub(r"\s+", " ", unescape(text)).strip()
+            if text:
+                return text.lower()
+        except Exception:
+            continue
+    return ""
+
+
+def _classify_listing_market_status(text):
+    combined = f" {str(text or '').lower()} "
+    checks = [
+        ("Coming Soon", ["coming soon"]),
+        ("For Sale by Owner", ["for sale by owner", " fsbo ", "fsbo."]),
+        ("For Rent", ["for rent", "for lease"]),
+        ("Sold", ["just sold", "recently sold", " sold on ", "last sold", " was sold "]),
+        ("For Sale", ["for sale", " active listing ", "active status"]),
+        ("Off Market", ["off market", "not currently for sale", "listing removed"]),
+    ]
+    for status, terms in checks:
+        for term in terms:
+            if term in combined:
+                return status, term.strip()
+    return "Unknown", ""
+
+
+def _fetch_market_status_from_remote_agent(full_address):
+    if not MARKET_STATUS_REMOTE_URL:
+        return {"status": "Unknown", "evidence": []}
+    payload = {
+        "address": str(full_address or "").strip(),
+        "task": "listing_status",
+        "allowed_statuses": [
+            "Off Market",
+            "For Sale by Owner",
+            "Coming Soon",
+            "For Sale",
+            "For Rent",
+            "Sold",
+            "Unknown",
+        ],
+    }
+    headers = {"Content-Type": "application/json"}
+    if MARKET_STATUS_REMOTE_TOKEN:
+        headers["Authorization"] = f"Bearer {MARKET_STATUS_REMOTE_TOKEN}"
+    try:
+        resp = requests.post(
+            MARKET_STATUS_REMOTE_URL,
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json() if resp.content else {}
+    except Exception:
+        return {"status": "Unknown", "evidence": []}
+    status = str(data.get("status") or "Unknown").strip() or "Unknown"
+    evidence = data.get("evidence") if isinstance(data.get("evidence"), list) else []
+    normalized = {
+        "Off Market",
+        "For Sale by Owner",
+        "Coming Soon",
+        "For Sale",
+        "For Rent",
+        "Sold",
+        "Unknown",
+    }
+    if status not in normalized:
+        status = "Unknown"
+    return {"status": status, "evidence": evidence[:5]}
+
+
+def infer_on_market_status_from_web_listing(full_address):
+    address_variants = _normalize_listing_address_variants(full_address)
+    if not address_variants:
         return {"status": "Unknown", "evidence": []}
     evidence = []
     snippets = []
-    queries = [
-        f'site:zillow.com "{address}"',
-        f'site:realtor.com "{address}"',
-    ]
+    queries = []
+    for addr in address_variants[:3]:
+        queries.extend(
+            [
+                f'site:zillow.com "{addr}"',
+                f'site:realtor.com "{addr}"',
+                f"{addr} zillow",
+                f"{addr} realtor",
+            ]
+        )
+
+    candidates = []
+    seen_urls = set()
     for q in queries:
+        results = []
         try:
-            results = fetch_search_results_duckduckgo(q, max_results=5)
+            results.extend(fetch_search_results_duckduckgo(q, max_results=8))
         except Exception:
-            results = []
+            pass
+        try:
+            results.extend(fetch_search_results_bing(q, max_results=8))
+        except Exception:
+            pass
         for r in results:
             url = str(r.get("url") or "")
             title = str(r.get("title") or "")
             snippet = str(r.get("snippet") or "")
-            if ("zillow.com" not in url.lower()) and ("realtor.com" not in url.lower()):
+            if not _is_supported_listing_result(url, title, snippet):
                 continue
             text = f"{title} {snippet}".strip()
             if not text:
                 continue
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
             snippets.append(text.lower())
-            evidence.append({"url": url, "title": title, "snippet": snippet})
+            candidates.append({"url": url, "title": title, "snippet": snippet})
 
-    combined = " \n ".join(snippets)
-    # Priority order requested by operator.
-    if "coming soon" in combined:
-        return {"status": "Coming Soon", "evidence": evidence[:5]}
-    if "for sale by owner" in combined or "fsbo" in combined:
-        return {"status": "For Sale by Owner", "evidence": evidence[:5]}
-    if "for rent" in combined or "for lease" in combined:
-        return {"status": "For Rent", "evidence": evidence[:5]}
-    if "just sold" in combined or "recently sold" in combined:
-        return {"status": "Sold", "evidence": evidence[:5]}
-    if (
-        " sold " in f" {combined} "
-        or "sold on" in combined
-        or "last sold" in combined
-    ):
-        return {"status": "Sold", "evidence": evidence[:5]}
-    if "for sale" in combined or "active" in combined:
-        return {"status": "For Sale", "evidence": evidence[:5]}
-    if (
-        "off market" in combined
-        or "not currently for sale" in combined
-        or "listing removed" in combined
-        or "sold" in combined
-    ):
-        return {"status": "Off Market", "evidence": evidence[:5]}
+    # Pass 1: classify from search snippets immediately.
+    combined_snippets = " \n ".join(snippets)
+    snippet_status, snippet_term = _classify_listing_market_status(combined_snippets)
+    if snippet_status != "Unknown":
+        for c in candidates[:5]:
+            evidence.append(
+                {
+                    "url": c["url"],
+                    "title": c["title"],
+                    "snippet": c["snippet"],
+                    "source": "search-snippet",
+                    "matched_term": snippet_term,
+                }
+            )
+        return {"status": snippet_status, "evidence": evidence[:5]}
+
+    # Pass 2: fetch page source and classify from page text.
+    page_evidence = []
+    for c in candidates[:6]:
+        if not _is_supported_listing_url(c["url"]):
+            continue
+        page_text = _fetch_listing_page_text(c["url"])
+        if not page_text:
+            continue
+        status, matched_term = _classify_listing_market_status(page_text)
+        page_evidence.append(
+            {
+                "url": c["url"],
+                "title": c["title"],
+                "snippet": c["snippet"],
+                "source": "page-source",
+                "matched_term": matched_term,
+            }
+        )
+        if status != "Unknown":
+            return {"status": status, "evidence": page_evidence[:5]}
+
+    # Pass 3: remote browser/AI fallback when local scraping is blocked.
+    remote = _fetch_market_status_from_remote_agent(full_address)
+    if (remote.get("status") or "Unknown") != "Unknown":
+        remote_evidence = remote.get("evidence") or []
+        if not remote_evidence:
+            remote_evidence = [{"source": "remote-agent", "note": "Remote classifier returned a resolved status."}]
+        return {"status": remote.get("status"), "evidence": remote_evidence[:5]}
+
+    evidence.extend(page_evidence[:5])
     return {"status": "Unknown", "evidence": evidence[:5]}
 
 
@@ -13367,9 +13557,14 @@ def referral_realtors_page():
         """,
         tuple(params),
     ).fetchall()
+    realtors = []
+    for row in rows:
+        item = dict(row)
+        item["target_markets_list"] = split_markets(item.get("target_markets"))
+        realtors.append(item)
     return render_template(
         "referral_realtors.html",
-        realtors=rows,
+        realtors=realtors,
         q=q,
         market=market,
         notice=notice,
@@ -13429,8 +13624,13 @@ def referral_realtor_update(realtor_id):
     if not first_name or not last_name:
         return redirect(url_for("referral_realtors_page", q=q, market=market, notice="First and last name are required."))
 
-    markets_raw = request.form.get("target_markets", "")
-    markets = join_markets(split_markets(markets_raw))
+    selected_markets = request.form.getlist("target_markets")
+    if selected_markets:
+        markets = join_markets(selected_markets)
+    else:
+        # Backward-compatible fallback for old comma-separated form submissions.
+        markets_raw = request.form.get("target_markets", "")
+        markets = join_markets(split_markets(markets_raw))
     db.execute(
         """
         UPDATE referral_realtors
@@ -18208,7 +18408,8 @@ if __name__ == "__main__":
         start_bulk_sms_worker()
         start_email_poll_worker()
         start_clever_leads_worker()
-        start_referral_on_market_worker()
+        if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
+            start_referral_on_market_worker()
         start_call_recording_worker()
         start_sms_analysis_worker()
     app.run(host=host, port=port, debug=debug_mode)

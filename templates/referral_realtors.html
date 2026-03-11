@@ -16,10 +16,18 @@
             <label>Email <input name="email"></label>
             <label>Phone <input name="phone"></label>
             <label>Brokerage <input name="brokerage"></label>
-            <fieldset class="span2 checkbox-grid">
+            <fieldset class="span2 county-toggle-grid">
                 <legend>Target Market (NJ Counties)</legend>
                 {% for county in nj_counties %}
-                <label><input type="checkbox" name="target_markets" value="{{ county }}"> {{ county }}</label>
+                <label class="county-toggle-item">
+                    <span class="county-name">{{ county }}</span>
+                    <span class="county-toggle-controls">
+                        <span class="toggle-switch">
+                            <input type="checkbox" name="target_markets" value="{{ county }}">
+                            <span class="toggle-slider"></span>
+                        </span>
+                    </span>
+                </label>
                 {% endfor %}
             </fieldset>
             <button type="submit">Add Realtor</button>
@@ -33,10 +41,18 @@
             <label class="span2">CSV file
                 <input type="file" name="realtors_file" accept=".csv" required>
             </label>
-            <fieldset class="span2 checkbox-grid">
+            <fieldset class="span2 county-toggle-grid">
                 <legend>Default Target Market(s)</legend>
                 {% for county in nj_counties %}
-                <label><input type="checkbox" name="target_markets" value="{{ county }}"> {{ county }}</label>
+                <label class="county-toggle-item">
+                    <span class="county-name">{{ county }}</span>
+                    <span class="county-toggle-controls">
+                        <span class="toggle-switch">
+                            <input type="checkbox" name="target_markets" value="{{ county }}">
+                            <span class="toggle-slider"></span>
+                        </span>
+                    </span>
+                </label>
                 {% endfor %}
             </fieldset>
             <button type="submit">Upload CSV</button>
@@ -95,7 +111,20 @@
                             <label>Email <input name="email" value="{{ r.email or '' }}"></label>
                             <label>Phone <input name="phone" value="{{ r.phone or '' }}"></label>
                             <label>Brokerage <input name="brokerage" value="{{ r.brokerage or '' }}"></label>
-                            <label class="span2">Target Markets (comma-separated) <input name="target_markets" value="{{ r.target_markets or '' }}"></label>
+                            <fieldset class="span2 county-toggle-grid">
+                                <legend>Target Market (NJ Counties)</legend>
+                                {% for county in nj_counties %}
+                                <label class="county-toggle-item">
+                                    <span class="county-name">{{ county }}</span>
+                                    <span class="county-toggle-controls">
+                                        <span class="toggle-switch">
+                                            <input type="checkbox" name="target_markets" value="{{ county }}" {% if county in r.target_markets_list %}checked{% endif %}>
+                                            <span class="toggle-slider"></span>
+                                        </span>
+                                    </span>
+                                </label>
+                                {% endfor %}
+                            </fieldset>
                             <button type="submit">Save</button>
                         </form>
                     </details>

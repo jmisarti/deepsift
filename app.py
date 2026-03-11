@@ -18830,26 +18830,48 @@ def integrations_agents_rerun_today_api():
     db = get_db()
     if not integration_auth_ok(db, request):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    errors = []
+
+    def _safe_run(step_name, fn):
+        try:
+            return fn()
+        except Exception as exc:
+            err = {"step": step_name, "error": str(exc)}
+            errors.append(err)
+            log_app_error(
+                db,
+                source="integrations_agents_rerun_today_api",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route=f"/api/integrations/agents/rerun-today:{step_name}",
+                status_code=500,
+            )
+            return {"error": str(exc)}
+
     # Agent 1: force rerun calls in the lead-watch window (yesterday 12:00 AM ET onward).
-    call_rerun = rerun_call_analysis_for_today(db, limit=800)
+    call_rerun = _safe_run("call_rerun", lambda: rerun_call_analysis_for_today(db, limit=800))
     db.commit()
     # Agent 1 SMS pass for the same lead-watch window.
-    sms_res = run_sms_analysis_once(lookback_days=2, limit_threads=250, start_utc=est_yesterday_start_utc())
+    sms_res = _safe_run(
+        "sms_analysis",
+        lambda: run_sms_analysis_once(lookback_days=2, limit_threads=250, start_utc=est_yesterday_start_utc()),
+    )
     # Agent 2 refresh across full touched lead set (UUID-only + local property leads).
-    lead_monitor_res = run_lead_monitor_once(db, source="rerun_today", property_id=None)
+    lead_monitor_res = _safe_run("lead_monitor", lambda: run_lead_monitor_once(db, source="rerun_today", property_id=None))
     # Agent 3 reconciliation + snapshot.
-    recon = run_agent3_lead_watch_reconcile(db, limit=200)
-    snapshot = build_today_lead_watch_snapshot(db, limit=200)
+    recon = _safe_run("reconcile", lambda: run_agent3_lead_watch_reconcile(db, limit=200))
+    snapshot = _safe_run("snapshot", lambda: build_today_lead_watch_snapshot(db, limit=200))
     db.commit()
     return jsonify(
         {
-            "ok": True,
+            "ok": len(errors) == 0,
             "call_cutoff": call_rerun.get("cutoff", ""),
             "call_rerun": call_rerun,
             "sms": sms_res,
             "lead_monitor": lead_monitor_res,
             "reconcile": recon,
             "snapshot": snapshot,
+            "errors": errors,
         }
     )
 

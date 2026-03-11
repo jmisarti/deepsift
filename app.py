@@ -5915,6 +5915,27 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
         )
     db.commit()
     if not is_new:
+        if source_label == "webhook":
+            msg = "\n".join(
+                [
+                    "New Clever Lead Received",
+                    "SIFT Status: duplicate (already processed)",
+                    f"Address: {address or '-'}",
+                    f"Seller: {seller_name or '-'}",
+                    f"Event Key: {event_key or '-'}",
+                ]
+            )
+            slack_result = send_slack_notification(db, msg)
+            if not slack_result.get("ok"):
+                log_app_error(
+                    db,
+                    source="clever_slack_notify",
+                    error_message=f"Slack notification failed: {slack_result.get('error') or 'Unknown error'}",
+                    details=json.dumps({"event_key": event_key, "source_label": source_label}),
+                    route="/api/integrations/google-sheets/row-added",
+                    status_code=500,
+                )
+                db.commit()
         return {"ok": True, "duplicate": True, "event_key": event_key}
 
     if address:
@@ -5982,7 +6003,16 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
                     referral_refresh_result = {"ok": False, "error": str(refresh_exc), "attempt": attempt + 1}
             if refresh_error:
                 msg_lines.append(f"Referral Refresh Error: {refresh_error}")
-            send_slack_notification(db, "\n".join(msg_lines))
+            slack_result = send_slack_notification(db, "\n".join(msg_lines))
+            if not slack_result.get("ok"):
+                log_app_error(
+                    db,
+                    source="clever_slack_notify",
+                    error_message=f"Slack notification failed: {slack_result.get('error') or 'Unknown error'}",
+                    details=json.dumps({"event_key": event_key, "source_label": source_label}),
+                    route="/api/integrations/google-sheets/row-added",
+                    status_code=500,
+                )
             status_note = (
                 "Post-Enrich Status: refer_lead"
                 if post_status_result and post_status_result.get("response") is not None
@@ -6047,6 +6077,42 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
             )
             db.commit()
             return {"ok": False, "error": err_text, "event_key": event_key}
+    else:
+        # Always notify webhook mode when payload arrives but cannot be processed into SIFT.
+        if source_label == "webhook":
+            msg = "\n".join(
+                [
+                    "New Clever Lead Received",
+                    "SIFT Status: skipped (missing address)",
+                    f"Seller: {seller_name or '-'}",
+                    f"Phone: {phone or '-'}",
+                    f"Email: {email or '-'}",
+                    f"Event Key: {event_key or '-'}",
+                ]
+            )
+            slack_result = send_slack_notification(db, msg)
+            if not slack_result.get("ok"):
+                log_app_error(
+                    db,
+                    source="clever_slack_notify",
+                    error_message=f"Slack notification failed: {slack_result.get('error') or 'Unknown error'}",
+                    details=json.dumps({"event_key": event_key, "source_label": source_label}),
+                    route="/api/integrations/google-sheets/row-added",
+                    status_code=500,
+                )
+            add_clever_webhook_note(
+                db,
+                event_key,
+                "\n".join(
+                    [
+                        "Clever Leads processing result",
+                        "Result: skipped",
+                        "Reason: missing address",
+                    ]
+                ),
+                payload,
+            )
+            db.commit()
     return {"ok": True, "event_key": event_key}
 
 

@@ -839,6 +839,10 @@ def migrate_db(db):
         )
         """
     )
+    ensure_column(db, "external_contact_context", "reisift_property_uuid", "reisift_property_uuid TEXT")
+    ensure_column(db, "external_contact_context", "reisift_full_address", "reisift_full_address TEXT")
+    ensure_column(db, "external_contact_context", "reisift_property_status", "reisift_property_status TEXT")
+    ensure_column(db, "external_contact_context", "last_reisift_lookup_at", "last_reisift_lookup_at TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS idx_external_contact_context_prop ON external_contact_context(property_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_external_contact_context_person ON external_contact_context(person_id)")
     db.execute(
@@ -1146,6 +1150,10 @@ def upsert_cached_contact_context(
     source="",
     confidence=0.5,
     notes="",
+    reisift_property_uuid=None,
+    reisift_full_address=None,
+    reisift_property_status=None,
+    last_reisift_lookup_at=None,
 ):
     norm = normalize_phone(phone_raw)
     if not norm:
@@ -1158,10 +1166,16 @@ def upsert_cached_contact_context(
         next_source = (source or row["source"] or "").strip()
         next_notes = (notes or row["notes"] or "").strip()
         next_conf = max(float(confidence or 0.5), float(row["confidence"] or 0.0))
+        next_reisift_uuid = (reisift_property_uuid or row["reisift_property_uuid"] or "").strip()
+        next_reisift_address = (reisift_full_address or row["reisift_full_address"] or "").strip()
+        next_reisift_status = (reisift_property_status or row["reisift_property_status"] or "").strip()
+        next_reisift_lookup = (last_reisift_lookup_at or row["last_reisift_lookup_at"] or "").strip()
         db.execute(
             """
             UPDATE external_contact_context
-            SET property_id = ?, person_id = ?, classification = ?, source = ?, confidence = ?, notes = ?, last_seen_at = CURRENT_TIMESTAMP
+            SET property_id = ?, person_id = ?, classification = ?, source = ?, confidence = ?, notes = ?,
+                reisift_property_uuid = ?, reisift_full_address = ?, reisift_property_status = ?, last_reisift_lookup_at = ?,
+                last_seen_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
             (
@@ -1171,6 +1185,10 @@ def upsert_cached_contact_context(
                 next_source,
                 next_conf,
                 next_notes,
+                next_reisift_uuid,
+                next_reisift_address,
+                next_reisift_status,
+                next_reisift_lookup,
                 row["id"],
             ),
         )
@@ -1178,8 +1196,8 @@ def upsert_cached_contact_context(
     cur = db.execute(
         """
         INSERT INTO external_contact_context
-        (phone_norm, property_id, person_id, classification, source, confidence, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        (phone_norm, property_id, person_id, classification, source, confidence, notes, reisift_property_uuid, reisift_full_address, reisift_property_status, last_reisift_lookup_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             norm,
@@ -1189,9 +1207,149 @@ def upsert_cached_contact_context(
             (source or "").strip(),
             float(confidence or 0.5),
             (notes or "").strip(),
+            (reisift_property_uuid or "").strip(),
+            (reisift_full_address or "").strip(),
+            (reisift_property_status or "").strip(),
+            (last_reisift_lookup_at or "").strip(),
         ),
     )
     return cur.lastrowid
+
+
+def _status_rank_for_phone_match(status_value):
+    status = _normalize_reisift_status(status_value)
+    priority = {
+        "new lead": 0,
+        "no contact new lead": 1,
+        "hot lead": 2,
+        "warm lead": 3,
+        "cold lead": 4,
+        "nurture new lead": 5,
+        "ghosting lead": 6,
+        "refer lead": 7,
+        "listed": 8,
+        "not interested": 9,
+        "opt-out": 10,
+        "dead lead": 11,
+    }
+    return priority.get(status, 50)
+
+
+def _best_reisift_phone_match(results):
+    if not results:
+        return {}
+    ordered = sorted(
+        results,
+        key=lambda r: (
+            _status_rank_for_phone_match(r.get("status")),
+            str(r.get("updated_at") or r.get("created_at") or ""),
+        ),
+        reverse=False,
+    )
+    # For same status rank, prefer most recent update/create.
+    best = ordered[0]
+    same_rank = [r for r in ordered if _status_rank_for_phone_match(r.get("status")) == _status_rank_for_phone_match(best.get("status"))]
+    if len(same_rank) > 1:
+        best = sorted(same_rank, key=lambda r: str(r.get("updated_at") or r.get("created_at") or ""), reverse=True)[0]
+    return best
+
+
+def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
+    norm = normalize_phone(phone_raw)
+    if not norm:
+        return {}
+    out = {
+        "phone_norm": norm,
+        "property_id": None,
+        "person_id": None,
+        "reisift_property_uuid": "",
+        "reisift_full_address": "",
+        "reisift_property_status": "",
+        "source": "",
+    }
+    cached = get_cached_contact_context(db, norm)
+    if cached:
+        out["property_id"] = cached["property_id"]
+        out["person_id"] = cached["person_id"]
+        out["reisift_property_uuid"] = str(cached["reisift_property_uuid"] or "").strip()
+        out["reisift_full_address"] = str(cached["reisift_full_address"] or "").strip()
+        out["reisift_property_status"] = str(cached["reisift_property_status"] or "").strip()
+        out["source"] = "cache"
+        if out["property_id"] or out["reisift_property_uuid"]:
+            return out
+
+    person_id = find_person_id_by_phone(db, norm)
+    property_id = find_property_id_for_person(db, person_id) if person_id else None
+    if property_id:
+        out["property_id"] = int(property_id)
+        out["person_id"] = int(person_id or 0) or None
+        out["source"] = "local"
+        local_row = db.execute(
+            """
+            SELECT p.reisift_property_uuid, a.street, a.city, a.state, a.postal_code, p.status
+            FROM properties p
+            LEFT JOIN addresses a ON a.id = p.property_address_id
+            WHERE p.id = ?
+            """,
+            (property_id,),
+        ).fetchone()
+        if local_row:
+            out["reisift_property_uuid"] = normalize_uuid(local_row["reisift_property_uuid"] or "")
+            out["reisift_full_address"] = ", ".join(
+                [x for x in [local_row["street"], local_row["city"], local_row["state"], local_row["postal_code"]] if x]
+            )
+            out["reisift_property_status"] = str(local_row["status"] or "").strip()
+        upsert_cached_contact_context(
+            db,
+            norm,
+            property_id=out["property_id"],
+            person_id=out["person_id"],
+            classification="potential_seller",
+            source="local_phone_resolution",
+            confidence=0.9,
+            notes="Resolved from local person/property linkage.",
+            reisift_property_uuid=out["reisift_property_uuid"],
+            reisift_full_address=out["reisift_full_address"],
+            reisift_property_status=out["reisift_property_status"],
+            last_reisift_lookup_at=format_db_time(datetime.utcnow()),
+        )
+        return out
+
+    if not search_reisift:
+        return out
+    try:
+        token = reisift_get_access_token()
+        matches = reisift_search_properties_by_phone(token, norm, limit=12)
+        best = _best_reisift_phone_match(matches)
+        if best:
+            out["reisift_property_uuid"] = normalize_uuid(best.get("uuid") or "")
+            out["reisift_full_address"] = str(best.get("full_address") or "").strip()
+            out["reisift_property_status"] = str(best.get("status") or "").strip()
+            out["source"] = "reisift_phone_search"
+            if out["reisift_property_uuid"]:
+                local_match = db.execute(
+                    "SELECT id FROM properties WHERE reisift_property_uuid = ? ORDER BY id DESC LIMIT 1",
+                    (out["reisift_property_uuid"],),
+                ).fetchone()
+                if local_match:
+                    out["property_id"] = int(local_match["id"])
+            upsert_cached_contact_context(
+                db,
+                norm,
+                property_id=out["property_id"],
+                person_id=out["person_id"],
+                classification="potential_seller",
+                source="reisift_phone_search",
+                confidence=0.85,
+                notes="Resolved via ReiSift phone search.",
+                reisift_property_uuid=out["reisift_property_uuid"],
+                reisift_full_address=out["reisift_full_address"],
+                reisift_property_status=out["reisift_property_status"],
+                last_reisift_lookup_at=format_db_time(datetime.utcnow()),
+            )
+    except Exception:
+        pass
+    return out
 
 
 def classify_unknown_contact_text(text):
@@ -7498,6 +7656,7 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
                         payload={"call_sid": call_sid, "call_outcome": outcome, "reason": reason},
                     )
                     route_new_agent_signals_once(db, limit=25)
+                    trigger_agent_pipeline_refresh(db, property_id=int(property_id), reason="call_no_answer")
             else:
                 no_recording_summary = (
                     f"{call_direction} call completed but no recording URL was returned by provider."
@@ -7518,6 +7677,8 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
                 "UPDATE call_recording_jobs SET analysis_status = ?, summary_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (analysis_status, no_recording_summary, job_id),
             )
+            if property_id:
+                trigger_agent_pipeline_refresh(db, property_id=int(property_id), reason="call_no_recording")
             return {"job_id": job_id, "status": "no_recording_url", "call_outcome": outcome}
 
     if force_reanalyze and existing_transcript:
@@ -7605,6 +7766,8 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
         payload={"call_sid": call_sid, "analysis": analysis, "recording_url": recording_url},
     )
     route_new_agent_signals_once(db, limit=25)
+    if property_id:
+        trigger_agent_pipeline_refresh(db, property_id=int(property_id), reason="call_analysis")
     return {"job_id": job_id, "status": "completed", "call_sid": call_sid, "next_step": analysis.get("next_best_step")}
 
 
@@ -8163,19 +8326,31 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30):
             (cutoff,),
         ).fetchall()
         system_numbers = _system_phone_numbers(db)
+        phone_resolution_cache = {}
         threads = {}
         for r in rows:
             direction = str(r["direction"] or "").strip().lower()
             counterpart = _thread_counterpart(system_numbers, direction, r["from_number"], r["to_number"])
             if not counterpart:
                 continue
-            key = f"{int(r['property_id'] or 0)}:{int(r['person_id'] or 0)}:{counterpart}"
+            resolved_property_id = int(r["property_id"] or 0)
+            resolved_person_id = int(r["person_id"] or 0)
+            phone_key = normalize_phone(counterpart)
+            if phone_key and (not resolved_property_id):
+                cached_resolution = phone_resolution_cache.get(phone_key)
+                if cached_resolution is None:
+                    cached_resolution = resolve_property_context_by_phone(db, phone_key, search_reisift=True)
+                    phone_resolution_cache[phone_key] = cached_resolution
+                if cached_resolution:
+                    resolved_property_id = int(cached_resolution.get("property_id") or 0)
+                    resolved_person_id = int(cached_resolution.get("person_id") or 0)
+            key = f"{resolved_property_id}:{resolved_person_id}:{counterpart}"
             t = threads.setdefault(
                 key,
                 {
                     "thread_key": key,
-                    "property_id": r["property_id"],
-                    "person_id": r["person_id"],
+                    "property_id": resolved_property_id or None,
+                    "person_id": resolved_person_id or None,
                     "counterpart": counterpart,
                     "messages": [],
                 },
@@ -8185,6 +8360,7 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30):
         processed = 0
         analyzed = 0
         failed = 0
+        touched_property_ids = set()
         details = []
         for t in thread_list[: max(1, int(limit_threads))]:
             processed += 1
@@ -8230,6 +8406,8 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30):
                     payload={"thread_key": t["thread_key"], "counterpart": t["counterpart"], "analysis": analysis, "messages": msgs[-30:]},
                 )
                 analyzed += 1
+                if int(t.get("property_id") or 0):
+                    touched_property_ids.add(int(t["property_id"]))
                 details.append({"thread_key": t["thread_key"], "status": "analyzed", "recommended_next_step": recommended})
             except Exception as exc:
                 failed += 1
@@ -8258,6 +8436,8 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30):
                 (t["thread_key"], t["property_id"], t["person_id"], t["counterpart"], last_at, len(msgs), transcript_hash),
             )
         route_summary = route_new_agent_signals_once(db, limit=200)
+        for pid in list(sorted(touched_property_ids))[:25]:
+            trigger_agent_pipeline_refresh(db, property_id=pid, reason="sms_analysis")
         db.commit()
         return {"ok": True, "processed": processed, "analyzed": analyzed, "failed": failed, "routed": route_summary.get("routed", 0), "details": details[:50]}
     except Exception as exc:
@@ -8467,7 +8647,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
 
     comm_rows = db.execute(
         """
-        SELECT c.id, c.property_id, c.person_id, c.channel, c.direction, c.from_number, c.to_number, c.body, c.sent_at
+        SELECT c.id, c.property_id, c.person_id, c.channel, c.direction, c.from_number, c.to_number, c.body, c.sent_at, c.external_id
         FROM communications c
         WHERE c.sent_at >= ?
           AND upper(c.channel) = 'SMS'
@@ -8476,7 +8656,11 @@ def build_today_lead_watch_snapshot(db, limit=60):
         """,
         (cutoff,),
     ).fetchall()
+    sms_external_ids = set()
     for c in comm_rows:
+        external_id = str(c["external_id"] or "").strip()
+        if external_id:
+            sms_external_ids.add(external_id)
         body = str(c["body"] or "")
         candidates = extract_address_candidates(body)
         from_num = normalize_phone(c["from_number"] if "from_number" in c.keys() else "")
@@ -8514,7 +8698,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
 
     event_rows = db.execute(
         """
-        SELECT id, event_type, from_number, to_number, processing_status, payload_json, received_at
+        SELECT id, event_type, from_number, to_number, sms_id, processing_status, payload_json, received_at
         FROM smrtphone_webhook_events
         WHERE received_at >= ?
         ORDER BY id DESC
@@ -8529,6 +8713,11 @@ def build_today_lead_watch_snapshot(db, limit=60):
         direction = "inbound"
         if "outgoing" in (event_name or "").lower() or (str(e["event_type"] or "").lower() == "outbound"):
             direction = "outbound"
+        sms_id = str(payload.get("smsId") or payload.get("sms_id") or e["sms_id"] or "").strip()
+        if str(e["event_type"] or "").lower() == "status":
+            continue
+        if sms_id and sms_id in sms_external_ids:
+            continue
         candidates = extract_address_candidates(msg)
         classification_info = classify_unknown_contact_text(msg)
         phone_norm = normalize_phone(e["from_number"] if direction == "inbound" else e["to_number"])
@@ -8565,7 +8754,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
             property_id=prop_id,
             person_id=person_id,
             direction=direction,
-            event_type="SMS" if str(e["event_type"] or "").lower() in {"inbound", "outbound", "status"} else "CALL",
+            event_type="SMS",
             source=f"smrtphone:{str(e['event_type'] or '').lower()}",
             classification=(ctx["classification"] if ctx else classification_info["classification"]),
             address_hint=(candidates[0] if candidates else ""),
@@ -8783,6 +8972,19 @@ def build_today_lead_watch_snapshot(db, limit=60):
             or (v["classification"] or "unknown")
         )
         ignore_agent2 = int(resolution.get("ignore_agent2") or 0)
+        if not effective_property_uuid:
+            for ph in list(v.get("phones") or [])[:4]:
+                ctx = get_cached_contact_context(db, ph)
+                if not ctx:
+                    continue
+                cached_uuid = normalize_uuid(ctx["reisift_property_uuid"] or "")
+                if cached_uuid:
+                    effective_property_uuid = cached_uuid
+                    if not effective_property_id and int(ctx["property_id"] or 0):
+                        effective_property_id = int(ctx["property_id"] or 0)
+                    if not v["label"] and str(ctx["reisift_full_address"] or "").strip():
+                        v["label"] = str(ctx["reisift_full_address"] or "").strip()
+                    break
         referral_data = {}
         for hint in list(v["address_hints"]):
             rk = normalize_address_key(hint)
@@ -8842,6 +9044,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
                 "label": effective_label,
                 "property_id": effective_property_id,
                 "reisift_property_uuid": effective_property_uuid,
+                "open_record_url": _sift_record_url(effective_property_uuid),
                 "person_id": v["person_id"] or 0,
                 "classification": effective_classification,
                 "sources": sorted(list(v["sources"]))[:6],
@@ -10960,6 +11163,61 @@ def fetch_reisift_referrals():
     return {"count": total or len(results), "status_slug": status_slug, "results": results}
 
 
+def reisift_search_properties_by_phone(token, phone_raw, limit=10):
+    phone_norm = normalize_phone(phone_raw)
+    if not phone_norm:
+        return []
+    body = {
+        "limit": max(1, min(50, int(limit or 10))),
+        "offset": 0,
+        "ordering": "-owner_updated",
+        "query": {"must": {"search": phone_norm}},
+    }
+    response = requests.post(
+        f"{REISIFT_BASE_URL}/api/internal/property/",
+        headers=reisift_auth_headers(token, {"x-http-method-override": "GET"}),
+        json=body,
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json() if response.headers.get("content-type", "").lower().startswith("application/json") else {}
+    rows = payload.get("results") if isinstance(payload, dict) else []
+    out = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        address = row.get("address") if isinstance(row.get("address"), dict) else {}
+        full_address = (
+            str(address.get("full_address") or "").strip()
+            or ", ".join(
+                [x for x in [address.get("street"), address.get("city"), address.get("state"), address.get("zip")] if x]
+            ).strip()
+        )
+        owners = row.get("owners") if isinstance(row.get("owners"), list) else []
+        owner_names = []
+        for owner in owners:
+            if not isinstance(owner, dict):
+                continue
+            full_name = (owner.get("full_name") or "").strip()
+            if full_name:
+                owner_names.append(full_name)
+                continue
+            candidate = " ".join([x for x in [(owner.get("first_name") or "").strip(), (owner.get("last_name") or "").strip()] if x]).strip()
+            if candidate:
+                owner_names.append(candidate)
+        out.append(
+            {
+                "uuid": normalize_uuid(row.get("uuid") or ""),
+                "status": str(row.get("status") or "").strip(),
+                "full_address": full_address,
+                "created_at": str(row.get("created") or "").strip(),
+                "updated_at": str(row.get("updated") or row.get("owner_updated") or "").strip(),
+                "owner_names": owner_names,
+            }
+        )
+    return out
+
+
 def reisift_search_referral_rows(token, status_slug):
     headers = {
         "Authorization": f"Bearer {token}",
@@ -12493,6 +12751,38 @@ def run_lead_monitor_once(db, source="manual", property_id=None):
     return {"run_id": run_id, **summary}
 
 
+def trigger_agent_pipeline_refresh(db, property_id=None, reason=""):
+    result = {"lead_monitor": {}, "reconcile": {}, "reason": (reason or "").strip()}
+    try:
+        if property_id:
+            result["lead_monitor"] = run_lead_monitor_once(db, source="agent1_event", property_id=int(property_id))
+        else:
+            result["lead_monitor"] = {"skipped": True}
+    except Exception as exc:
+        result["lead_monitor"] = {"error": str(exc)}
+        log_app_error(
+            db,
+            source="agent_pipeline_refresh",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="trigger_agent_pipeline_refresh.lead_monitor",
+            status_code=500,
+        )
+    try:
+        result["reconcile"] = run_agent3_lead_watch_reconcile(db, limit=120)
+    except Exception as exc:
+        result["reconcile"] = {"error": str(exc)}
+        log_app_error(
+            db,
+            source="agent_pipeline_refresh",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="trigger_agent_pipeline_refresh.reconcile",
+            status_code=500,
+        )
+    return result
+
+
 @app.route("/")
 def dashboard():
     ensure_db()
@@ -12738,12 +13028,85 @@ def agents_page():
     }
     signals = db.execute(
         """
-        SELECT id, source_type, source_key, property_id, person_id, intent, sentiment, confidence, recommended_next_step, routing_status, summary_text, updated_at
+        SELECT id, source_type, source_key, property_id, person_id, intent, sentiment, confidence, recommended_next_step, routing_status, summary_text, payload_json, updated_at
         FROM agent_signals
         ORDER BY id DESC
         LIMIT 100
         """
     ).fetchall()
+
+    def _property_uuid_map(ids):
+        out = {}
+        clean_ids = [int(x) for x in ids if int(x or 0) > 0]
+        if not clean_ids:
+            return out
+        placeholders = ",".join(["?"] * len(clean_ids))
+        try:
+            rows = db.execute(
+                f"SELECT id, reisift_property_uuid FROM properties WHERE id IN ({placeholders})",
+                tuple(clean_ids),
+            ).fetchall()
+            for r in rows:
+                out[int(r["id"])] = normalize_uuid(r["reisift_property_uuid"] or "")
+        except Exception:
+            return {}
+        return out
+
+    def _resolve_uuid_from_numbers(numbers, fallback_property_id=None):
+        if int(fallback_property_id or 0) > 0 and property_uuid_by_id.get(int(fallback_property_id), ""):
+            return property_uuid_by_id.get(int(fallback_property_id), "")
+        for raw in numbers:
+            norm = normalize_phone(raw)
+            if not norm:
+                continue
+            ctx = get_cached_contact_context(db, norm)
+            if not ctx:
+                continue
+            cached_uuid = normalize_uuid(ctx["reisift_property_uuid"] or "")
+            if cached_uuid:
+                return cached_uuid
+            ctx_pid = int(ctx["property_id"] or 0)
+            if ctx_pid and property_uuid_by_id.get(ctx_pid, ""):
+                return property_uuid_by_id.get(ctx_pid, "")
+        return ""
+
+    all_property_ids = set()
+    for r in call_jobs:
+        if int(r["property_id"] or 0):
+            all_property_ids.add(int(r["property_id"]))
+    for r in signals:
+        if int(r["property_id"] or 0):
+            all_property_ids.add(int(r["property_id"]))
+    property_uuid_by_id = _property_uuid_map(sorted(list(all_property_ids)))
+
+    call_jobs_enriched = []
+    for row in call_jobs:
+        item = dict(row)
+        phone_candidates = [item.get("from_number"), item.get("to_number")]
+        uuid = _resolve_uuid_from_numbers(phone_candidates, fallback_property_id=item.get("property_id"))
+        item["reisift_property_uuid"] = uuid
+        item["open_record_url"] = _sift_record_url(uuid)
+        call_jobs_enriched.append(item)
+
+    signals_enriched = []
+    for row in signals:
+        item = dict(row)
+        payload_obj = parse_json_object(item.get("payload_json") or "{}")
+        phone_candidates = []
+        for key in ["from", "to", "counterpart", "phone", "counterpart_number"]:
+            val = extract_first_string_by_keys(payload_obj, [key])
+            if val:
+                phone_candidates.append(val)
+        # Fallback parse from source key (e.g., sms_thread:0:0:9734492338)
+        source_key = str(item.get("source_key") or "")
+        source_tail = source_key.rsplit(":", 1)[-1] if ":" in source_key else ""
+        if normalize_phone(source_tail):
+            phone_candidates.append(source_tail)
+        uuid = _resolve_uuid_from_numbers(phone_candidates, fallback_property_id=item.get("property_id"))
+        item["reisift_property_uuid"] = uuid
+        item["open_record_url"] = _sift_record_url(uuid)
+        signals_enriched.append(item)
+
     advisor_snapshot = build_agent_advisor_snapshot(db, window_hours=72)
     advisor_recommendations = build_agent_advisor_recommendations(advisor_snapshot)
     advisor_summary_row = db.execute(
@@ -12776,9 +13139,9 @@ def agents_page():
         latest_run=latest_run,
         latest_run_summary=latest_run_summary,
         call_job_summary=call_job_summary,
-        call_jobs=call_jobs,
+        call_jobs=call_jobs_enriched,
         signal_summary=signal_summary,
-        signals=signals,
+        signals=signals_enriched,
         advisor_snapshot=advisor_snapshot,
         advisor_recommendations=advisor_recommendations,
         advisor_summary_row=advisor_summary_row,
@@ -13073,9 +13436,12 @@ def run_agent3_lead_watch_resolve_route():
                     source="agent3_manual_resolution",
                     confidence=0.95,
                     notes=f"lead_key={lead_key}",
+                    reisift_property_uuid=approved_property_uuid,
+                    last_reisift_lookup_at=format_db_time(datetime.utcnow()),
                 )
         remap = _retarget_unmapped_signals_for_lead_key(db, lead_key, approved_property_id)
         route_new_agent_signals_once(db, limit=100)
+        trigger_agent_pipeline_refresh(db, property_id=int(approved_property_id), reason="agent3_manual_resolution")
     db.commit()
     return redirect(url_for("agents_page", notice=f"Lead resolution saved for {lead_key}."))
 
@@ -17287,10 +17653,17 @@ def smrtphone_inbound_webhook():
     counterparty_number = from_number if direction == "Inbound" else to_number
     person_id = find_person_id_by_phone(db, counterparty_number)
     property_id = None
+    reisift_context = {}
     if str(payload.get("property_id", "")).isdigit():
         property_id = int(payload["property_id"])
     elif person_id:
         property_id = find_property_id_for_person(db, person_id)
+    if not property_id and counterparty_number:
+        reisift_context = resolve_property_context_by_phone(db, counterparty_number, search_reisift=True)
+        if int(reisift_context.get("property_id") or 0):
+            property_id = int(reisift_context.get("property_id") or 0)
+            if not person_id and int(reisift_context.get("person_id") or 0):
+                person_id = int(reisift_context.get("person_id") or 0)
     if not property_id:
         recent_link = db.execute(
             """
@@ -17357,7 +17730,7 @@ def smrtphone_inbound_webhook():
             sms_id=sms_id,
             from_number=from_number,
             to_number=to_number,
-            error_text=f"Unresolved property_id for {direction.lower()} message (event={event_name or 'unknown'}); classified={signal['classification']}",
+            error_text=f"Context unresolved for {direction.lower()} message (event={event_name or 'unknown'}); classified={signal['classification']}",
         )
         db.commit()
         return jsonify({"ok": True, "stored_unresolved": True, "classification": signal["classification"]}), 200
@@ -17372,6 +17745,10 @@ def smrtphone_inbound_webhook():
         source="smrtphone_webhook_resolved",
         confidence=0.9,
         notes=f"direction={direction}; event={event_name or event_type}",
+        reisift_property_uuid=normalize_uuid(reisift_context.get("reisift_property_uuid") or ""),
+        reisift_full_address=str(reisift_context.get("reisift_full_address") or "").strip(),
+        reisift_property_status=str(reisift_context.get("reisift_property_status") or "").strip(),
+        last_reisift_lookup_at=format_db_time(datetime.utcnow()),
     )
 
     existing = None
@@ -17472,6 +17849,8 @@ def smrtphone_inbound_webhook():
         to_number=to_number,
         communication_id=cur.lastrowid,
     )
+    if property_id:
+        trigger_agent_pipeline_refresh(db, property_id=int(property_id), reason=f"smrtphone_{event_type}")
     db.commit()
     return jsonify({"ok": True, "communication_id": cur.lastrowid}), 201
 
@@ -17671,6 +18050,7 @@ def smrtphone_call_completed_webhook():
     call_outcome = extract_first_string_by_keys(payload, ["callOutcome", "call_outcome", "outcome", "status"])
     direct_recording_url = extract_first_string_by_keys(payload, ["recordingUrl", "recording_url", "recording", "url"])
     normalized_outcome = (call_outcome or "").strip().lower()
+    resolved_reisift_context = {}
 
     def _resolve_property_person():
         _person_id = find_person_id_by_phone(db, from_number) or find_person_id_by_phone(db, to_number)
@@ -17679,6 +18059,16 @@ def smrtphone_call_completed_webhook():
             _property_id = int(payload.get("property_id"))
         elif _person_id:
             _property_id = find_property_id_for_person(db, _person_id)
+        if not _property_id:
+            for candidate in [from_number, to_number]:
+                ctx = resolve_property_context_by_phone(db, candidate, search_reisift=True)
+                if int(ctx.get("property_id") or 0):
+                    _property_id = int(ctx.get("property_id") or 0)
+                    if not _person_id and int(ctx.get("person_id") or 0):
+                        _person_id = int(ctx.get("person_id") or 0)
+                    if not resolved_reisift_context:
+                        resolved_reisift_context.update(ctx)
+                    break
         if not _property_id:
             outbound = db.execute(
                 """
@@ -17761,6 +18151,10 @@ def smrtphone_call_completed_webhook():
             source="smrtphone_call_completed",
             confidence=0.9,
             notes=f"call_sid={call_sid}",
+            reisift_property_uuid=normalize_uuid(resolved_reisift_context.get("reisift_property_uuid") or ""),
+            reisift_full_address=str(resolved_reisift_context.get("reisift_full_address") or "").strip(),
+            reisift_property_status=str(resolved_reisift_context.get("reisift_property_status") or "").strip(),
+            last_reisift_lookup_at=format_db_time(datetime.utcnow()),
         )
 
     recording_url = (direct_recording_url or "").strip()
@@ -17819,6 +18213,7 @@ def smrtphone_call_completed_webhook():
             payload={"call_sid": call_sid, "call_outcome": normalized_outcome, "reason": reason},
         )
         route_new_agent_signals_once(db, limit=25)
+        trigger_agent_pipeline_refresh(db, property_id=int(property_id), reason="call_completed_no_answer")
 
     log_smrtphone_webhook_event(
         db,
@@ -18137,6 +18532,23 @@ def integrations_agents_rerun_today_api():
     db.commit()
     # Agent 1 SMS pass for last day.
     sms_res = run_sms_analysis_once(lookback_days=1, limit_threads=250)
+    # Agent 2 refresh across today's affected lead set only.
+    pre_snapshot = build_today_lead_watch_snapshot(db, limit=250)
+    touched_property_ids = sorted(
+        {
+            int(item.get("property_id") or 0)
+            for item in (pre_snapshot.get("items") or [])
+            if int(item.get("property_id") or 0) > 0
+        }
+    )
+    lead_monitor_runs = []
+    for pid in touched_property_ids[:120]:
+        lead_monitor_runs.append(run_lead_monitor_once(db, source="rerun_today", property_id=pid))
+    lead_monitor_res = {
+        "run_count": len(lead_monitor_runs),
+        "property_ids": touched_property_ids[:120],
+        "runs": lead_monitor_runs[:30],
+    }
     # Agent 3 reconciliation + snapshot.
     recon = run_agent3_lead_watch_reconcile(db, limit=200)
     snapshot = build_today_lead_watch_snapshot(db, limit=200)
@@ -18147,6 +18559,7 @@ def integrations_agents_rerun_today_api():
             "call_cutoff": call_rerun.get("cutoff", ""),
             "call_rerun": call_rerun,
             "sms": sms_res,
+            "lead_monitor": lead_monitor_res,
             "reconcile": recon,
             "snapshot": snapshot,
         }

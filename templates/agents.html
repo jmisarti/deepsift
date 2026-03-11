@@ -134,6 +134,7 @@
                 <th>ID</th>
                 <th>Call SID</th>
                 <th>Link</th>
+                <th>Open Record</th>
                 <th>Fetch</th>
                 <th>Analysis</th>
                 <th>Summary</th>
@@ -150,6 +151,13 @@
                     <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">Person {{ row.person_id }}</a>
                     {% elif row.property_id %}
                     <a href="{{ url_for('property_detail', property_id=row.property_id) }}">Property {{ row.property_id }}</a>
+                    {% else %}
+                    -
+                    {% endif %}
+                </td>
+                <td>
+                    {% if row.open_record_url %}
+                    <a href="{{ row.open_record_url }}" target="_blank">Open in Sift</a>
                     {% else %}
                     -
                     {% endif %}
@@ -207,6 +215,7 @@
                 <th>ID</th>
                 <th>Source</th>
                 <th>Link</th>
+                <th>Open Record</th>
                 <th>Intent</th>
                 <th>Sentiment</th>
                 <th>Confidence</th>
@@ -225,6 +234,13 @@
                     <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">Person {{ row.person_id }}</a>
                     {% elif row.property_id %}
                     <a href="{{ url_for('property_detail', property_id=row.property_id) }}">Property {{ row.property_id }}</a>
+                    {% else %}
+                    -
+                    {% endif %}
+                </td>
+                <td>
+                    {% if row.open_record_url %}
+                    <a href="{{ row.open_record_url }}" target="_blank">Open in Sift</a>
                     {% else %}
                     -
                     {% endif %}
@@ -435,6 +451,9 @@
                         {% if row.reisift_property_uuid %}
                         ReiSIFT UUID: {{ row.reisift_property_uuid }}<br>
                         {% endif %}
+                        {% if row.open_record_url %}
+                        <a href="{{ row.open_record_url }}" target="_blank">Open in Sift</a><br>
+                        {% endif %}
                         {% if row.phones %}
                         Phone(s): {{ row.phones|join(', ') }}
                         {% endif %}
@@ -509,6 +528,9 @@
                         No Agent 2 resolution data yet.
                         {% endif %}
                     </td>
+                </tr>
+                <tr>
+                    <td colspan="7" style="padding:0.25rem 0; background:#ffffff; border:none;"></td>
                 </tr>
                 {% endfor %}
             </tbody>

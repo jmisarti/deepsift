@@ -93,6 +93,7 @@
                             <tr>
                                 <th>Property</th>
                                 <th>Push Status</th>
+                                <th>Referral Mgmt Status</th>
                                 <th>Last Sent</th>
                             </tr>
                         </thead>
@@ -101,6 +102,7 @@
                             <tr>
                                 <td><a href="{{ url_for('referral_property_detail', property_uuid=p.property_uuid) }}">{{ p.full_address }}</a></td>
                                 <td><span class="pill">{{ p.last_push_status }}</span></td>
+                                <td>{% if p.referral_management_status %}<span class="pill">{{ p.referral_management_status }}</span>{% else %}-{% endif %}</td>
                                 <td>{{ p.last_sent_at|fmt_est_datetime if p.last_sent_at else "-" }}</td>
                             </tr>
                             {% endfor %}

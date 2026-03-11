@@ -214,7 +214,7 @@ AGENT_DEFINITIONS = [
         "status": "In Progress",
     },
 ]
-REFERRAL_STATUSES = ["Untouched", "Referred", "Under Contract", "Dead", "Other"]
+REFERRAL_STATUSES = ["Untouched", "Referred", "Appointment Set", "Under Contract", "Closed", "Dead", "Other"]
 LEAD_ACTION_STATUSES = ["Pending", "Approved", "Completed", "Dismissed"]
 LEAD_ACTION_PRIORITIES = ["Low", "Medium", "High"]
 LEAD_ACTION_TYPES = [
@@ -13060,7 +13060,9 @@ def referral_dashboard():
             rpa.property_uuid,
             rpa.status AS push_status,
             rpa.created_at AS push_created_at,
-            COALESCE(rf.full_address, rpa.property_uuid) AS full_address
+            COALESCE(rf.full_address, rpa.property_uuid) AS full_address,
+            COALESCE(rf.referral_status, 'Untouched') AS referral_status,
+            rf.winning_realtor_id
         FROM referral_realtors rr
         LEFT JOIN referral_push_activity rpa ON rpa.realtor_id = rr.id
         LEFT JOIN reisift_referrals rf ON rf.property_uuid = rpa.property_uuid
@@ -13096,12 +13098,16 @@ def referral_dashboard():
             bucket["last_sent_at"] = str(row["push_created_at"] or "")
         if prop_uuid not in bucket["_seen_props"]:
             bucket["_seen_props"].add(prop_uuid)
+            row_status = str(row["referral_status"] or "").strip() or "Untouched"
+            winner_id = int(row["winning_realtor_id"]) if str(row["winning_realtor_id"] or "").isdigit() else None
+            show_status = winner_id == realtor_id and row_status in {"Appointment Set", "Under Contract", "Closed"}
             bucket["properties"].append(
                 {
                     "property_uuid": prop_uuid,
                     "full_address": str(row["full_address"] or prop_uuid).strip(),
                     "last_push_status": str(row["push_status"] or "").strip() or "unknown",
                     "last_sent_at": str(row["push_created_at"] or "").strip(),
+                    "referral_management_status": row_status if show_status else "",
                 }
             )
     for bucket in realtor_activity:

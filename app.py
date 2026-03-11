@@ -9048,7 +9048,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
         recommended = "Continue monitoring"
         if effective_classification in {"spam", "solicitor"} or ignore_agent2:
             recommended = "No Agent 2 action (monitor only)"
-        elif effective_property_id:
+        elif effective_property_id or effective_property_uuid:
             recommended = "Route to Agent 2 playbook for next touchpoint"
         else:
             recommended = "Resolve property link (address/phone) before Agent 2 action"

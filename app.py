@@ -18872,7 +18872,7 @@ def integrations_agents_reset_associations_api():
 
     # Remove hard links that were collapsing many leads into Property 2 / Person 4.
     counts["communications_property_null"] = _count_update(
-        "UPDATE communications SET property_id = NULL WHERE property_id = ?",
+        "UPDATE communications SET property_id = 0 WHERE property_id = ?",
         (property_id,),
     )
     counts["communications_person_null"] = _count_update(

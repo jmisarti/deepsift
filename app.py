@@ -144,6 +144,7 @@ CALL_RECORDING_WORKER_STARTED = False
 SMS_ANALYSIS_WORKER_STARTED = False
 WEBSITE_LEADS_HOLD_WORKER_STARTED = False
 AGENT_REFRESH_WORKER_STARTED = False
+SYSTEM_PHONE_CACHE = {"numbers": set(), "expires_at": None}
 NJ_COUNTIES = [
     "Atlantic",
     "Bergen",
@@ -8277,6 +8278,27 @@ def _infer_system_numbers_from_smrt_events(db, cutoff=None):
     return vals
 
 
+def _known_system_numbers(db, refresh_seconds=300):
+    base = set(_system_phone_numbers(db))
+    now_utc = datetime.utcnow()
+    try:
+        expires_at = SYSTEM_PHONE_CACHE.get("expires_at")
+        cached_numbers = set(SYSTEM_PHONE_CACHE.get("numbers") or set())
+        if isinstance(expires_at, datetime) and expires_at > now_utc and cached_numbers:
+            return base | cached_numbers
+    except Exception:
+        pass
+    inferred = set()
+    try:
+        cutoff = format_db_time(now_utc - timedelta(days=30))
+        inferred = _infer_system_numbers_from_smrt_events(db, cutoff=cutoff)
+    except Exception:
+        inferred = set()
+    SYSTEM_PHONE_CACHE["numbers"] = set(inferred)
+    SYSTEM_PHONE_CACHE["expires_at"] = now_utc + timedelta(seconds=max(60, int(refresh_seconds or 300)))
+    return base | inferred
+
+
 def _thread_counterpart(system_numbers, direction, from_number, to_number):
     from_norm = normalize_phone(from_number)
     to_norm = normalize_phone(to_number)
@@ -8294,12 +8316,7 @@ def _thread_counterpart(system_numbers, direction, from_number, to_number):
 def _counterparty_candidates(db, from_number, to_number):
     from_norm = normalize_phone(from_number)
     to_norm = normalize_phone(to_number)
-    system_numbers = set(_system_phone_numbers(db))
-    # Expand known owned numbers from recent webhook telemetry.
-    try:
-        system_numbers |= _infer_system_numbers_from_smrt_events(db)
-    except Exception:
-        pass
+    system_numbers = _known_system_numbers(db, refresh_seconds=300)
     candidates = []
     for n in [from_norm, to_norm]:
         if n and n not in system_numbers and n not in candidates:
@@ -13468,12 +13485,7 @@ def agents_page():
             return {}
         return out
 
-    system_numbers = set(_system_phone_numbers(db))
-    try:
-        cutoff = format_db_time(datetime.utcnow() - timedelta(days=30))
-        system_numbers |= _infer_system_numbers_from_smrt_events(db, cutoff=cutoff)
-    except Exception:
-        pass
+    system_numbers = _known_system_numbers(db, refresh_seconds=300)
     cached_ctx_by_phone = {}
 
     def _resolve_uuid_from_numbers(numbers, fallback_property_id=None):
@@ -19000,8 +19012,10 @@ def integrations_agents_reset_associations_api():
     if not integration_auth_ok(db, request):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     payload = request.get_json(silent=True) or {}
-    property_id = int(payload.get("property_id") or 2)
-    person_id = int(payload.get("person_id") or 4)
+    property_id = int(payload.get("property_id") or 0)
+    person_id = int(payload.get("person_id") or 0)
+    if property_id <= 0:
+        return jsonify({"ok": False, "error": "property_id is required"}), 400
     rerun = bool(payload.get("rerun", True))
     counts = {}
 

@@ -8966,6 +8966,10 @@ def start_sms_analysis_worker():
 
 def build_today_lead_watch_snapshot(db, limit=60):
     cutoff_dt = est_yesterday_start_utc()
+    baseline_raw = str(get_setting(db, "agent_lead_watch_baseline_utc", "") or "").strip()
+    baseline_dt = parse_db_time(baseline_raw) if baseline_raw else None
+    if baseline_dt and baseline_dt > cutoff_dt:
+        cutoff_dt = baseline_dt
     cutoff = format_db_time(cutoff_dt)
     leads = {}
     system_numbers = _known_system_numbers(db, refresh_seconds=300)
@@ -15032,6 +15036,8 @@ def clear_agent_logs_route():
     db = get_db()
     ajax = _is_ajax_request(request)
     try:
+        baseline_utc = format_db_time(datetime.utcnow())
+        set_setting(db, "agent_lead_watch_baseline_utc", baseline_utc)
         c1 = db.execute("DELETE FROM lead_management_actions")
         c2 = db.execute("DELETE FROM lead_monitor_runs")
         c3 = db.execute("DELETE FROM agent_advisor_logs")
@@ -15044,7 +15050,8 @@ def clear_agent_logs_route():
             f"lead_monitor_runs={int(c2.rowcount or 0)}, "
             f"agent_advisor_logs={int(c3.rowcount or 0)}, "
             f"agent3_lead_resolutions={int(c4.rowcount or 0)}, "
-            f"agent2_learning_feedback={int(c5.rowcount or 0)}."
+            f"agent2_learning_feedback={int(c5.rowcount or 0)}. "
+            f"Agent3 baseline reset to {baseline_utc} UTC."
         )
         if ajax:
             return jsonify(

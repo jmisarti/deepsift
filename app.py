@@ -98,6 +98,19 @@ app.config["SESSION_COOKIE_SECURE"] = env_flag("SESSION_COOKIE_SECURE", False)
 
 SMRTPHONE_SEND_URL = os.getenv("SMRTPHONE_SEND_URL", "https://phone.smrt.studio/sms/send").strip()
 SMRTPHONE_FROM_NUMBER = os.getenv("SMRTPHONE_FROM_NUMBER", "19088679098").strip() or "19088679098"
+SMRTPHONE_OWNED_NUMBERS = os.getenv("SMRTPHONE_OWNED_NUMBERS", "").strip()
+SMRTPHONE_OWNED_DEFAULT_NUMBERS = [
+    "6829002099",
+    "9088679098",
+    "9733975960",
+    "9733975244",
+    "9083650901",
+    "9177175632",
+    "9086631158",
+    "9735471692",
+    "9732734272",
+    "9083410891",
+]
 SKIPSHERPA_BASE_URL = "https://skipsherpa.com"
 SKIPSHERPA_API_KEY = os.getenv("SKIPSHERPA_API_KEY", "").strip()
 REISIFT_BASE_URL = os.getenv("REISIFT_BASE_URL", "https://apiv2.reisift.io")
@@ -1744,17 +1757,20 @@ def transcribe_recording_with_openai(audio_bytes, filename="call_recording.mp3",
     return {"transcript": transcript, "raw": payload}
 
 
-def _infer_call_direction_from_numbers(db, from_number, to_number):
-    system_numbers = set(_system_phone_numbers(db))
-    try:
-        system_numbers.update(_infer_system_numbers_from_smrt_events(db))
-    except Exception:
-        pass
+def _infer_call_direction_from_numbers(db, from_number, to_number, agent_user_name=""):
+    system_numbers = _known_system_numbers(db, refresh_seconds=300)
     from_norm = normalize_phone(from_number)
     to_norm = normalize_phone(to_number)
     if from_norm and from_norm in system_numbers and (not to_norm or to_norm not in system_numbers):
         return "Outbound"
     if to_norm and to_norm in system_numbers and (not from_norm or from_norm not in system_numbers):
+        return "Inbound"
+    # smrtPhone often includes userName for team-originated outbound calls.
+    if (agent_user_name or "").strip() and from_norm:
+        return "Outbound"
+    if from_norm and not to_norm and from_norm in system_numbers:
+        return "Outbound"
+    if to_norm and not from_norm and to_norm in system_numbers:
         return "Inbound"
     return "Unknown"
 
@@ -1895,8 +1911,29 @@ def _short_text(value, max_len=180):
     return text[: max_len - 1].rstrip() + "..."
 
 
+def _infer_call_direction_without_db(context):
+    from_norm = normalize_phone(context.get("from_number") or "")
+    to_norm = normalize_phone(context.get("to_number") or "")
+    owned = set()
+    env_owned = str(SMRTPHONE_OWNED_NUMBERS or "").replace("\n", ",").replace(";", ",")
+    for raw in [SMRTPHONE_FROM_NUMBER] + SMRTPHONE_OWNED_DEFAULT_NUMBERS + [x.strip() for x in env_owned.split(",") if x.strip()]:
+        n = normalize_phone(raw)
+        if n:
+            owned.add(n)
+    if from_norm and from_norm in owned and (not to_norm or to_norm not in owned):
+        return "Outbound"
+    if to_norm and to_norm in owned and (not from_norm or from_norm not in owned):
+        return "Inbound"
+    return "Unknown"
+
+
 def compose_call_summary(context, analysis, transcript_text):
-    direction = (analysis.get("call_direction") or context.get("direction") or "Unknown").strip().title()
+    direction_candidate = (analysis.get("call_direction") or "").strip().title()
+    if direction_candidate in {"", "Unknown", "Undetermined"}:
+        direction_candidate = (context.get("direction") or "").strip().title()
+    if direction_candidate in {"", "Unknown", "Undetermined"}:
+        direction_candidate = _infer_call_direction_without_db(context)
+    direction = direction_candidate or "Unknown"
     outcome = (analysis.get("call_outcome_type") or "").strip().title()
     voicemail_left = (analysis.get("voicemail_left") or "").strip().title()
     caller = (context.get("caller_name") or "").strip() or ("Team" if direction == "Outbound" else "Lead")
@@ -7740,6 +7777,10 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
         or payload_obj.get("call_outcome")
         or ""
     ).strip()
+    agent_user_name = (
+        extract_first_string_by_keys(webhook, ["userName", "user_name", "agentName"])
+        or ""
+    ).strip()
     caller_name = (
         extract_first_string_by_keys(webhook, ["userName", "user_name", "agentName", "callerName"])
         or extract_first_string_by_keys(webhook, ["callerIdName", "caller_id_name"])
@@ -7753,7 +7794,27 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
         event_caller, event_callee = _lookup_call_party_names_from_smrt_events(db, call_sid)
         caller_name = caller_name or event_caller
         callee_name = callee_name or event_callee
-    call_direction = _infer_call_direction_from_numbers(db, from_number, to_number)
+    call_direction = _infer_call_direction_from_numbers(db, from_number, to_number, agent_user_name=agent_user_name)
+
+    # Keep call-job context fresh even when initial webhook could not map property/person.
+    if not property_id:
+        for candidate in _counterparty_candidates(db, from_number, to_number):
+            resolved_ctx = resolve_property_context_by_phone(db, candidate, search_reisift=True, force_reisift=True) or {}
+            if int(resolved_ctx.get("property_id") or 0):
+                property_id = int(resolved_ctx.get("property_id") or 0)
+                if not person_id and int(resolved_ctx.get("person_id") or 0):
+                    person_id = int(resolved_ctx.get("person_id") or 0)
+                db.execute(
+                    """
+                    UPDATE call_recording_jobs
+                    SET property_id = COALESCE(?, property_id),
+                        person_id = COALESCE(?, person_id),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (property_id, person_id, job_id),
+                )
+                break
     analysis_context = {
         "direction": call_direction,
         "call_outcome": call_outcome,
@@ -8305,7 +8366,15 @@ def route_new_agent_signals_once(db, limit=50):
 
 def _system_phone_numbers(db):
     vals = set()
-    for raw in [SMRTPHONE_FROM_NUMBER, get_setting(db, "deep_dive_smrtphone_from", ""), get_setting(db, "referral_smrtphone_from", "")]:
+    configured_owned = []
+    for chunk in [SMRTPHONE_OWNED_NUMBERS, get_setting(db, "smrtphone_owned_numbers", "")]:
+        txt = str(chunk or "").replace("\n", ",").replace(";", ",")
+        configured_owned.extend([p.strip() for p in txt.split(",") if p.strip()])
+    for raw in (
+        [SMRTPHONE_FROM_NUMBER, get_setting(db, "deep_dive_smrtphone_from", ""), get_setting(db, "referral_smrtphone_from", "")]
+        + SMRTPHONE_OWNED_DEFAULT_NUMBERS
+        + configured_owned
+    ):
         n = normalize_phone(raw)
         if n:
             vals.add(n)
@@ -9050,12 +9119,14 @@ def build_today_lead_watch_snapshot(db, limit=60):
             addr_norm = normalize_address_key(candidates[0])
             if addr_norm:
                 lead_key = addr_to_key.get(addr_norm, f"address:{addr_norm}")
+        if not lead_key and phone_candidates:
+            lead_key = f"phone:{phone_candidates[0]}"
         if not lead_key:
             continue
         signal = classify_unknown_contact_text(summary)
         _touch(
             key=lead_key,
-            label=(candidates[0] if candidates else lead_key),
+            label=(candidates[0] if candidates else (f"Phone {phone_candidates[0]}" if phone_candidates else lead_key)),
             occurred_at=str(c["created_at"] or ""),
             property_id=c["property_id"],
             person_id=c["person_id"],

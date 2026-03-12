@@ -1288,7 +1288,38 @@ def _best_reisift_phone_match(results):
     return best
 
 
-def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
+def _get_local_property_uuid(db, property_id):
+    pid = int(property_id or 0)
+    if pid <= 0:
+        return ""
+    try:
+        row = db.execute("SELECT reisift_property_uuid FROM properties WHERE id = ? LIMIT 1", (pid,)).fetchone()
+    except Exception:
+        return ""
+    return normalize_uuid((row["reisift_property_uuid"] if row else "") or "")
+
+
+def _set_local_property_uuid(db, property_id, property_uuid):
+    pid = int(property_id or 0)
+    uid = normalize_uuid(property_uuid or "")
+    if pid <= 0 or not uid:
+        return False
+    try:
+        db.execute(
+            """
+            UPDATE properties
+            SET reisift_property_uuid = ?
+            WHERE id = ?
+              AND (reisift_property_uuid IS NULL OR trim(reisift_property_uuid) = '')
+            """,
+            (uid, pid),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def resolve_property_context_by_phone(db, phone_raw, search_reisift=True, force_reisift=False):
     norm = normalize_phone(phone_raw)
     if not norm:
         return {}
@@ -1301,6 +1332,7 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
         "reisift_owner_name": "",
         "reisift_property_status": "",
         "source": "",
+        "error": "",
     }
     cached = get_cached_contact_context(db, norm)
     if cached:
@@ -1315,7 +1347,7 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
             return out
         # Backoff behavior: avoid hammering ReiSift, but allow periodic retries for unresolved numbers.
         last_lookup_at = parse_db_time(cached["last_reisift_lookup_at"])
-        if last_lookup_at and (datetime.utcnow() - last_lookup_at) < timedelta(hours=6):
+        if (not force_reisift) and last_lookup_at and (datetime.utcnow() - last_lookup_at) < timedelta(hours=6):
             return out
 
     person_id = find_person_id_by_phone(db, norm)
@@ -1359,7 +1391,9 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
             reisift_property_status=out["reisift_property_status"],
             last_reisift_lookup_at=format_db_time(datetime.utcnow()),
         )
-        return out
+        # For forced one-time backfill, keep going if UUID is still missing.
+        if out["reisift_property_uuid"] or not force_reisift:
+            return out
 
     if not search_reisift:
         return out
@@ -1381,6 +1415,8 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
                 ).fetchone()
                 if local_match:
                     out["property_id"] = int(local_match["id"])
+                elif int(out.get("property_id") or 0) > 0:
+                    _set_local_property_uuid(db, int(out["property_id"]), out["reisift_property_uuid"])
             upsert_cached_contact_context(
                 db,
                 norm,
@@ -1397,6 +1433,7 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
                 last_reisift_lookup_at=format_db_time(datetime.utcnow()),
             )
         else:
+            out["source"] = "reisift_phone_search_no_match"
             upsert_cached_contact_context(
                 db,
                 norm,
@@ -1408,7 +1445,9 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
                 notes="No ReiSift phone match found.",
                 last_reisift_lookup_at=format_db_time(datetime.utcnow()),
             )
-    except Exception:
+    except Exception as exc:
+        out["source"] = "reisift_phone_search_error"
+        out["error"] = str(exc)
         # Mark lookup attempt timestamp so we do not hammer ReiSift repeatedly for the same number.
         upsert_cached_contact_context(
             db,
@@ -13170,6 +13209,123 @@ def backfill_reisift_context_for_recent_phones(db, cutoff=None, limit=20):
     }
 
 
+def run_uuid_backfill_once(db, snapshot_limit=300, phone_limit=200):
+    snapshot = build_today_lead_watch_snapshot(db, limit=max(1, min(500, int(snapshot_limit or 300))))
+    items = snapshot.get("items") or []
+    unresolved = [x for x in items if int(x.get("unresolved") or 0) == 1]
+    system_numbers = _known_system_numbers(db, refresh_seconds=300)
+    seen = set()
+    candidates = []
+    no_phone_rows = 0
+    for row in unresolved:
+        row_phones = list(row.get("phones") or [])
+        if not row_phones and str(row.get("lead_key") or "").startswith("phone:"):
+            row_phones = [str(row.get("lead_key") or "").split(":", 1)[1]]
+        picked_any = False
+        for raw in row_phones:
+            n = normalize_phone(raw)
+            if not n or n in system_numbers:
+                continue
+            picked_any = True
+            if n not in seen:
+                seen.add(n)
+                candidates.append(n)
+        if not picked_any:
+            no_phone_rows += 1
+    max_phones = max(1, min(500, int(phone_limit or 200)))
+    candidates = candidates[:max_phones]
+
+    local_hits_cached_uuid = 0
+    local_hits_property_uuid = 0
+    sift_attempted = 0
+    resolved_from_sift = 0
+    unresolved_after_lookup = 0
+    errors = []
+    processed = []
+    for phone in candidates:
+        item = {"phone": phone, "result": "", "uuid": "", "source": "", "error": ""}
+        ctx = get_cached_contact_context(db, phone)
+        cached_uuid = normalize_uuid((ctx["reisift_property_uuid"] if ctx else "") or "")
+        if cached_uuid:
+            local_hits_cached_uuid += 1
+            item["result"] = "local_cached_uuid"
+            item["uuid"] = cached_uuid
+            item["source"] = "cache"
+            processed.append(item)
+            continue
+        property_id = int((ctx["property_id"] if ctx else 0) or 0)
+        local_uuid = _get_local_property_uuid(db, property_id)
+        if local_uuid:
+            local_hits_property_uuid += 1
+            item["result"] = "local_property_uuid"
+            item["uuid"] = local_uuid
+            item["source"] = "local_property"
+            upsert_cached_contact_context(
+                db,
+                phone,
+                property_id=property_id,
+                person_id=(ctx["person_id"] if ctx else None),
+                classification=(ctx["classification"] if ctx else "potential_seller"),
+                source="uuid_backfill_local_property",
+                confidence=0.95,
+                notes="Filled UUID from local property link.",
+                reisift_property_uuid=local_uuid,
+                reisift_full_address=(ctx["reisift_full_address"] if ctx else ""),
+                reisift_owner_name=(ctx["reisift_owner_name"] if ctx else ""),
+                reisift_property_status=(ctx["reisift_property_status"] if ctx else ""),
+                last_reisift_lookup_at=format_db_time(datetime.utcnow()),
+            )
+            processed.append(item)
+            continue
+
+        sift_attempted += 1
+        resolved = resolve_property_context_by_phone(db, phone, search_reisift=True, force_reisift=True) or {}
+        resolved_uuid = normalize_uuid(resolved.get("reisift_property_uuid") or "")
+        item["uuid"] = resolved_uuid
+        item["source"] = str(resolved.get("source") or "")
+        item["error"] = str(resolved.get("error") or "")
+        if resolved_uuid:
+            resolved_from_sift += 1
+            item["result"] = "resolved_from_sift"
+        else:
+            unresolved_after_lookup += 1
+            if item["error"]:
+                item["result"] = "reisift_error"
+                err_payload = {
+                    "phone": phone,
+                    "source": item["source"],
+                    "error": item["error"],
+                }
+                errors.append(err_payload)
+                log_app_error(
+                    db,
+                    source="uuid_backfill_once",
+                    error_message=item["error"][:500],
+                    details=json.dumps(err_payload),
+                    route="/api/integrations/agents/uuid-backfill-once",
+                    status_code=500,
+                )
+            else:
+                # Acceptable unresolved reason if ReiSift has no linked property/address payload for this phone.
+                item["result"] = "no_uuid_found_for_phone"
+        processed.append(item)
+
+    return {
+        "cutoff_utc": snapshot.get("cutoff_utc"),
+        "snapshot_count": int(snapshot.get("count") or 0),
+        "unresolved_before": len(unresolved),
+        "rows_without_phone": int(no_phone_rows),
+        "candidate_phones": len(candidates),
+        "local_hits_cached_uuid": local_hits_cached_uuid,
+        "local_hits_property_uuid": local_hits_property_uuid,
+        "sift_lookups_attempted": sift_attempted,
+        "resolved_from_sift": resolved_from_sift,
+        "unresolved_after_lookup": unresolved_after_lookup,
+        "errors": errors[:100],
+        "processed_sample": processed[:120],
+    }
+
+
 def run_lead_monitor_once(db, source="manual", property_id=None):
     run_cur = db.execute(
         """
@@ -19098,6 +19254,46 @@ def integrations_agents_lead_watch_api():
         limit = 80
     snapshot = build_today_lead_watch_snapshot(db, limit=limit)
     return jsonify({"ok": True, "snapshot": snapshot})
+
+
+@app.route("/api/integrations/agents/uuid-backfill-once", methods=["POST"])
+def integrations_agents_uuid_backfill_once_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    snapshot_limit = payload.get("snapshot_limit", 300)
+    phone_limit = payload.get("phone_limit", 200)
+    try:
+        before = build_today_lead_watch_snapshot(db, limit=max(1, min(500, int(snapshot_limit))))
+        before_unresolved = int(before.get("unresolved_count") or 0)
+        report = run_uuid_backfill_once(db, snapshot_limit=snapshot_limit, phone_limit=phone_limit)
+        reconcile = run_agent3_lead_watch_reconcile(db, limit=300)
+        after = build_today_lead_watch_snapshot(db, limit=max(1, min(500, int(snapshot_limit))))
+        after_unresolved = int(after.get("unresolved_count") or 0)
+        db.commit()
+        return jsonify(
+            {
+                "ok": True,
+                "before_unresolved": before_unresolved,
+                "after_unresolved": after_unresolved,
+                "delta_resolved": max(0, before_unresolved - after_unresolved),
+                "report": report,
+                "reconcile": reconcile,
+            }
+        )
+    except Exception as exc:
+        log_app_error(
+            db,
+            source="integrations_agents_uuid_backfill_once_api",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/api/integrations/agents/uuid-backfill-once",
+            status_code=500,
+        )
+        db.commit()
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/api/integrations/agents/rerun-today", methods=["POST"])

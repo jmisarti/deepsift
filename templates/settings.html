@@ -113,9 +113,16 @@
             <label>Slack Default Channel (optional)
                 <input name="slack_default_channel" value="{{ slack_settings.default_channel }}" placeholder="#alerts">
             </label>
+            <label class="span2">Slack Agent Ops Webhook URL (optional)
+                <input name="slack_agent_ops_webhook_url" value="{{ slack_settings.agent_ops_webhook_url }}" placeholder="Dedicated webhook for #agent-ops">
+            </label>
+            <label>Slack Agent Ops Channel (optional)
+                <input name="slack_agent_ops_channel" value="{{ slack_settings.agent_ops_channel }}" placeholder="#agent-ops">
+            </label>
             <div class="inline-actions span2">
                 <button type="submit">Save Integration Settings</button>
                 <button type="submit" name="integration_action" value="test_slack">Save + Test Slack</button>
+                <button type="submit" name="integration_action" value="test_slack_agent_ops">Save + Test Agent Ops Slack</button>
             </div>
         </form>
         <form method="post" class="inline-form" onsubmit="return confirm('Clear all unread items from the notification bar?');" style="margin-top:0.5rem;">

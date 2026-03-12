@@ -265,6 +265,30 @@ ACTIVE_LEAD_STATUSES = {
     "nurture new lead",
 }
 NO_ANSWER_OUTCOMES = {"missed", "no_answer", "failed", "busy", "no answer"}
+ON_MARKET_STATUSES = {"for sale", "for_sale", "coming soon", "listed", "active", "for sale by owner", "fsbo"}
+LEAD_STATUS_CADENCE_DAYS = {
+    "new lead": 0,
+    "no contact new lead": 1,
+    "hot lead": 1,
+    "warm lead": 4,
+    "cold lead": 21,
+    "nurture new lead": 7,
+    "ghosting lead": 6,
+    "refer lead": 1,
+    "listed": 7,
+    "for sale": 7,
+    "for sale by owner": 7,
+    "coming soon": 7,
+}
+TIMELINE_TRIGGER_TERMS = [
+    "call me back",
+    "call back",
+    "available",
+    "reach me",
+    "best time",
+    "follow up",
+    "text me",
+]
 
 REISIFT_PLAYBOOK_PRIORITY = {
     "new lead": {
@@ -797,6 +821,7 @@ def migrate_db(db):
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_lma_property_status ON lead_management_actions(property_id, status)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_lma_status_priority ON lead_management_actions(status, priority)")
+    ensure_column(db, "lead_management_actions", "due_at", "due_at TEXT")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS call_recording_jobs (
@@ -5326,6 +5351,8 @@ def get_slack_settings(db):
         "webhook_url": get_setting(db, "slack_webhook_url", ""),
         "signing_secret": get_setting(db, "slack_signing_secret", ""),
         "default_channel": get_setting(db, "slack_default_channel", ""),
+        "agent_ops_webhook_url": get_setting(db, "slack_agent_ops_webhook_url", ""),
+        "agent_ops_channel": get_setting(db, "slack_agent_ops_channel", ""),
     }
 
 
@@ -5366,6 +5393,28 @@ def send_slack_notification(db, text, blocks=None, channel=""):
         return {"ok": False, "error": "Slack webhook not configured"}
     payload = {"text": (text or "").strip() or "Notification"}
     target_channel = (channel or settings.get("default_channel") or "").strip()
+    if target_channel:
+        payload["channel"] = target_channel
+    if isinstance(blocks, list) and blocks:
+        payload["blocks"] = blocks
+    response = requests.post(
+        webhook_url,
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=15,
+    )
+    if not response.ok:
+        raise ValueError(f"Slack webhook failed ({response.status_code}): {response.text}")
+    return {"ok": True}
+
+
+def send_agent_ops_notification(db, text, blocks=None, channel=""):
+    settings = get_slack_settings(db)
+    webhook_url = (settings.get("agent_ops_webhook_url") or "").strip() or (settings.get("webhook_url") or "").strip()
+    if not webhook_url:
+        return {"ok": False, "error": "Agent Ops Slack webhook not configured"}
+    payload = {"text": (text or "").strip() or "Notification"}
+    target_channel = (channel or settings.get("agent_ops_channel") or "").strip()
     if target_channel:
         payload["channel"] = target_channel
     if isinstance(blocks, list) and blocks:
@@ -9332,7 +9381,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
         if property_id > 0:
             action_rows = db.execute(
                 """
-                SELECT id, action_type, priority, status, reason, updated_at, created_at
+                SELECT id, action_type, priority, status, reason, due_at, updated_at, created_at
                 FROM lead_management_actions
                 WHERE property_id = ?
                 ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
@@ -9348,7 +9397,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
                     continue
                 for r in db.execute(
                     """
-                    SELECT id, action_type, priority, status, reason, updated_at, created_at
+                    SELECT id, action_type, priority, status, reason, due_at, updated_at, created_at
                     FROM lead_management_actions
                     WHERE property_id = 0
                       AND payload_json LIKE ?
@@ -9361,7 +9410,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
             if lead_key:
                 for r in db.execute(
                     """
-                    SELECT id, action_type, priority, status, reason, updated_at, created_at
+                    SELECT id, action_type, priority, status, reason, due_at, updated_at, created_at
                     FROM lead_management_actions
                     WHERE property_id = 0
                       AND payload_json LIKE ?
@@ -9431,13 +9480,16 @@ def build_today_lead_watch_snapshot(db, limit=60):
                 + (f" with status '{referral_status}'." if referral_status else ".")
             )
 
-        timeline = f"It's been {elapsed} since {last_action}."
+        due_at = str(latest.get("due_at") or "")
+        due_txt = format_est_datetime(due_at) if due_at else "-"
+        timeline = f"It's been {elapsed} since {last_action}. Due: {due_txt}."
         return {
             "timeline": timeline,
             "recommendation": rec,
             "reason": reason,
             "last_action": last_action,
             "elapsed": elapsed,
+            "due_at": due_at,
             "pending_count": len(pending),
             "total_count": len(all_rows),
         }
@@ -12937,7 +12989,17 @@ def communication_counts_for_people(db, person_ids, property_id=None):
     return out
 
 
-def _upsert_lead_action(db, property_id, person_id, action_type, priority, reason, payload, dedupe_key_override=None):
+def _upsert_lead_action(
+    db,
+    property_id,
+    person_id,
+    action_type,
+    priority,
+    reason,
+    payload,
+    dedupe_key_override=None,
+    due_at=None,
+):
     property_val = int(property_id or 0)
     dedupe_key = (dedupe_key_override or f"{property_val}:{int(person_id or 0)}:{action_type}").strip()
     existing = db.execute(
@@ -12952,19 +13014,19 @@ def _upsert_lead_action(db, property_id, person_id, action_type, priority, reaso
         db.execute(
             """
             UPDATE lead_management_actions
-            SET priority = ?, reason = ?, payload_json = ?, updated_at = CURRENT_TIMESTAMP
+            SET priority = ?, reason = ?, payload_json = ?, due_at = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (priority, reason, payload_json, existing["id"]),
+            (priority, reason, payload_json, (due_at or ""), existing["id"]),
         )
         return False
     db.execute(
         """
         INSERT INTO lead_management_actions
-        (dedupe_key, property_id, person_id, action_type, priority, status, reason, payload_json)
-        VALUES (?, ?, ?, ?, ?, 'Pending', ?, ?)
+        (dedupe_key, property_id, person_id, action_type, priority, status, reason, payload_json, due_at)
+        VALUES (?, ?, ?, ?, ?, 'Pending', ?, ?, ?)
         """,
-        (dedupe_key, property_val, person_id, action_type, priority, reason, payload_json),
+        (dedupe_key, property_val, person_id, action_type, priority, reason, payload_json, (due_at or "")),
     )
     return True
 
@@ -13098,28 +13160,16 @@ def _owner_relative_contact_count(db, owner_person_id):
 
 
 def _latest_inbound_text_for_lead_watch_item(db, item):
-    property_id = int(item.get("property_id") or 0)
-    phones = [normalize_phone(x) for x in (item.get("phones") or []) if normalize_phone(x)]
-    if property_id > 0:
-        row = db.execute(
-            """
-            SELECT lower(COALESCE(body, '')) AS body
-            FROM communications
-            WHERE property_id = ?
-              AND lower(direction) = 'inbound'
-            ORDER BY COALESCE(sent_at, created_at) DESC, id DESC
-            LIMIT 1
-            """,
-            (property_id,),
-        ).fetchone()
-        if row:
-            return str(row["body"] or "")
-    if not phones:
-        return ""
+    texts = _collect_recent_lead_text_entries(db, item, limit=40)
+    for t in texts:
+        if (t.get("direction") or "").lower() == "inbound":
+            return str(t.get("text") or "").strip().lower()
+    return ""
+
+
+def _lead_phone_match_clause(max_phones):
     conds = []
-    args = []
-    for p in phones[:4]:
-        like = f"%{p}%"
+    for _ in range(max_phones):
         conds.append(
             """
             (
@@ -13128,23 +13178,335 @@ def _latest_inbound_text_for_lead_watch_item(db, item):
             )
             """
         )
-        args.extend([like, like])
-    query = f"""
-        SELECT lower(COALESCE(body, '')) AS body
-        FROM communications
-        WHERE lower(direction) = 'inbound'
-          AND ({' OR '.join(conds)})
-        ORDER BY COALESCE(sent_at, created_at) DESC, id DESC
-        LIMIT 1
-    """
-    row = db.execute(query, tuple(args)).fetchone()
-    return str(row["body"] or "") if row else ""
+    return " OR ".join(conds)
+
+
+def _collect_recent_lead_text_entries(db, item, limit=40):
+    property_id = int(item.get("property_id") or 0)
+    phones = [normalize_phone(x) for x in (item.get("phones") or []) if normalize_phone(x)]
+    phones = list(dict.fromkeys([p for p in phones if p]))[:5]
+    entries = []
+
+    def _add_entry(text, ts, direction, source):
+        clean = re.sub(r"\s+", " ", str(text or "").strip())
+        if not clean:
+            return
+        key = (clean.lower(), str(ts or "").strip(), (direction or "").lower(), source)
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append(
+            {
+                "text": clean,
+                "ts": str(ts or ""),
+                "direction": (direction or "").strip().lower(),
+                "source": source,
+            }
+        )
+
+    seen = set()
+    if property_id > 0:
+        comm_rows = db.execute(
+            """
+            SELECT body, direction, COALESCE(sent_at, created_at) AS ts
+            FROM communications
+            WHERE property_id = ?
+            ORDER BY COALESCE(sent_at, created_at) DESC, id DESC
+            LIMIT 120
+            """,
+            (property_id,),
+        ).fetchall()
+        for r in comm_rows:
+            _add_entry(r["body"], r["ts"], r["direction"], "communications")
+        call_rows = db.execute(
+            """
+            SELECT summary_text, transcript_text, created_at
+            FROM call_recording_jobs
+            WHERE property_id = ?
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT 120
+            """,
+            (property_id,),
+        ).fetchall()
+        for r in call_rows:
+            _add_entry(r["summary_text"], r["created_at"], "", "call_summary")
+            _add_entry(r["transcript_text"], r["created_at"], "", "call_transcript")
+
+    if phones:
+        phone_clause = _lead_phone_match_clause(len(phones))
+        args = []
+        for p in phones:
+            like = f"%{p}%"
+            args.extend([like, like])
+        comm_rows = db.execute(
+            f"""
+            SELECT body, direction, COALESCE(sent_at, created_at) AS ts
+            FROM communications
+            WHERE {phone_clause}
+            ORDER BY COALESCE(sent_at, created_at) DESC, id DESC
+            LIMIT 120
+            """,
+            tuple(args),
+        ).fetchall()
+        for r in comm_rows:
+            _add_entry(r["body"], r["ts"], r["direction"], "communications")
+
+        call_rows = db.execute(
+            f"""
+            SELECT summary_text, transcript_text, created_at
+            FROM call_recording_jobs
+            WHERE {phone_clause}
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT 120
+            """,
+            tuple(args),
+        ).fetchall()
+        for r in call_rows:
+            _add_entry(r["summary_text"], r["created_at"], "", "call_summary")
+            _add_entry(r["transcript_text"], r["created_at"], "", "call_transcript")
+
+    entries.sort(key=lambda x: x.get("ts") or "", reverse=True)
+    return entries[: max(1, int(limit or 40))]
+
+
+def _parse_explicit_timeline_from_text(text, now_est):
+    low = str(text or "").lower()
+    if not low:
+        return None
+    if not any(term in low for term in TIMELINE_TRIGGER_TERMS):
+        return None
+
+    intent = "callback"
+    if "appointment" in low or "meet" in low or "showing" in low:
+        intent = "appointment"
+
+    target_date = None
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    for name, idx in weekdays.items():
+        if re.search(rf"\b(next\s+)?{name}\b", low):
+            days_ahead = (idx - now_est.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            target_date = (now_est + timedelta(days=days_ahead)).date()
+            break
+    if target_date is None and "tomorrow" in low:
+        target_date = (now_est + timedelta(days=1)).date()
+    if target_date is None and "today" in low:
+        target_date = now_est.date()
+    if target_date is None:
+        rel = re.search(r"\bin\s+(\d{1,2})\s+(day|days|week|weeks)\b", low)
+        if rel:
+            n = int(rel.group(1))
+            unit = rel.group(2)
+            if "week" in unit:
+                target_date = (now_est + timedelta(days=n * 7)).date()
+            else:
+                target_date = (now_est + timedelta(days=n)).date()
+
+    hm = re.search(r"\b(?:after|at|around)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", low)
+    hour = 10
+    minute = 0
+    if hm:
+        hour = int(hm.group(1))
+        minute = int(hm.group(2) or 0)
+        meridiem = (hm.group(3) or "").lower()
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        if meridiem == "am" and hour == 12:
+            hour = 0
+        if "after" in hm.group(0).lower() and minute == 0:
+            minute = 15
+
+    if target_date is None:
+        return None
+    due_est = datetime(
+        year=target_date.year,
+        month=target_date.month,
+        day=target_date.day,
+        hour=max(0, min(23, hour)),
+        minute=max(0, min(59, minute)),
+        second=0,
+        tzinfo=EST_TZ,
+    )
+    return {
+        "due_est": due_est,
+        "intent": intent,
+        "confidence": 0.92 if hm else 0.84,
+        "phrase": _short_text(text, 180),
+    }
+
+
+def _extract_timeline_override_for_lead(db, item):
+    now_est = datetime.now(EST_TZ)
+    entries = _collect_recent_lead_text_entries(db, item, limit=50)
+    for ent in entries:
+        parsed = _parse_explicit_timeline_from_text(ent.get("text"), now_est)
+        if parsed:
+            due_utc = parsed["due_est"].astimezone(timezone.utc).replace(tzinfo=None)
+            return {
+                "due_at": format_db_time(due_utc),
+                "intent": parsed["intent"],
+                "confidence": float(parsed["confidence"]),
+                "phrase": parsed["phrase"],
+                "source": ent.get("source") or "",
+            }
+    return {}
+
+
+def _dismiss_open_leadwatch_actions(db, lead_key, reason):
+    if not lead_key:
+        return 0
+    cur = db.execute(
+        """
+        UPDATE lead_management_actions
+        SET status = CASE WHEN status = 'Pending' THEN 'Dismissed' ELSE status END,
+            reason = TRIM(COALESCE(reason, '') || ' [Auto-dismissed: ' || ? || ']'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE dedupe_key LIKE ?
+          AND status = 'Pending'
+        """,
+        ((reason or "").strip()[:120], f"leadwatch:{lead_key}:%"),
+    )
+    return int(cur.rowcount or 0)
+
+
+def _close_other_pending_leadwatch_actions(db, lead_key, keep_action_type):
+    if not lead_key:
+        return 0
+    cur = db.execute(
+        """
+        UPDATE lead_management_actions
+        SET status = 'Completed',
+            reason = TRIM(COALESCE(reason, '') || ' [Superseded by Agent 2]'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE dedupe_key LIKE ?
+          AND status = 'Pending'
+          AND action_type <> ?
+        """,
+        (f"leadwatch:{lead_key}:%", (keep_action_type or "").strip()),
+    )
+    return int(cur.rowcount or 0)
+
+
+def _determine_agent2_action(item, snapshot, timeline_override, latest_inbound_text):
+    classification = str(snapshot.get("classification") or "unknown").strip().lower()
+    reisift_status = _normalize_reisift_status(snapshot.get("reisift_status") or "")
+    on_market_status = str(snapshot.get("on_market_status") or "").strip().lower()
+    outbound_total = int(snapshot.get("outbound_total") or 0)
+    inbound_total = int(snapshot.get("inbound_total") or 0)
+    last_activity_at = str(item.get("last_activity_at") or "")
+    now_utc = datetime.utcnow()
+    last_dt = parse_db_time(last_activity_at) or now_utc
+    days_since_touch = max(0.0, (now_utc - last_dt).total_seconds() / 86400.0)
+    cadence_days = int(LEAD_STATUS_CADENCE_DAYS.get(reisift_status, 1))
+    due_by_cadence = last_dt + timedelta(days=max(0, cadence_days))
+
+    if classification in {"spam", "solicitor"}:
+        return {"skip": True, "skip_reason": "classification_suppressed"}
+    if reisift_status in {"opt-out", "opt out", "dead", "dead lead", "dnc"}:
+        return {"skip": True, "skip_reason": "reisift_stop_status"}
+    if reisift_status == "not interested":
+        return {
+            "action_type": "HumanReviewDisposition",
+            "priority": "Medium",
+            "due_at": format_db_time(now_utc),
+            "reason": "Not Interested requires Agent 3 recommendation and human confirmation before status transition.",
+        }
+    if on_market_status in ON_MARKET_STATUSES:
+        return {
+            "action_type": "ReviewInboundAndNextBestAction",
+            "priority": "Medium",
+            "due_at": format_db_time(due_by_cadence),
+            "reason": "Lead appears listed/on-market; monitor referral side while preserving cash-offer lane.",
+        }
+    if any(token in (latest_inbound_text or "") for token in LEAD_NEGATIVE_INTENT_TOKENS):
+        return {
+            "action_type": "HumanReviewDisposition",
+            "priority": "High",
+            "due_at": format_db_time(now_utc),
+            "reason": "Latest inbound message indicates negative/disposition risk requiring human review.",
+        }
+    if timeline_override and timeline_override.get("due_at"):
+        intent = str(timeline_override.get("intent") or "callback")
+        act = "ScheduleAppointment" if intent in {"appointment", "callback"} else "FollowUpTouchDue"
+        return {
+            "action_type": act,
+            "priority": _playbook_priority_for_action(reisift_status, act, "High"),
+            "due_at": str(timeline_override.get("due_at") or ""),
+            "reason": (
+                "Agent 1 extracted explicit timeline from communication: "
+                f"\"{timeline_override.get('phrase') or ''}\""
+            ),
+            "timeline_override": True,
+        }
+
+    if inbound_total > 0:
+        return {
+            "action_type": "ReviewInboundAndNextBestAction",
+            "priority": _playbook_priority_for_action(reisift_status, "ReviewInboundAndNextBestAction", "Medium"),
+            "due_at": format_db_time(now_utc),
+            "reason": "Inbound activity detected; confirm intent and choose next touchpoint.",
+        }
+
+    # Status-specific cadence behavior.
+    if reisift_status == "no contact new lead":
+        if outbound_total >= 1 and days_since_touch >= 1.0:
+            return {
+                "action_type": "EscalateToDeepDiveResearch",
+                "priority": "High",
+                "due_at": format_db_time(now_utc),
+                "reason": "No Contact New Lead day-2 escalation: no reply after initial outreach.",
+            }
+        return {
+            "action_type": "FollowUpTouchDue",
+            "priority": "High",
+            "due_at": format_db_time(due_by_cadence),
+            "reason": "No Contact New Lead day-1 follow-up is due.",
+        }
+    if reisift_status == "ghosting lead":
+        if outbound_total >= 2 and days_since_touch >= 5.0:
+            return {
+                "action_type": "EscalateToDeepDiveResearch",
+                "priority": "High",
+                "due_at": format_db_time(now_utc),
+                "reason": "Ghosting lead with repeated no-response; escalate to Deep Dive.",
+            }
+        return {
+            "action_type": "FollowUpTouchDue",
+            "priority": "Medium",
+            "due_at": format_db_time(due_by_cadence),
+            "reason": "Ghosting lead follow-up cadence reached.",
+        }
+    if reisift_status in {"new lead", "hot lead"} and outbound_total == 0:
+        return {
+            "action_type": "ScheduleAppointment",
+            "priority": "High",
+            "due_at": format_db_time(now_utc),
+            "reason": "High-priority lead with no outbound touch yet; initiate call scheduling now.",
+        }
+    if now_utc >= due_by_cadence:
+        return {
+            "action_type": "FollowUpTouchDue",
+            "priority": _playbook_priority_for_action(reisift_status, "FollowUpTouchDue", "Medium"),
+            "due_at": format_db_time(due_by_cadence),
+            "reason": f"Cadence reached for status '{reisift_status or 'unknown'}' after {max(0, int(days_since_touch))} day(s).",
+        }
+    return {"skip": True, "skip_reason": "not_due"}
 
 
 def evaluate_lead_watch_item_lead_management(db, item):
     lead_key = str(item.get("lead_key") or "").strip()
     if not lead_key:
         return {"lead_key": "", "skipped": True, "created_actions": 0, "snapshot": {}}
+
     property_id = int(item.get("property_id") or 0)
     person_id = int(item.get("person_id") or 0) or None
     classification = str(item.get("classification") or "unknown").strip().lower()
@@ -13155,10 +13517,9 @@ def evaluate_lead_watch_item_lead_management(db, item):
     outbound_total = sms_outbound + calls
     inbound_total = sms_inbound
     referral = item.get("referral") if isinstance(item.get("referral"), dict) else {}
-    reisift_status = _normalize_reisift_status(
-        str(referral.get("status") or "") or str(item.get("reisift_property_status") or "")
-    )
+    reisift_status = _normalize_reisift_status(str(referral.get("status") or "") or str(item.get("reisift_property_status") or ""))
     on_market_status = str(referral.get("on_market_status") or "").strip().lower()
+
     snapshot = {
         "outbound_total": outbound_total,
         "inbound_total": inbound_total,
@@ -13173,84 +13534,52 @@ def evaluate_lead_watch_item_lead_management(db, item):
         "reisift_property_uuid": str(item.get("reisift_property_uuid") or ""),
         "phones": list(item.get("phones") or []),
     }
-    created_actions = 0
-    if ignore_agent2 or classification in {"spam", "solicitor"}:
+    if ignore_agent2:
+        _dismiss_open_leadwatch_actions(db, lead_key, "manual_ignore_agent2")
         return {"lead_key": lead_key, "skipped": True, "created_actions": 0, "snapshot": snapshot}
-    if reisift_status in LEAD_STOP_STATUSES:
-        return {"lead_key": lead_key, "skipped": True, "created_actions": 0, "snapshot": snapshot}
-    if on_market_status in {"for sale", "for_sale", "coming soon", "listed", "active", "for sale by owner", "fsbo"}:
-        created_actions += int(
-            _upsert_lead_action(
-                db,
-                property_id,
-                person_id,
-                "ReviewInboundAndNextBestAction",
-                "Medium",
-                "Lead is listed/on-market. Coordinate listing-side follow-up while maintaining cash-offer lane.",
-                {"snapshot": snapshot, "source": "agent2_lead_watch"},
-                dedupe_key_override=f"leadwatch:{lead_key}:ReviewInboundAndNextBestAction",
-            )
-        )
-        return {"lead_key": lead_key, "skipped": False, "created_actions": created_actions, "snapshot": snapshot}
 
+    timeline_override = _extract_timeline_override_for_lead(db, item)
     latest_inbound = _latest_inbound_text_for_lead_watch_item(db, item)
-    has_negative_intent = any(token in latest_inbound for token in LEAD_NEGATIVE_INTENT_TOKENS)
-    if has_negative_intent:
-        created_actions += int(
-            _upsert_lead_action(
-                db,
-                property_id,
-                person_id,
-                "HumanReviewDisposition",
-                "High",
-                "Inbound response appears negative and requires disposition decision before further outreach.",
-                {"snapshot": snapshot, "source": "agent2_lead_watch", "reason": "negative_intent_detected"},
-                dedupe_key_override=f"leadwatch:{lead_key}:HumanReviewDisposition",
-            )
-        )
-        return {"lead_key": lead_key, "skipped": False, "created_actions": created_actions, "snapshot": snapshot}
+    decision = _determine_agent2_action(item, snapshot, timeline_override, latest_inbound)
 
-    if outbound_total >= 3 and inbound_total == 0:
-        created_actions += int(
-            _upsert_lead_action(
-                db,
-                property_id,
-                person_id,
-                "EscalateToRelativeOutreach",
-                "High",
-                "No inbound responses after 3+ outbound touches. Escalate outreach path.",
-                {"snapshot": snapshot, "source": "agent2_lead_watch"},
-                dedupe_key_override=f"leadwatch:{lead_key}:EscalateToRelativeOutreach",
-            )
-        )
-    elif outbound_total >= 1 and inbound_total == 0:
-        created_actions += int(
-            _upsert_lead_action(
-                db,
-                property_id,
-                person_id,
-                "FollowUpTouchDue",
-                "Medium",
-                "Outreach exists with no inbound response yet. Schedule next compliant touchpoint.",
-                {"snapshot": snapshot, "source": "agent2_lead_watch"},
-                dedupe_key_override=f"leadwatch:{lead_key}:FollowUpTouchDue",
-            )
-        )
+    if decision.get("skip"):
+        if decision.get("skip_reason") in {"classification_suppressed", "reisift_stop_status"}:
+            _dismiss_open_leadwatch_actions(db, lead_key, decision.get("skip_reason"))
+        return {"lead_key": lead_key, "skipped": True, "created_actions": 0, "snapshot": snapshot}
 
-    if inbound_total > 0:
-        created_actions += int(
-            _upsert_lead_action(
-                db,
-                property_id,
-                person_id,
-                "ReviewInboundAndNextBestAction",
-                "Medium",
-                "Inbound activity exists. Confirm intent and set next best action.",
-                {"snapshot": snapshot, "source": "agent2_lead_watch"},
-                dedupe_key_override=f"leadwatch:{lead_key}:ReviewInboundAndNextBestAction",
-            )
+    action_type = str(decision.get("action_type") or "ReviewInboundAndNextBestAction")
+    priority = str(decision.get("priority") or "Medium").title()
+    due_at = str(decision.get("due_at") or "")
+    reason = str(decision.get("reason") or "Agent 2 generated next best action.").strip()
+    payload = {
+        "snapshot": snapshot,
+        "source": "agent2_lead_watch_v2",
+        "timeline_override": timeline_override,
+        "latest_inbound": latest_inbound[:800],
+    }
+    created = int(
+        _upsert_lead_action(
+            db,
+            property_id,
+            person_id,
+            action_type,
+            priority,
+            reason,
+            payload,
+            dedupe_key_override=f"leadwatch:{lead_key}:{action_type}",
+            due_at=due_at,
         )
-    return {"lead_key": lead_key, "skipped": False, "created_actions": created_actions, "snapshot": snapshot}
+    )
+    _close_other_pending_leadwatch_actions(db, lead_key, action_type)
+    return {
+        "lead_key": lead_key,
+        "skipped": False,
+        "created_actions": created,
+        "snapshot": snapshot,
+        "action_type": action_type,
+        "priority": priority,
+        "due_at": due_at,
+    }
 
 
 def evaluate_property_lead_management(db, property_row):
@@ -13747,6 +14076,9 @@ def run_lead_monitor_once(db, source="manual", property_id=None):
                     "label": str(row.get("label") or ""),
                     "created_actions": result["created_actions"],
                     "skipped": bool(result.get("skipped")),
+                    "action_type": str(result.get("action_type") or ""),
+                    "priority": str(result.get("priority") or ""),
+                    "due_at": str(result.get("due_at") or ""),
                     "outbound_total": (result.get("snapshot") or {}).get("outbound_total", 0),
                     "inbound_total": (result.get("snapshot") or {}).get("inbound_total", 0),
                 }
@@ -14095,7 +14427,7 @@ def agents_page():
     }
     lead_actions = db.execute(
         """
-        SELECT a.id, a.property_id, a.person_id, a.action_type, a.priority, a.status, a.reason, a.payload_json, a.created_at, a.updated_at,
+        SELECT a.id, a.property_id, a.person_id, a.action_type, a.priority, a.status, a.reason, a.payload_json, a.due_at, a.created_at, a.updated_at,
                adr.street, adr.city, adr.state, adr.postal_code,
                pe.first_name, pe.middle_name, pe.last_name
         FROM lead_management_actions a
@@ -15814,6 +16146,8 @@ def settings_page():
                     "slack_webhook_url": request.form.get("slack_webhook_url", ""),
                     "slack_signing_secret": request.form.get("slack_signing_secret", ""),
                     "slack_default_channel": request.form.get("slack_default_channel", ""),
+                    "slack_agent_ops_webhook_url": request.form.get("slack_agent_ops_webhook_url", ""),
+                    "slack_agent_ops_channel": request.form.get("slack_agent_ops_channel", ""),
                 }
                 for key, value in fields.items():
                     set_setting(db, key, value)
@@ -15826,6 +16160,20 @@ def settings_page():
                     log_app_error(
                         db,
                         source="slack_test",
+                        error_message=str(exc),
+                        details=traceback.format_exc(),
+                        route="/settings",
+                        status_code=400,
+                    )
+            elif test_action == "test_slack_agent_ops":
+                try:
+                    send_agent_ops_notification(db, "DeepSift test notification: Agent Ops Slack integration is configured.")
+                    notice = "Integrations saved. Agent Ops Slack test sent."
+                except Exception as exc:
+                    error_notice = f"Integrations saved, but Agent Ops Slack test failed: {exc}"
+                    log_app_error(
+                        db,
+                        source="slack_agent_ops_test",
                         error_message=str(exc),
                         details=traceback.format_exc(),
                         route="/settings",
@@ -18767,7 +19115,7 @@ def slack_events_webhook():
     try:
         if event.get("type") == "app_mention":
             text = (event.get("text") or "").strip()
-            send_slack_notification(db, f"Slack mention received: {text}")
+            send_agent_ops_notification(db, f"Slack mention received: {text}")
     except Exception:
         pass
     return jsonify({"ok": True})

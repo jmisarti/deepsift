@@ -8297,6 +8297,25 @@ def _thread_counterpart(system_numbers, direction, from_number, to_number):
     return from_norm or to_norm
 
 
+def _counterparty_candidates(db, from_number, to_number):
+    from_norm = normalize_phone(from_number)
+    to_norm = normalize_phone(to_number)
+    system_numbers = set(_system_phone_numbers(db))
+    # Expand known owned numbers from recent webhook telemetry.
+    try:
+        system_numbers |= _infer_system_numbers_from_smrt_events(db)
+    except Exception:
+        pass
+    candidates = []
+    for n in [from_norm, to_norm]:
+        if n and n not in system_numbers and n not in candidates:
+            candidates.append(n)
+    for n in [from_norm, to_norm]:
+        if n and n not in candidates:
+            candidates.append(n)
+    return candidates
+
+
 def _apply_sms_analysis_guardrails(messages, analysis):
     analysis = dict(analysis or {})
     msgs = list(messages or [])
@@ -13458,13 +13477,28 @@ def agents_page():
     def _resolve_uuid_from_numbers(numbers, fallback_property_id=None):
         if int(fallback_property_id or 0) > 0 and property_uuid_by_id.get(int(fallback_property_id), ""):
             return property_uuid_by_id.get(int(fallback_property_id), "")
+        system_numbers = set(_system_phone_numbers(db))
+        try:
+            system_numbers |= _infer_system_numbers_from_smrt_events(db)
+        except Exception:
+            pass
         for raw in numbers:
             norm = normalize_phone(raw)
             if not norm:
                 continue
+            if norm in system_numbers:
+                continue
             ctx = get_cached_contact_context(db, norm)
             if not ctx:
-                continue
+                # One-time cache-first fallback: resolve and persist from ReiSift only when absent.
+                try:
+                    resolved = resolve_property_context_by_phone(db, norm, search_reisift=True)
+                except Exception:
+                    resolved = {}
+                if resolved:
+                    ctx = get_cached_contact_context(db, norm)
+                if not ctx:
+                    continue
             cached_uuid = normalize_uuid(ctx["reisift_property_uuid"] or "")
             if cached_uuid:
                 return cached_uuid
@@ -18444,8 +18478,9 @@ def smrtphone_call_completed_webhook():
             _property_id = int(payload.get("property_id"))
         elif _person_id:
             _property_id = find_property_id_for_person(db, _person_id)
+        phone_candidates = _counterparty_candidates(db, from_number, to_number)
         if not _property_id:
-            for candidate in [from_number, to_number]:
+            for candidate in phone_candidates:
                 ctx = resolve_property_context_by_phone(db, candidate, search_reisift=True)
                 if int(ctx.get("property_id") or 0):
                     _property_id = int(ctx.get("property_id") or 0)
@@ -18455,7 +18490,7 @@ def smrtphone_call_completed_webhook():
                         resolved_reisift_context.update(ctx)
                     break
         if not _property_id:
-            for candidate in [from_number, to_number]:
+            for candidate in phone_candidates:
                 ctx = get_cached_contact_context(db, candidate)
                 if ctx and ctx["property_id"]:
                     _property_id = int(ctx["property_id"])
@@ -18506,7 +18541,8 @@ def smrtphone_call_completed_webhook():
 
     property_id, person_id = _resolve_property_person()
     if property_id:
-        counterparty_number = from_number or to_number
+        phone_candidates = _counterparty_candidates(db, from_number, to_number)
+        counterparty_number = phone_candidates[0] if phone_candidates else (from_number or to_number)
         upsert_cached_contact_context(
             db,
             counterparty_number,

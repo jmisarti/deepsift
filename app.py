@@ -2008,8 +2008,12 @@ def compose_call_summary(context, analysis, transcript_text):
     if callee.strip().lower() in generic_labels:
         callee = to_number or callee
     transcript = (transcript_text or "").strip()
-    model_summary = _short_text(analysis.get("summary") or "")
-    key_fact = _short_text((analysis.get("key_facts") or [""])[0] if isinstance(analysis.get("key_facts"), list) else "")
+    model_summary = re.sub(r"\s+", " ", str(analysis.get("summary") or "").strip())
+    key_fact = re.sub(
+        r"\s+",
+        " ",
+        str((analysis.get("key_facts") or [""])[0] if isinstance(analysis.get("key_facts"), list) else "").strip(),
+    )
 
     if direction == "Outbound":
         intro = f"Outbound call by {caller} to {callee or to_number or 'lead'}."
@@ -2028,22 +2032,22 @@ def compose_call_summary(context, analysis, transcript_text):
             msg_state = "voicemail not applicable"
         detail = f" Outcome: {outcome}; {msg_state}."
         if transcript and voicemail_left == "Yes":
-            detail += f" Message summary: {_short_text(model_summary or key_fact or transcript, 220)}"
+            detail += f" Message summary: {re.sub(r'\\s+', ' ', str(model_summary or key_fact or transcript).strip())}"
         elif model_summary:
-            detail += f" Notes: {_short_text(model_summary, 220)}"
+            detail += f" Notes: {model_summary}"
         return (intro + detail).strip()
 
     if outcome == "Answered":
         detail = f" Outcome: Answered conversation between {caller} and {callee or 'the lead'}."
         if model_summary:
-            detail += f" Summary: {_short_text(model_summary, 240)}"
+            detail += f" Summary: {model_summary}"
         elif key_fact:
             detail += f" Key point: {key_fact}"
         return (intro + detail).strip()
 
     detail = f" Outcome: {outcome or 'Unknown'}."
     if model_summary:
-        detail += f" Summary: {_short_text(model_summary, 220)}"
+        detail += f" Summary: {model_summary}"
     return (intro + detail).strip()
 
 
@@ -14783,7 +14787,7 @@ def agents_page():
     }
     call_jobs = db.execute(
         """
-        SELECT id, call_sid, property_id, person_id, from_number, to_number, recording_url, fetch_status, analysis_status, summary_text, analysis_json, payload_json, created_at, updated_at
+        SELECT id, call_sid, property_id, person_id, from_number, to_number, recording_url, fetch_status, analysis_status, transcript_text, summary_text, analysis_json, payload_json, created_at, updated_at
         FROM call_recording_jobs
         ORDER BY id DESC
         LIMIT 100
@@ -14886,7 +14890,7 @@ def agents_page():
         payload_obj = parse_json_object(item.get("payload_json") or "{}")
         analysis_obj = parse_json_object(item.get("analysis_json") or "{}")
         context = payload_obj.get("analysis_context") if isinstance(payload_obj.get("analysis_context"), dict) else {}
-        detail = compose_call_summary(context, analysis_obj, "")
+        detail = compose_call_summary(context, analysis_obj, str(item.get("transcript_text") or ""))
         if not detail:
             detail = str(item.get("summary_text") or "").strip()
         item["detail_summary"] = detail
@@ -15028,15 +15032,19 @@ def clear_agent_logs_route():
     db = get_db()
     ajax = _is_ajax_request(request)
     try:
-        c1 = db.execute("DELETE FROM lead_monitor_runs")
-        c2 = db.execute("DELETE FROM agent_advisor_logs")
-        c3 = db.execute("DELETE FROM agent3_lead_resolutions")
+        c1 = db.execute("DELETE FROM lead_management_actions")
+        c2 = db.execute("DELETE FROM lead_monitor_runs")
+        c3 = db.execute("DELETE FROM agent_advisor_logs")
+        c4 = db.execute("DELETE FROM agent3_lead_resolutions")
+        c5 = db.execute("DELETE FROM agent2_learning_feedback")
         db.commit()
         msg = (
-            "Cleared Agent 2/3 logs. "
-            f"lead_monitor_runs={int(c1.rowcount or 0)}, "
-            f"agent_advisor_logs={int(c2.rowcount or 0)}, "
-            f"agent3_lead_resolutions={int(c3.rowcount or 0)}."
+            "Cleared Agent 2/3 tables. "
+            f"lead_management_actions={int(c1.rowcount or 0)}, "
+            f"lead_monitor_runs={int(c2.rowcount or 0)}, "
+            f"agent_advisor_logs={int(c3.rowcount or 0)}, "
+            f"agent3_lead_resolutions={int(c4.rowcount or 0)}, "
+            f"agent2_learning_feedback={int(c5.rowcount or 0)}."
         )
         if ajax:
             return jsonify(
@@ -15044,9 +15052,11 @@ def clear_agent_logs_route():
                     "ok": True,
                     "message": msg,
                     "counts": {
-                        "lead_monitor_runs": int(c1.rowcount or 0),
-                        "agent_advisor_logs": int(c2.rowcount or 0),
-                        "agent3_lead_resolutions": int(c3.rowcount or 0),
+                        "lead_management_actions": int(c1.rowcount or 0),
+                        "lead_monitor_runs": int(c2.rowcount or 0),
+                        "agent_advisor_logs": int(c3.rowcount or 0),
+                        "agent3_lead_resolutions": int(c4.rowcount or 0),
+                        "agent2_learning_feedback": int(c5.rowcount or 0),
                     },
                 }
             )

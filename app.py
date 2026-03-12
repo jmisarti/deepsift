@@ -1272,20 +1272,25 @@ def _status_rank_for_phone_match(status_value):
 def _best_reisift_phone_match(results):
     if not results:
         return {}
+    # User rule: when phone maps to multiple properties, pick the most recently updated/created.
     ordered = sorted(
         results,
-        key=lambda r: (
-            _status_rank_for_phone_match(r.get("status")),
-            str(r.get("updated_at") or r.get("created_at") or ""),
-        ),
-        reverse=False,
+        key=lambda r: str(r.get("updated_at") or r.get("created_at") or ""),
+        reverse=True,
     )
-    # For same status rank, prefer most recent update/create.
-    best = ordered[0]
-    same_rank = [r for r in ordered if _status_rank_for_phone_match(r.get("status")) == _status_rank_for_phone_match(best.get("status"))]
-    if len(same_rank) > 1:
-        best = sorted(same_rank, key=lambda r: str(r.get("updated_at") or r.get("created_at") or ""), reverse=True)[0]
-    return best
+    return ordered[0] if ordered else {}
+
+
+def _table_has_column(db, table_name, column_name):
+    try:
+        rows = db.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except Exception:
+        return False
+    wanted = str(column_name or "").strip().lower()
+    for r in rows or []:
+        if str(r["name"] if isinstance(r, sqlite3.Row) else r[1]).strip().lower() == wanted:
+            return True
+    return False
 
 
 def _get_local_property_uuid(db, property_id):
@@ -1356,17 +1361,30 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True, force_
         out["property_id"] = int(property_id)
         out["person_id"] = int(person_id or 0) or None
         out["source"] = "local"
-        local_row = db.execute(
-            """
-            SELECT p.reisift_property_uuid, a.street, a.city, a.state, a.postal_code, p.status,
-                   op.first_name AS owner_first_name, op.last_name AS owner_last_name
-            FROM properties p
-            LEFT JOIN addresses a ON a.id = p.property_address_id
-            LEFT JOIN people op ON op.id = p.owner_person_id
-            WHERE p.id = ?
-            """,
-            (property_id,),
-        ).fetchone()
+        if _table_has_column(db, "properties", "reisift_property_uuid"):
+            local_row = db.execute(
+                """
+                SELECT p.reisift_property_uuid, a.street, a.city, a.state, a.postal_code, p.status,
+                       op.first_name AS owner_first_name, op.last_name AS owner_last_name
+                FROM properties p
+                LEFT JOIN addresses a ON a.id = p.property_address_id
+                LEFT JOIN people op ON op.id = p.owner_person_id
+                WHERE p.id = ?
+                """,
+                (property_id,),
+            ).fetchone()
+        else:
+            local_row = db.execute(
+                """
+                SELECT '' AS reisift_property_uuid, a.street, a.city, a.state, a.postal_code, p.status,
+                       op.first_name AS owner_first_name, op.last_name AS owner_last_name
+                FROM properties p
+                LEFT JOIN addresses a ON a.id = p.property_address_id
+                LEFT JOIN people op ON op.id = p.owner_person_id
+                WHERE p.id = ?
+                """,
+                (property_id,),
+            ).fetchone()
         if local_row:
             out["reisift_property_uuid"] = normalize_uuid(local_row["reisift_property_uuid"] or "")
             out["reisift_full_address"] = ", ".join(

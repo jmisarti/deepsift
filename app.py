@@ -13216,12 +13216,17 @@ def backfill_reisift_context_for_recent_phones(db, cutoff=None, limit=20):
 def run_uuid_backfill_once(db, snapshot_limit=300, phone_limit=200):
     snapshot = build_today_lead_watch_snapshot(db, limit=max(1, min(500, int(snapshot_limit or 300))))
     items = snapshot.get("items") or []
-    unresolved = [x for x in items if int(x.get("unresolved") or 0) == 1]
+    targets = []
+    for x in items:
+        uuid_missing = not normalize_uuid(x.get("reisift_property_uuid") or "")
+        has_phone_or_property = bool(int(x.get("property_id") or 0)) or bool(x.get("phones") or []) or str(x.get("lead_key") or "").startswith("phone:")
+        if int(x.get("unresolved") or 0) == 1 or (uuid_missing and has_phone_or_property):
+            targets.append(x)
     system_numbers = _known_system_numbers(db, refresh_seconds=300)
     seen = set()
     candidates = []
     no_phone_rows = 0
-    for row in unresolved:
+    for row in targets:
         row_phones = list(row.get("phones") or [])
         if not row_phones and str(row.get("lead_key") or "").startswith("phone:"):
             row_phones = [str(row.get("lead_key") or "").split(":", 1)[1]]
@@ -13317,7 +13322,8 @@ def run_uuid_backfill_once(db, snapshot_limit=300, phone_limit=200):
     return {
         "cutoff_utc": snapshot.get("cutoff_utc"),
         "snapshot_count": int(snapshot.get("count") or 0),
-        "unresolved_before": len(unresolved),
+        "target_rows": len(targets),
+        "unresolved_before": sum(1 for x in items if int(x.get("unresolved") or 0) == 1),
         "rows_without_phone": int(no_phone_rows),
         "candidate_phones": len(candidates),
         "local_hits_cached_uuid": local_hits_cached_uuid,

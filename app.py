@@ -1312,8 +1312,9 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True):
         out["source"] = "cache"
         if out["property_id"] or out["reisift_property_uuid"]:
             return out
-        # One-time ReiSift fallback behavior: if this number was looked up before, do not re-query.
-        if str(cached["last_reisift_lookup_at"] or "").strip():
+        # Backoff behavior: avoid hammering ReiSift, but allow periodic retries for unresolved numbers.
+        last_lookup_at = parse_db_time(cached["last_reisift_lookup_at"])
+        if last_lookup_at and (datetime.utcnow() - last_lookup_at) < timedelta(hours=6):
             return out
 
     person_id = find_person_id_by_phone(db, norm)
@@ -8255,16 +8256,16 @@ def _infer_system_numbers_from_smrt_events(db, cutoff=None):
         """
         SELECT event_type, from_number, to_number, payload_json, received_at
         FROM smrtphone_webhook_events
-        WHERE (? IS NULL OR received_at >= ?)
+        WHERE event_type IN ('inbound', 'outbound')
+          AND (? IS NULL OR received_at >= ?)
         ORDER BY id DESC
-        LIMIT 4000
+        LIMIT 1200
         """,
         (cutoff, cutoff),
     ).fetchall()
     for r in rows:
         payload = parse_json_object(r["payload_json"])
         event_name = extract_first_string_by_keys(payload, ["event", "eventType"]).lower()
-        user_name = extract_first_string_by_keys(payload, ["userName", "user_name"]).strip()
         from_n = normalize_phone(r["from_number"])
         to_n = normalize_phone(r["to_number"])
         if event_name == "smsoutgoing":
@@ -8272,13 +8273,6 @@ def _infer_system_numbers_from_smrt_events(db, cutoff=None):
                 vals.add(from_n)
         elif event_name == "smsincoming":
             if to_n:
-                vals.add(to_n)
-        elif str(r["event_type"] or "").lower() == "call_completed":
-            # Outbound calls usually carry userName and originate from owned number.
-            if user_name and from_n:
-                vals.add(from_n)
-            # Inbound calls terminate at owned number.
-            if (not user_name) and to_n:
                 vals.add(to_n)
     return vals
 
@@ -13474,31 +13468,50 @@ def agents_page():
             return {}
         return out
 
+    system_numbers = set(_system_phone_numbers(db))
+    try:
+        cutoff = format_db_time(datetime.utcnow() - timedelta(days=30))
+        system_numbers |= _infer_system_numbers_from_smrt_events(db, cutoff=cutoff)
+    except Exception:
+        pass
+    cached_ctx_by_phone = {}
+
     def _resolve_uuid_from_numbers(numbers, fallback_property_id=None):
         if int(fallback_property_id or 0) > 0 and property_uuid_by_id.get(int(fallback_property_id), ""):
             return property_uuid_by_id.get(int(fallback_property_id), "")
-        system_numbers = set(_system_phone_numbers(db))
-        try:
-            system_numbers |= _infer_system_numbers_from_smrt_events(db)
-        except Exception:
-            pass
+        normalized_numbers = []
         for raw in numbers:
             norm = normalize_phone(raw)
             if not norm:
                 continue
+            if norm not in normalized_numbers:
+                normalized_numbers.append(norm)
+        # Pass 1: counterparty-first (non-system)
+        for norm in normalized_numbers:
             if norm in system_numbers:
                 continue
-            ctx = get_cached_contact_context(db, norm)
+            ctx = cached_ctx_by_phone.get(norm)
+            if ctx is None:
+                ctx = get_cached_contact_context(db, norm)
+                cached_ctx_by_phone[norm] = ctx
             if not ctx:
-                # One-time cache-first fallback: resolve and persist from ReiSift only when absent.
-                try:
-                    resolved = resolve_property_context_by_phone(db, norm, search_reisift=True)
-                except Exception:
-                    resolved = {}
-                if resolved:
-                    ctx = get_cached_contact_context(db, norm)
-                if not ctx:
-                    continue
+                continue
+            cached_uuid = normalize_uuid(ctx["reisift_property_uuid"] or "")
+            if cached_uuid:
+                return cached_uuid
+            ctx_pid = int(ctx["property_id"] or 0)
+            if ctx_pid and property_uuid_by_id.get(ctx_pid, ""):
+                return property_uuid_by_id.get(ctx_pid, "")
+        # Pass 2: allow system numbers only if no counterparty match was found.
+        for norm in normalized_numbers:
+            if norm not in system_numbers:
+                continue
+            ctx = cached_ctx_by_phone.get(norm)
+            if ctx is None:
+                ctx = get_cached_contact_context(db, norm)
+                cached_ctx_by_phone[norm] = ctx
+            if not ctx:
+                continue
             cached_uuid = normalize_uuid(ctx["reisift_property_uuid"] or "")
             if cached_uuid:
                 return cached_uuid

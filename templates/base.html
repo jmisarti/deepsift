@@ -87,16 +87,26 @@
           list.innerHTML = '<p class="top-notify-empty">No unread notifications</p>';
           return;
         }
-        list.innerHTML = items.map((item) => {
-          const href = buildHref(item);
-          const from = esc(item.from_number || 'Unknown');
-          const sentAt = esc(item.sent_at || '');
-          const channel = String(item.channel || '').toUpperCase();
-          const linked = item.link_person_name ? ` (${esc(item.link_person_name)})` : '';
-          const msg = channel === 'EMAIL' ? `Email reply from ${from}${linked}` : `SMS received from ${from}${linked}`;
-          return `<article class="top-notify-item" data-id="${item.id}"><a class="top-notify-link" href="${href}" data-id="${item.id}">${msg}</a><p>${sentAt}</p></article>`;
-        }).join('');
-      }
+          list.innerHTML = items.map((item) => {
+            const href = buildHref(item);
+            const from = esc(item.from_number || 'Unknown');
+            const to = esc(item.to_number || 'Unknown');
+            const sentAt = esc(item.sent_at || '');
+            const channel = String(item.channel || '').toUpperCase();
+            const direction = String(item.direction || '').toLowerCase();
+            const status = String(item.status || '').toLowerCase();
+            const linked = item.link_person_name ? ` (${esc(item.link_person_name)})` : '';
+            let msg = '';
+            if (channel === 'EMAIL' && direction === 'outbound' && status === 'opened') {
+              msg = `Email opened by ${to}${linked}`;
+            } else if (channel === 'EMAIL') {
+              msg = `Email reply from ${from}${linked}`;
+            } else {
+              msg = `SMS received from ${from}${linked}`;
+            }
+            return `<article class="top-notify-item" data-id="${item.id}"><a class="top-notify-link" href="${href}" data-id="${item.id}">${msg}</a><p>${sentAt}</p></article>`;
+          }).join('');
+        }
 
       async function refresh() {
         try {

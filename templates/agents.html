@@ -331,6 +331,7 @@
                 <th>Person</th>
                 <th>Action</th>
                 <th>Priority</th>
+                <th>Class</th>
                 <th>Status</th>
                 <th>Due</th>
                 <th>Reason</th>
@@ -362,6 +363,7 @@
                 </td>
                 <td class="agent2-col-action">{{ row.action_type }}</td>
                 <td class="agent2-col-priority">{{ row.priority }}</td>
+                <td class="agent2-col-classification">{{ row.contact_classification or '-' }}</td>
                 <td class="agent2-col-status">{{ row.status }}</td>
                 <td class="agent2-col-due">{% if row.due_at %}{{ row.due_at|fmt_est_datetime }}{% else %}-{% endif %}</td>
                 <td class="agent2-col-reason">{{ row.reason }}</td>
@@ -384,6 +386,11 @@
                         <select name="priority">
                             {% for p in lead_action_priorities %}
                             <option value="{{ p }}" {% if p == row.priority %}selected{% endif %}>{{ p }}</option>
+                            {% endfor %}
+                        </select>
+                        <select name="contact_classification">
+                            {% for c in lead_contact_classifications %}
+                            <option value="{{ c }}" {% if c == (row.contact_classification or '') %}selected{% endif %}>{{ c if c else 'unclassified' }}</option>
                             {% endfor %}
                         </select>
                         <input type="text" name="reason" value="{{ row.reason or '' }}" placeholder="Override reason" style="min-width:220px;">
@@ -661,12 +668,14 @@ async function submitAgent2Form(form, options) {
         const row = data.row;
         const cAction = tr.querySelector(".agent2-col-action");
         const cPriority = tr.querySelector(".agent2-col-priority");
+        const cClass = tr.querySelector(".agent2-col-classification");
         const cStatus = tr.querySelector(".agent2-col-status");
         const cReason = tr.querySelector(".agent2-col-reason");
         const cUpdated = tr.querySelector(".agent2-col-updated");
         const cDue = tr.querySelector(".agent2-col-due");
         if (cAction) cAction.textContent = row.action_type || "-";
         if (cPriority) cPriority.textContent = row.priority || "-";
+        if (cClass) cClass.textContent = row.contact_classification || "-";
         if (cStatus) cStatus.textContent = row.status || "-";
         if (cReason) cReason.textContent = row.reason || "-";
         if (cUpdated) cUpdated.textContent = row.updated_at_est || "-";

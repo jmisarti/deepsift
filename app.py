@@ -246,6 +246,7 @@ LEAD_ACTION_TYPES = [
     "ReviewInboundAndNextBestAction",
     "AgentDiagnosisReview",
 ]
+LEAD_CONTACT_CLASSIFICATIONS = ["", "buyer", "wholesaler", "spam", "realtor"]
 LEAD_STOP_STATUSES = {"not interested", "dnc", "opt out", "dead"}
 LEAD_NEGATIVE_INTENT_TOKENS = [
     "not interested",
@@ -266,6 +267,18 @@ ACTIVE_LEAD_STATUSES = {
 }
 NO_ANSWER_OUTCOMES = {"missed", "no_answer", "failed", "busy", "no answer"}
 ON_MARKET_STATUSES = {"for sale", "for_sale", "coming soon", "listed", "active", "for sale by owner", "fsbo"}
+
+
+def normalize_lead_contact_classification(value):
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "potential_buyer": "buyer",
+        "potential buyer": "buyer",
+        "real estate agent": "realtor",
+        "listing agent": "realtor",
+    }
+    norm = aliases.get(raw, raw)
+    return norm if norm in LEAD_CONTACT_CLASSIFICATIONS else ""
 LEAD_STATUS_CADENCE_DAYS = {
     "new lead": 0,
     "no contact new lead": 1,
@@ -822,6 +835,7 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_lma_property_status ON lead_management_actions(property_id, status)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_lma_status_priority ON lead_management_actions(status, priority)")
     ensure_column(db, "lead_management_actions", "due_at", "due_at TEXT")
+    ensure_column(db, "lead_management_actions", "contact_classification", "contact_classification TEXT NOT NULL DEFAULT ''")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS agent2_learning_feedback (
@@ -2888,6 +2902,8 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
     primary_owner_id = prop["owner_person_id"] if prop else None
     owners_created = 0
     co_owner_links = 0
+    synced_phone_items = []
+    synced_email_items = []
 
     for idx, owner_entry in enumerate(property_payload.get("owners") or []):
         person_payload = owner_entry.get("person") or {}
@@ -2982,6 +2998,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                 """,
                 (owner_person_id, email, "Imported from SkipSherpa property owner payload", ""),
             )
+            synced_email_items.append(email)
 
         for ph in person_payload.get("phone_numbers") or []:
             number = (ph.get("e164_format") or ph.get("local_format") or "").strip()
@@ -3002,6 +3019,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                     "",
                 ),
             )
+            synced_phone_items.append({"number": number, "type": _reisift_phone_type_from_touchpoint(label)})
 
         if primary_owner_id is None:
             db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (owner_person_id, property_id))
@@ -3046,11 +3064,19 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
         ),
     )
 
+    skiptrace_sync = sync_skiptrace_contacts_to_reisift_owner(
+        db,
+        property_id,
+        phone_items=synced_phone_items,
+        email_items=synced_email_items,
+    )
+
     return {
         "owners_processed": owners_created,
         "co_owner_links": co_owner_links,
         "attom_last_sold_date": last_sold_date,
         "attom_last_sold_price": last_sold_price,
+        "reisift_contact_sync": skiptrace_sync,
     }
 
 
@@ -3984,6 +4010,37 @@ def import_skipsherpa_person_result(db, property_id, person_id, lookup_response)
     )
     cleanup_person_contact_and_relationship_duplicates(db, person_id)
 
+    sync_phone_items = []
+    sync_email_items = []
+    if touched_person_ids:
+        placeholders = ",".join(["?"] * len(touched_person_ids))
+        tp_rows = db.execute(
+            f"""
+            SELECT person_id, channel_type, channel_label, value
+            FROM touchpoints
+            WHERE person_id IN ({placeholders})
+              AND lower(channel_type) IN ('phone', 'email')
+            """,
+            tuple(sorted(touched_person_ids)),
+        ).fetchall()
+        for tp in tp_rows:
+            ctype = str(tp["channel_type"] or "").strip().lower()
+            if ctype == "phone":
+                sync_phone_items.append(
+                    {
+                        "number": str(tp["value"] or "").strip(),
+                        "type": _reisift_phone_type_from_touchpoint(tp["channel_label"]),
+                    }
+                )
+            elif ctype == "email":
+                sync_email_items.append(str(tp["value"] or "").strip())
+    skiptrace_sync = sync_skiptrace_contacts_to_reisift_owner(
+        db,
+        property_id,
+        phone_items=sync_phone_items,
+        email_items=sync_email_items,
+    )
+
     db.execute(
         """
         INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
@@ -4011,6 +4068,7 @@ def import_skipsherpa_person_result(db, property_id, person_id, lookup_response)
                 "relatives_added": relatives_added,
                 "deduped_people_merged": dedupe_result.get("merged_count", 0),
                 "deduped_groups": dedupe_result.get("groups_merged", 0),
+                "reisift_contact_sync": skiptrace_sync,
             },
             "response": lookup_response,
         },
@@ -4023,6 +4081,7 @@ def import_skipsherpa_person_result(db, property_id, person_id, lookup_response)
         "relatives_added": relatives_added,
         "deduped_people_merged": dedupe_result.get("merged_count", 0),
         "deduped_groups": dedupe_result.get("groups_merged", 0),
+        "reisift_contact_sync": skiptrace_sync,
     }
 
 
@@ -11571,13 +11630,24 @@ def reisift_upsert_owner_contacts(token, owner_uuid, phones, emails):
         if isinstance(p, dict):
             number = normalize_phone(p.get("number") or p.get("phone") or "")
             p_type = (p.get("type") or "UNKNOWN").strip().upper()
+            raw_tags = p.get("tags") if isinstance(p.get("tags"), list) else []
         else:
             number = normalize_phone(str(p or ""))
             p_type = "UNKNOWN"
+            raw_tags = []
         if not number or number in seen_phones:
             continue
         seen_phones.add(number)
-        normalized_phones.append({"type": p_type or "UNKNOWN", "tags": [], "number": number})
+        tags = []
+        seen_tags = set()
+        for t in raw_tags:
+            tag = str(t or "").strip()
+            low = tag.lower()
+            if not tag or low in seen_tags:
+                continue
+            seen_tags.add(low)
+            tags.append(tag)
+        normalized_phones.append({"type": p_type or "UNKNOWN", "tags": tags, "number": number})
 
     normalized_emails = []
     seen_emails = set()
@@ -11620,6 +11690,164 @@ def reisift_upsert_owner_contacts(token, owner_uuid, phones, emails):
             raise ValueError(f"ReiSift owner email upsert failed ({email_res.status_code}): {email_body}")
         out["emails"] = {"request": email_payload, "response": email_body}
 
+    return out
+
+
+def _reisift_phone_type_from_touchpoint(channel_label):
+    label = str(channel_label or "").strip().lower()
+    if label == "mobile":
+        return "MOBILE"
+    if label == "landline":
+        return "LANDLINE"
+    if label == "voip":
+        return "VOIP"
+    if label == "fax":
+        return "FAX"
+    return "UNKNOWN"
+
+
+def _property_address_string(db, property_id):
+    try:
+        row = db.execute(
+            """
+            SELECT a.street, a.city, a.state, a.postal_code
+            FROM properties p
+            LEFT JOIN addresses a ON a.id = p.property_address_id
+            WHERE p.id = ?
+            LIMIT 1
+            """,
+            (int(property_id or 0),),
+        ).fetchone()
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    return ", ".join(
+        [
+            str(row["street"] or "").strip(),
+            str(row["city"] or "").strip(),
+            str(row["state"] or "").strip(),
+            str(row["postal_code"] or "").strip(),
+        ]
+    ).strip(", ").strip()
+
+
+def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, email_items=None):
+    property_id = int(property_id or 0)
+    phones_in = phone_items if isinstance(phone_items, list) else []
+    emails_in = email_items if isinstance(email_items, list) else []
+    out = {
+        "ok": False,
+        "property_id": property_id,
+        "property_uuid": "",
+        "owner_uuid": "",
+        "phones_attempted": 0,
+        "emails_attempted": 0,
+        "error": "",
+        "result": None,
+    }
+
+    phones = []
+    seen_phone = set()
+    for p in phones_in:
+        if isinstance(p, dict):
+            number = normalize_phone(p.get("number") or p.get("phone") or "")
+            p_type = (p.get("type") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        else:
+            number = normalize_phone(str(p or ""))
+            p_type = "UNKNOWN"
+        if not number or number in seen_phone:
+            continue
+        seen_phone.add(number)
+        phones.append({"number": number, "type": p_type, "tags": ["Relative"]})
+
+    emails = []
+    seen_email = set()
+    for e in emails_in:
+        if isinstance(e, dict):
+            value = str(e.get("email") or e.get("value") or "").strip().lower()
+        else:
+            value = str(e or "").strip().lower()
+        if not value or value in seen_email:
+            continue
+        seen_email.add(value)
+        emails.append(value)
+
+    out["phones_attempted"] = len(phones)
+    out["emails_attempted"] = len(emails)
+    if not phones and not emails:
+        out["ok"] = True
+        out["result"] = {"skipped": True, "reason": "no_contacts"}
+        return out
+
+    property_uuid = _get_local_property_uuid(db, property_id)
+    owner_uuid = ""
+    has_owner_col = _table_has_column(db, "properties", "reisift_owner_uuid")
+    if has_owner_col:
+        try:
+            row = db.execute("SELECT reisift_owner_uuid FROM properties WHERE id = ? LIMIT 1", (property_id,)).fetchone()
+            owner_uuid = normalize_uuid((row["reisift_owner_uuid"] if row else "") or "")
+        except Exception:
+            owner_uuid = ""
+    out["property_uuid"] = normalize_uuid(property_uuid or "")
+
+    try:
+        token = reisift_get_access_token()
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+
+    if not owner_uuid and out["property_uuid"]:
+        try:
+            owner_uuid = _reisift_find_owner_uuid(fetch_reisift_property_payload(token, out["property_uuid"])) or ""
+        except Exception as exc:
+            out["error"] = f"Owner UUID lookup failed: {exc}"
+            return out
+        if owner_uuid and has_owner_col:
+            try:
+                db.execute(
+                    """
+                    UPDATE properties
+                    SET reisift_owner_uuid = ?
+                    WHERE id = ?
+                      AND (reisift_owner_uuid IS NULL OR trim(reisift_owner_uuid) = '')
+                    """,
+                    (owner_uuid, property_id),
+                )
+            except Exception:
+                pass
+    out["owner_uuid"] = owner_uuid
+    if not owner_uuid:
+        out["error"] = "No ReiSift owner UUID available for skiptrace contact sync."
+        return out
+
+    try:
+        sync_result = reisift_upsert_owner_contacts(token, owner_uuid, phones, emails)
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+
+    full_address = _property_address_string(db, property_id)
+    for p in phones:
+        linked_person = find_person_id_by_phone(db, p["number"])
+        upsert_cached_contact_context(
+            db,
+            p["number"],
+            property_id=property_id,
+            person_id=linked_person,
+            classification="potential_seller",
+            source="skiptrace_sync",
+            confidence=0.9,
+            notes="Skiptrace contact synced to ReiSift owner as Relative.",
+            reisift_property_uuid=out["property_uuid"],
+            reisift_full_address=full_address,
+            reisift_owner_name="",
+            reisift_property_status="",
+            last_reisift_lookup_at=format_db_time(datetime.utcnow()),
+        )
+
+    out["ok"] = bool(sync_result.get("ok"))
+    out["result"] = sync_result
     return out
 
 
@@ -13050,7 +13278,8 @@ def communication_counts_for_people(db, person_ids, property_id=None):
                SUM(CASE WHEN upper(channel)='SMS' AND lower(direction)='outbound' THEN 1 ELSE 0 END) AS sms_outbound,
                SUM(CASE WHEN upper(channel)='SMS' AND lower(direction)='inbound' THEN 1 ELSE 0 END) AS sms_inbound,
                SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='outbound' THEN 1 ELSE 0 END) AS email_outbound,
-               SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='inbound' THEN 1 ELSE 0 END) AS email_inbound
+               SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='inbound' THEN 1 ELSE 0 END) AS email_inbound,
+               SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='outbound' AND COALESCE(open_count, 0) > 0 THEN 1 ELSE 0 END) AS email_opened
         FROM communications
         WHERE {' AND '.join(where)}
         GROUP BY person_id
@@ -13064,6 +13293,7 @@ def communication_counts_for_people(db, person_ids, property_id=None):
             "sms_inbound": int(r["sms_inbound"] or 0),
             "email_outbound": int(r["email_outbound"] or 0),
             "email_inbound": int(r["email_inbound"] or 0),
+            "email_opened": int(r["email_opened"] or 0),
         }
     return out
 
@@ -13078,15 +13308,18 @@ def _upsert_lead_action(
     payload,
     dedupe_key_override=None,
     due_at=None,
+    contact_classification="",
 ):
     property_val = int(property_id or 0)
     dedupe_key = (dedupe_key_override or f"{property_val}:{int(person_id or 0)}:{action_type}").strip()
     existing = db.execute(
-        "SELECT id, status FROM lead_management_actions WHERE dedupe_key = ?",
+        "SELECT id, status, contact_classification FROM lead_management_actions WHERE dedupe_key = ?",
         (dedupe_key,),
     ).fetchone()
     payload_json = json.dumps(payload or {})
+    normalized_class = normalize_lead_contact_classification(contact_classification)
     if existing:
+        next_class = normalized_class or normalize_lead_contact_classification(existing["contact_classification"] or "")
         db.execute(
             """
             UPDATE lead_management_actions
@@ -13096,19 +13329,20 @@ def _upsert_lead_action(
                 reason = ?,
                 payload_json = ?,
                 due_at = ?,
+                contact_classification = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (action_type, priority, reason, payload_json, (due_at or ""), existing["id"]),
+            (action_type, priority, reason, payload_json, (due_at or ""), next_class, existing["id"]),
         )
         return False
     db.execute(
         """
         INSERT INTO lead_management_actions
-        (dedupe_key, property_id, person_id, action_type, priority, status, reason, payload_json, due_at)
-        VALUES (?, ?, ?, ?, ?, 'Pending', ?, ?, ?)
+        (dedupe_key, property_id, person_id, action_type, priority, status, reason, payload_json, due_at, contact_classification)
+        VALUES (?, ?, ?, ?, ?, 'Pending', ?, ?, ?, ?)
         """,
-        (dedupe_key, property_val, person_id, action_type, priority, reason, payload_json, (due_at or "")),
+        (dedupe_key, property_val, person_id, action_type, priority, reason, payload_json, (due_at or ""), normalized_class),
     )
     return True
 
@@ -13867,6 +14101,7 @@ def evaluate_lead_watch_item_lead_management(db, item):
             payload,
             dedupe_key_override=dedupe_key,
             due_at=due_at,
+            contact_classification=classification,
         )
     )
     _close_other_pending_leadwatch_actions(db, rollup_key, dedupe_key, phone_tokens=rollup_phone_norms)
@@ -14815,7 +15050,7 @@ def agents_page():
     }
     lead_actions = db.execute(
         """
-        SELECT a.id, a.property_id, a.person_id, a.action_type, a.priority, a.status, a.reason, a.payload_json, a.due_at, a.created_at, a.updated_at,
+        SELECT a.id, a.property_id, a.person_id, a.action_type, a.priority, a.status, a.reason, a.payload_json, a.due_at, a.created_at, a.updated_at, a.contact_classification,
                adr.street, adr.city, adr.state, adr.postal_code,
                pe.first_name, pe.middle_name, pe.last_name
         FROM lead_management_actions a
@@ -14834,6 +15069,7 @@ def agents_page():
     lead_actions_enriched = []
     for row in lead_actions:
         item = dict(row)
+        item["contact_classification"] = normalize_lead_contact_classification(item.get("contact_classification") or "")
         address_parts = [str(item.get("street") or "").strip(), str(item.get("city") or "").strip()]
         state_zip = " ".join(
             p for p in [str(item.get("state") or "").strip(), str(item.get("postal_code") or "").strip()] if p
@@ -15046,6 +15282,7 @@ def agents_page():
         lead_action_statuses=LEAD_ACTION_STATUSES,
         lead_action_types=LEAD_ACTION_TYPES,
         lead_action_priorities=LEAD_ACTION_PRIORITIES,
+        lead_contact_classifications=LEAD_CONTACT_CLASSIFICATIONS,
         latest_run=latest_run,
         latest_run_summary=latest_run_summary,
         call_job_summary=call_job_summary,
@@ -15064,6 +15301,41 @@ def _is_ajax_request(req):
     xr = (req.headers.get("X-Requested-With") or "").strip().lower()
     accept = (req.headers.get("Accept") or "").strip().lower()
     return xr == "xmlhttprequest" or "application/json" in accept
+
+
+def _lead_key_from_action_row(action_row):
+    row = dict(action_row or {})
+    payload = parse_json_object(row.get("payload_json") or "{}")
+    snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    lead_key = str(snapshot.get("lead_key") or payload.get("lead_key") or "").strip()
+    if not lead_key:
+        dedupe = str(row.get("dedupe_key") or "").strip()
+        if dedupe.startswith("leadwatch:"):
+            lead_key = dedupe.split(":", 1)[1].strip()
+    return lead_key
+
+
+def _upsert_agent3_classification_from_action(db, action_row, contact_classification):
+    classification = normalize_lead_contact_classification(contact_classification)
+    lead_key = _lead_key_from_action_row(action_row)
+    if not lead_key:
+        return False
+    db.execute(
+        """
+        INSERT INTO agent3_lead_resolutions
+        (lead_key, classification_override, status, notes, updated_at)
+        VALUES (?, ?, 'Pending', ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(lead_key) DO UPDATE SET
+            classification_override = excluded.classification_override,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            lead_key,
+            classification,
+            "Classification set from Agent 2 action queue.",
+        ),
+    )
+    return True
 
 
 def _record_agent2_learning_feedback(
@@ -15181,7 +15453,7 @@ def update_lead_action_status_route(action_id):
         return redirect(url_for("agents_page", notice="Invalid lead action status."))
     row = db.execute(
         """
-        SELECT id, dedupe_key, property_id, person_id, action_type, priority, status, reason, due_at, updated_at
+        SELECT id, dedupe_key, property_id, person_id, action_type, priority, status, reason, due_at, updated_at, payload_json, contact_classification
         FROM lead_management_actions
         WHERE id = ?
         """,
@@ -15206,7 +15478,7 @@ def update_lead_action_status_route(action_id):
     )
     updated = db.execute(
         """
-        SELECT id, action_type, priority, status, reason, due_at, updated_at
+        SELECT id, action_type, priority, status, reason, due_at, updated_at, contact_classification
         FROM lead_management_actions
         WHERE id = ?
         """,
@@ -15215,6 +15487,7 @@ def update_lead_action_status_route(action_id):
     db.commit()
     if ajax:
         out = dict(updated or {})
+        out["contact_classification"] = normalize_lead_contact_classification(out.get("contact_classification") or "")
         out["updated_at_est"] = format_est_datetime(out.get("updated_at") or "")
         out["due_at_est"] = format_est_datetime(out.get("due_at") or "") if str(out.get("due_at") or "").strip() else "-"
         return jsonify({"ok": True, "row": out, "message": f"Lead action #{action_id} updated to {status}."})
@@ -15228,7 +15501,7 @@ def update_lead_action_override_route(action_id):
     ajax = _is_ajax_request(request)
     row = db.execute(
         """
-        SELECT id, dedupe_key, property_id, person_id, payload_json, action_type, priority, reason, status, due_at, updated_at
+        SELECT id, dedupe_key, property_id, person_id, payload_json, action_type, priority, reason, status, due_at, updated_at, contact_classification
         FROM lead_management_actions
         WHERE id = ?
         """,
@@ -15247,11 +15520,15 @@ def update_lead_action_override_route(action_id):
         priority = row["priority"]
     if not reason:
         reason = row["reason"]
+    contact_classification = normalize_lead_contact_classification(
+        request.form.get("contact_classification") or row["contact_classification"] or ""
+    )
     payload = parse_json_object(row["payload_json"] or "{}")
     payload["manual_override"] = {
         "at": format_db_time(datetime.utcnow()),
         "action_type": action_type,
         "priority": priority,
+        "contact_classification": contact_classification,
     }
     _record_agent2_learning_feedback(
         db,
@@ -15265,14 +15542,15 @@ def update_lead_action_override_route(action_id):
     db.execute(
         """
         UPDATE lead_management_actions
-        SET action_type = ?, priority = ?, reason = ?, payload_json = ?, updated_at = CURRENT_TIMESTAMP
+        SET action_type = ?, priority = ?, reason = ?, payload_json = ?, contact_classification = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        (action_type, priority, reason, json.dumps(payload), action_id),
+        (action_type, priority, reason, json.dumps(payload), contact_classification, action_id),
     )
+    _upsert_agent3_classification_from_action(db, row, contact_classification)
     updated = db.execute(
         """
-        SELECT id, action_type, priority, status, reason, due_at, updated_at
+        SELECT id, action_type, priority, status, reason, due_at, updated_at, contact_classification
         FROM lead_management_actions
         WHERE id = ?
         """,
@@ -15281,6 +15559,7 @@ def update_lead_action_override_route(action_id):
     db.commit()
     if ajax:
         out = dict(updated or {})
+        out["contact_classification"] = normalize_lead_contact_classification(out.get("contact_classification") or "")
         out["updated_at_est"] = format_est_datetime(out.get("updated_at") or "")
         out["due_at_est"] = format_est_datetime(out.get("due_at") or "") if str(out.get("due_at") or "").strip() else "-"
         return jsonify({"ok": True, "row": out, "message": f"Lead action #{action_id} recommendation updated."})
@@ -16708,7 +16987,7 @@ def settings_page():
                     """
                     UPDATE communications
                     SET is_read = 1
-                    WHERE lower(direction) = 'inbound' AND COALESCE(is_read, 1) = 0
+                    WHERE COALESCE(is_read, 1) = 0
                     """
                 )
                 notice = f"Notification bar cleared. {int(cur.rowcount or 0)} unread item(s) marked as read."
@@ -17548,6 +17827,7 @@ def property_detail(property_id):
                 "sms_inbound": int(c.get("sms_inbound", 0)),
                 "email_outbound": int(c.get("email_outbound", 0)),
                 "email_inbound": int(c.get("email_inbound", 0)),
+                "email_opened": int(c.get("email_opened", 0)),
             }
         )
     sequence_campaigns = get_sequence_campaigns(db, only_active=True)
@@ -17814,6 +18094,7 @@ def person_detail(person_id):
                 "sms_inbound": int(c.get("sms_inbound", 0)),
                 "email_outbound": int(c.get("email_outbound", 0)),
                 "email_inbound": int(c.get("email_inbound", 0)),
+                "email_opened": int(c.get("email_opened", 0)),
             }
         )
 
@@ -20330,10 +20611,29 @@ def unread_notifications():
     db = get_db()
     rows = db.execute(
         """
-        SELECT id, property_id, person_id, channel, from_number, to_number, status, body, sent_at
+        SELECT id,
+               property_id,
+               person_id,
+               channel,
+               direction,
+               from_number,
+               to_number,
+               status,
+               body,
+               sent_at,
+               opened_at,
+               open_count
         FROM communications
-        WHERE lower(direction) = 'inbound' AND COALESCE(is_read, 1) = 0
-        ORDER BY sent_at DESC, id DESC
+        WHERE COALESCE(is_read, 1) = 0
+          AND (
+              lower(direction) = 'inbound'
+              OR (
+                  upper(channel) = 'EMAIL'
+                  AND lower(direction) = 'outbound'
+                  AND lower(COALESCE(status, '')) = 'opened'
+              )
+          )
+        ORDER BY COALESCE(opened_at, sent_at) DESC, id DESC
         LIMIT 50
         """
     ).fetchall()
@@ -20368,6 +20668,20 @@ def unread_notifications():
                     linked_person_id = outbound["person_id"] or linked_person_id
                 if not linked_person_id:
                     linked_person_id = find_person_id_by_phone(db, inbound_from)
+            item["link_person_id"] = linked_person_id
+            item["link_property_id"] = linked_property_id
+            if linked_person_id:
+                p = db.execute(
+                    "SELECT first_name, last_name FROM people WHERE id = ?",
+                    (linked_person_id,),
+                ).fetchone()
+                if p:
+                    item["link_person_name"] = f"{p['first_name']} {p['last_name']}".strip()
+        elif str(item.get("channel", "")).upper() == "EMAIL":
+            linked_person_id = item.get("person_id")
+            linked_property_id = item.get("property_id")
+            if str(item.get("direction", "")).lower() == "outbound" and str(item.get("status", "")).lower() == "opened":
+                item["sent_at"] = item.get("opened_at") or item.get("sent_at")
             item["link_person_id"] = linked_person_id
             item["link_property_id"] = linked_property_id
             if linked_person_id:
@@ -20488,7 +20802,7 @@ def clear_unread_notifications():
         """
         UPDATE communications
         SET is_read = 1
-        WHERE lower(direction) = 'inbound' AND COALESCE(is_read, 1) = 0
+        WHERE COALESCE(is_read, 1) = 0
         """
     )
     db.commit()
@@ -21104,25 +21418,50 @@ def email_open_tracking_pixel(token):
     clean_token = (token or "").strip()
     if clean_token:
         now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        db.execute(
+        tracked = db.execute(
             """
-            UPDATE communications
-            SET open_count = COALESCE(open_count, 0) + 1,
-                opened_at = COALESCE(opened_at, ?),
-                status = CASE
-                    WHEN upper(channel) = 'EMAIL' AND lower(direction) = 'outbound' AND (
-                        COALESCE(status, '') = '' OR lower(status) IN ('sent', 'queued', 'delivered')
-                    )
-                    THEN 'Opened'
-                    ELSE status
-                END
+            SELECT id, property_id, person_id, to_number, open_count
+            FROM communications
             WHERE open_tracking_token = ?
               AND upper(channel) = 'EMAIL'
               AND lower(direction) = 'outbound'
+            ORDER BY id DESC
+            LIMIT 1
             """,
-            (now_str, clean_token),
-        )
-        db.commit()
+            (clean_token,),
+        ).fetchone()
+        if tracked:
+            first_open = int(tracked["open_count"] or 0) <= 0
+            db.execute(
+                """
+                UPDATE communications
+                SET open_count = COALESCE(open_count, 0) + 1,
+                    opened_at = COALESCE(opened_at, ?),
+                    status = CASE
+                        WHEN upper(channel) = 'EMAIL' AND lower(direction) = 'outbound' AND (
+                            COALESCE(status, '') = '' OR lower(status) IN ('sent', 'queued', 'delivered')
+                        )
+                        THEN 'Opened'
+                        ELSE status
+                    END,
+                    is_read = CASE WHEN ? = 1 THEN 0 ELSE COALESCE(is_read, 1) END
+                WHERE id = ?
+                """,
+                (now_str, (1 if first_open else 0), int(tracked["id"])),
+            )
+            if first_open:
+                db.execute(
+                    """
+                    INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+                    VALUES (?, ?, 'Email Opened', 'Opened', ?)
+                    """,
+                    (
+                        int(tracked["property_id"] or 0),
+                        tracked["person_id"],
+                        f"Tracking pixel fired for outbound email to {(tracked['to_number'] or '').strip()}",
+                    ),
+                )
+            db.commit()
     return app.response_class(
         OPEN_TRACK_PIXEL_GIF,
         mimetype="image/gif",

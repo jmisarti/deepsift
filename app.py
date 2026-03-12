@@ -1409,10 +1409,14 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True, force_
             out["reisift_property_status"] = str(best.get("status") or "").strip()
             out["source"] = "reisift_phone_search"
             if out["reisift_property_uuid"]:
-                local_match = db.execute(
-                    "SELECT id FROM properties WHERE reisift_property_uuid = ? ORDER BY id DESC LIMIT 1",
-                    (out["reisift_property_uuid"],),
-                ).fetchone()
+                local_match = None
+                try:
+                    local_match = db.execute(
+                        "SELECT id FROM properties WHERE reisift_property_uuid = ? ORDER BY id DESC LIMIT 1",
+                        (out["reisift_property_uuid"],),
+                    ).fetchone()
+                except Exception:
+                    local_match = None
                 if local_match:
                     out["property_id"] = int(local_match["id"])
                 elif int(out.get("property_id") or 0) > 0:

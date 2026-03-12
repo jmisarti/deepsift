@@ -13812,9 +13812,6 @@ def _canonical_rollup_key_for_item(db, item, lead_key=""):
             rollup_uuid = _get_local_property_uuid(db, property_id)
     if rollup_uuid:
         return f"uuid:{rollup_uuid}", []
-    addr_key = _rollup_address_key_for_item(item)
-    if addr_key:
-        return f"address:{addr_key}", []
     phones = _rollup_phone_candidates_for_item(item, lead_key=lead_key)
     if phones:
         return f"phone:{phones[0]}", phones
@@ -13832,44 +13829,6 @@ def _canonical_rollup_key_for_action_row(db, action_row):
             rollup_uuid = _get_local_property_uuid(db, property_id)
     if rollup_uuid:
         return f"uuid:{rollup_uuid}"
-    addr_key = ""
-    if isinstance(snapshot, dict):
-        addr_hints = snapshot.get("address_hints") if isinstance(snapshot.get("address_hints"), list) else []
-        for h in addr_hints:
-            nk = normalize_address_key(h)
-            if nk:
-                addr_key = nk
-                break
-        if not addr_key:
-            nk = normalize_address_key(snapshot.get("label") or "")
-            if nk:
-                addr_key = nk
-    if not addr_key:
-        property_id = int(row.get("property_id") or 0)
-        if property_id > 0:
-            prow = db.execute(
-                """
-                SELECT a.street, a.city, a.state, a.postal_code
-                FROM properties p
-                LEFT JOIN addresses a ON a.id = p.property_address_id
-                WHERE p.id = ?
-                LIMIT 1
-                """,
-                (property_id,),
-            ).fetchone()
-            if prow:
-                addr_key = normalize_address_key(
-                    " ".join(
-                        [
-                            str(prow["street"] or "").strip(),
-                            str(prow["city"] or "").strip(),
-                            str(prow["state"] or "").strip(),
-                            str(prow["postal_code"] or "").strip(),
-                        ]
-                    ).strip()
-                )
-    if addr_key:
-        return f"address:{addr_key}"
     phones = []
     for raw in list(snapshot.get("phones") or []):
         n = normalize_phone(raw)
@@ -15081,7 +15040,7 @@ def agents_page():
         payload_obj = parse_json_object(item.get("payload_json") or "{}")
         snapshot = payload_obj.get("snapshot") if isinstance(payload_obj.get("snapshot"), dict) else {}
         item["lead_key"] = str(snapshot.get("lead_key") or payload_obj.get("lead_key") or "").strip()
-        item["latest_inbound_text"] = str(payload_obj.get("latest_inbound") or "").strip()
+        item["latest_inbound_text"] = str(payload_obj.get("latest_inbound") or snapshot.get("latest_inbound") or "").strip()
         item["timeline_override"] = payload_obj.get("timeline_override") if isinstance(payload_obj.get("timeline_override"), dict) else {}
         item["snapshot_obj"] = snapshot
         phone_candidates = []
@@ -15094,15 +15053,20 @@ def agents_page():
             norm = normalize_phone(val)
             if norm and norm not in phone_candidates:
                 phone_candidates.append(norm)
+        if not phone_candidates and str(item["lead_key"]).lower().startswith("phone:"):
+            lead_phone = normalize_phone(str(item["lead_key"]).split(":", 1)[1])
+            if lead_phone:
+                phone_candidates.append(lead_phone)
         phone_label = ", ".join(format_phone_display(n) for n in phone_candidates if n)
         item["phone_candidates"] = phone_candidates
         item["phone_candidates_display"] = ", ".join(format_phone_display(n) for n in phone_candidates if n)
 
         item["target_label"] = address_label or (phone_label if phone_label else "-")
         item["target_kind"] = "address" if address_label else ("phone" if phone_label else "none")
-        item["reisift_property_uuid"] = ""
-        item["open_record_url"] = ""
-        item["resolver_source"] = ""
+        snapshot_uuid = normalize_uuid(snapshot.get("reisift_property_uuid") or payload_obj.get("reisift_property_uuid") or "")
+        item["reisift_property_uuid"] = snapshot_uuid
+        item["open_record_url"] = _sift_record_url(snapshot_uuid) if snapshot_uuid else ""
+        item["resolver_source"] = "snapshot" if snapshot_uuid else ""
         item["resolver_phone"] = ""
         item["last_call_summary"] = ""
         item["last_call_at"] = ""
@@ -15227,6 +15191,28 @@ def agents_page():
         if int(r["property_id"] or 0):
             all_property_ids.add(int(r["property_id"]))
     property_uuid_by_id = _property_uuid_map(sorted(list(all_property_ids)))
+    latest_inbound_by_property = {}
+    lead_property_ids = sorted({int(r.get("property_id") or 0) for r in lead_actions if int(r.get("property_id") or 0) > 0})
+    if lead_property_ids:
+        placeholders = ",".join(["?"] * len(lead_property_ids))
+        inbound_rows = db.execute(
+            f"""
+            SELECT property_id, body, COALESCE(sent_at, created_at) AS when_at, id
+            FROM communications
+            WHERE lower(direction) = 'inbound'
+              AND property_id IN ({placeholders})
+            ORDER BY property_id ASC, COALESCE(sent_at, created_at) DESC, id DESC
+            """,
+            tuple(lead_property_ids),
+        ).fetchall()
+        for r in inbound_rows:
+            pid = int(r["property_id"] or 0)
+            if pid <= 0 or pid in latest_inbound_by_property:
+                continue
+            latest_inbound_by_property[pid] = {
+                "body": str(r["body"] or "").strip(),
+                "when": str(r["when_at"] or "").strip(),
+            }
 
     call_jobs_enriched = []
     for row in call_jobs:
@@ -15272,6 +15258,8 @@ def agents_page():
         signals_enriched.append(item)
 
     latest_call_by_phone = {}
+    latest_call_by_property = {}
+    latest_call_by_uuid = {}
     for row in call_jobs_enriched:
         detail = str(row.get("detail_summary") or row.get("summary_text") or "").strip()
         if not detail:
@@ -15281,8 +15269,16 @@ def agents_page():
             n = normalize_phone(raw)
             if n and n not in latest_call_by_phone:
                 latest_call_by_phone[n] = {"summary": detail, "when": when}
+        pid = int(row.get("property_id") or 0)
+        if pid > 0 and pid not in latest_call_by_property:
+            latest_call_by_property[pid] = {"summary": detail, "when": when}
+        uuid_key = normalize_uuid(row.get("reisift_property_uuid") or "")
+        if uuid_key and uuid_key not in latest_call_by_uuid:
+            latest_call_by_uuid[uuid_key] = {"summary": detail, "when": when}
 
     latest_sms_by_phone = {}
+    latest_sms_by_property = {}
+    latest_sms_by_uuid = {}
     for row in signals_enriched:
         detail = str(row.get("detail_summary") or row.get("summary_text") or "").strip()
         if not detail:
@@ -15292,15 +15288,25 @@ def agents_page():
             n = normalize_phone(raw)
             if n and n not in latest_sms_by_phone:
                 latest_sms_by_phone[n] = {"summary": detail, "when": when}
+        pid = int(row.get("property_id") or 0)
+        if pid > 0 and pid not in latest_sms_by_property:
+            latest_sms_by_property[pid] = {"summary": detail, "when": when}
+        uuid_key = normalize_uuid(row.get("reisift_property_uuid") or "")
+        if uuid_key and uuid_key not in latest_sms_by_uuid:
+            latest_sms_by_uuid[uuid_key] = {"summary": detail, "when": when}
 
     lead_actions_with_context = []
     for item in lead_actions:
         resolved_link = _resolve_uuid_from_numbers(item.get("phone_candidates") or [], fallback_property_id=item.get("property_id"))
         uuid = normalize_uuid(resolved_link.get("uuid") or "")
-        item["reisift_property_uuid"] = uuid
-        item["open_record_url"] = _sift_record_url(uuid)
-        item["resolver_source"] = str(resolved_link.get("source") or "").strip()
-        item["resolver_phone"] = format_phone_display(resolved_link.get("phone_norm") or "")
+        if uuid:
+            item["reisift_property_uuid"] = uuid
+            item["open_record_url"] = _sift_record_url(uuid)
+            item["resolver_source"] = str(resolved_link.get("source") or "").strip() or item.get("resolver_source") or ""
+        elif not item.get("reisift_property_uuid"):
+            item["reisift_property_uuid"] = ""
+            item["open_record_url"] = ""
+        item["resolver_phone"] = format_phone_display(resolved_link.get("phone_norm") or "") or item.get("resolver_phone") or ""
         for n in item.get("phone_candidates") or []:
             if n in latest_call_by_phone and not item["last_call_summary"]:
                 item["last_call_summary"] = latest_call_by_phone[n]["summary"]
@@ -15308,6 +15314,30 @@ def agents_page():
             if n in latest_sms_by_phone and not item["last_sms_summary"]:
                 item["last_sms_summary"] = latest_sms_by_phone[n]["summary"]
                 item["last_sms_at"] = latest_sms_by_phone[n]["when"]
+        property_id = int(item.get("property_id") or 0)
+        if property_id > 0:
+            if not item["last_call_summary"] and property_id in latest_call_by_property:
+                item["last_call_summary"] = latest_call_by_property[property_id]["summary"]
+                item["last_call_at"] = latest_call_by_property[property_id]["when"]
+            if not item["last_sms_summary"] and property_id in latest_sms_by_property:
+                item["last_sms_summary"] = latest_sms_by_property[property_id]["summary"]
+                item["last_sms_at"] = latest_sms_by_property[property_id]["when"]
+            if not item["latest_inbound_text"] and property_id in latest_inbound_by_property:
+                item["latest_inbound_text"] = latest_inbound_by_property[property_id]["body"]
+        uuid_key = normalize_uuid(item.get("reisift_property_uuid") or "")
+        if uuid_key:
+            if not item["last_call_summary"] and uuid_key in latest_call_by_uuid:
+                item["last_call_summary"] = latest_call_by_uuid[uuid_key]["summary"]
+                item["last_call_at"] = latest_call_by_uuid[uuid_key]["when"]
+            if not item["last_sms_summary"] and uuid_key in latest_sms_by_uuid:
+                item["last_sms_summary"] = latest_sms_by_uuid[uuid_key]["summary"]
+                item["last_sms_at"] = latest_sms_by_uuid[uuid_key]["when"]
+        if not item["latest_inbound_text"] and item["last_sms_summary"]:
+            item["latest_inbound_text"] = item["last_sms_summary"]
+        if not item["last_sms_summary"]:
+            item["last_sms_summary"] = str(item.get("reason") or "").strip()
+        if not item["last_call_summary"] and item["last_sms_summary"]:
+            item["last_call_summary"] = item["last_sms_summary"]
         lead_actions_with_context.append(item)
     lead_actions = lead_actions_with_context
 

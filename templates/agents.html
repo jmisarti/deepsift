@@ -43,7 +43,36 @@
 }
 .agent-detail-row td {
     background: #f8fafc;
+    white-space: normal;
+}
+.agent-detail-wrap {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.75rem 0.9rem;
+}
+.agent2-context-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 0.55rem 0.75rem;
+}
+.agent2-context-item {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 0.45rem 0.6rem;
+}
+.agent2-context-item strong {
+    display: block;
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #475569;
+    margin-bottom: 0.18rem;
+}
+.agent2-context-item span {
+    display: block;
     white-space: pre-wrap;
+    word-break: break-word;
 }
 .agent-detail-label {
     font-weight: 600;
@@ -400,30 +429,56 @@
                 </td>
             </tr>
             <tr id="agent2-detail-{{ row.id }}" class="agent-detail-row">
-                <td colspan="11">
-                    <div class="agent-detail-label">Agent 2 Context</div>
-                    <div><strong>Lead Key:</strong> {{ row.lead_key or '-' }}</div>
-                    <div><strong>Phones:</strong> {{ row.phone_candidates_display or '-' }}</div>
-                    <div><strong>Resolved Via:</strong> {{ row.resolver_source or '-' }}{% if row.resolver_phone %} ({{ row.resolver_phone }}){% endif %}</div>
-                    <div>
-                        <strong>Reisift:</strong>
-                        {% if row.open_record_url %}
-                        <a href="{{ row.open_record_url }}" target="_blank">Open in Sift</a>
-                        {% else %}
-                        -
-                        {% endif %}
-                    </div>
-                    <div><strong>Latest Inbound Message:</strong> {{ row.latest_inbound_text or '-' }}</div>
-                    <div><strong>Last SMS Analysis{% if row.last_sms_at %} ({{ row.last_sms_at|fmt_est_datetime }}){% endif %}:</strong> {{ row.last_sms_summary or '-' }}</div>
-                    <div><strong>Last Call Analysis{% if row.last_call_at %} ({{ row.last_call_at|fmt_est_datetime }}){% endif %}:</strong> {{ row.last_call_summary or '-' }}</div>
-                    {% set snap = row.snapshot_obj or {} %}
-                    <div>
-                        <strong>Snapshot:</strong>
-                        SMS Out {{ snap.sms_outbound or 0 }},
-                        SMS In {{ snap.sms_inbound or 0 }},
-                        Calls {{ snap.calls or 0 }},
-                        Classification {{ snap.classification or 'unknown' }},
-                        ReiSift Status {{ snap.reisift_status or '-' }}
+                <td colspan="11" style="padding:0;">
+                    <div class="agent-detail-wrap">
+                        <div class="agent-detail-label">Agent 2 Context</div>
+                        <div class="agent2-context-grid">
+                            <div class="agent2-context-item">
+                                <strong>Lead Key</strong>
+                                <span>{{ row.lead_key or '-' }}</span>
+                            </div>
+                            <div class="agent2-context-item">
+                                <strong>Phones</strong>
+                                <span>{{ row.phone_candidates_display or '-' }}</span>
+                            </div>
+                            <div class="agent2-context-item">
+                                <strong>Resolved Via</strong>
+                                <span>{{ row.resolver_source or '-' }}{% if row.resolver_phone %} ({{ row.resolver_phone }}){% endif %}</span>
+                            </div>
+                            <div class="agent2-context-item">
+                                <strong>Reisift</strong>
+                                <span>
+                                    {% if row.open_record_url %}
+                                    <a href="{{ row.open_record_url }}" target="_blank">Open in Sift</a>
+                                    {% else %}
+                                    -
+                                    {% endif %}
+                                </span>
+                            </div>
+                            <div class="agent2-context-item">
+                                <strong>Latest Inbound Message</strong>
+                                <span>{{ row.latest_inbound_text or '-' }}</span>
+                            </div>
+                            <div class="agent2-context-item">
+                                <strong>Last SMS Analysis{% if row.last_sms_at %} ({{ row.last_sms_at|fmt_est_datetime }}){% endif %}</strong>
+                                <span>{{ row.last_sms_summary or '-' }}</span>
+                            </div>
+                            <div class="agent2-context-item">
+                                <strong>Last Call Analysis{% if row.last_call_at %} ({{ row.last_call_at|fmt_est_datetime }}){% endif %}</strong>
+                                <span>{{ row.last_call_summary or '-' }}</span>
+                            </div>
+                            {% set snap = row.snapshot_obj or {} %}
+                            <div class="agent2-context-item">
+                                <strong>Snapshot</strong>
+                                <span>
+                                    SMS Out {{ snap.sms_outbound or 0 }},
+                                    SMS In {{ snap.sms_inbound or 0 }},
+                                    Calls {{ snap.calls or 0 }},
+                                    Classification {{ snap.classification or 'unknown' }},
+                                    ReiSift Status {{ snap.reisift_status or '-' }}
+                                </span>
+                            </div>
+                        </div>
                     </div>
                 </td>
             </tr>

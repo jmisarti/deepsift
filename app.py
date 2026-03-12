@@ -34,7 +34,7 @@ try:
     from bs4 import BeautifulSoup
 except Exception:
     BeautifulSoup = None
-from flask import Flask, g, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, g, jsonify, redirect, render_template, request, send_from_directory, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 from werkzeug.exceptions import HTTPException
@@ -12914,6 +12914,11 @@ def build_market_status_helper(address_text):
 @app.route("/healthz")
 def healthz():
     return jsonify({"ok": True}), 200
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return send_from_directory(app.static_folder, "favicon.ico", mimetype="image/x-icon")
 
 
 @app.route("/login", methods=["GET", "POST"])

@@ -13426,7 +13426,7 @@ def _dismiss_open_leadwatch_actions(db, lead_key, reason):
     return int(cur.rowcount or 0)
 
 
-def _close_other_pending_leadwatch_actions(db, lead_key, keep_dedupe_key):
+def _close_other_pending_leadwatch_actions(db, lead_key, keep_dedupe_key, phone_tokens=None):
     if not lead_key and not keep_dedupe_key:
         return 0
     rollup = str(lead_key or "").strip()
@@ -13454,7 +13454,130 @@ def _close_other_pending_leadwatch_actions(db, lead_key, keep_dedupe_key):
         """,
         tuple(params),
     )
-    return int(cur.rowcount or 0)
+    closed = int(cur.rowcount or 0)
+    phone_norms = []
+    for p in phone_tokens or []:
+        n = normalize_phone(p)
+        if n and n not in phone_norms:
+            phone_norms.append(n)
+    if phone_norms:
+        payload_clause = " OR ".join(["payload_json LIKE ?"] * len(phone_norms))
+        key_clause = " OR ".join(["dedupe_key LIKE ?"] * len(phone_norms))
+        payload_args = [f"%{p}%" for p in phone_norms]
+        key_args = [f"%{p}%" for p in phone_norms]
+        cur_phone = db.execute(
+            f"""
+            UPDATE lead_management_actions
+            SET status = 'Completed',
+                reason = TRIM(COALESCE(reason, '') || ' [Superseded by Agent 2 phone roll-up]'),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'Pending'
+              AND property_id = 0
+              AND dedupe_key <> ?
+              AND (({payload_clause}) OR ({key_clause}))
+            """,
+            tuple([str(keep_dedupe_key or "").strip(), *payload_args, *key_args]),
+        )
+        closed += int(cur_phone.rowcount or 0)
+    return closed
+
+
+def _extract_phone_from_lead_key(lead_key):
+    lk = str(lead_key or "").strip().lower()
+    if lk.startswith("phone:"):
+        return normalize_phone(lk.split("phone:", 1)[1])
+    return ""
+
+
+def _rollup_phone_candidates_for_item(item, lead_key=""):
+    out = []
+    for raw in list(item.get("phones") or []):
+        n = normalize_phone(raw)
+        if n and n not in out:
+            out.append(n)
+    from_key = _extract_phone_from_lead_key(lead_key)
+    if from_key and from_key not in out:
+        out.append(from_key)
+    return sorted(out)
+
+
+def _canonical_rollup_key_for_item(item, lead_key=""):
+    property_id = int(item.get("property_id") or 0)
+    if property_id > 0:
+        return f"property:{property_id}", []
+    rollup_uuid = normalize_uuid(item.get("reisift_property_uuid") or "")
+    if rollup_uuid:
+        return f"uuid:{rollup_uuid}", []
+    phones = _rollup_phone_candidates_for_item(item, lead_key=lead_key)
+    if phones:
+        return f"phone:{phones[0]}", phones
+    return f"lead:{str(lead_key or '').strip()}", []
+
+
+def _canonical_rollup_key_for_action_row(action_row):
+    row = dict(action_row or {})
+    property_id = int(row.get("property_id") or 0)
+    if property_id > 0:
+        return f"property:{property_id}"
+    payload = parse_json_object(row.get("payload_json") or "{}")
+    snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    rollup_uuid = normalize_uuid(snapshot.get("reisift_property_uuid") or "")
+    if rollup_uuid:
+        return f"uuid:{rollup_uuid}"
+    phones = []
+    for raw in list(snapshot.get("phones") or []):
+        n = normalize_phone(raw)
+        if n and n not in phones:
+            phones.append(n)
+    dk = str(row.get("dedupe_key") or "")
+    phone_match = re.search(r"(?:^|:)phone:([0-9]{10,15})(?:$|:)", dk)
+    if phone_match:
+        n = normalize_phone(phone_match.group(1))
+        if n and n not in phones:
+            phones.append(n)
+    lead_key = str(snapshot.get("lead_key") or "")
+    lk_phone = _extract_phone_from_lead_key(lead_key)
+    if lk_phone and lk_phone not in phones:
+        phones.append(lk_phone)
+    if phones:
+        return f"phone:{sorted(phones)[0]}"
+    if dk.startswith("leadwatch:"):
+        tail = dk[len("leadwatch:") :].strip()
+        return tail or dk
+    return dk or f"row:{int(row.get('id') or 0)}"
+
+
+def dedupe_pending_lead_actions_by_rollup(db):
+    rows = db.execute(
+        """
+        SELECT id, dedupe_key, property_id, payload_json, updated_at, created_at, reason
+        FROM lead_management_actions
+        WHERE status = 'Pending'
+        ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+        """
+    ).fetchall()
+    seen = {}
+    closed = 0
+    for r in rows:
+        row = dict(r)
+        rollup = _canonical_rollup_key_for_action_row(row)
+        keep_id = seen.get(rollup)
+        if keep_id is None:
+            seen[rollup] = int(row["id"])
+            continue
+        db.execute(
+            """
+            UPDATE lead_management_actions
+            SET status = 'Completed',
+                reason = TRIM(COALESCE(reason, '') || ' [Auto-merged duplicate roll-up]'),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND status = 'Pending'
+            """,
+            (int(row["id"]),),
+        )
+        closed += 1
+    return {"kept_rollups": len(seen), "closed_duplicates": closed}
 
 
 def _determine_agent2_action(item, snapshot, timeline_override, latest_inbound_text):
@@ -13595,15 +13718,7 @@ def evaluate_lead_watch_item_lead_management(db, item):
         "reisift_property_uuid": str(item.get("reisift_property_uuid") or ""),
         "phones": list(item.get("phones") or []),
     }
-    rollup_key = ""
-    if property_id > 0:
-        rollup_key = f"property:{property_id}"
-    else:
-        rollup_uuid = normalize_uuid(item.get("reisift_property_uuid") or "")
-        if rollup_uuid:
-            rollup_key = f"uuid:{rollup_uuid}"
-        else:
-            rollup_key = f"lead:{lead_key}"
+    rollup_key, rollup_phone_norms = _canonical_rollup_key_for_item(item, lead_key=lead_key)
     snapshot["rollup_key"] = rollup_key
     if ignore_agent2:
         _dismiss_open_leadwatch_actions(db, rollup_key, "manual_ignore_agent2")
@@ -13642,7 +13757,7 @@ def evaluate_lead_watch_item_lead_management(db, item):
             due_at=due_at,
         )
     )
-    _close_other_pending_leadwatch_actions(db, rollup_key, dedupe_key)
+    _close_other_pending_leadwatch_actions(db, rollup_key, dedupe_key, phone_tokens=rollup_phone_norms)
     return {
         "lead_key": lead_key,
         "skipped": False,
@@ -14155,10 +14270,12 @@ def run_lead_monitor_once(db, source="manual", property_id=None):
                     "inbound_total": (result.get("snapshot") or {}).get("inbound_total", 0),
                 }
             )
+    dedupe_stats = dedupe_pending_lead_actions_by_rollup(db)
     summary = {
         "inspected": inspected,
         "skipped": skipped,
         "created_actions": created_actions,
+        "dedupe": dedupe_stats,
         "uuid_backfill": backfill_stats,
         "details": details,
     }
@@ -14483,6 +14600,9 @@ def agents_page():
         "queued_count": int((queue_counts["queued_count"] or 0) if queue_counts else 0),
         "no_realtor_count": int((queue_counts["no_realtor_count"] or 0) if queue_counts else 0),
     }
+    dedupe_stats = dedupe_pending_lead_actions_by_rollup(db)
+    if int(dedupe_stats.get("closed_duplicates") or 0) > 0:
+        db.commit()
     lead_counts = db.execute(
         """
         SELECT
@@ -14506,6 +14626,7 @@ def agents_page():
         LEFT JOIN properties p ON p.id = a.property_id
         LEFT JOIN addresses adr ON adr.id = p.property_address_id
         LEFT JOIN people pe ON pe.id = a.person_id
+        WHERE a.status = 'Pending'
         ORDER BY
             CASE a.status WHEN 'Pending' THEN 0 WHEN 'Approved' THEN 1 WHEN 'Completed' THEN 2 ELSE 3 END,
             CASE a.priority WHEN 'High' THEN 0 WHEN 'Medium' THEN 1 ELSE 2 END,

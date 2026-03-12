@@ -152,6 +152,7 @@
                 <th>Date/Time</th>
                 <th>Call SID</th>
                 <th>ReiSift</th>
+                <th>Resolver</th>
                 <th>Fetch</th>
                 <th>Analysis</th>
                 <th>Details</th>
@@ -170,12 +171,16 @@
                     -
                     {% endif %}
                 </td>
+                <td>
+                    {{ row.resolver_source or '-' }}
+                    {% if row.resolver_phone %}<br><small>{{ row.resolver_phone }}</small>{% endif %}
+                </td>
                 <td>{{ row.fetch_status }}</td>
                 <td>{{ row.analysis_status }}</td>
                 <td>Click row to expand</td>
             </tr>
             <tr id="call-detail-{{ row.id }}" class="agent-detail-row">
-                <td colspan="7">
+                <td colspan="8">
                     <div class="agent-detail-label">Call Detail</div>
                     {{ row.detail_summary or row.summary_text or '-' }}
                 </td>
@@ -229,6 +234,7 @@
                 <th>Date/Time</th>
                 <th>Source</th>
                 <th>ReiSift</th>
+                <th>Resolver</th>
                 <th>Fetch</th>
                 <th>Intent</th>
                 <th>Sentiment</th>
@@ -250,6 +256,10 @@
                     -
                     {% endif %}
                 </td>
+                <td>
+                    {{ row.resolver_source or '-' }}
+                    {% if row.resolver_phone %}<br><small>{{ row.resolver_phone }}</small>{% endif %}
+                </td>
                 <td>{{ row.routing_status }}</td>
                 <td>{{ row.intent or '-' }}</td>
                 <td>{{ row.sentiment or '-' }}</td>
@@ -258,7 +268,7 @@
                 <td>Click row to expand</td>
             </tr>
             <tr id="signal-detail-{{ row.id }}" class="agent-detail-row">
-                <td colspan="10">
+                <td colspan="11">
                     <div class="agent-detail-label">SMS/Signal Detail</div>
                     {{ row.detail_summary or row.summary_text or '-' }}
                 </td>

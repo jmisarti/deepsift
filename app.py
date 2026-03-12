@@ -20,6 +20,7 @@ import time
 import traceback
 from urllib.parse import quote, quote_plus, urlsplit
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import EmailMessage
@@ -158,6 +159,7 @@ SMS_ANALYSIS_WORKER_STARTED = False
 WEBSITE_LEADS_HOLD_WORKER_STARTED = False
 AGENT_REFRESH_WORKER_STARTED = False
 SYSTEM_PHONE_CACHE = {"numbers": set(), "expires_at": None}
+AGENT_PIPELINE_LOCK = threading.RLock()
 NJ_COUNTIES = [
     "Atlantic",
     "Bergen",
@@ -578,6 +580,18 @@ def commit_with_retry(db, retries=8, base_delay=0.2):
             if "locked" not in str(exc).lower() or attempt >= retries - 1:
                 raise
             time.sleep(base_delay * (attempt + 1))
+
+
+@contextmanager
+def agent_pipeline_guard(purpose="agent_pipeline", timeout_seconds=20):
+    wait_seconds = max(1, int(timeout_seconds or 20))
+    acquired = AGENT_PIPELINE_LOCK.acquire(timeout=wait_seconds)
+    if not acquired:
+        raise TimeoutError(f"agent pipeline busy ({purpose})")
+    try:
+        yield
+    finally:
+        AGENT_PIPELINE_LOCK.release()
 
 
 @app.teardown_appcontext
@@ -8004,86 +8018,89 @@ def run_call_recording_analysis_once(limit=2, statuses=None, created_after=None,
     ensure_db()
     db = open_sqlite_connection()
     try:
-        where = []
-        params = []
-        use_statuses = statuses or ["Pending", "Retry"]
-        if use_statuses:
-            placeholders = ",".join(["?"] * len(use_statuses))
-            where.append(f"analysis_status IN ({placeholders})")
-            params.extend(use_statuses)
-        if created_after:
-            where.append("created_at >= ?")
-            params.append(created_after)
-        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-        rows = db.execute(
-            f"""
-            SELECT *
-            FROM call_recording_jobs
-            {where_sql}
-            ORDER BY id ASC
-            LIMIT ?
-            """,
-            tuple(params + [max(1, int(limit))]),
-        ).fetchall()
-        processed = 0
-        completed = 0
-        failed = 0
-        details = []
-        for row in rows:
-            processed += 1
-            try:
-                out = process_single_call_recording_job(db, row, force_reanalyze=force_reanalyze)
-                details.append(out)
-                if out.get("status") == "completed":
-                    completed += 1
-            except Exception as exc:
-                failed += 1
-                payload = parse_json_object(row["payload_json"] or "{}")
-                retry_count = int(payload.get("retry_count", 0) or 0) + 1
-                payload["retry_count"] = retry_count
-                payload["error"] = str(exc)
-                db.execute(
-                    """
-                    UPDATE call_recording_jobs
-                    SET analysis_status = ?,
-                        fetch_status = CASE WHEN fetch_status = 'Queued' THEN 'Error' ELSE fetch_status END,
-                        payload_json = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (
-                        "Retry" if retry_count < CALL_ANALYSIS_MAX_RETRIES else "Failed",
-                        json.dumps(payload),
-                        row["id"],
-                    ),
-                )
-                if row["property_id"]:
-                    _create_agent_diagnosis_review_action(
-                        db,
-                        property_id=int(row["property_id"]),
-                        person_id=row["person_id"],
-                        call_sid=row["call_sid"],
-                        diagnosis="Call analysis failed",
-                        attempted_fix=f"Automatic retry {retry_count}/{CALL_ANALYSIS_MAX_RETRIES}",
-                        proposed_resolution=(
-                            "Retry analysis automatically."
-                            if retry_count < CALL_ANALYSIS_MAX_RETRIES
-                            else "Retries exhausted; review payload/provider recording quality."
+        with agent_pipeline_guard("call_recording_analysis", timeout_seconds=20):
+            where = []
+            params = []
+            use_statuses = statuses or ["Pending", "Retry"]
+            if use_statuses:
+                placeholders = ",".join(["?"] * len(use_statuses))
+                where.append(f"analysis_status IN ({placeholders})")
+                params.extend(use_statuses)
+            if created_after:
+                where.append("created_at >= ?")
+                params.append(created_after)
+            where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+            rows = db.execute(
+                f"""
+                SELECT *
+                FROM call_recording_jobs
+                {where_sql}
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                tuple(params + [max(1, int(limit))]),
+            ).fetchall()
+            processed = 0
+            completed = 0
+            failed = 0
+            details = []
+            for row in rows:
+                processed += 1
+                try:
+                    out = process_single_call_recording_job(db, row, force_reanalyze=force_reanalyze)
+                    details.append(out)
+                    if out.get("status") == "completed":
+                        completed += 1
+                except Exception as exc:
+                    failed += 1
+                    payload = parse_json_object(row["payload_json"] or "{}")
+                    retry_count = int(payload.get("retry_count", 0) or 0) + 1
+                    payload["retry_count"] = retry_count
+                    payload["error"] = str(exc)
+                    db.execute(
+                        """
+                        UPDATE call_recording_jobs
+                        SET analysis_status = ?,
+                            fetch_status = CASE WHEN fetch_status = 'Queued' THEN 'Error' ELSE fetch_status END,
+                            payload_json = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (
+                            "Retry" if retry_count < CALL_ANALYSIS_MAX_RETRIES else "Failed",
+                            json.dumps(payload),
+                            row["id"],
                         ),
-                        priority="Medium" if retry_count < CALL_ANALYSIS_MAX_RETRIES else "High",
-                        extra={"error": str(exc)},
                     )
-                details.append({"job_id": row["id"], "status": "error", "error": str(exc)})
-                log_app_error(
-                    db,
-                    source="call_recording_worker",
-                    error_message=str(exc),
-                    details=traceback.format_exc(),
-                    route="run_call_recording_analysis_once",
-                    status_code=500,
-                )
-        db.commit()
-        return {"ok": True, "processed": processed, "completed": completed, "failed": failed, "details": details}
+                    if row["property_id"]:
+                        _create_agent_diagnosis_review_action(
+                            db,
+                            property_id=int(row["property_id"]),
+                            person_id=row["person_id"],
+                            call_sid=row["call_sid"],
+                            diagnosis="Call analysis failed",
+                            attempted_fix=f"Automatic retry {retry_count}/{CALL_ANALYSIS_MAX_RETRIES}",
+                            proposed_resolution=(
+                                "Retry analysis automatically."
+                                if retry_count < CALL_ANALYSIS_MAX_RETRIES
+                                else "Retries exhausted; review payload/provider recording quality."
+                            ),
+                            priority="Medium" if retry_count < CALL_ANALYSIS_MAX_RETRIES else "High",
+                            extra={"error": str(exc)},
+                        )
+                    details.append({"job_id": row["id"], "status": "error", "error": str(exc)})
+                    log_app_error(
+                        db,
+                        source="call_recording_worker",
+                        error_message=str(exc),
+                        details=traceback.format_exc(),
+                        route="run_call_recording_analysis_once",
+                        status_code=500,
+                    )
+            db.commit()
+            return {"ok": True, "processed": processed, "completed": completed, "failed": failed, "details": details}
+    except TimeoutError:
+        return {"ok": True, "skipped": "agent_pipeline_busy"}
     except Exception as exc:
         db.rollback()
         log_app_error(
@@ -8686,7 +8703,11 @@ def analyze_sms_thread_with_openai(messages, property_id=None, person_id=None, c
 def run_sms_analysis_once(lookback_days=14, limit_threads=30, start_utc=None):
     ensure_db()
     db = open_sqlite_connection()
+    lock_acquired = False
     try:
+        lock_acquired = AGENT_PIPELINE_LOCK.acquire(timeout=20)
+        if not lock_acquired:
+            return {"ok": True, "skipped": "agent_pipeline_busy"}
         if start_utc is not None:
             cutoff = format_db_time(start_utc)
         else:
@@ -8840,6 +8861,8 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30, start_utc=None):
         db.commit()
         return {"ok": False, "error": str(exc)}
     finally:
+        if lock_acquired:
+            AGENT_PIPELINE_LOCK.release()
         db.close()
 
 
@@ -13545,6 +13568,153 @@ def run_uuid_backfill_once(db, snapshot_limit=300, phone_limit=200):
     }
 
 
+def repair_unresolved_call_context_once(db, limit=80, max_reisift_lookups=12):
+    max_rows = max(1, min(500, int(limit or 80)))
+    lookup_budget = max(0, min(200, int(max_reisift_lookups or 12)))
+    rows = db.execute(
+        """
+        SELECT id, call_sid, from_number, to_number, property_id, person_id, payload_json
+        FROM call_recording_jobs
+        WHERE COALESCE(property_id, 0) = 0
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (max_rows,),
+    ).fetchall()
+    processed = 0
+    repaired = 0
+    unresolved = 0
+    reisift_lookups = 0
+    phone_lookup_cache = {}
+    sample = []
+
+    def _pick_best_resolution(base_ctx, candidate_ctx):
+        result = dict(base_ctx or {})
+        cand = dict(candidate_ctx or {})
+        for key in ["phone_norm", "source", "reisift_full_address", "reisift_owner_name", "reisift_property_status"]:
+            if (not result.get(key)) and cand.get(key):
+                result[key] = cand.get(key)
+        if int(cand.get("property_id") or 0) and not int(result.get("property_id") or 0):
+            result["property_id"] = int(cand.get("property_id") or 0)
+        if int(cand.get("person_id") or 0) and not int(result.get("person_id") or 0):
+            result["person_id"] = int(cand.get("person_id") or 0)
+        cand_uuid = normalize_uuid(cand.get("reisift_property_uuid") or "")
+        base_uuid = normalize_uuid(result.get("reisift_property_uuid") or "")
+        if cand_uuid and not base_uuid:
+            result["reisift_property_uuid"] = cand_uuid
+        return result
+
+    for row in rows:
+        processed += 1
+        candidates = _counterparty_candidates(db, row["from_number"], row["to_number"])
+        resolved = resolve_shared_contact_context_by_numbers(
+            db,
+            candidates,
+            fallback_property_id=None,
+            force_reisift=False,
+            search_reisift=False,
+        ) or {}
+        resolved_uuid = normalize_uuid(resolved.get("reisift_property_uuid") or "")
+        if not (int(resolved.get("property_id") or 0) or resolved_uuid):
+            for phone in candidates:
+                n = normalize_phone(phone)
+                if not n:
+                    continue
+                ctx = phone_lookup_cache.get(n)
+                if ctx is None:
+                    if reisift_lookups >= lookup_budget:
+                        continue
+                    ctx = resolve_property_context_by_phone(
+                        db,
+                        n,
+                        search_reisift=True,
+                        force_reisift=True,
+                    ) or {}
+                    phone_lookup_cache[n] = ctx
+                    reisift_lookups += 1
+                resolved = _pick_best_resolution(resolved, ctx)
+                resolved_uuid = normalize_uuid(resolved.get("reisift_property_uuid") or "")
+                if int(resolved.get("property_id") or 0) or resolved_uuid:
+                    break
+
+        resolved_pid = int(resolved.get("property_id") or 0) or None
+        resolved_person_id = int(resolved.get("person_id") or 0) or None
+        resolved_uuid = normalize_uuid(resolved.get("reisift_property_uuid") or "")
+        if resolved_pid or resolved_uuid:
+            payload_obj = parse_json_object(row["payload_json"] or "{}")
+            payload_obj["context_repair"] = {
+                "repaired_at": format_db_time(datetime.utcnow()),
+                "from_number": row["from_number"],
+                "to_number": row["to_number"],
+                "resolved_property_id": resolved_pid,
+                "resolved_person_id": resolved_person_id,
+                "reisift_property_uuid": resolved_uuid,
+                "source": str(resolved.get("source") or ""),
+            }
+            db.execute(
+                """
+                UPDATE call_recording_jobs
+                SET property_id = COALESCE(?, property_id),
+                    person_id = COALESCE(?, person_id),
+                    payload_json = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    resolved_pid,
+                    resolved_person_id,
+                    json.dumps(payload_obj),
+                    int(row["id"]),
+                ),
+            )
+            if resolved_pid and resolved_uuid:
+                _set_local_property_uuid(db, int(resolved_pid), resolved_uuid)
+            primary_phone = normalize_phone(candidates[0] if candidates else "")
+            if primary_phone:
+                upsert_cached_contact_context(
+                    db,
+                    primary_phone,
+                    property_id=resolved_pid,
+                    person_id=resolved_person_id,
+                    classification="potential_seller",
+                    source="call_context_repair",
+                    confidence=0.9 if resolved_uuid else 0.8,
+                    notes=f"repair call_sid={row['call_sid']}",
+                    reisift_property_uuid=resolved_uuid,
+                    reisift_full_address=str(resolved.get("reisift_full_address") or "").strip(),
+                    reisift_owner_name=str(resolved.get("reisift_owner_name") or "").strip(),
+                    reisift_property_status=str(resolved.get("reisift_property_status") or "").strip(),
+                    last_reisift_lookup_at=format_db_time(datetime.utcnow()),
+                )
+            repaired += 1
+            status_value = "repaired"
+        else:
+            unresolved += 1
+            status_value = "unresolved"
+        if len(sample) < 120:
+            sample.append(
+                {
+                    "call_job_id": int(row["id"]),
+                    "call_sid": str(row["call_sid"] or ""),
+                    "status": status_value,
+                    "from_number": str(row["from_number"] or ""),
+                    "to_number": str(row["to_number"] or ""),
+                    "resolved_property_id": int(resolved_pid or 0),
+                    "resolved_person_id": int(resolved_person_id or 0),
+                    "reisift_property_uuid": resolved_uuid,
+                    "resolver_source": str(resolved.get("source") or ""),
+                }
+            )
+    return {
+        "processed": processed,
+        "repaired": repaired,
+        "unresolved": unresolved,
+        "reisift_lookups": reisift_lookups,
+        "lookup_budget": lookup_budget,
+        "sample": sample,
+    }
+
+
 def run_lead_monitor_once(db, source="manual", property_id=None):
     run_cur = db.execute(
         """
@@ -13661,7 +13831,11 @@ def enqueue_agent_refresh(db, property_id, reason="", delay_seconds=0):
 def run_agent_refresh_queue_once(limit=25):
     ensure_db()
     db = open_sqlite_connection()
+    lock_acquired = False
     try:
+        lock_acquired = AGENT_PIPELINE_LOCK.acquire(timeout=20)
+        if not lock_acquired:
+            return {"ok": True, "skipped": "agent_pipeline_busy"}
         now_utc = format_db_time(datetime.utcnow())
         rows = db.execute(
             """
@@ -13717,6 +13891,8 @@ def run_agent_refresh_queue_once(limit=25):
         db.commit()
         return {"ok": False, "error": str(exc)}
     finally:
+        if lock_acquired:
+            AGENT_PIPELINE_LOCK.release()
         db.close()
 
 
@@ -14016,12 +14192,28 @@ def agents_page():
             search_reisift=False,
         ) or {}
         uuid_value = normalize_uuid(resolved.get("reisift_property_uuid") or "")
+        resolver_source = str(resolved.get("source") or "").strip()
+        resolver_phone = normalize_phone(resolved.get("phone_norm") or "")
         if uuid_value:
-            return uuid_value
+            return {
+                "uuid": uuid_value,
+                "source": resolver_source or "cache",
+                "phone_norm": resolver_phone,
+            }
         pid = int(resolved.get("property_id") or 0)
         if pid and property_uuid_by_id.get(pid, ""):
-            return property_uuid_by_id.get(pid, "")
-        return ""
+            return {
+                "uuid": property_uuid_by_id.get(pid, ""),
+                "source": resolver_source or "local_property",
+                "phone_norm": resolver_phone,
+            }
+        if int(fallback_property_id or 0) > 0 and property_uuid_by_id.get(int(fallback_property_id), ""):
+            return {
+                "uuid": property_uuid_by_id.get(int(fallback_property_id), ""),
+                "source": "local_property",
+                "phone_norm": resolver_phone,
+            }
+        return {"uuid": "", "source": resolver_source or "", "phone_norm": resolver_phone}
 
     all_property_ids = set()
     for r in call_jobs:
@@ -14036,9 +14228,12 @@ def agents_page():
     for row in call_jobs:
         item = dict(row)
         phone_candidates = [item.get("from_number"), item.get("to_number")]
-        uuid = _resolve_uuid_from_numbers(phone_candidates, fallback_property_id=item.get("property_id"))
+        resolved_link = _resolve_uuid_from_numbers(phone_candidates, fallback_property_id=item.get("property_id"))
+        uuid = normalize_uuid(resolved_link.get("uuid") or "")
         item["reisift_property_uuid"] = uuid
         item["open_record_url"] = _sift_record_url(uuid)
+        item["resolver_source"] = str(resolved_link.get("source") or "").strip()
+        item["resolver_phone"] = format_phone_display(resolved_link.get("phone_norm") or "")
         payload_obj = parse_json_object(item.get("payload_json") or "{}")
         analysis_obj = parse_json_object(item.get("analysis_json") or "{}")
         context = payload_obj.get("analysis_context") if isinstance(payload_obj.get("analysis_context"), dict) else {}
@@ -14062,9 +14257,12 @@ def agents_page():
         source_tail = source_key.rsplit(":", 1)[-1] if ":" in source_key else ""
         if normalize_phone(source_tail):
             phone_candidates.append(source_tail)
-        uuid = _resolve_uuid_from_numbers(phone_candidates, fallback_property_id=item.get("property_id"))
+        resolved_link = _resolve_uuid_from_numbers(phone_candidates, fallback_property_id=item.get("property_id"))
+        uuid = normalize_uuid(resolved_link.get("uuid") or "")
         item["reisift_property_uuid"] = uuid
         item["open_record_url"] = _sift_record_url(uuid)
+        item["resolver_source"] = str(resolved_link.get("source") or "").strip()
+        item["resolver_phone"] = format_phone_display(resolved_link.get("phone_norm") or "")
         item["detail_summary"] = compose_sms_signal_detail(item) if str(item.get("source_type") or "").lower() == "sms" else str(item.get("summary_text") or "").strip()
         signals_enriched.append(item)
 
@@ -19479,56 +19677,97 @@ def integrations_agents_uuid_backfill_once_api():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.route("/api/integrations/agents/call-context-repair", methods=["POST"])
+def integrations_agents_call_context_repair_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    limit = payload.get("limit", 80)
+    max_reisift_lookups = payload.get("max_reisift_lookups", 12)
+    try:
+        with agent_pipeline_guard("call_context_repair", timeout_seconds=25):
+            report = repair_unresolved_call_context_once(
+                db,
+                limit=limit,
+                max_reisift_lookups=max_reisift_lookups,
+            )
+            reconcile = run_agent3_lead_watch_reconcile(db, limit=200)
+            snapshot = build_today_lead_watch_snapshot(db, limit=200)
+            db.commit()
+            return jsonify({"ok": True, "report": report, "reconcile": reconcile, "snapshot": snapshot})
+    except TimeoutError:
+        return jsonify({"ok": False, "error": "agent_pipeline_busy"}), 409
+    except Exception as exc:
+        log_app_error(
+            db,
+            source="integrations_agents_call_context_repair_api",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/api/integrations/agents/call-context-repair",
+            status_code=500,
+        )
+        db.commit()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/api/integrations/agents/rerun-today", methods=["POST"])
 def integrations_agents_rerun_today_api():
     ensure_db()
     db = get_db()
     if not integration_auth_ok(db, request):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    lock_acquired = AGENT_PIPELINE_LOCK.acquire(timeout=20)
+    if not lock_acquired:
+        return jsonify({"ok": False, "error": "agent_pipeline_busy"}), 409
     errors = []
 
-    def _safe_run(step_name, fn):
-        try:
-            return fn()
-        except Exception as exc:
-            err = {"step": step_name, "error": str(exc)}
-            errors.append(err)
-            log_app_error(
-                db,
-                source="integrations_agents_rerun_today_api",
-                error_message=str(exc),
-                details=traceback.format_exc(),
-                route=f"/api/integrations/agents/rerun-today:{step_name}",
-                status_code=500,
-            )
-            return {"error": str(exc)}
+    try:
+        def _safe_run(step_name, fn):
+            try:
+                return fn()
+            except Exception as exc:
+                err = {"step": step_name, "error": str(exc)}
+                errors.append(err)
+                log_app_error(
+                    db,
+                    source="integrations_agents_rerun_today_api",
+                    error_message=str(exc),
+                    details=traceback.format_exc(),
+                    route=f"/api/integrations/agents/rerun-today:{step_name}",
+                    status_code=500,
+                )
+                return {"error": str(exc)}
 
-    # Agent 1: force rerun calls in the lead-watch window (yesterday 12:00 AM ET onward).
-    call_rerun = _safe_run("call_rerun", lambda: rerun_call_analysis_for_today(db, limit=800))
-    db.commit()
-    # Agent 1 SMS pass for the same lead-watch window.
-    sms_res = _safe_run(
-        "sms_analysis",
-        lambda: run_sms_analysis_once(lookback_days=2, limit_threads=250, start_utc=est_yesterday_start_utc()),
-    )
-    # Agent 2 refresh across full touched lead set (UUID-only + local property leads).
-    lead_monitor_res = _safe_run("lead_monitor", lambda: run_lead_monitor_once(db, source="rerun_today", property_id=None))
-    # Agent 3 reconciliation + snapshot.
-    recon = _safe_run("reconcile", lambda: run_agent3_lead_watch_reconcile(db, limit=200))
-    snapshot = _safe_run("snapshot", lambda: build_today_lead_watch_snapshot(db, limit=200))
-    db.commit()
-    return jsonify(
-        {
-            "ok": len(errors) == 0,
-            "call_cutoff": call_rerun.get("cutoff", ""),
-            "call_rerun": call_rerun,
-            "sms": sms_res,
-            "lead_monitor": lead_monitor_res,
-            "reconcile": recon,
-            "snapshot": snapshot,
-            "errors": errors,
-        }
-    )
+        # Agent 1: force rerun calls in the lead-watch window (yesterday 12:00 AM ET onward).
+        call_rerun = _safe_run("call_rerun", lambda: rerun_call_analysis_for_today(db, limit=800))
+        db.commit()
+        # Agent 1 SMS pass for the same lead-watch window.
+        sms_res = _safe_run(
+            "sms_analysis",
+            lambda: run_sms_analysis_once(lookback_days=2, limit_threads=250, start_utc=est_yesterday_start_utc()),
+        )
+        # Agent 2 refresh across full touched lead set (UUID-only + local property leads).
+        lead_monitor_res = _safe_run("lead_monitor", lambda: run_lead_monitor_once(db, source="rerun_today", property_id=None))
+        # Agent 3 reconciliation + snapshot.
+        recon = _safe_run("reconcile", lambda: run_agent3_lead_watch_reconcile(db, limit=200))
+        snapshot = _safe_run("snapshot", lambda: build_today_lead_watch_snapshot(db, limit=200))
+        db.commit()
+        return jsonify(
+            {
+                "ok": len(errors) == 0,
+                "call_cutoff": call_rerun.get("cutoff", ""),
+                "call_rerun": call_rerun,
+                "sms": sms_res,
+                "lead_monitor": lead_monitor_res,
+                "reconcile": recon,
+                "snapshot": snapshot,
+                "errors": errors,
+            }
+        )
+    finally:
+        AGENT_PIPELINE_LOCK.release()
 
 
 @app.route("/api/integrations/agents/reset-associations", methods=["POST"])

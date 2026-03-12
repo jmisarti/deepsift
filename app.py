@@ -19068,29 +19068,85 @@ def slack_command_webhook():
     cmd = (request.form.get("command") or "").strip()
     user_name = (request.form.get("user_name") or "").strip()
     low = text.lower()
-    if low in {"help", "?"}:
+    tokens = [t for t in re.split(r"\s+", low) if t]
+    sub = tokens[0] if tokens else "help"
+    if sub in {"help", "?"}:
         return jsonify(
             {
                 "response_type": "ephemeral",
-                "text": "Commands: `status` (counts), `health` (app health), `help`.",
+                "text": (
+                    "Agent Ops commands:\n"
+                    "• `status` - agent pipeline snapshot\n"
+                    "• `queue` - pending Agent 2 actions\n"
+                    "• `unresolved` - unresolved lead-watch items\n"
+                    "• `health` - agent endpoint health\n"
+                    "• `help` - command list"
+                ),
             }
         )
-    if low in {"status", "counts"}:
-        counts = {
-            "properties": db.execute("SELECT COUNT(*) AS c FROM properties").fetchone()["c"],
-            "people": db.execute("SELECT COUNT(*) AS c FROM people").fetchone()["c"],
-            "referrals": db.execute("SELECT COUNT(*) AS c FROM reisift_referrals").fetchone()["c"],
-            "realtors": db.execute("SELECT COUNT(*) AS c FROM referral_realtors").fetchone()["c"],
-        }
+    if sub in {"status", "overview"}:
+        snap = build_agent_advisor_snapshot(db, window_hours=72)
+        signals = snap.get("signals", {})
+        actions = snap.get("actions", {})
+        calls = snap.get("calls", {})
+        lw = snap.get("lead_watch_today", {})
+        latest_run = snap.get("latest_run", {})
         msg = (
-            f"DeepSift status for @{user_name or 'user'}: "
-            f"properties={counts['properties']}, people={counts['people']}, "
-            f"referrals={counts['referrals']}, realtors={counts['realtors']}"
+            f"DeepSift Agent Ops status for @{user_name or 'user'}:\n"
+            f"Signals: new={signals.get('new_total', 0)}, routed={signals.get('routed_total', 0)}, "
+            f"sms={signals.get('sms_total', 0)}, calls={signals.get('call_total', 0)}\n"
+            f"Agent 2 queue: pending={actions.get('pending_total', 0)}, "
+            f"high={actions.get('high_pending_total', 0)}, stale_2d={actions.get('stale_pending_2d', 0)}\n"
+            f"Call analysis: pending={calls.get('pending_total', 0)}, failed={calls.get('failed_total', 0)}\n"
+            f"Lead watch: total={lw.get('count', 0)}, unresolved={lw.get('unresolved_count', 0)}, "
+            f"actionable_unresolved={lw.get('unresolved_active_count', 0)}\n"
+            f"Latest lead monitor run: #{latest_run.get('id', 0)} ({latest_run.get('status', '-')})"
         )
         return jsonify({"response_type": "ephemeral", "text": msg})
-    if low in {"health", "ping"}:
-        return jsonify({"response_type": "ephemeral", "text": "DeepSift is online."})
-    return jsonify({"response_type": "ephemeral", "text": f"Unknown command `{text or cmd}`. Try `help`."})
+    if sub in {"queue", "pending"}:
+        rows = db.execute(
+            """
+            SELECT id, action_type, priority, status, due_at, reason, property_id
+            FROM lead_management_actions
+            WHERE status = 'Pending'
+            ORDER BY
+                CASE priority WHEN 'High' THEN 0 WHEN 'Medium' THEN 1 ELSE 2 END,
+                datetime(COALESCE(due_at, updated_at, created_at)) ASC,
+                id ASC
+            LIMIT 8
+            """
+        ).fetchall()
+        if not rows:
+            return jsonify({"response_type": "ephemeral", "text": "Agent 2 queue is clear (no pending actions)."})
+        lines = ["Top Agent 2 pending actions:"]
+        for r in rows:
+            due = format_est_datetime(str(r["due_at"] or "")) if str(r["due_at"] or "").strip() else "-"
+            lines.append(
+                f"• #{int(r['id'])} [{r['priority']}] {r['action_type']} | due {due} | "
+                f"lead property_id={int(r['property_id'] or 0)}"
+            )
+        return jsonify({"response_type": "ephemeral", "text": "\n".join(lines)})
+    if sub in {"unresolved", "watch"}:
+        lw = build_today_lead_watch_snapshot(db, limit=50)
+        unresolved = [
+            x
+            for x in (lw.get("items") or [])
+            if int(x.get("unresolved") or 0) == 1
+            and int(x.get("ignore_agent2") or 0) == 0
+            and str(x.get("classification") or "").strip().lower() not in {"spam", "solicitor"}
+        ]
+        if not unresolved:
+            return jsonify({"response_type": "ephemeral", "text": "No actionable unresolved lead-watch items right now."})
+        lines = [f"Actionable unresolved lead-watch items: {len(unresolved)}"]
+        for row in unresolved[:8]:
+            lines.append(
+                f"• {row.get('label') or row.get('lead_key')}: "
+                f"sms_out={int(row.get('sms_outbound') or 0)}, sms_in={int(row.get('sms_inbound') or 0)}, calls={int(row.get('calls') or 0)}"
+            )
+        return jsonify({"response_type": "ephemeral", "text": "\n".join(lines)})
+    if sub in {"health", "ping"}:
+        return jsonify({"response_type": "ephemeral", "text": "DeepSift Agent Ops is online."})
+    return jsonify({"response_type": "ephemeral", "text": f"Unknown agent-ops command `{text or cmd}`. Try `help`."})
 
 
 @app.route("/webhooks/slack/events", methods=["POST"])

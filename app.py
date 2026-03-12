@@ -9357,11 +9357,40 @@ def build_today_lead_watch_snapshot(db, limit=60):
             clever_related=("clever" in summary.lower()),
         )
 
-    # Merge fragmented keys that resolve to the same property into a single canonical row.
+    def _canonical_lead_row_key(row):
+        # Canonical identity: uuid -> normalized address -> phone.
+        row_uuid = ""
+        for ph in list(row.get("phones") or []):
+            pu = normalize_uuid(referral_uuid_by_phone.get(normalize_phone(ph) or "") or "")
+            if pu:
+                row_uuid = pu
+                break
+        if not row_uuid:
+            ctx = _best_cached_context_for_phones(list(row.get("phones") or []))
+            if ctx:
+                row_uuid = normalize_uuid(ctx["reisift_property_uuid"] or "")
+        if not row_uuid:
+            pid = int(row.get("property_id") or 0)
+            if pid > 0:
+                row_uuid = _get_local_property_uuid(db, pid)
+        if row_uuid:
+            return f"uuid:{row_uuid}"
+        for hint in list(row.get("address_hints") or []):
+            nk = normalize_address_key(hint)
+            if nk:
+                return f"address:{nk}"
+        nk = normalize_address_key(row.get("label") or "")
+        if nk:
+            return f"address:{nk}"
+        phones = sorted([normalize_phone(x) for x in list(row.get("phones") or []) if normalize_phone(x)])
+        if phones:
+            return f"phone:{phones[0]}"
+        return str(row.get("lead_key") or "").strip()
+
+    # Merge fragmented keys into canonical roll-up rows.
     merged = {}
     for key, row in list(leads.items()):
-        pid = int(row.get("property_id") or 0)
-        canonical = f"property:{pid}" if pid else key
+        canonical = _canonical_lead_row_key(row)
         tgt = merged.get(canonical)
         if not tgt:
             merged[canonical] = row
@@ -13501,29 +13530,94 @@ def _rollup_phone_candidates_for_item(item, lead_key=""):
     return sorted(out)
 
 
-def _canonical_rollup_key_for_item(item, lead_key=""):
-    property_id = int(item.get("property_id") or 0)
-    if property_id > 0:
-        return f"property:{property_id}", []
+def _rollup_address_key_for_item(item):
+    hints = list(item.get("address_hints") or [])
+    for h in hints:
+        nk = normalize_address_key(h)
+        if nk:
+            return nk
+    lbl = str(item.get("label") or "").strip()
+    low = lbl.lower()
+    if (
+        lbl
+        and not low.startswith("phone:")
+        and not low.startswith("phone ")
+        and not low.startswith("uuid:")
+        and not low.startswith("property:")
+        and not normalize_phone(lbl)
+    ):
+        nk = normalize_address_key(lbl)
+        if nk:
+            return nk
+    return ""
+
+
+def _canonical_rollup_key_for_item(db, item, lead_key=""):
     rollup_uuid = normalize_uuid(item.get("reisift_property_uuid") or "")
+    if not rollup_uuid:
+        property_id = int(item.get("property_id") or 0)
+        if property_id > 0:
+            rollup_uuid = _get_local_property_uuid(db, property_id)
     if rollup_uuid:
         return f"uuid:{rollup_uuid}", []
+    addr_key = _rollup_address_key_for_item(item)
+    if addr_key:
+        return f"address:{addr_key}", []
     phones = _rollup_phone_candidates_for_item(item, lead_key=lead_key)
     if phones:
         return f"phone:{phones[0]}", phones
     return f"lead:{str(lead_key or '').strip()}", []
 
 
-def _canonical_rollup_key_for_action_row(action_row):
+def _canonical_rollup_key_for_action_row(db, action_row):
     row = dict(action_row or {})
-    property_id = int(row.get("property_id") or 0)
-    if property_id > 0:
-        return f"property:{property_id}"
     payload = parse_json_object(row.get("payload_json") or "{}")
     snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
     rollup_uuid = normalize_uuid(snapshot.get("reisift_property_uuid") or "")
+    if not rollup_uuid:
+        property_id = int(row.get("property_id") or 0)
+        if property_id > 0:
+            rollup_uuid = _get_local_property_uuid(db, property_id)
     if rollup_uuid:
         return f"uuid:{rollup_uuid}"
+    addr_key = ""
+    if isinstance(snapshot, dict):
+        addr_hints = snapshot.get("address_hints") if isinstance(snapshot.get("address_hints"), list) else []
+        for h in addr_hints:
+            nk = normalize_address_key(h)
+            if nk:
+                addr_key = nk
+                break
+        if not addr_key:
+            nk = normalize_address_key(snapshot.get("label") or "")
+            if nk:
+                addr_key = nk
+    if not addr_key:
+        property_id = int(row.get("property_id") or 0)
+        if property_id > 0:
+            prow = db.execute(
+                """
+                SELECT a.street, a.city, a.state, a.postal_code
+                FROM properties p
+                LEFT JOIN addresses a ON a.id = p.property_address_id
+                WHERE p.id = ?
+                LIMIT 1
+                """,
+                (property_id,),
+            ).fetchone()
+            if prow:
+                addr_key = normalize_address_key(
+                    " ".join(
+                        [
+                            str(prow["street"] or "").strip(),
+                            str(prow["city"] or "").strip(),
+                            str(prow["state"] or "").strip(),
+                            str(prow["postal_code"] or "").strip(),
+                        ]
+                    ).strip()
+                )
+    if addr_key:
+        return f"address:{addr_key}"
     phones = []
     for raw in list(snapshot.get("phones") or []):
         n = normalize_phone(raw)
@@ -13560,7 +13654,7 @@ def dedupe_pending_lead_actions_by_rollup(db):
     closed = 0
     for r in rows:
         row = dict(r)
-        rollup = _canonical_rollup_key_for_action_row(row)
+        rollup = _canonical_rollup_key_for_action_row(db, row)
         keep_id = seen.get(rollup)
         if keep_id is None:
             seen[rollup] = int(row["id"])
@@ -13718,7 +13812,7 @@ def evaluate_lead_watch_item_lead_management(db, item):
         "reisift_property_uuid": str(item.get("reisift_property_uuid") or ""),
         "phones": list(item.get("phones") or []),
     }
-    rollup_key, rollup_phone_norms = _canonical_rollup_key_for_item(item, lead_key=lead_key)
+    rollup_key, rollup_phone_norms = _canonical_rollup_key_for_item(db, item, lead_key=lead_key)
     snapshot["rollup_key"] = rollup_key
     if ignore_agent2:
         _dismiss_open_leadwatch_actions(db, rollup_key, "manual_ignore_agent2")

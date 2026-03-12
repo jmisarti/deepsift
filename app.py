@@ -18109,7 +18109,9 @@ def smrtphone_inbound_webhook():
             property_id = int(reisift_context.get("property_id") or 0)
             if not person_id and int(reisift_context.get("person_id") or 0):
                 person_id = int(reisift_context.get("person_id") or 0)
-    if not property_id:
+    resolved_reisift_uuid = normalize_uuid(reisift_context.get("reisift_property_uuid") or "")
+    has_resolved_context = bool(int(property_id or 0)) or bool(resolved_reisift_uuid)
+    if not has_resolved_context:
         signal = classify_unknown_contact_text(message)
         source_key_basis = sms_id or hashlib.sha1(
             f"{event_type}|{from_number}|{to_number}|{message}|{event_name}".encode("utf-8", errors="ignore")
@@ -18155,7 +18157,10 @@ def smrtphone_inbound_webhook():
         db.commit()
         return jsonify({"ok": True, "stored_unresolved": True, "classification": signal["classification"]}), 200
     if not person_id:
-        person_id = find_person_id_by_recent_outbound_to_number(db, property_id, counterparty_number)
+        if property_id:
+            person_id = find_person_id_by_recent_outbound_to_number(db, property_id, counterparty_number)
+        if not person_id:
+            person_id = find_person_id_by_phone(db, counterparty_number)
     upsert_cached_contact_context(
         db,
         counterparty_number,
@@ -18165,7 +18170,7 @@ def smrtphone_inbound_webhook():
         source="smrtphone_webhook_resolved",
         confidence=0.9,
         notes=f"direction={direction}; event={event_name or event_type}",
-        reisift_property_uuid=normalize_uuid(reisift_context.get("reisift_property_uuid") or ""),
+        reisift_property_uuid=resolved_reisift_uuid,
         reisift_full_address=str(reisift_context.get("reisift_full_address") or "").strip(),
         reisift_owner_name=str(reisift_context.get("reisift_owner_name") or "").strip(),
         reisift_property_status=str(reisift_context.get("reisift_property_status") or "").strip(),

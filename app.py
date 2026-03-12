@@ -824,6 +824,29 @@ def migrate_db(db):
     ensure_column(db, "lead_management_actions", "due_at", "due_at TEXT")
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS agent2_learning_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id INTEGER,
+            dedupe_key TEXT,
+            property_id INTEGER,
+            person_id INTEGER,
+            model_action_type TEXT,
+            model_priority TEXT,
+            model_reason TEXT,
+            model_status TEXT,
+            user_action_type TEXT,
+            user_priority TEXT,
+            user_reason TEXT,
+            user_status TEXT,
+            change_source TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_agent2_learning_feedback_action ON agent2_learning_feedback(action_id, created_at DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_agent2_learning_feedback_prop ON agent2_learning_feedback(property_id, created_at DESC)")
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS call_recording_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             call_sid TEXT NOT NULL UNIQUE,
@@ -14491,6 +14514,35 @@ def agents_page():
         LIMIT 200
         """
     ).fetchall()
+    lead_actions_enriched = []
+    for row in lead_actions:
+        item = dict(row)
+        address_parts = [str(item.get("street") or "").strip(), str(item.get("city") or "").strip()]
+        state_zip = " ".join(
+            p for p in [str(item.get("state") or "").strip(), str(item.get("postal_code") or "").strip()] if p
+        ).strip()
+        if state_zip:
+            address_parts.append(state_zip)
+        address_label = ", ".join([p for p in address_parts if p]).strip()
+
+        payload_obj = parse_json_object(item.get("payload_json") or "{}")
+        phone_candidates = []
+        snapshot = payload_obj.get("snapshot") if isinstance(payload_obj.get("snapshot"), dict) else {}
+        for n in (snapshot.get("phones") if isinstance(snapshot.get("phones"), list) else []):
+            norm = normalize_phone(n)
+            if norm and norm not in phone_candidates:
+                phone_candidates.append(norm)
+        for key in ["counterpart", "phone", "counterpart_number"]:
+            val = extract_first_string_by_keys(payload_obj, [key])
+            norm = normalize_phone(val)
+            if norm and norm not in phone_candidates:
+                phone_candidates.append(norm)
+        phone_label = ", ".join(format_phone_display(n) for n in phone_candidates if n)
+
+        item["target_label"] = address_label or (phone_label if phone_label else "-")
+        item["target_kind"] = "address" if address_label else ("phone" if phone_label else "none")
+        lead_actions_enriched.append(item)
+    lead_actions = lead_actions_enriched
     latest_run = db.execute(
         """
         SELECT id, source, property_id, status, summary_json, created_at, completed_at
@@ -14691,6 +14743,51 @@ def agents_page():
     )
 
 
+def _is_ajax_request(req):
+    xr = (req.headers.get("X-Requested-With") or "").strip().lower()
+    accept = (req.headers.get("Accept") or "").strip().lower()
+    return xr == "xmlhttprequest" or "application/json" in accept
+
+
+def _record_agent2_learning_feedback(
+    db,
+    action_row,
+    *,
+    user_action_type="",
+    user_priority="",
+    user_reason="",
+    user_status="",
+    change_source="manual",
+):
+    row = dict(action_row or {})
+    db.execute(
+        """
+        INSERT INTO agent2_learning_feedback
+        (
+            action_id, dedupe_key, property_id, person_id,
+            model_action_type, model_priority, model_reason, model_status,
+            user_action_type, user_priority, user_reason, user_status, change_source
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(row.get("id") or 0) or None,
+            str(row.get("dedupe_key") or "").strip(),
+            int(row.get("property_id") or 0),
+            int(row.get("person_id") or 0) or None,
+            str(row.get("action_type") or "").strip(),
+            str(row.get("priority") or "").strip(),
+            str(row.get("reason") or "").strip(),
+            str(row.get("status") or "").strip(),
+            str(user_action_type or "").strip(),
+            str(user_priority or "").strip(),
+            str(user_reason or "").strip(),
+            str(user_status or "").strip(),
+            str(change_source or "manual")[:50],
+        ),
+    )
+
+
 @app.route("/agents/lead-monitor/run", methods=["POST"])
 def run_lead_monitor_route():
     ensure_db()
@@ -14710,21 +14807,91 @@ def run_lead_monitor_route():
         return redirect(url_for("agents_page", notice=f"Lead monitor failed: {exc}"))
 
 
+@app.route("/agents/logs/clear", methods=["POST"])
+def clear_agent_logs_route():
+    ensure_db()
+    db = get_db()
+    ajax = _is_ajax_request(request)
+    try:
+        c1 = db.execute("DELETE FROM lead_monitor_runs")
+        c2 = db.execute("DELETE FROM agent_advisor_logs")
+        c3 = db.execute("DELETE FROM agent3_lead_resolutions")
+        db.commit()
+        msg = (
+            "Cleared Agent 2/3 logs. "
+            f"lead_monitor_runs={int(c1.rowcount or 0)}, "
+            f"agent_advisor_logs={int(c2.rowcount or 0)}, "
+            f"agent3_lead_resolutions={int(c3.rowcount or 0)}."
+        )
+        if ajax:
+            return jsonify(
+                {
+                    "ok": True,
+                    "message": msg,
+                    "counts": {
+                        "lead_monitor_runs": int(c1.rowcount or 0),
+                        "agent_advisor_logs": int(c2.rowcount or 0),
+                        "agent3_lead_resolutions": int(c3.rowcount or 0),
+                    },
+                }
+            )
+        return redirect(url_for("agents_page", notice=msg))
+    except Exception as exc:
+        db.rollback()
+        if ajax:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        return redirect(url_for("agents_page", notice=f"Failed to clear Agent 2/3 logs: {exc}"))
+
+
 @app.route("/agents/lead-actions/<int:action_id>/status", methods=["POST"])
 def update_lead_action_status_route(action_id):
     ensure_db()
     db = get_db()
+    ajax = _is_ajax_request(request)
     status = (request.form.get("status") or "").strip()
     if status not in LEAD_ACTION_STATUSES:
+        if ajax:
+            return jsonify({"ok": False, "error": "Invalid lead action status."}), 400
         return redirect(url_for("agents_page", notice="Invalid lead action status."))
-    row = db.execute("SELECT id FROM lead_management_actions WHERE id = ?", (action_id,)).fetchone()
+    row = db.execute(
+        """
+        SELECT id, dedupe_key, property_id, person_id, action_type, priority, status, reason, due_at, updated_at
+        FROM lead_management_actions
+        WHERE id = ?
+        """,
+        (action_id,),
+    ).fetchone()
     if not row:
+        if ajax:
+            return jsonify({"ok": False, "error": "Lead action not found."}), 404
         return redirect(url_for("agents_page", notice="Lead action not found."))
+    _record_agent2_learning_feedback(
+        db,
+        row,
+        user_action_type=row["action_type"],
+        user_priority=row["priority"],
+        user_reason=row["reason"],
+        user_status=status,
+        change_source="status_update",
+    )
     db.execute(
         "UPDATE lead_management_actions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         (status, action_id),
     )
+    updated = db.execute(
+        """
+        SELECT id, action_type, priority, status, reason, due_at, updated_at
+        FROM lead_management_actions
+        WHERE id = ?
+        """,
+        (action_id,),
+    ).fetchone()
     db.commit()
+    if ajax:
+        out = dict(updated or {})
+        out["updated_at_est"] = format_est_datetime(out.get("updated_at") or "")
+        out["due_at_est"] = format_est_datetime(out.get("due_at") or "") if str(out.get("due_at") or "").strip() else "-"
+        return jsonify({"ok": True, "row": out, "message": f"Lead action #{action_id} updated to {status}."})
     return redirect(url_for("agents_page", notice=f"Lead action #{action_id} updated to {status}."))
 
 
@@ -14732,11 +14899,18 @@ def update_lead_action_status_route(action_id):
 def update_lead_action_override_route(action_id):
     ensure_db()
     db = get_db()
+    ajax = _is_ajax_request(request)
     row = db.execute(
-        "SELECT id, payload_json, action_type, priority, reason FROM lead_management_actions WHERE id = ?",
+        """
+        SELECT id, dedupe_key, property_id, person_id, payload_json, action_type, priority, reason, status, due_at, updated_at
+        FROM lead_management_actions
+        WHERE id = ?
+        """,
         (action_id,),
     ).fetchone()
     if not row:
+        if ajax:
+            return jsonify({"ok": False, "error": "Lead action not found."}), 404
         return redirect(url_for("agents_page", notice="Lead action not found."))
     action_type = (request.form.get("action_type") or "").strip()
     priority = (request.form.get("priority") or "").strip().title()
@@ -14753,6 +14927,15 @@ def update_lead_action_override_route(action_id):
         "action_type": action_type,
         "priority": priority,
     }
+    _record_agent2_learning_feedback(
+        db,
+        row,
+        user_action_type=action_type,
+        user_priority=priority,
+        user_reason=reason,
+        user_status=row["status"],
+        change_source="recommendation_override",
+    )
     db.execute(
         """
         UPDATE lead_management_actions
@@ -14761,7 +14944,20 @@ def update_lead_action_override_route(action_id):
         """,
         (action_type, priority, reason, json.dumps(payload), action_id),
     )
+    updated = db.execute(
+        """
+        SELECT id, action_type, priority, status, reason, due_at, updated_at
+        FROM lead_management_actions
+        WHERE id = ?
+        """,
+        (action_id,),
+    ).fetchone()
     db.commit()
+    if ajax:
+        out = dict(updated or {})
+        out["updated_at_est"] = format_est_datetime(out.get("updated_at") or "")
+        out["due_at_est"] = format_est_datetime(out.get("due_at") or "") if str(out.get("due_at") or "").strip() else "-"
+        return jsonify({"ok": True, "row": out, "message": f"Lead action #{action_id} recommendation updated."})
     return redirect(url_for("agents_page", notice=f"Lead action #{action_id} recommendation updated."))
 
 

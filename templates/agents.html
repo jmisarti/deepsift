@@ -316,6 +316,12 @@
     <p class="agent-kicker">Agent 2</p>
     <h3>Agent 2: Lead Action Queue</h3>
     <p><small>Changing <strong>Update Rec</strong> rewrites Agent 2's current recommendation (action type, priority, reason) and is used by Agent 3 in subsequent summaries and next-step guidance.</small></p>
+    <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; margin-bottom:0.5rem;">
+        <form method="post" action="{{ url_for('clear_agent_logs_route') }}">
+            <button type="submit">Clear Agent 2/3 Logs</button>
+        </form>
+        <small id="agent2AsyncNotice" style="display:none;"></small>
+    </div>
     {% if lead_actions %}
     <table>
         <thead>
@@ -334,11 +340,16 @@
         </thead>
         <tbody>
             {% for row in lead_actions %}
-            <tr>
+            <tr id="agent2-row-{{ row.id }}" data-action-id="{{ row.id }}">
                 <td>#{{ row.id }}</td>
-                <td>
-                    <a href="{{ url_for('property_detail', property_id=row.property_id) }}">Property {{ row.property_id }}</a><br>
-                    <small>{{ row.street or '' }} {{ row.city or '' }} {{ row.state or '' }} {{ row.postal_code or '' }}</small>
+                <td class="agent2-col-property">
+                    {% if row.target_kind == 'address' %}
+                    {{ row.target_label }}
+                    {% elif row.target_kind == 'phone' %}
+                    <small>{{ row.target_label }}</small>
+                    {% else %}
+                    -
+                    {% endif %}
                 </td>
                 <td>
                     {% if row.person_id %}
@@ -349,14 +360,14 @@
                     -
                     {% endif %}
                 </td>
-                <td>{{ row.action_type }}</td>
-                <td>{{ row.priority }}</td>
-                <td>{{ row.status }}</td>
-                <td>{% if row.due_at %}{{ row.due_at|fmt_est_datetime }}{% else %}-{% endif %}</td>
-                <td>{{ row.reason }}</td>
-                <td>{{ row.updated_at|fmt_est_datetime }}</td>
+                <td class="agent2-col-action">{{ row.action_type }}</td>
+                <td class="agent2-col-priority">{{ row.priority }}</td>
+                <td class="agent2-col-status">{{ row.status }}</td>
+                <td class="agent2-col-due">{% if row.due_at %}{{ row.due_at|fmt_est_datetime }}{% else %}-{% endif %}</td>
+                <td class="agent2-col-reason">{{ row.reason }}</td>
+                <td class="agent2-col-updated">{{ row.updated_at|fmt_est_datetime }}</td>
                 <td>
-                    <form method="post" action="{{ url_for('update_lead_action_status_route', action_id=row.id) }}" style="display:flex; gap:0.4rem;">
+                    <form method="post" class="js-agent2-status-form" action="{{ url_for('update_lead_action_status_route', action_id=row.id) }}" style="display:flex; gap:0.4rem;">
                         <select name="status">
                             {% for s in lead_action_statuses %}
                             <option value="{{ s }}" {% if s == row.status %}selected{% endif %}>{{ s }}</option>
@@ -364,7 +375,7 @@
                         </select>
                         <button type="submit">Save</button>
                     </form>
-                    <form method="post" action="{{ url_for('update_lead_action_override_route', action_id=row.id) }}" style="display:flex; gap:0.35rem; margin-top:0.35rem; flex-wrap:wrap;">
+                    <form method="post" class="js-agent2-override-form" action="{{ url_for('update_lead_action_override_route', action_id=row.id) }}" style="display:flex; gap:0.35rem; margin-top:0.35rem; flex-wrap:wrap;">
                         <select name="action_type">
                             {% for a in lead_action_types %}
                             <option value="{{ a }}" {% if a == row.action_type %}selected{% endif %}>{{ a }}</option>
@@ -617,6 +628,80 @@ document.addEventListener("click", function (event) {
     const detailRow = document.getElementById(detailId);
     if (!detailRow) return;
     detailRow.style.display = detailRow.style.display === "table-row" ? "none" : "table-row";
+});
+
+function setAgent2Notice(msg, isError) {
+    const el = document.getElementById("agent2AsyncNotice");
+    if (!el) return;
+    if (!msg) {
+        el.style.display = "none";
+        el.textContent = "";
+        return;
+    }
+    el.textContent = msg;
+    el.style.display = "inline";
+    el.style.color = isError ? "#b91c1c" : "#166534";
+}
+
+async function submitAgent2Form(form, options) {
+    setAgent2Notice("");
+    const fd = new FormData(form);
+    const resp = await fetch(form.action, {
+        method: "POST",
+        body: fd,
+        headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" }
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.ok) {
+        throw new Error(data.error || "Request failed");
+    }
+    const tr = form.closest("tr");
+    if (!tr) return data;
+    if (data.row) {
+        const row = data.row;
+        const cAction = tr.querySelector(".agent2-col-action");
+        const cPriority = tr.querySelector(".agent2-col-priority");
+        const cStatus = tr.querySelector(".agent2-col-status");
+        const cReason = tr.querySelector(".agent2-col-reason");
+        const cUpdated = tr.querySelector(".agent2-col-updated");
+        const cDue = tr.querySelector(".agent2-col-due");
+        if (cAction) cAction.textContent = row.action_type || "-";
+        if (cPriority) cPriority.textContent = row.priority || "-";
+        if (cStatus) cStatus.textContent = row.status || "-";
+        if (cReason) cReason.textContent = row.reason || "-";
+        if (cUpdated) cUpdated.textContent = row.updated_at_est || "-";
+        if (cDue) cDue.textContent = row.due_at_est || "-";
+    }
+    if (options && options.removeWhenNotPending) {
+        const statusVal = (data.row && data.row.status) ? String(data.row.status) : "";
+        if (statusVal && statusVal !== "Pending") {
+            tr.remove();
+        }
+    }
+    setAgent2Notice(data.message || "Saved.", false);
+    return data;
+}
+
+document.addEventListener("submit", async function (event) {
+    const statusForm = event.target.closest(".js-agent2-status-form");
+    if (statusForm) {
+        event.preventDefault();
+        try {
+            await submitAgent2Form(statusForm, { removeWhenNotPending: true });
+        } catch (err) {
+            setAgent2Notice(err.message || "Save failed.", true);
+        }
+        return;
+    }
+    const overrideForm = event.target.closest(".js-agent2-override-form");
+    if (overrideForm) {
+        event.preventDefault();
+        try {
+            await submitAgent2Form(overrideForm, { removeWhenNotPending: false });
+        } catch (err) {
+            setAgent2Notice(err.message || "Update failed.", true);
+        }
+    }
 });
 </script>
 {% endblock %}

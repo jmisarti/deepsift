@@ -7797,24 +7797,30 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
     call_direction = _infer_call_direction_from_numbers(db, from_number, to_number, agent_user_name=agent_user_name)
 
     # Keep call-job context fresh even when initial webhook could not map property/person.
-    if not property_id:
-        for candidate in _counterparty_candidates(db, from_number, to_number):
-            resolved_ctx = resolve_property_context_by_phone(db, candidate, search_reisift=True, force_reisift=True) or {}
-            if int(resolved_ctx.get("property_id") or 0):
-                property_id = int(resolved_ctx.get("property_id") or 0)
-                if not person_id and int(resolved_ctx.get("person_id") or 0):
-                    person_id = int(resolved_ctx.get("person_id") or 0)
-                db.execute(
-                    """
-                    UPDATE call_recording_jobs
-                    SET property_id = COALESCE(?, property_id),
-                        person_id = COALESCE(?, person_id),
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (property_id, person_id, job_id),
-                )
-                break
+    if not property_id or not _get_local_property_uuid(db, property_id):
+        resolved_ctx = resolve_shared_event_context(
+            db,
+            from_number,
+            to_number,
+            fallback_property_id=property_id,
+            force_reisift=True,
+            search_reisift=True,
+        ) or {}
+        if (not property_id) and int(resolved_ctx.get("property_id") or 0):
+            property_id = int(resolved_ctx.get("property_id") or 0)
+        if (not person_id) and int(resolved_ctx.get("person_id") or 0):
+            person_id = int(resolved_ctx.get("person_id") or 0)
+        if property_id or person_id:
+            db.execute(
+                """
+                UPDATE call_recording_jobs
+                SET property_id = COALESCE(?, property_id),
+                    person_id = COALESCE(?, person_id),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (property_id, person_id, job_id),
+            )
     analysis_context = {
         "direction": call_direction,
         "call_outcome": call_outcome,
@@ -8457,6 +8463,114 @@ def _counterparty_candidates(db, from_number, to_number):
     return candidates
 
 
+def resolve_shared_contact_context_by_numbers(
+    db,
+    numbers,
+    fallback_property_id=None,
+    force_reisift=False,
+    search_reisift=True,
+):
+    """
+    Shared resolver for call and SMS pipelines.
+    Prefers non-system numbers, reuses cached context, and only falls back to ReiSift when allowed.
+    """
+    system_numbers = _known_system_numbers(db, refresh_seconds=300)
+    norms = []
+    for raw in numbers or []:
+        n = normalize_phone(raw)
+        if n and n not in norms:
+            norms.append(n)
+    result = {
+        "phone_norm": "",
+        "property_id": int(fallback_property_id or 0) or None,
+        "person_id": None,
+        "reisift_property_uuid": "",
+        "reisift_full_address": "",
+        "reisift_owner_name": "",
+        "reisift_property_status": "",
+        "source": "",
+    }
+    fallback_uuid = _get_local_property_uuid(db, result["property_id"])
+    if fallback_uuid:
+        result["reisift_property_uuid"] = fallback_uuid
+        result["source"] = "fallback_property"
+        return result
+
+    def _merge_context(ctx, source_label):
+        if not ctx:
+            return False
+        merged = False
+        if not result["phone_norm"]:
+            result["phone_norm"] = normalize_phone(ctx.get("phone_norm") or "") or ""
+        ctx_pid = int(ctx.get("property_id") or 0) or None
+        ctx_person = int(ctx.get("person_id") or 0) or None
+        ctx_uuid = normalize_uuid(ctx.get("reisift_property_uuid") or "")
+        if (not result["property_id"]) and ctx_pid:
+            result["property_id"] = ctx_pid
+            merged = True
+        if (not result["person_id"]) and ctx_person:
+            result["person_id"] = ctx_person
+            merged = True
+        if (not result["reisift_property_uuid"]) and ctx_uuid:
+            result["reisift_property_uuid"] = ctx_uuid
+            merged = True
+        if (not result["reisift_full_address"]) and str(ctx.get("reisift_full_address") or "").strip():
+            result["reisift_full_address"] = str(ctx.get("reisift_full_address") or "").strip()
+            merged = True
+        if (not result["reisift_owner_name"]) and str(ctx.get("reisift_owner_name") or "").strip():
+            result["reisift_owner_name"] = str(ctx.get("reisift_owner_name") or "").strip()
+            merged = True
+        if (not result["reisift_property_status"]) and str(ctx.get("reisift_property_status") or "").strip():
+            result["reisift_property_status"] = str(ctx.get("reisift_property_status") or "").strip()
+            merged = True
+        if merged and (not result["source"]):
+            result["source"] = source_label
+        return merged
+
+    ordered = [n for n in norms if n not in system_numbers] + [n for n in norms if n in system_numbers]
+    for n in ordered:
+        cached = get_cached_contact_context(db, n)
+        if cached:
+            cdict = dict(cached)
+            cdict["phone_norm"] = n
+            _merge_context(cdict, "cache")
+            if result["reisift_property_uuid"] or result["property_id"]:
+                return result
+        if not search_reisift:
+            continue
+        resolved = resolve_property_context_by_phone(
+            db,
+            n,
+            search_reisift=True,
+            force_reisift=bool(force_reisift),
+        ) or {}
+        if resolved:
+            resolved["phone_norm"] = normalize_phone(resolved.get("phone_norm") or n) or n
+            _merge_context(resolved, str(resolved.get("source") or "resolver"))
+            if result["reisift_property_uuid"] or result["property_id"]:
+                return result
+    if result["property_id"] and not result["reisift_property_uuid"]:
+        result["reisift_property_uuid"] = _get_local_property_uuid(db, result["property_id"])
+    return result
+
+
+def resolve_shared_event_context(
+    db,
+    from_number,
+    to_number,
+    fallback_property_id=None,
+    force_reisift=False,
+    search_reisift=True,
+):
+    return resolve_shared_contact_context_by_numbers(
+        db,
+        _counterparty_candidates(db, from_number, to_number),
+        fallback_property_id=fallback_property_id,
+        force_reisift=force_reisift,
+        search_reisift=search_reisift,
+    )
+
+
 def _apply_sms_analysis_guardrails(messages, analysis):
     analysis = dict(analysis or {})
     msgs = list(messages or [])
@@ -8601,7 +8715,13 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30, start_utc=None):
             if phone_key and (not resolved_property_id):
                 cached_resolution = phone_resolution_cache.get(phone_key)
                 if cached_resolution is None:
-                    cached_resolution = resolve_property_context_by_phone(db, phone_key, search_reisift=True)
+                    cached_resolution = resolve_shared_contact_context_by_numbers(
+                        db,
+                        [phone_key],
+                        fallback_property_id=resolved_property_id,
+                        force_reisift=False,
+                        search_reisift=True,
+                    )
                     phone_resolution_cache[phone_key] = cached_resolution
                 if cached_resolution:
                     resolved_property_id = int(cached_resolution.get("property_id") or 0)
@@ -13887,51 +14007,20 @@ def agents_page():
             return {}
         return out
 
-    system_numbers = _known_system_numbers(db, refresh_seconds=300)
-    cached_ctx_by_phone = {}
-
     def _resolve_uuid_from_numbers(numbers, fallback_property_id=None):
-        if int(fallback_property_id or 0) > 0 and property_uuid_by_id.get(int(fallback_property_id), ""):
-            return property_uuid_by_id.get(int(fallback_property_id), "")
-        normalized_numbers = []
-        for raw in numbers:
-            norm = normalize_phone(raw)
-            if not norm:
-                continue
-            if norm not in normalized_numbers:
-                normalized_numbers.append(norm)
-        # Pass 1: counterparty-first (non-system)
-        for norm in normalized_numbers:
-            if norm in system_numbers:
-                continue
-            ctx = cached_ctx_by_phone.get(norm)
-            if ctx is None:
-                ctx = get_cached_contact_context(db, norm)
-                cached_ctx_by_phone[norm] = ctx
-            if not ctx:
-                continue
-            cached_uuid = normalize_uuid(ctx["reisift_property_uuid"] or "")
-            if cached_uuid:
-                return cached_uuid
-            ctx_pid = int(ctx["property_id"] or 0)
-            if ctx_pid and property_uuid_by_id.get(ctx_pid, ""):
-                return property_uuid_by_id.get(ctx_pid, "")
-        # Pass 2: allow system numbers only if no counterparty match was found.
-        for norm in normalized_numbers:
-            if norm not in system_numbers:
-                continue
-            ctx = cached_ctx_by_phone.get(norm)
-            if ctx is None:
-                ctx = get_cached_contact_context(db, norm)
-                cached_ctx_by_phone[norm] = ctx
-            if not ctx:
-                continue
-            cached_uuid = normalize_uuid(ctx["reisift_property_uuid"] or "")
-            if cached_uuid:
-                return cached_uuid
-            ctx_pid = int(ctx["property_id"] or 0)
-            if ctx_pid and property_uuid_by_id.get(ctx_pid, ""):
-                return property_uuid_by_id.get(ctx_pid, "")
+        resolved = resolve_shared_contact_context_by_numbers(
+            db,
+            numbers,
+            fallback_property_id=fallback_property_id,
+            force_reisift=False,
+            search_reisift=False,
+        ) or {}
+        uuid_value = normalize_uuid(resolved.get("reisift_property_uuid") or "")
+        if uuid_value:
+            return uuid_value
+        pid = int(resolved.get("property_id") or 0)
+        if pid and property_uuid_by_id.get(pid, ""):
+            return property_uuid_by_id.get(pid, "")
         return ""
 
     all_property_ids = set()
@@ -18910,25 +18999,20 @@ def smrtphone_call_completed_webhook():
             _property_id = int(payload.get("property_id"))
         elif _person_id:
             _property_id = find_property_id_for_person(db, _person_id)
-        phone_candidates = _counterparty_candidates(db, from_number, to_number)
-        if not _property_id:
-            for candidate in phone_candidates:
-                ctx = resolve_property_context_by_phone(db, candidate, search_reisift=True)
-                if int(ctx.get("property_id") or 0):
-                    _property_id = int(ctx.get("property_id") or 0)
-                    if not _person_id and int(ctx.get("person_id") or 0):
-                        _person_id = int(ctx.get("person_id") or 0)
-                    if not resolved_reisift_context:
-                        resolved_reisift_context.update(ctx)
-                    break
-        if not _property_id:
-            for candidate in phone_candidates:
-                ctx = get_cached_contact_context(db, candidate)
-                if ctx and ctx["property_id"]:
-                    _property_id = int(ctx["property_id"])
-                    if not _person_id and ctx["person_id"]:
-                        _person_id = int(ctx["person_id"])
-                    break
+        ctx = resolve_shared_event_context(
+            db,
+            from_number,
+            to_number,
+            fallback_property_id=_property_id,
+            force_reisift=True,
+            search_reisift=True,
+        ) or {}
+        if int(ctx.get("property_id") or 0):
+            _property_id = int(ctx.get("property_id") or 0)
+        if not _person_id and int(ctx.get("person_id") or 0):
+            _person_id = int(ctx.get("person_id") or 0)
+        if ctx and not resolved_reisift_context:
+            resolved_reisift_context.update(ctx)
         return _property_id, _person_id
 
     if not call_sid:
@@ -18972,9 +19056,9 @@ def smrtphone_call_completed_webhook():
         return jsonify({"ok": True, "deduped": True, "job_id": existing["id"]}), 200
 
     property_id, person_id = _resolve_property_person()
-    if property_id:
-        phone_candidates = _counterparty_candidates(db, from_number, to_number)
-        counterparty_number = phone_candidates[0] if phone_candidates else (from_number or to_number)
+    phone_candidates = _counterparty_candidates(db, from_number, to_number)
+    counterparty_number = phone_candidates[0] if phone_candidates else (from_number or to_number)
+    if property_id or normalize_uuid(resolved_reisift_context.get("reisift_property_uuid") or ""):
         upsert_cached_contact_context(
             db,
             counterparty_number,

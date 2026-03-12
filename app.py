@@ -8615,8 +8615,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
     cutoff_dt = est_yesterday_start_utc()
     cutoff = format_db_time(cutoff_dt)
     leads = {}
-    system_numbers = set(_system_phone_numbers(db))
-    system_numbers.update(_infer_system_numbers_from_smrt_events(db, cutoff=cutoff))
+    system_numbers = _known_system_numbers(db, refresh_seconds=300)
     phone_to_key = {}
     addr_to_key = {}
     resolution_rows = db.execute(
@@ -8676,16 +8675,24 @@ def build_today_lead_watch_snapshot(db, limit=60):
         """
     ).fetchall()
     referral_by_addr = {}
+    referral_by_uuid = {}
     for rr in referrals:
         key = normalize_address_key(rr["full_address"])
         if key:
             referral_by_addr[key] = dict(rr)
+        uuid_key = normalize_uuid(rr["property_uuid"] or "")
+        if uuid_key:
+            referral_by_uuid[uuid_key] = dict(rr)
     referral_push_by_uuid = {}
+    referral_uuid_by_phone = {}
     for pr in referral_push_rows:
         pu = str(pr["property_uuid"] or "").strip()
         if not pu:
             continue
         referral_push_by_uuid.setdefault(pu, []).append(dict(pr))
+        phone_norm = normalize_phone(pr["to_number"])
+        if phone_norm and phone_norm not in referral_uuid_by_phone:
+            referral_uuid_by_phone[phone_norm] = pu
 
     def _touch(
         key,
@@ -8835,6 +8842,10 @@ def build_today_lead_watch_snapshot(db, limit=60):
         lead_key = f"property:{int(c['property_id'])}" if c["property_id"] else ""
         if not lead_key and counterpart_num and phone_to_key.get(counterpart_num):
             lead_key = phone_to_key.get(counterpart_num, "")
+        if not lead_key and counterpart_num and referral_uuid_by_phone.get(counterpart_num):
+            pu = normalize_uuid(referral_uuid_by_phone.get(counterpart_num) or "")
+            if pu:
+                lead_key = f"uuid:{pu}"
         if not lead_key and candidates:
             addr_norm = normalize_address_key(candidates[0])
             if addr_norm:
@@ -8847,7 +8858,14 @@ def build_today_lead_watch_snapshot(db, limit=60):
         clever_related = "clever" in body.lower()
         _touch(
             key=lead_key,
-            label=(candidates[0] if candidates else lead_key),
+            label=(
+                (
+                    str((referral_by_uuid.get(lead_key.split("uuid:", 1)[1]) or {}).get("full_address") or "").strip()
+                    if lead_key.startswith("uuid:")
+                    else ""
+                )
+                or (candidates[0] if candidates else lead_key)
+            ),
             occurred_at=str(c["sent_at"] or ""),
             property_id=c["property_id"],
             person_id=c["person_id"],
@@ -8900,6 +8918,11 @@ def build_today_lead_watch_snapshot(db, limit=60):
         elif phone_norm and phone_to_key.get(phone_norm):
             lead_key = phone_to_key.get(phone_norm, "")
             label = lead_key
+        elif phone_norm and referral_uuid_by_phone.get(phone_norm):
+            pu = normalize_uuid(referral_uuid_by_phone.get(phone_norm) or "")
+            if pu:
+                lead_key = f"uuid:{pu}"
+                label = str((referral_by_uuid.get(pu) or {}).get("full_address") or "").strip() or f"ReiSIFT {pu}"
         elif candidates:
             addr_norm = normalize_address_key(candidates[0])
             if addr_norm:
@@ -8949,6 +8972,12 @@ def build_today_lead_watch_snapshot(db, limit=60):
             for pn in phone_candidates:
                 if pn in phone_to_key:
                     lead_key = phone_to_key[pn]
+                    break
+        if not lead_key:
+            for pn in phone_candidates:
+                pu = normalize_uuid(referral_uuid_by_phone.get(pn) or "")
+                if pu:
+                    lead_key = f"uuid:{pu}"
                     break
         if not lead_key:
             for num in [c["from_number"], c["to_number"]]:
@@ -9150,6 +9179,12 @@ def build_today_lead_watch_snapshot(db, limit=60):
             or (v["classification"] or "unknown")
         )
         ignore_agent2 = int(resolution.get("ignore_agent2") or 0)
+        if not effective_property_uuid:
+            for ph in list(v.get("phones") or []):
+                pu = normalize_uuid(referral_uuid_by_phone.get(normalize_phone(ph) or "") or "")
+                if pu:
+                    effective_property_uuid = pu
+                    break
         if not effective_property_uuid:
             ctx = _best_cached_context_for_phones(list(v.get("phones") or []))
             if not ctx and str(v.get("lead_key") or "").startswith("phone:"):
@@ -13025,6 +13060,116 @@ def evaluate_property_lead_management(db, property_row):
     return {"property_id": property_id, "skipped": skipped, "created_actions": created_actions, "snapshot": snapshot}
 
 
+def backfill_reisift_context_for_recent_phones(db, cutoff=None, limit=20):
+    cutoff_value = (cutoff or "").strip() or format_db_time(est_yesterday_start_utc())
+    max_attempts = max(1, min(200, int(limit or 20)))
+    system_numbers = _known_system_numbers(db, refresh_seconds=300)
+    ordered_phones = []
+
+    def _add_phone(raw):
+        n = normalize_phone(raw)
+        if not n or n in system_numbers or n in ordered_phones:
+            return
+        ordered_phones.append(n)
+
+    try:
+        comm_rows = db.execute(
+            """
+            SELECT from_number, to_number
+            FROM communications
+            WHERE sent_at >= ?
+              AND upper(channel) = 'SMS'
+            ORDER BY id DESC
+            LIMIT 2000
+            """,
+            (cutoff_value,),
+        ).fetchall()
+        for r in comm_rows:
+            _add_phone(r["from_number"])
+            _add_phone(r["to_number"])
+    except Exception:
+        pass
+    try:
+        event_rows = db.execute(
+            """
+            SELECT from_number, to_number
+            FROM smrtphone_webhook_events
+            WHERE received_at >= ?
+              AND event_type IN ('inbound', 'outbound', 'call_completed')
+            ORDER BY id DESC
+            LIMIT 2000
+            """,
+            (cutoff_value,),
+        ).fetchall()
+        for r in event_rows:
+            _add_phone(r["from_number"])
+            _add_phone(r["to_number"])
+    except Exception:
+        pass
+    try:
+        call_rows = db.execute(
+            """
+            SELECT from_number, to_number
+            FROM call_recording_jobs
+            WHERE created_at >= ?
+            ORDER BY id DESC
+            LIMIT 1200
+            """,
+            (cutoff_value,),
+        ).fetchall()
+        for r in call_rows:
+            _add_phone(r["from_number"])
+            _add_phone(r["to_number"])
+    except Exception:
+        pass
+
+    attempted = 0
+    resolved = 0
+    skipped_recent = 0
+    skipped_already = 0
+    sampled = []
+    now_utc = datetime.utcnow()
+    for phone in ordered_phones:
+        if attempted >= max_attempts:
+            break
+        ctx = get_cached_contact_context(db, phone)
+        if ctx:
+            cached_uuid = normalize_uuid(ctx["reisift_property_uuid"] or "")
+            cached_pid = int(ctx["property_id"] or 0)
+            if cached_uuid or cached_pid:
+                skipped_already += 1
+                continue
+            last_lookup = parse_db_time(ctx["last_reisift_lookup_at"])
+            if last_lookup and (now_utc - last_lookup) < timedelta(hours=6):
+                skipped_recent += 1
+                continue
+        attempted += 1
+        resolved_ctx = resolve_property_context_by_phone(db, phone, search_reisift=True) or {}
+        has_resolution = bool(normalize_uuid(resolved_ctx.get("reisift_property_uuid") or "")) or bool(
+            int(resolved_ctx.get("property_id") or 0)
+        )
+        if has_resolution:
+            resolved += 1
+        if len(sampled) < 10:
+            sampled.append(
+                {
+                    "phone": phone,
+                    "resolved": bool(has_resolution),
+                    "uuid": normalize_uuid(resolved_ctx.get("reisift_property_uuid") or ""),
+                    "property_id": int(resolved_ctx.get("property_id") or 0),
+                    "source": str(resolved_ctx.get("source") or ""),
+                }
+            )
+    return {
+        "checked_candidates": len(ordered_phones),
+        "attempted": attempted,
+        "resolved": resolved,
+        "skipped_already": skipped_already,
+        "skipped_recent": skipped_recent,
+        "sample": sampled,
+    }
+
+
 def run_lead_monitor_once(db, source="manual", property_id=None):
     run_cur = db.execute(
         """
@@ -13034,6 +13179,7 @@ def run_lead_monitor_once(db, source="manual", property_id=None):
         ((source or "manual")[:40], property_id, "{}"),
     )
     run_id = run_cur.lastrowid
+    backfill_stats = backfill_reisift_context_for_recent_phones(db, cutoff=format_db_time(est_yesterday_start_utc()), limit=20)
     snapshot = build_today_lead_watch_snapshot(db, limit=300)
     rows = snapshot.get("items") or []
     if property_id:
@@ -13064,6 +13210,7 @@ def run_lead_monitor_once(db, source="manual", property_id=None):
         "inspected": inspected,
         "skipped": skipped,
         "created_actions": created_actions,
+        "uuid_backfill": backfill_stats,
         "details": details,
     }
     db.execute(

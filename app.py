@@ -8466,78 +8466,189 @@ def route_new_agent_signals_once(db, limit=50):
     ).fetchall()
     routed = 0
     skipped = 0
+    system_numbers = _known_system_numbers(db, refresh_seconds=300)
+
+    def _signal_rollup_context(signal_row, payload_obj):
+        payload_obj = payload_obj if isinstance(payload_obj, dict) else {}
+        signal_obj = payload_obj.get("signal") if isinstance(payload_obj.get("signal"), dict) else {}
+        analysis_obj = payload_obj.get("analysis") if isinstance(payload_obj.get("analysis"), dict) else {}
+        source_key = str(signal_row.get("source_key") or "").strip()
+
+        phones_all = []
+
+        def _add_phone(raw):
+            n = normalize_phone(raw)
+            if n and n not in phones_all:
+                phones_all.append(n)
+
+        # Capture all possible phone hints from signal payload variants.
+        for scope in [signal_obj, payload_obj, analysis_obj]:
+            if not isinstance(scope, dict):
+                continue
+            for k in ["counterpart", "phone", "counterpart_number", "from", "to", "from_number", "to_number", "caller", "callee"]:
+                _add_phone(scope.get(k))
+        tail = source_key.rsplit(":", 1)[-1] if ":" in source_key else ""
+        _add_phone(tail)
+
+        # Prefer third-party phone; never roll up on owned/system numbers.
+        third_party_phone = next((n for n in phones_all if n not in system_numbers), "")
+        if not third_party_phone:
+            for n in phones_all:
+                if n:
+                    third_party_phone = n
+                    break
+
+        property_id = int(signal_row.get("property_id") or 0)
+        person_id = int(signal_row.get("person_id") or 0) or None
+        reisift_uuid = ""
+
+        # Direct UUID in payload if available.
+        reisift_uuid = normalize_uuid(
+            extract_first_string_by_keys(signal_obj, ["reisift_property_uuid", "property_uuid", "uuid"])
+            or extract_first_string_by_keys(payload_obj, ["reisift_property_uuid", "property_uuid", "uuid"])
+        )
+        if not reisift_uuid and property_id > 0:
+            reisift_uuid = _get_local_property_uuid(db, property_id)
+
+        # Resolve by third-party phone when UUID/property missing.
+        if not reisift_uuid and third_party_phone:
+            resolved = resolve_shared_contact_context_by_numbers(
+                db,
+                [third_party_phone],
+                fallback_property_id=property_id,
+                force_reisift=False,
+                search_reisift=True,
+            ) or {}
+            if int(resolved.get("property_id") or 0):
+                property_id = int(resolved.get("property_id") or 0)
+            if int(resolved.get("person_id") or 0):
+                person_id = int(resolved.get("person_id") or 0)
+            resolved_uuid = normalize_uuid(resolved.get("reisift_property_uuid") or "")
+            if resolved_uuid:
+                reisift_uuid = resolved_uuid
+            if (not reisift_uuid) and property_id > 0:
+                reisift_uuid = _get_local_property_uuid(db, property_id)
+
+        lead_key = ""
+        if reisift_uuid:
+            lead_key = f"uuid:{reisift_uuid}"
+        elif third_party_phone:
+            lead_key = f"phone:{third_party_phone}"
+        elif property_id > 0:
+            lead_key = f"property:{property_id}"
+        else:
+            lead_key = f"source:{source_key or 'unresolved'}"
+
+        return {
+            "lead_key": lead_key,
+            "property_id": property_id,
+            "person_id": person_id,
+            "reisift_property_uuid": reisift_uuid,
+            "third_party_phone": third_party_phone,
+            "phones_all": phones_all,
+        }
+
     for row in rows:
-        property_id = row["property_id"]
-        person_id = row["person_id"]
+        property_id = int(row["property_id"] or 0)
+        person_id = int(row["person_id"] or 0) or None
         payload = parse_json_object(row["payload_json"] or "{}")
-        if not property_id:
-            action_type, priority = _map_signal_to_action(row, "")
-            created = _upsert_lead_action(
-                db,
-                0,
-                person_id,
-                action_type,
-                priority,
-                (
-                    f"Unmapped lead signal ({row['source_type']}) recommends "
-                    f"{(row['recommended_next_step'] or 'review')}. Link this signal to a property_id/UUID."
-                ),
-                {"signal_id": row["id"], "signal": payload, "source_key": row["source_key"], "unmapped": True},
-                dedupe_key_override=f"unmapped:{row['source_key']}:{action_type}",
-            )
+        roll = _signal_rollup_context(row, payload)
+        rollup_key = str(roll.get("lead_key") or "").strip() or f"source:{row['source_key']}"
+        property_id = int(roll.get("property_id") or 0)
+        person_id = int(roll.get("person_id") or 0) or None
+        reisift_uuid = normalize_uuid(roll.get("reisift_property_uuid") or "")
+        third_party_phone = normalize_phone(roll.get("third_party_phone") or "")
+        snapshot = {
+            "lead_key": rollup_key,
+            "phones": ([third_party_phone] if third_party_phone else []),
+            "reisift_property_uuid": reisift_uuid,
+        }
+
+        if property_id > 0 or person_id:
             db.execute(
-                "UPDATE agent_signals SET routing_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                ("routed_unmapped", row["id"]),
+                """
+                UPDATE agent_signals
+                SET property_id = COALESCE(?, property_id),
+                    person_id = COALESCE(?, person_id),
+                    payload_json = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    (property_id or None),
+                    person_id,
+                    json.dumps({**payload, "lead_key": rollup_key, "snapshot": snapshot}),
+                    int(row["id"]),
+                ),
             )
-            if created:
-                routed += 1
-            else:
-                skipped += 1
-            continue
+
+        prop_status = ""
         prop = db.execute("SELECT status FROM properties WHERE id = ?", (property_id,)).fetchone()
-        prop_status = str((prop["status"] if prop else "") or "").strip().lower()
+        if prop:
+            prop_status = str((prop["status"] if prop else "") or "").strip().lower()
         is_conflict = bool(row["do_not_contact"]) and prop_status in ACTIVE_LEAD_STATUSES
+
+        action_type = ""
+        priority = ""
+        reason_text = ""
         if is_conflict:
-            _upsert_lead_action(
-                db,
-                int(property_id),
-                person_id,
-                "HumanReviewDisposition",
-                "High",
-                "Conflict detected: do-not-contact signal conflicts with active lead status. Human review required.",
-                {"signal_id": row["id"], "property_status": prop_status, "signal": payload},
-            )
+            action_type = "HumanReviewDisposition"
+            priority = "High"
+            reason_text = "Conflict detected: do-not-contact signal conflicts with active lead status. Human review required."
         elif row["is_spam"]:
-            _upsert_lead_action(
-                db,
-                int(property_id),
-                person_id,
-                "ReviewInboundAndNextBestAction",
-                "Low",
-                "Signal classified as spam/solicitation. Verify and dismiss if not business related.",
-                {"signal_id": row["id"], "signal": payload},
-            )
+            action_type = "ReviewInboundAndNextBestAction"
+            priority = "Low"
+            reason_text = "Signal classified as spam/solicitation. Verify and dismiss if not business related."
         else:
             action_type, priority = _map_signal_to_action(row, prop_status)
-            _upsert_lead_action(
-                db,
-                int(property_id),
-                person_id,
-                action_type,
-                priority,
-                (
-                    f"Agent signal ({row['source_type']}) recommends: {(row['recommended_next_step'] or 'review')}. "
-                    f"Priority derived from ReiSift playbook status '{prop_status or '-'}'."
-                ),
-                {"signal_id": row["id"], "signal": payload},
+            reason_text = (
+                f"Agent signal ({row['source_type']}) recommends: {(row['recommended_next_step'] or 'review')}. "
+                f"Priority derived from ReiSift playbook status '{prop_status or '-'}'."
             )
+
+        created = _upsert_lead_action(
+            db,
+            int(property_id),
+            person_id,
+            action_type,
+            priority,
+            reason_text,
+            {
+                "signal_id": row["id"],
+                "signal": payload,
+                "source_key": row["source_key"],
+                "lead_key": rollup_key,
+                "snapshot": snapshot,
+                "unmapped": 1 if int(property_id or 0) == 0 else 0,
+            },
+            dedupe_key_override=f"leadwatch:{rollup_key}",
+            contact_classification=str(
+                extract_first_string_by_keys(payload, ["classification"])
+                or extract_first_string_by_keys(payload.get("signal") if isinstance(payload.get("signal"), dict) else {}, ["classification"])
+                or ("unknown" if not row["is_spam"] else "spam")
+            ).strip().lower(),
+        )
+
+        _close_other_pending_leadwatch_actions(
+            db,
+            rollup_key,
+            f"leadwatch:{rollup_key}",
+            phone_tokens=([third_party_phone] if third_party_phone else []),
+        )
+
+        if property_id > 0:
             _close_unmapped_actions_for_source_key(db, row["source_key"], int(property_id))
+
         db.execute(
             "UPDATE agent_signals SET routing_status = 'routed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (row["id"],),
         )
-        routed += 1
-    return {"processed": len(rows), "routed": routed, "skipped": skipped}
+        if created:
+            routed += 1
+        else:
+            skipped += 1
+    dedupe = dedupe_pending_lead_actions_by_rollup(db)
+    return {"processed": len(rows), "routed": routed, "skipped": skipped, "dedupe": dedupe}
 
 
 def _system_phone_numbers(db):
@@ -9435,7 +9546,7 @@ def build_today_lead_watch_snapshot(db, limit=60):
         )
 
     def _canonical_lead_row_key(row):
-        # Canonical identity: uuid -> normalized address -> phone.
+        # Canonical identity: uuid -> third-party phone -> lead key.
         row_uuid = ""
         for ph in list(row.get("phones") or []):
             pu = normalize_uuid(referral_uuid_by_phone.get(normalize_phone(ph) or "") or "")
@@ -9452,17 +9563,16 @@ def build_today_lead_watch_snapshot(db, limit=60):
                 row_uuid = _get_local_property_uuid(db, pid)
         if row_uuid:
             return f"uuid:{row_uuid}"
-        for hint in list(row.get("address_hints") or []):
-            nk = normalize_address_key(hint)
-            if nk:
-                return f"address:{nk}"
-        nk = normalize_address_key(row.get("label") or "")
-        if nk:
-            return f"address:{nk}"
         phones = sorted([normalize_phone(x) for x in list(row.get("phones") or []) if normalize_phone(x)])
+        non_system = [p for p in phones if p not in system_numbers]
+        if non_system:
+            return f"phone:{non_system[0]}"
         if phones:
             return f"phone:{phones[0]}"
-        return str(row.get("lead_key") or "").strip()
+        lk = str(row.get("lead_key") or "").strip()
+        if lk:
+            return lk
+        return "lead:unresolved"
 
     # Merge fragmented keys into canonical roll-up rows.
     merged = {}
@@ -13770,16 +13880,19 @@ def _extract_phone_from_lead_key(lead_key):
     return ""
 
 
-def _rollup_phone_candidates_for_item(item, lead_key=""):
-    out = []
+def _rollup_phone_candidates_for_item(db, item, lead_key=""):
+    system_numbers = _known_system_numbers(db, refresh_seconds=300)
+    all_norm = []
     for raw in list(item.get("phones") or []):
         n = normalize_phone(raw)
-        if n and n not in out:
-            out.append(n)
+        if n and n not in all_norm:
+            all_norm.append(n)
     from_key = _extract_phone_from_lead_key(lead_key)
-    if from_key and from_key not in out:
-        out.append(from_key)
-    return sorted(out)
+    if from_key and from_key not in all_norm:
+        all_norm.append(from_key)
+    preferred = [n for n in all_norm if n not in system_numbers]
+    chosen = preferred if preferred else all_norm
+    return sorted(chosen)
 
 
 def _rollup_address_key_for_item(item):
@@ -13812,7 +13925,7 @@ def _canonical_rollup_key_for_item(db, item, lead_key=""):
             rollup_uuid = _get_local_property_uuid(db, property_id)
     if rollup_uuid:
         return f"uuid:{rollup_uuid}", []
-    phones = _rollup_phone_candidates_for_item(item, lead_key=lead_key)
+    phones = _rollup_phone_candidates_for_item(db, item, lead_key=lead_key)
     if phones:
         return f"phone:{phones[0]}", phones
     return f"lead:{str(lead_key or '').strip()}", []
@@ -13822,15 +13935,39 @@ def _canonical_rollup_key_for_action_row(db, action_row):
     row = dict(action_row or {})
     payload = parse_json_object(row.get("payload_json") or "{}")
     snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    lead_key = str(snapshot.get("lead_key") or payload.get("lead_key") or "").strip()
+    if lead_key.startswith("uuid:") or lead_key.startswith("phone:"):
+        return lead_key
     rollup_uuid = normalize_uuid(snapshot.get("reisift_property_uuid") or "")
+    if not rollup_uuid:
+        rollup_uuid = normalize_uuid(payload.get("reisift_property_uuid") or "")
     if not rollup_uuid:
         property_id = int(row.get("property_id") or 0)
         if property_id > 0:
             rollup_uuid = _get_local_property_uuid(db, property_id)
     if rollup_uuid:
         return f"uuid:{rollup_uuid}"
+    system_numbers = _known_system_numbers(db, refresh_seconds=300)
     phones = []
     for raw in list(snapshot.get("phones") or []):
+        n = normalize_phone(raw)
+        if n and n not in phones:
+            phones.append(n)
+    signal = payload.get("signal") if isinstance(payload.get("signal"), dict) else {}
+    for raw in [
+        payload.get("counterpart"),
+        payload.get("phone"),
+        payload.get("counterpart_number"),
+        payload.get("from"),
+        payload.get("to"),
+        signal.get("counterpart"),
+        signal.get("phone"),
+        signal.get("counterpart_number"),
+        signal.get("from"),
+        signal.get("to"),
+        signal.get("from_number"),
+        signal.get("to_number"),
+    ]:
         n = normalize_phone(raw)
         if n and n not in phones:
             phones.append(n)
@@ -13840,12 +13977,22 @@ def _canonical_rollup_key_for_action_row(db, action_row):
         n = normalize_phone(phone_match.group(1))
         if n and n not in phones:
             phones.append(n)
-    lead_key = str(snapshot.get("lead_key") or "")
+    if not phones and dk.startswith("unmapped:sms-unresolved:"):
+        # Legacy key format can still include numbers in the tail.
+        for found in re.findall(r"([0-9]{10,15})", dk):
+            n = normalize_phone(found)
+            if n and n not in phones:
+                phones.append(n)
     lk_phone = _extract_phone_from_lead_key(lead_key)
     if lk_phone and lk_phone not in phones:
         phones.append(lk_phone)
+    preferred = sorted([n for n in phones if n not in system_numbers])
+    if preferred:
+        return f"phone:{preferred[0]}"
     if phones:
         return f"phone:{sorted(phones)[0]}"
+    if lead_key:
+        return lead_key
     if dk.startswith("leadwatch:"):
         tail = dk[len("leadwatch:") :].strip()
         return tail or dk

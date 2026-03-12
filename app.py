@@ -2028,6 +2028,9 @@ def compose_sms_signal_detail(signal_row):
     row = dict(signal_row or {})
     payload_obj = parse_json_object(row.get("payload_json") or "{}")
     messages = payload_obj.get("messages") if isinstance(payload_obj.get("messages"), list) else []
+    if not messages:
+        return str(row.get("summary_text") or payload_obj.get("summary") or "").strip() or "-"
+
     last_msg = messages[-1] if messages else {}
     direction = str(last_msg.get("direction") or "").strip().title()
     from_number = format_phone_display(last_msg.get("from_number") or "")
@@ -2036,21 +2039,22 @@ def compose_sms_signal_detail(signal_row):
     to_label = to_number or "Unknown Recipient"
     if direction not in {"Inbound", "Outbound"}:
         direction = "Unknown"
-    intro = f"{direction} SMS from {from_label} to {to_label}."
-    thread_summary = re.sub(r"\s+", " ", str(row.get("summary_text") or payload_obj.get("summary") or "").strip())
-    important = re.sub(
-        r"\s+",
-        " ",
-        str(payload_obj.get("analysis", {}).get("key_point") if isinstance(payload_obj.get("analysis"), dict) else "").strip(),
-    )
-    if thread_summary:
-        intro += f" Summary: {thread_summary}"
-    if important:
-        intro += f" Important detail: {important}"
-    msg_count = len(messages)
-    if msg_count:
-        intro += f" Thread messages analyzed: {msg_count}."
-    return intro.strip()
+    header = f"{direction} SMS from {from_label} to {to_label}."
+
+    lines = []
+    for msg in messages:
+        ts = str(msg.get("sent_at") or msg.get("created_at") or "").strip()
+        d = str(msg.get("direction") or "").strip().title() or "Unknown"
+        fnum = format_phone_display(msg.get("from_number") or "") or "Unknown"
+        tnum = format_phone_display(msg.get("to_number") or "") or "Unknown"
+        body = str(msg.get("body") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        meta = f"[{ts}] {d} {fnum} -> {tnum}" if ts else f"{d} {fnum} -> {tnum}"
+        if body:
+            lines.append(f"{meta}\n{body}")
+        else:
+            lines.append(meta)
+
+    return f"{header}\n\n" + "\n\n".join(lines)
 
 
 def analyze_call_transcript_with_openai(transcript_text, property_id=None, person_id=None, context=None):
@@ -8855,7 +8859,7 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30, start_utc=None):
                     summary_text=(analysis.get("summary") or "").strip(),
                     is_spam=is_spam,
                     do_not_contact=dnc,
-                    payload={"thread_key": t["thread_key"], "counterpart": t["counterpart"], "analysis": analysis, "messages": msgs[-30:]},
+                    payload={"thread_key": t["thread_key"], "counterpart": t["counterpart"], "analysis": analysis, "messages": msgs},
                 )
                 analyzed += 1
                 if int(t.get("property_id") or 0):
@@ -13008,16 +13012,19 @@ def _upsert_lead_action(
     ).fetchone()
     payload_json = json.dumps(payload or {})
     if existing:
-        status = (existing["status"] or "Pending").strip()
-        if status in {"Completed", "Dismissed"}:
-            return False
         db.execute(
             """
             UPDATE lead_management_actions
-            SET priority = ?, reason = ?, payload_json = ?, due_at = ?, updated_at = CURRENT_TIMESTAMP
+            SET action_type = ?,
+                priority = ?,
+                status = CASE WHEN status IN ('Completed', 'Dismissed') THEN 'Pending' ELSE status END,
+                reason = ?,
+                payload_json = ?,
+                due_at = ?,
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (priority, reason, payload_json, (due_at or ""), existing["id"]),
+            (action_type, priority, reason, payload_json, (due_at or ""), existing["id"]),
         )
         return False
     db.execute(
@@ -13364,34 +13371,60 @@ def _extract_timeline_override_for_lead(db, item):
 def _dismiss_open_leadwatch_actions(db, lead_key, reason):
     if not lead_key:
         return 0
+    rollup = str(lead_key or "").strip()
+    patterns = []
+    if rollup:
+        patterns.append(f"leadwatch:{rollup}%")
+    lk = str(lead_key or "").strip()
+    if lk and not lk.startswith("lead:"):
+        patterns.append(f"leadwatch:lead:{lk}%")
+        patterns.append(f"leadwatch:{lk}:%")
+    patterns = list(dict.fromkeys([p for p in patterns if p]))
+    if not patterns:
+        return 0
+    where_clause = " OR ".join(["dedupe_key LIKE ?"] * len(patterns))
+    params = [(reason or "").strip()[:120], *patterns]
     cur = db.execute(
-        """
+        f"""
         UPDATE lead_management_actions
         SET status = CASE WHEN status = 'Pending' THEN 'Dismissed' ELSE status END,
             reason = TRIM(COALESCE(reason, '') || ' [Auto-dismissed: ' || ? || ']'),
             updated_at = CURRENT_TIMESTAMP
-        WHERE dedupe_key LIKE ?
+        WHERE ({where_clause})
           AND status = 'Pending'
         """,
-        ((reason or "").strip()[:120], f"leadwatch:{lead_key}:%"),
+        tuple(params),
     )
     return int(cur.rowcount or 0)
 
 
-def _close_other_pending_leadwatch_actions(db, lead_key, keep_action_type):
-    if not lead_key:
+def _close_other_pending_leadwatch_actions(db, lead_key, keep_dedupe_key):
+    if not lead_key and not keep_dedupe_key:
         return 0
+    rollup = str(lead_key or "").strip()
+    patterns = []
+    if rollup:
+        patterns.append(f"leadwatch:{rollup}%")
+    lk = str(lead_key or "").strip()
+    if lk and not lk.startswith("lead:"):
+        patterns.append(f"leadwatch:lead:{lk}%")
+        patterns.append(f"leadwatch:{lk}:%")
+    patterns = list(dict.fromkeys([p for p in patterns if p]))
+    if not patterns:
+        return 0
+    where_clause = " OR ".join(["dedupe_key LIKE ?"] * len(patterns))
+    params = [*patterns, str(keep_dedupe_key or "").strip()]
     cur = db.execute(
-        """
+        f"""
         UPDATE lead_management_actions
         SET status = 'Completed',
             reason = TRIM(COALESCE(reason, '') || ' [Superseded by Agent 2]'),
             updated_at = CURRENT_TIMESTAMP
-        WHERE dedupe_key LIKE ?
+        WHERE ({where_clause})
           AND status = 'Pending'
-          AND action_type <> ?
+          AND dedupe_key <> ?
         """,
-        (f"leadwatch:{lead_key}:%", (keep_action_type or "").strip()),
+        tuple(params),
     )
     return int(cur.rowcount or 0)
 
@@ -13534,8 +13567,18 @@ def evaluate_lead_watch_item_lead_management(db, item):
         "reisift_property_uuid": str(item.get("reisift_property_uuid") or ""),
         "phones": list(item.get("phones") or []),
     }
+    rollup_key = ""
+    if property_id > 0:
+        rollup_key = f"property:{property_id}"
+    else:
+        rollup_uuid = normalize_uuid(item.get("reisift_property_uuid") or "")
+        if rollup_uuid:
+            rollup_key = f"uuid:{rollup_uuid}"
+        else:
+            rollup_key = f"lead:{lead_key}"
+    snapshot["rollup_key"] = rollup_key
     if ignore_agent2:
-        _dismiss_open_leadwatch_actions(db, lead_key, "manual_ignore_agent2")
+        _dismiss_open_leadwatch_actions(db, rollup_key, "manual_ignore_agent2")
         return {"lead_key": lead_key, "skipped": True, "created_actions": 0, "snapshot": snapshot}
 
     timeline_override = _extract_timeline_override_for_lead(db, item)
@@ -13544,7 +13587,7 @@ def evaluate_lead_watch_item_lead_management(db, item):
 
     if decision.get("skip"):
         if decision.get("skip_reason") in {"classification_suppressed", "reisift_stop_status"}:
-            _dismiss_open_leadwatch_actions(db, lead_key, decision.get("skip_reason"))
+            _dismiss_open_leadwatch_actions(db, rollup_key, decision.get("skip_reason"))
         return {"lead_key": lead_key, "skipped": True, "created_actions": 0, "snapshot": snapshot}
 
     action_type = str(decision.get("action_type") or "ReviewInboundAndNextBestAction")
@@ -13557,6 +13600,7 @@ def evaluate_lead_watch_item_lead_management(db, item):
         "timeline_override": timeline_override,
         "latest_inbound": latest_inbound[:800],
     }
+    dedupe_key = f"leadwatch:{rollup_key}"
     created = int(
         _upsert_lead_action(
             db,
@@ -13566,11 +13610,11 @@ def evaluate_lead_watch_item_lead_management(db, item):
             priority,
             reason,
             payload,
-            dedupe_key_override=f"leadwatch:{lead_key}:{action_type}",
+            dedupe_key_override=dedupe_key,
             due_at=due_at,
         )
     )
-    _close_other_pending_leadwatch_actions(db, lead_key, action_type)
+    _close_other_pending_leadwatch_actions(db, rollup_key, dedupe_key)
     return {
         "lead_key": lead_key,
         "skipped": False,
@@ -14493,6 +14537,7 @@ def agents_page():
         """
         SELECT id, source_type, source_key, property_id, person_id, intent, sentiment, confidence, recommended_next_step, routing_status, summary_text, payload_json, updated_at
         FROM agent_signals
+        WHERE lower(COALESCE(source_type, '')) = 'sms'
         ORDER BY id DESC
         LIMIT 100
         """

@@ -151,7 +151,7 @@
                 <th>ID</th>
                 <th>Date/Time</th>
                 <th>Call SID</th>
-                <th>ReiSift</th>
+                <th>Reisift</th>
                 <th>Resolver</th>
                 <th>Fetch</th>
                 <th>Analysis</th>
@@ -166,7 +166,7 @@
                 <td>{{ row.call_sid }}</td>
                 <td>
                     {% if row.open_record_url %}
-                    <a href="{{ row.open_record_url }}" target="_blank">ReiSift</a>
+                    <a href="{{ row.open_record_url }}" target="_blank">Reisift</a>
                     {% else %}
                     -
                     {% endif %}
@@ -221,10 +221,6 @@
             <h3>SMS Signals</h3>
             <p>{{ signal_summary.sms_count }}</p>
         </article>
-        <article>
-            <h3>Call Signals</h3>
-            <p>{{ signal_summary.call_count }}</p>
-        </article>
     </div>
     {% if signals %}
     <table style="margin-top:0.75rem;">
@@ -233,7 +229,7 @@
                 <th>ID</th>
                 <th>Date/Time</th>
                 <th>Source</th>
-                <th>ReiSift</th>
+                <th>Reisift</th>
                 <th>Resolver</th>
                 <th>Fetch</th>
                 <th>Intent</th>
@@ -251,7 +247,7 @@
                 <td>{{ row.source_type }}</td>
                 <td>
                     {% if row.open_record_url %}
-                    <a href="{{ row.open_record_url }}" target="_blank">ReiSift</a>
+                    <a href="{{ row.open_record_url }}" target="_blank">Reisift</a>
                     {% else %}
                     -
                     {% endif %}

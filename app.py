@@ -1343,7 +1343,7 @@ def resolve_property_context_by_phone(db, phone_raw, search_reisift=True, force_
         out["reisift_owner_name"] = str(cached["reisift_owner_name"] or "").strip()
         out["reisift_property_status"] = str(cached["reisift_property_status"] or "").strip()
         out["source"] = "cache"
-        if out["property_id"] or out["reisift_property_uuid"]:
+        if out["reisift_property_uuid"] or (out["property_id"] and not force_reisift):
             return out
         # Backoff behavior: avoid hammering ReiSift, but allow periodic retries for unresolved numbers.
         last_lookup_at = parse_db_time(cached["last_reisift_lookup_at"])

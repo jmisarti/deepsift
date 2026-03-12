@@ -21015,6 +21015,173 @@ def integrations_agents_lead_watch_api():
     return jsonify({"ok": True, "snapshot": snapshot})
 
 
+@app.route("/api/integrations/agents/action-trace", methods=["GET"])
+def integrations_agents_action_trace_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    action_id_raw = (request.args.get("action_id") or "").strip()
+    if not action_id_raw.isdigit():
+        return jsonify({"ok": False, "error": "action_id is required"}), 400
+    action_id = int(action_id_raw)
+    row = db.execute(
+        """
+        SELECT id, dedupe_key, property_id, person_id, action_type, priority, status, reason, payload_json, due_at, created_at, updated_at
+        FROM lead_management_actions
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (action_id,),
+    ).fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "Action not found"}), 404
+    action = dict(row)
+    payload = parse_json_object(action.get("payload_json") or "{}")
+    snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    lead_key = str(snapshot.get("lead_key") or payload.get("lead_key") or "").strip()
+    phone_candidates = []
+    for raw in list(snapshot.get("phones") or []):
+        n = normalize_phone(raw)
+        if n and n not in phone_candidates:
+            phone_candidates.append(n)
+    if lead_key.lower().startswith("phone:"):
+        n = normalize_phone(lead_key.split(":", 1)[1])
+        if n and n not in phone_candidates:
+            phone_candidates.append(n)
+    for raw in [payload.get("counterpart"), payload.get("phone"), payload.get("counterpart_number")]:
+        n = normalize_phone(raw)
+        if n and n not in phone_candidates:
+            phone_candidates.append(n)
+    pid = int(action.get("property_id") or 0)
+    rollup = _canonical_rollup_key_for_action_row(db, action)
+
+    call_rows = []
+    sms_rows = []
+    comm_rows = []
+    if pid > 0:
+        call_rows = [dict(r) for r in db.execute(
+            """
+            SELECT id, call_sid, property_id, from_number, to_number, summary_text, created_at, updated_at
+            FROM call_recording_jobs
+            WHERE property_id = ?
+            ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+            LIMIT 20
+            """,
+            (pid,),
+        ).fetchall()]
+        sms_rows = [dict(r) for r in db.execute(
+            """
+            SELECT id, source_type, source_key, property_id, intent, sentiment, confidence, summary_text, updated_at, payload_json
+            FROM agent_signals
+            WHERE lower(COALESCE(source_type,'')) = 'sms'
+              AND property_id = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 20
+            """,
+            (pid,),
+        ).fetchall()]
+        comm_rows = [dict(r) for r in db.execute(
+            """
+            SELECT id, channel, direction, from_number, to_number, body, sent_at, external_id
+            FROM communications
+            WHERE property_id = ?
+            ORDER BY COALESCE(sent_at, created_at) DESC, id DESC
+            LIMIT 30
+            """,
+            (pid,),
+        ).fetchall()]
+    else:
+        if phone_candidates:
+            chunks = []
+            args = []
+            for p in phone_candidates[:5]:
+                like = f"%{p}%"
+                chunks.append(
+                    "("
+                    "replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ? "
+                    "OR replace(replace(replace(replace(replace(COALESCE(to_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?"
+                    ")"
+                )
+                args.extend([like, like])
+            where_phone = " OR ".join(chunks) if chunks else "1=0"
+            call_rows = [dict(r) for r in db.execute(
+                f"""
+                SELECT id, call_sid, property_id, from_number, to_number, summary_text, created_at, updated_at
+                FROM call_recording_jobs
+                WHERE {where_phone}
+                ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+                LIMIT 20
+                """,
+                tuple(args),
+            ).fetchall()]
+            sms_rows = [dict(r) for r in db.execute(
+                """
+                SELECT id, source_type, source_key, property_id, intent, sentiment, confidence, summary_text, updated_at, payload_json
+                FROM agent_signals
+                WHERE lower(COALESCE(source_type,'')) = 'sms'
+                  AND (
+                    payload_json LIKE ?
+                    OR payload_json LIKE ?
+                    OR source_key LIKE ?
+                  )
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 20
+                """,
+                (
+                    f"%{phone_candidates[0]}%",
+                    f"%{lead_key}%" if lead_key else "%%",
+                    f"%{phone_candidates[0]}%",
+                ),
+            ).fetchall()]
+            comm_rows = [dict(r) for r in db.execute(
+                f"""
+                SELECT id, channel, direction, from_number, to_number, body, sent_at, external_id, property_id
+                FROM communications
+                WHERE {where_phone}
+                ORDER BY COALESCE(sent_at, created_at) DESC, id DESC
+                LIMIT 30
+                """,
+                tuple(args),
+            ).fetchall()]
+        elif lead_key:
+            sms_rows = [dict(r) for r in db.execute(
+                """
+                SELECT id, source_type, source_key, property_id, intent, sentiment, confidence, summary_text, updated_at, payload_json
+                FROM agent_signals
+                WHERE lower(COALESCE(source_type,'')) = 'sms'
+                  AND payload_json LIKE ?
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 20
+                """,
+                (f"%{lead_key}%",),
+            ).fetchall()]
+
+    # Keep payloads readable in response.
+    for r in sms_rows:
+        r["payload_json"] = parse_json_object(r.get("payload_json") or "{}")
+    return jsonify(
+        {
+            "ok": True,
+            "action": action,
+            "trace": {
+                "rollup_key": rollup,
+                "lead_key": lead_key,
+                "property_id": pid,
+                "phone_candidates": phone_candidates,
+                "snapshot": snapshot,
+                "latest_inbound": payload.get("latest_inbound") if isinstance(payload, dict) else "",
+                "timeline_override": payload.get("timeline_override") if isinstance(payload, dict) else {},
+            },
+            "agent1_sources": {
+                "calls": call_rows,
+                "sms_signals": sms_rows,
+                "communications": comm_rows,
+            },
+        }
+    )
+
+
 @app.route("/api/integrations/agents/uuid-backfill-once", methods=["POST"])
 def integrations_agents_uuid_backfill_once_api():
     ensure_db()

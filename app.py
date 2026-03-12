@@ -966,6 +966,20 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_agent3_lead_resolutions_status ON agent3_lead_resolutions(status, updated_at)")
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS agent3_kick_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER,
+            lead_key TEXT NOT NULL,
+            property_id INTEGER,
+            reisift_property_uuid TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_agent3_kick_logs_lead ON agent3_kick_logs(lead_key, id DESC)")
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS agent_refresh_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             property_id INTEGER,
@@ -8966,10 +8980,6 @@ def start_sms_analysis_worker():
 
 def build_today_lead_watch_snapshot(db, limit=60):
     cutoff_dt = est_yesterday_start_utc()
-    baseline_raw = str(get_setting(db, "agent_lead_watch_baseline_utc", "") or "").strip()
-    baseline_dt = parse_db_time(baseline_raw) if baseline_raw else None
-    if baseline_dt and baseline_dt > cutoff_dt:
-        cutoff_dt = baseline_dt
     cutoff = format_db_time(cutoff_dt)
     leads = {}
     system_numbers = _known_system_numbers(db, refresh_seconds=300)
@@ -9813,7 +9823,7 @@ def build_agent_advisor_snapshot(db, window_hours=72):
         }
         for r in pending_actions
     ]
-    snapshot["lead_watch_today"] = build_today_lead_watch_snapshot(db, limit=80)
+    snapshot["lead_watch_today"] = build_agent3_lead_watch_snapshot_from_logs(db, limit=80)
     return snapshot
 
 
@@ -14351,9 +14361,30 @@ def run_lead_monitor_once(db, source="manual", property_id=None):
     skipped = 0
     created_actions = 0
     details = []
+
+    def _append_agent3_kick_log(run_id_value, item_row, result_row):
+        lead_key_val = str(item_row.get("lead_key") or "").strip()
+        if not lead_key_val:
+            return
+        db.execute(
+            """
+            INSERT INTO agent3_kick_logs
+            (run_id, lead_key, property_id, reisift_property_uuid, payload_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                int(run_id_value or 0) or None,
+                lead_key_val,
+                int(item_row.get("property_id") or 0),
+                normalize_uuid(item_row.get("reisift_property_uuid") or ""),
+                json.dumps({"item": item_row, "result": result_row}),
+            ),
+        )
+
     for row in rows:
         inspected += 1
         result = evaluate_lead_watch_item_lead_management(db, row)
+        _append_agent3_kick_log(run_id, row, result)
         created_actions += int(result.get("created_actions") or 0)
         if result.get("skipped"):
             skipped += 1
@@ -14425,6 +14456,69 @@ def trigger_agent_pipeline_refresh(db, property_id=None, reason=""):
             status_code=500,
         )
     return result
+
+
+def build_agent3_lead_watch_snapshot_from_logs(db, limit=80):
+    rows = db.execute(
+        """
+        SELECT l.id, l.run_id, l.lead_key, l.property_id, l.reisift_property_uuid, l.payload_json, l.created_at
+        FROM agent3_kick_logs l
+        JOIN (
+            SELECT lead_key, MAX(id) AS max_id
+            FROM agent3_kick_logs
+            GROUP BY lead_key
+        ) latest ON latest.max_id = l.id
+        ORDER BY l.id DESC
+        LIMIT ?
+        """,
+        (max(1, min(500, int(limit or 80))),),
+    ).fetchall()
+    items = []
+    unresolved_count = 0
+    unresolved_active_count = 0
+    for r in rows:
+        payload = parse_json_object(r["payload_json"] or "{}")
+        item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+        if not item:
+            item = {"lead_key": str(r["lead_key"] or "").strip()}
+        row = dict(item)
+        row["lead_key"] = str(row.get("lead_key") or r["lead_key"] or "").strip()
+        row["property_id"] = int(row.get("property_id") or r["property_id"] or 0)
+        row["reisift_property_uuid"] = normalize_uuid(row.get("reisift_property_uuid") or r["reisift_property_uuid"] or "")
+        row["open_record_url"] = _sift_record_url(row.get("reisift_property_uuid") or "")
+        row["phones"] = list(row.get("phones") or [])
+        row["address_hints"] = list(row.get("address_hints") or [])
+        row["sources"] = list(row.get("sources") or [])
+        row["sms_inbound"] = int(row.get("sms_inbound") or 0)
+        row["sms_outbound"] = int(row.get("sms_outbound") or 0)
+        row["calls"] = int(row.get("calls") or 0)
+        row["events"] = int(row.get("events") or 0)
+        row["classification"] = str(row.get("classification") or "unknown").strip().lower()
+        row["unresolved"] = int(row.get("unresolved") or 0)
+        row["ignore_agent2"] = int(row.get("ignore_agent2") or 0)
+        row["agent_summary"] = str(row.get("agent_summary") or "").strip()
+        row["recommended"] = str(row.get("recommended") or "").strip()
+        row["last_activity_at"] = str(row.get("last_activity_at") or r["created_at"] or "")
+        row["referral"] = row.get("referral") if isinstance(row.get("referral"), dict) else {}
+        row["referral_pushes"] = row.get("referral_pushes") if isinstance(row.get("referral_pushes"), list) else []
+        row["agent2_resolution"] = row.get("agent2_resolution") if isinstance(row.get("agent2_resolution"), dict) else {}
+        row["resolution_status"] = str(row.get("resolution_status") or "")
+        row["resolution_notes"] = str(row.get("resolution_notes") or "")
+        row["resolution_updated_at"] = str(row.get("resolution_updated_at") or "")
+        row["suggested_property_id"] = int(row.get("suggested_property_id") or 0)
+        row["suggested_property_uuid"] = normalize_uuid(row.get("suggested_property_uuid") or "")
+        items.append(row)
+        if row["unresolved"]:
+            unresolved_count += 1
+            if (not row["ignore_agent2"]) and row["classification"] not in {"spam", "solicitor"}:
+                unresolved_active_count += 1
+    return {
+        "cutoff_utc": "",
+        "count": len(items),
+        "unresolved_count": unresolved_count,
+        "unresolved_active_count": unresolved_active_count,
+        "items": items,
+    }
 
 
 def enqueue_agent_refresh(db, property_id, reason="", delay_seconds=0):
@@ -14600,7 +14694,7 @@ def coming_soon():
 
 
 def run_agent3_lead_watch_reconcile(db, limit=80):
-    snapshot = build_today_lead_watch_snapshot(db, limit=limit)
+    snapshot = build_agent3_lead_watch_snapshot_from_logs(db, limit=limit)
     suggested = 0
     touched = 0
     for item in snapshot.get("items", []):
@@ -15036,13 +15130,12 @@ def clear_agent_logs_route():
     db = get_db()
     ajax = _is_ajax_request(request)
     try:
-        baseline_utc = format_db_time(datetime.utcnow())
-        set_setting(db, "agent_lead_watch_baseline_utc", baseline_utc)
         c1 = db.execute("DELETE FROM lead_management_actions")
         c2 = db.execute("DELETE FROM lead_monitor_runs")
         c3 = db.execute("DELETE FROM agent_advisor_logs")
         c4 = db.execute("DELETE FROM agent3_lead_resolutions")
         c5 = db.execute("DELETE FROM agent2_learning_feedback")
+        c6 = db.execute("DELETE FROM agent3_kick_logs")
         db.commit()
         msg = (
             "Cleared Agent 2/3 tables. "
@@ -15050,8 +15143,8 @@ def clear_agent_logs_route():
             f"lead_monitor_runs={int(c2.rowcount or 0)}, "
             f"agent_advisor_logs={int(c3.rowcount or 0)}, "
             f"agent3_lead_resolutions={int(c4.rowcount or 0)}, "
-            f"agent2_learning_feedback={int(c5.rowcount or 0)}. "
-            f"Agent3 baseline reset to {baseline_utc} UTC."
+            f"agent2_learning_feedback={int(c5.rowcount or 0)}, "
+            f"agent3_kick_logs={int(c6.rowcount or 0)}."
         )
         if ajax:
             return jsonify(
@@ -15064,6 +15157,7 @@ def clear_agent_logs_route():
                         "agent_advisor_logs": int(c3.rowcount or 0),
                         "agent3_lead_resolutions": int(c4.rowcount or 0),
                         "agent2_learning_feedback": int(c5.rowcount or 0),
+                        "agent3_kick_logs": int(c6.rowcount or 0),
                     },
                 }
             )

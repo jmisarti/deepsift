@@ -341,7 +341,7 @@
         </thead>
         <tbody>
             {% for row in lead_actions %}
-            <tr id="agent2-row-{{ row.id }}" data-action-id="{{ row.id }}">
+            <tr id="agent2-row-{{ row.id }}" data-action-id="{{ row.id }}" class="agent-expandable-row" data-detail-row="agent2-detail-{{ row.id }}">
                 <td>#{{ row.id }}</td>
                 <td class="agent2-col-property">
                     {% if row.target_kind == 'address' %}
@@ -396,6 +396,35 @@
                         <input type="text" name="reason" value="{{ row.reason or '' }}" placeholder="Override reason" style="min-width:220px;">
                         <button type="submit">Update Rec</button>
                     </form>
+                    <small style="display:block; margin-top:0.35rem; opacity:0.75;">Click row to expand</small>
+                </td>
+            </tr>
+            <tr id="agent2-detail-{{ row.id }}" class="agent-detail-row">
+                <td colspan="11">
+                    <div class="agent-detail-label">Agent 2 Context</div>
+                    <div><strong>Lead Key:</strong> {{ row.lead_key or '-' }}</div>
+                    <div><strong>Phones:</strong> {{ row.phone_candidates_display or '-' }}</div>
+                    <div><strong>Resolved Via:</strong> {{ row.resolver_source or '-' }}{% if row.resolver_phone %} ({{ row.resolver_phone }}){% endif %}</div>
+                    <div>
+                        <strong>Reisift:</strong>
+                        {% if row.open_record_url %}
+                        <a href="{{ row.open_record_url }}" target="_blank">Open in Sift</a>
+                        {% else %}
+                        -
+                        {% endif %}
+                    </div>
+                    <div><strong>Latest Inbound Message:</strong> {{ row.latest_inbound_text or '-' }}</div>
+                    <div><strong>Last SMS Analysis{% if row.last_sms_at %} ({{ row.last_sms_at|fmt_est_datetime }}){% endif %}:</strong> {{ row.last_sms_summary or '-' }}</div>
+                    <div><strong>Last Call Analysis{% if row.last_call_at %} ({{ row.last_call_at|fmt_est_datetime }}){% endif %}:</strong> {{ row.last_call_summary or '-' }}</div>
+                    {% set snap = row.snapshot_obj or {} %}
+                    <div>
+                        <strong>Snapshot:</strong>
+                        SMS Out {{ snap.sms_outbound or 0 }},
+                        SMS In {{ snap.sms_inbound or 0 }},
+                        Calls {{ snap.calls or 0 }},
+                        Classification {{ snap.classification or 'unknown' }},
+                        ReiSift Status {{ snap.reisift_status or '-' }}
+                    </div>
                 </td>
             </tr>
             {% endfor %}
@@ -684,6 +713,11 @@ async function submitAgent2Form(form, options) {
     if (options && options.removeWhenNotPending) {
         const statusVal = (data.row && data.row.status) ? String(data.row.status) : "";
         if (statusVal && statusVal !== "Pending") {
+            const detailId = tr.getAttribute("data-detail-row");
+            if (detailId) {
+                const detailRow = document.getElementById(detailId);
+                if (detailRow) detailRow.remove();
+            }
             tr.remove();
         }
     }

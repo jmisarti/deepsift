@@ -15026,6 +15026,7 @@ def agents_page():
         """
     ).fetchall()
     lead_actions_enriched = []
+    system_numbers_for_page = _known_system_numbers(db, refresh_seconds=300)
     for row in lead_actions:
         item = dict(row)
         item["contact_classification"] = normalize_lead_contact_classification(item.get("contact_classification") or "")
@@ -15039,9 +15040,46 @@ def agents_page():
 
         payload_obj = parse_json_object(item.get("payload_json") or "{}")
         snapshot = payload_obj.get("snapshot") if isinstance(payload_obj.get("snapshot"), dict) else {}
+        signal_obj = payload_obj.get("signal") if isinstance(payload_obj.get("signal"), dict) else {}
+        signal_event = (
+            extract_first_string_by_keys(signal_obj, ["event", "eventType"])
+            or extract_first_string_by_keys(payload_obj, ["event", "eventType"])
+        ).lower()
+        signal_from = normalize_phone(
+            extract_first_string_by_keys(signal_obj, ["from", "from_number"])
+            or extract_first_string_by_keys(payload_obj, ["from", "from_number"])
+        )
+        signal_to = normalize_phone(
+            extract_first_string_by_keys(signal_obj, ["to", "to_number"])
+            or extract_first_string_by_keys(payload_obj, ["to", "to_number"])
+        )
+        signal_message = (
+            extract_first_string_by_keys(signal_obj, ["message", "body", "text"])
+            or extract_first_string_by_keys(payload_obj, ["message", "body", "text"])
+        ).strip()
+        signal_classification = str(
+            signal_obj.get("classification") if isinstance(signal_obj, dict) else payload_obj.get("classification") or ""
+        ).strip().lower()
+        signal_is_inbound = "incoming" in signal_event
+        signal_is_outbound = "outgoing" in signal_event
         item["lead_key"] = str(snapshot.get("lead_key") or payload_obj.get("lead_key") or "").strip()
         item["latest_inbound_text"] = str(payload_obj.get("latest_inbound") or snapshot.get("latest_inbound") or "").strip()
         item["timeline_override"] = payload_obj.get("timeline_override") if isinstance(payload_obj.get("timeline_override"), dict) else {}
+        if not snapshot and (signal_is_inbound or signal_is_outbound or signal_message):
+            snapshot = {
+                "sms_outbound": 1 if signal_is_outbound else 0,
+                "sms_inbound": 1 if signal_is_inbound else 0,
+                "calls": 0,
+                "classification": signal_classification or "unknown",
+                "reisift_status": "-",
+            }
+        elif snapshot and (signal_is_inbound or signal_is_outbound):
+            # For unresolved signal payloads that still have sparse snapshots, populate visible counts.
+            snapshot.setdefault("sms_outbound", 1 if signal_is_outbound else 0)
+            snapshot.setdefault("sms_inbound", 1 if signal_is_inbound else 0)
+            snapshot.setdefault("calls", 0)
+            snapshot.setdefault("classification", signal_classification or "unknown")
+            snapshot.setdefault("reisift_status", "-")
         item["snapshot_obj"] = snapshot
         phone_candidates = []
         for n in (snapshot.get("phones") if isinstance(snapshot.get("phones"), list) else []):
@@ -15053,6 +15091,9 @@ def agents_page():
             norm = normalize_phone(val)
             if norm and norm not in phone_candidates:
                 phone_candidates.append(norm)
+        for n in [signal_from, signal_to]:
+            if n and n not in phone_candidates:
+                phone_candidates.append(n)
         if not phone_candidates and str(item["lead_key"]).lower().startswith("phone:"):
             lead_phone = normalize_phone(str(item["lead_key"]).split(":", 1)[1])
             if lead_phone:
@@ -15072,6 +15113,34 @@ def agents_page():
         item["last_call_at"] = ""
         item["last_sms_summary"] = ""
         item["last_sms_at"] = ""
+        if signal_message:
+            from_disp = format_phone_display(signal_from) if signal_from else "-"
+            to_disp = format_phone_display(signal_to) if signal_to else "-"
+            if signal_is_inbound:
+                dir_label = "Inbound SMS"
+            elif signal_is_outbound:
+                dir_label = "Outbound SMS"
+            else:
+                dir_label = "SMS"
+            item["last_sms_summary"] = f"{dir_label} from {from_disp} to {to_disp}. Message: {signal_message}"
+            item["last_sms_at"] = str(item.get("updated_at") or item.get("created_at") or "").strip()
+            if signal_is_inbound and not item["latest_inbound_text"]:
+                item["latest_inbound_text"] = signal_message
+        if not item["resolver_phone"]:
+            counterparty = ""
+            if signal_is_inbound:
+                if signal_from and signal_from not in system_numbers_for_page:
+                    counterparty = signal_from
+            elif signal_is_outbound:
+                if signal_to and signal_to not in system_numbers_for_page:
+                    counterparty = signal_to
+            else:
+                for n in [signal_from, signal_to]:
+                    if n and n not in system_numbers_for_page:
+                        counterparty = n
+                        break
+            if counterparty:
+                item["resolver_phone"] = format_phone_display(counterparty)
         lead_actions_enriched.append(item)
     lead_actions = lead_actions_enriched
     latest_run = db.execute(

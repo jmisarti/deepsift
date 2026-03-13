@@ -14,10 +14,11 @@
             <p>Property-centric prospecting and relationship mapping</p>
         </div>
         <nav>
-            <a class="module-link {% if not request.path.startswith('/referral') and not request.path.startswith('/settings') and not request.path.startswith('/sequences') and not request.path.startswith('/follow-ups') and not request.path.startswith('/coming-soon') and not request.path.startswith('/agents') %}active{% endif %}" href="{{ url_for('dashboard') }}">Deep Dive</a>
+            <a class="module-link {% if not request.path.startswith('/referral') and not request.path.startswith('/settings') and not request.path.startswith('/sequences') and not request.path.startswith('/follow-ups') and not request.path.startswith('/coming-soon') and not request.path.startswith('/agents') and not request.path.startswith('/authority') %}active{% endif %}" href="{{ url_for('dashboard') }}">Deep Dive</a>
             <a class="module-link {% if request.path.startswith('/referral') %}active{% endif %}" href="{{ url_for('referral_dashboard') }}">Referral</a>
             <a class="module-link {% if request.path.startswith('/follow-ups') %}active{% endif %}" href="{{ url_for('follow_ups_page') }}">New Leads</a>
             <a class="module-link {% if request.path.startswith('/agents') %}active{% endif %}" href="{{ url_for('agents_page') }}">Agents</a>
+            <a class="module-link {% if request.path.startswith('/authority') %}active{% endif %}" href="{{ url_for('authority_page') }}">Authority</a>
             <div class="module-dropdown {% if request.path.startswith('/settings') or request.path.startswith('/sequences') or request.path.startswith('/coming-soon') %}active{% endif %}" id="settingsMenuWrap">
                 <button type="button" class="module-link module-dropdown-toggle" id="settingsMenuToggle">Settings</button>
                 <div class="module-dropdown-menu hidden" id="settingsMenuPanel">

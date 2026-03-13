@@ -1297,3 +1297,43 @@ button:hover { filter: brightness(1.05); }
         transform: translateY(0);
     }
 }
+
+.authority-table ul {
+    margin: 0.2rem 0 0.2rem 1rem;
+    padding: 0;
+}
+
+.authority-feed-picker {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: #f8fbfe;
+    padding: 0.6rem;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0.45rem;
+}
+
+.authority-feed-picker label {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin: 0;
+}
+
+.authority-idea-form {
+    display: grid;
+    gap: 0.4rem;
+}
+
+.authority-detail {
+    margin: 0.25rem 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.authority-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0.7rem;
+    margin-top: 0.55rem;
+}

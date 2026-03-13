@@ -27,6 +27,7 @@ from email.message import EmailMessage
 from email.utils import make_msgid
 from html import unescape
 from pathlib import Path
+from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
@@ -247,6 +248,9 @@ LEAD_ACTION_TYPES = [
     "AgentDiagnosisReview",
 ]
 LEAD_CONTACT_CLASSIFICATIONS = ["", "buyer", "wholesaler", "spam", "realtor"]
+AUTHORITY_AUDIENCES = ["General Investors", "Accredited Investors", "Operators", "Brokers", "Title Agents"]
+AUTHORITY_CHANNELS = ["LinkedIn Long-Form", "X", "BiggerPockets", "Reddit"]
+AUTHORITY_IDEA_STATUSES = ["Draft", "Review", "Approved", "Rejected", "Backlog"]
 LEAD_STOP_STATUSES = {"not interested", "dnc", "opt out", "dead"}
 LEAD_NEGATIVE_INTENT_TOKENS = [
     "not interested",
@@ -1007,6 +1011,70 @@ def migrate_db(db):
         """
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_agent_refresh_queue_due ON agent_refresh_queue(status, run_after, id)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS authority_feeds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            feed_type TEXT NOT NULL DEFAULT 'rss',
+            notes TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            last_fetched_at TEXT,
+            last_fetch_status TEXT,
+            last_fetch_error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_authority_feeds_url ON authority_feeds(url)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_authority_feeds_active ON authority_feeds(is_active, id DESC)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS authority_research_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT NOT NULL DEFAULT 'Queued',
+            focus_topic TEXT,
+            target_audience TEXT,
+            channel_focus TEXT,
+            requested_idea_count INTEGER NOT NULL DEFAULT 10,
+            selected_feed_ids_json TEXT,
+            prompt_json TEXT,
+            summary_json TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_authority_runs_status ON authority_research_runs(status, id DESC)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS authority_research_ideas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            angle TEXT,
+            target_audience TEXT,
+            platform_primary TEXT,
+            hook TEXT,
+            thesis TEXT,
+            outline_json TEXT,
+            cta TEXT,
+            seo_keywords_json TEXT,
+            sources_json TEXT,
+            confidence REAL NOT NULL DEFAULT 0.0,
+            status TEXT NOT NULL DEFAULT 'Draft',
+            editor_notes TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_authority_ideas_run ON authority_research_ideas(run_id, id DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_authority_ideas_status ON authority_research_ideas(status, id DESC)")
 
 
 def log_app_error(db, source, error_message, details="", route="", status_code=None):
@@ -13319,6 +13387,643 @@ def build_market_status_helper(address_text):
     }
 
 
+def _authority_clean_text(value, max_len=420):
+    text = unescape(str(value or ""))
+    if "<" in text and ">" in text:
+        if BeautifulSoup:
+            try:
+                text = BeautifulSoup(text, "html.parser").get_text(" ")
+            except Exception:
+                text = re.sub(r"<[^>]+>", " ", text)
+        else:
+            text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if max_len and len(text) > max_len:
+        return text[: max_len - 3].rstrip() + "..."
+    return text
+
+
+def _authority_tag_name(tag):
+    raw = str(tag or "")
+    if "}" in raw:
+        return raw.split("}", 1)[1].lower()
+    return raw.lower()
+
+
+def _authority_direct_child_text(node, accepted_names):
+    accepted = {str(x).strip().lower() for x in (accepted_names or []) if str(x).strip()}
+    for child in list(node or []):
+        if _authority_tag_name(child.tag) in accepted:
+            return _authority_clean_text(" ".join(child.itertext()), max_len=800)
+    return ""
+
+
+def _authority_direct_child_link(node):
+    for child in list(node or []):
+        if _authority_tag_name(child.tag) != "link":
+            continue
+        href = str(child.attrib.get("href") or "").strip()
+        if href.startswith("http://") or href.startswith("https://"):
+            return href
+        text_value = _authority_clean_text(" ".join(child.itertext()), max_len=800)
+        if text_value.startswith("http://") or text_value.startswith("https://"):
+            return text_value
+    return ""
+
+
+def _authority_parse_xml_entries(xml_root, max_items=10):
+    entries = []
+    max_items = max(1, int(max_items or 10))
+    root_name = _authority_tag_name(xml_root.tag)
+    if root_name == "rss":
+        channel = None
+        for child in list(xml_root):
+            if _authority_tag_name(child.tag) == "channel":
+                channel = child
+                break
+        if channel is None:
+            channel = xml_root
+        for item in list(channel):
+            if _authority_tag_name(item.tag) != "item":
+                continue
+            title = _authority_direct_child_text(item, ["title"])
+            url = _authority_direct_child_text(item, ["link"])
+            summary = _authority_direct_child_text(item, ["description", "content", "content:encoded"])
+            published_at = _authority_direct_child_text(item, ["pubdate", "published", "updated", "dc:date"])
+            if title or url:
+                entries.append(
+                    {
+                        "title": title or "Untitled update",
+                        "url": url,
+                        "summary": summary,
+                        "published_at": published_at,
+                    }
+                )
+            if len(entries) >= max_items:
+                break
+        return entries
+
+    # Atom-style feeds (and mixed XML payloads with <entry>).
+    for node in list(xml_root):
+        if _authority_tag_name(node.tag) != "entry":
+            continue
+        title = _authority_direct_child_text(node, ["title"])
+        url = _authority_direct_child_link(node)
+        summary = _authority_direct_child_text(node, ["summary", "content"])
+        published_at = _authority_direct_child_text(node, ["published", "updated"])
+        if title or url:
+            entries.append(
+                {
+                    "title": title or "Untitled update",
+                    "url": url,
+                    "summary": summary,
+                    "published_at": published_at,
+                }
+            )
+        if len(entries) >= max_items:
+            break
+    return entries
+
+
+def _authority_fetch_feed_entries(feed_url, max_items=10):
+    if not str(feed_url or "").strip():
+        raise ValueError("Feed URL is required.")
+    headers = {"User-Agent": "DeepSift Authority Researcher/1.0"}
+    response = requests.get(str(feed_url).strip(), headers=headers, timeout=25)
+    response.raise_for_status()
+    body = response.content or b""
+    entries = []
+    parse_error = ""
+    if body:
+        try:
+            root = ET.fromstring(body)
+            entries = _authority_parse_xml_entries(root, max_items=max_items)
+        except Exception as exc:
+            parse_error = str(exc)
+    if not entries and body:
+        html_title = ""
+        html_summary = ""
+        decoded = body.decode("utf-8", errors="ignore")
+        if BeautifulSoup:
+            try:
+                soup = BeautifulSoup(decoded, "html.parser")
+                html_title = _authority_clean_text((soup.title.string or "") if soup.title else "", max_len=220)
+                desc = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+                html_summary = _authority_clean_text(desc.get("content") if desc else "", max_len=320)
+            except Exception:
+                html_title = ""
+                html_summary = ""
+        if not html_title:
+            match = re.search(r"<title[^>]*>(.*?)</title>", decoded, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                html_title = _authority_clean_text(match.group(1), max_len=220)
+        if html_title:
+            entries = [
+                {
+                    "title": html_title,
+                    "url": str(feed_url).strip(),
+                    "summary": html_summary,
+                    "published_at": "",
+                }
+            ]
+    if not entries:
+        if parse_error:
+            raise ValueError(f"No feed entries parsed: {parse_error}")
+        raise ValueError("No feed entries parsed from response.")
+    cleaned = []
+    seen = set()
+    for entry in entries:
+        title = _authority_clean_text(entry.get("title") or "", max_len=220)
+        url = str(entry.get("url") or "").strip()
+        summary = _authority_clean_text(entry.get("summary") or "", max_len=420)
+        published_at = _authority_clean_text(entry.get("published_at") or "", max_len=80)
+        key = (title.lower(), url.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(
+            {
+                "title": title or "Untitled update",
+                "url": url,
+                "summary": summary,
+                "published_at": published_at,
+            }
+        )
+        if len(cleaned) >= max(1, int(max_items or 10)):
+            break
+    if not cleaned:
+        raise ValueError("Parsed feed was empty after cleanup.")
+    return cleaned
+
+
+def _authority_extract_keywords(*parts, max_keywords=8):
+    words = []
+    for part in parts:
+        for token in re.findall(r"[A-Za-z0-9\-]{4,}", str(part or "").lower()):
+            if token not in words:
+                words.append(token)
+    return words[: max(1, int(max_keywords or 8))]
+
+
+def _authority_normalize_idea(raw, default_audience="", default_channel=""):
+    item = raw if isinstance(raw, dict) else {}
+    title = _authority_clean_text(item.get("title") or "", max_len=220)
+    if not title:
+        return None
+    outline = item.get("outline")
+    if not isinstance(outline, list):
+        outline = []
+    outline = [_authority_clean_text(x, max_len=200) for x in outline if _authority_clean_text(x, max_len=200)]
+    keywords = item.get("seo_keywords")
+    if not isinstance(keywords, list):
+        keywords = []
+    keywords = [_authority_clean_text(x, max_len=45).lower() for x in keywords if _authority_clean_text(x, max_len=45)]
+    sources = item.get("sources")
+    if not isinstance(sources, list):
+        sources = []
+    normalized_sources = []
+    for src in sources:
+        if isinstance(src, dict):
+            source_title = _authority_clean_text(src.get("title") or src.get("name") or "", max_len=180)
+            source_url = str(src.get("url") or "").strip()
+            if source_title or source_url:
+                normalized_sources.append({"title": source_title, "url": source_url})
+        else:
+            source_text = _authority_clean_text(src, max_len=220)
+            if source_text:
+                normalized_sources.append({"title": source_text, "url": ""})
+    try:
+        confidence = float(item.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    confidence = min(max(confidence, 0.0), 1.0)
+    return {
+        "title": title,
+        "angle": _authority_clean_text(item.get("angle") or "", max_len=320),
+        "target_audience": _authority_clean_text(item.get("target_audience") or default_audience, max_len=90),
+        "platform_primary": _authority_clean_text(item.get("platform_primary") or default_channel, max_len=70),
+        "hook": _authority_clean_text(item.get("hook") or "", max_len=320),
+        "thesis": _authority_clean_text(item.get("thesis") or "", max_len=500),
+        "outline": outline,
+        "cta": _authority_clean_text(item.get("cta") or "", max_len=220),
+        "seo_keywords": keywords[:10],
+        "sources": normalized_sources[:8],
+        "confidence": confidence,
+    }
+
+
+def _authority_generate_fallback_ideas(feed_items, focus_topic="", target_audience="", channel_focus="", idea_count=8):
+    count = max(1, min(int(idea_count or 8), 25))
+    items = list(feed_items or [])
+    ideas = []
+    if not items:
+        seed_topic = _authority_clean_text(focus_topic or "Real estate strategy", max_len=120)
+        for idx in range(count):
+            base = f"{seed_topic} insight #{idx + 1}"
+            ideas.append(
+                {
+                    "title": base.title(),
+                    "angle": f"Translate {seed_topic.lower()} into practical talking points for serious investors.",
+                    "target_audience": target_audience or "General Investors",
+                    "platform_primary": channel_focus or "LinkedIn Long-Form",
+                    "hook": f"What the market is signaling about {seed_topic.lower()} right now.",
+                    "thesis": "Frame the opportunity with evidence, risk controls, and an execution perspective from active operators.",
+                    "outline": [
+                        "Market context and why this matters now",
+                        "One decision framework readers can apply immediately",
+                        "Risk factors and how experienced operators mitigate them",
+                        "Call to discuss strategy with other serious investors",
+                    ],
+                    "cta": "Invite conversation with other operators and accredited investors.",
+                    "seo_keywords": _authority_extract_keywords(seed_topic, target_audience, channel_focus),
+                    "sources": [],
+                    "confidence": 0.45,
+                }
+            )
+        return ideas
+
+    used = set()
+    for item in items:
+        title = _authority_clean_text(item.get("title") or "", max_len=220)
+        if not title:
+            continue
+        key = title.lower()
+        if key in used:
+            continue
+        used.add(key)
+        url = str(item.get("url") or "").strip()
+        summary = _authority_clean_text(item.get("summary") or "", max_len=320)
+        feed_name = _authority_clean_text(item.get("feed_name") or "Source", max_len=80)
+        angle = f"Use this update to explain second-order implications for acquisition and asset management decisions."
+        thesis = summary or "Explain what changed, why it matters, and how disciplined investors should respond."
+        ideas.append(
+            {
+                "title": title,
+                "angle": angle,
+                "target_audience": target_audience or "General Investors",
+                "platform_primary": channel_focus or "LinkedIn Long-Form",
+                "hook": f"Signal from {feed_name}: {title}",
+                "thesis": thesis,
+                "outline": [
+                    "What happened and why sophisticated investors should care",
+                    "How this changes underwriting, financing, or execution assumptions",
+                    "Risks, caveats, and where people usually overreact",
+                    "Actionable next step for operators and capital partners",
+                ],
+                "cta": "Invite peers to compare assumptions and decision rules.",
+                "seo_keywords": _authority_extract_keywords(title, summary, focus_topic, target_audience, channel_focus),
+                "sources": [{"title": title, "url": url}],
+                "confidence": 0.58,
+            }
+        )
+        if len(ideas) >= count:
+            break
+    while len(ideas) < count:
+        ideas.append(
+            {
+                "title": f"Market pulse idea #{len(ideas) + 1}",
+                "angle": "Synthesize multiple market signals into a clear operator playbook.",
+                "target_audience": target_audience or "General Investors",
+                "platform_primary": channel_focus or "LinkedIn Long-Form",
+                "hook": "Where conviction should increase or decrease this week.",
+                "thesis": "Discuss practical decision filters instead of broad predictions.",
+                "outline": [
+                    "Current market context",
+                    "What is noise vs signal",
+                    "Operator response framework",
+                    "Discussion prompt",
+                ],
+                "cta": "Ask network members how they are adjusting strategy this week.",
+                "seo_keywords": _authority_extract_keywords(focus_topic, target_audience, channel_focus),
+                "sources": [],
+                "confidence": 0.42,
+            }
+        )
+    return ideas[:count]
+
+
+def _authority_generate_ideas_with_openai(feed_items, focus_topic="", target_audience="", channel_focus="", idea_count=8):
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set")
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    count = max(1, min(int(idea_count or 8), 25))
+    corpus = []
+    for idx, item in enumerate(list(feed_items or [])[:45], start=1):
+        corpus.append(
+            (
+                f"{idx}. [{_authority_clean_text(item.get('feed_name') or 'Source', max_len=80)}] "
+                f"{_authority_clean_text(item.get('title') or '', max_len=200)} | "
+                f"{_authority_clean_text(item.get('published_at') or '-', max_len=50)} | "
+                f"{_authority_clean_text(item.get('summary') or '', max_len=260)} | "
+                f"{str(item.get('url') or '').strip()}"
+            )
+        )
+    corpus_text = "\n".join(corpus)[:14000]
+    schema = {
+        "name": "authority_research_ideas",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "ideas": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": count,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "title": {"type": "string"},
+                            "angle": {"type": "string"},
+                            "target_audience": {"type": "string"},
+                            "platform_primary": {"type": "string"},
+                            "hook": {"type": "string"},
+                            "thesis": {"type": "string"},
+                            "outline": {"type": "array", "items": {"type": "string"}},
+                            "cta": {"type": "string"},
+                            "seo_keywords": {"type": "array", "items": {"type": "string"}},
+                            "sources": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "title": {"type": "string"},
+                                        "url": {"type": "string"},
+                                    },
+                                    "required": ["title", "url"],
+                                },
+                            },
+                            "confidence": {"type": "number"},
+                        },
+                        "required": [
+                            "title",
+                            "angle",
+                            "target_audience",
+                            "platform_primary",
+                            "hook",
+                            "thesis",
+                            "outline",
+                            "cta",
+                            "seo_keywords",
+                            "sources",
+                            "confidence",
+                        ],
+                    },
+                }
+            },
+            "required": ["ideas"],
+        },
+        "strict": True,
+    }
+    prompt = (
+        "You are the Researcher agent for a real-estate authority content pipeline.\n"
+        "Goal: produce high-quality article/post ideas for investors and accredited investors.\n"
+        "Audience should never be homeowners.\n"
+        "Never promise returns and never make guaranteed-income claims.\n"
+        "Use source-backed angles and mention concrete third-party sources.\n"
+        f"Generate exactly {count} ideas.\n"
+        f"Focus topic: {_authority_clean_text(focus_topic, max_len=120) or '-'}\n"
+        f"Target audience: {_authority_clean_text(target_audience, max_len=80) or 'General Investors'}\n"
+        f"Primary channel: {_authority_clean_text(channel_focus, max_len=60) or 'LinkedIn Long-Form'}\n\n"
+        f"Source corpus:\n{corpus_text}"
+    )
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": "You are a strategic research analyst for real estate content."}]},
+                {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+            ],
+            "text": {"format": {"type": "json_schema", "name": schema["name"], "schema": schema["schema"], "strict": True}},
+        },
+        timeout=90,
+    )
+    response.raise_for_status()
+    data = response.json()
+    output_text = (data.get("output_text") or "").strip()
+    payload = {}
+    if output_text:
+        payload = json.loads(output_text)
+    else:
+        for item in data.get("output", []):
+            for part in item.get("content", []):
+                if part.get("type") in {"output_text", "text"} and part.get("text"):
+                    payload = json.loads(part["text"])
+                    break
+            if payload:
+                break
+    if not isinstance(payload, dict):
+        raise ValueError("Authority researcher did not return JSON object output.")
+    raw_ideas = payload.get("ideas")
+    if not isinstance(raw_ideas, list) or not raw_ideas:
+        raise ValueError("Authority researcher returned no ideas.")
+    ideas = []
+    for raw in raw_ideas[:count]:
+        normalized = _authority_normalize_idea(raw, default_audience=target_audience, default_channel=channel_focus)
+        if normalized:
+            ideas.append(normalized)
+    if not ideas:
+        raise ValueError("Authority researcher ideas could not be normalized.")
+    return ideas[:count], {"model": model}
+
+
+def run_authority_research_once(
+    db,
+    *,
+    focus_topic="",
+    target_audience="",
+    channel_focus="",
+    requested_idea_count=8,
+    selected_feed_ids=None,
+):
+    idea_count = max(1, min(int(requested_idea_count or 8), 25))
+    selected_ids = []
+    for raw in selected_feed_ids or []:
+        try:
+            val = int(raw)
+        except Exception:
+            continue
+        if val > 0 and val not in selected_ids:
+            selected_ids.append(val)
+    if selected_ids:
+        placeholders = ",".join(["?"] * len(selected_ids))
+        feed_rows = db.execute(
+            f"""
+            SELECT id, name, url, feed_type, notes, is_active
+            FROM authority_feeds
+            WHERE id IN ({placeholders})
+            ORDER BY is_active DESC, id DESC
+            """,
+            tuple(selected_ids),
+        ).fetchall()
+    else:
+        feed_rows = db.execute(
+            """
+            SELECT id, name, url, feed_type, notes, is_active
+            FROM authority_feeds
+            WHERE is_active = 1
+            ORDER BY id DESC
+            """
+        ).fetchall()
+    if not feed_rows:
+        raise ValueError("No feeds selected. Add at least one feed or enable an existing feed.")
+
+    prompt_payload = {
+        "focus_topic": (focus_topic or "").strip(),
+        "target_audience": (target_audience or "").strip(),
+        "channel_focus": (channel_focus or "").strip(),
+        "requested_idea_count": idea_count,
+        "selected_feed_ids": selected_ids,
+    }
+    run_cur = db.execute(
+        """
+        INSERT INTO authority_research_runs
+        (status, focus_topic, target_audience, channel_focus, requested_idea_count, selected_feed_ids_json, prompt_json, started_at, updated_at)
+        VALUES ('Running', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """,
+        (
+            prompt_payload["focus_topic"],
+            prompt_payload["target_audience"],
+            prompt_payload["channel_focus"],
+            idea_count,
+            json.dumps(selected_ids),
+            json.dumps(prompt_payload),
+        ),
+    )
+    run_id = int(run_cur.lastrowid or 0)
+    fetched_items = []
+    feed_errors = []
+    for feed in feed_rows:
+        feed_id = int(feed["id"])
+        feed_name = str(feed["name"] or "").strip() or f"Feed {feed_id}"
+        feed_url = str(feed["url"] or "").strip()
+        try:
+            entries = _authority_fetch_feed_entries(feed_url, max_items=8)
+            db.execute(
+                """
+                UPDATE authority_feeds
+                SET last_fetched_at = CURRENT_TIMESTAMP,
+                    last_fetch_status = 'ok',
+                    last_fetch_error = '',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (feed_id,),
+            )
+            for entry in entries:
+                fetched_items.append(
+                    {
+                        "feed_id": feed_id,
+                        "feed_name": feed_name,
+                        "title": entry.get("title") or "",
+                        "url": entry.get("url") or "",
+                        "summary": entry.get("summary") or "",
+                        "published_at": entry.get("published_at") or "",
+                    }
+                )
+        except Exception as exc:
+            feed_errors.append(f"{feed_name}: {exc}")
+            db.execute(
+                """
+                UPDATE authority_feeds
+                SET last_fetched_at = CURRENT_TIMESTAMP,
+                    last_fetch_status = 'error',
+                    last_fetch_error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (str(exc)[:600], feed_id),
+            )
+
+    generation_mode = "fallback"
+    generation_meta = {}
+    try:
+        ideas = []
+        if os.getenv("OPENAI_API_KEY", "").strip():
+            ideas, generation_meta = _authority_generate_ideas_with_openai(
+                fetched_items,
+                focus_topic=focus_topic,
+                target_audience=target_audience,
+                channel_focus=channel_focus,
+                idea_count=idea_count,
+            )
+            generation_mode = "openai"
+        else:
+            ideas = _authority_generate_fallback_ideas(
+                fetched_items,
+                focus_topic=focus_topic,
+                target_audience=target_audience,
+                channel_focus=channel_focus,
+                idea_count=idea_count,
+            )
+    except Exception as exc:
+        feed_errors.append(f"Idea generation fallback used: {exc}")
+        ideas = _authority_generate_fallback_ideas(
+            fetched_items,
+            focus_topic=focus_topic,
+            target_audience=target_audience,
+            channel_focus=channel_focus,
+            idea_count=idea_count,
+        )
+        generation_mode = "fallback"
+
+    inserted_ideas = 0
+    for raw in ideas:
+        normalized = _authority_normalize_idea(
+            raw,
+            default_audience=target_audience or "General Investors",
+            default_channel=channel_focus or "LinkedIn Long-Form",
+        )
+        if not normalized:
+            continue
+        db.execute(
+            """
+            INSERT INTO authority_research_ideas
+            (run_id, title, angle, target_audience, platform_primary, hook, thesis, outline_json, cta, seo_keywords_json, sources_json, confidence, status, editor_notes, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft', '', CURRENT_TIMESTAMP)
+            """,
+            (
+                run_id,
+                normalized["title"],
+                normalized["angle"],
+                normalized["target_audience"],
+                normalized["platform_primary"],
+                normalized["hook"],
+                normalized["thesis"],
+                json.dumps(normalized["outline"]),
+                normalized["cta"],
+                json.dumps(normalized["seo_keywords"]),
+                json.dumps(normalized["sources"]),
+                float(normalized["confidence"] or 0.0),
+            ),
+        )
+        inserted_ideas += 1
+
+    run_status = "Completed" if inserted_ideas > 0 else "Failed"
+    summary = {
+        "run_id": run_id,
+        "feeds_considered": len(feed_rows),
+        "feed_items_collected": len(fetched_items),
+        "ideas_inserted": inserted_ideas,
+        "generation_mode": generation_mode,
+        "generation_meta": generation_meta,
+        "errors": feed_errors,
+    }
+    db.execute(
+        """
+        UPDATE authority_research_runs
+        SET status = ?, summary_json = ?, completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (run_status, json.dumps(summary), run_id),
+    )
+    return summary
+
+
 @app.route("/healthz")
 def healthz():
     return jsonify({"ok": True}), 200
@@ -15032,6 +15737,207 @@ def dashboard():
 @app.route("/coming-soon")
 def coming_soon():
     return render_template("coming_soon.html")
+
+
+@app.route("/authority", methods=["GET", "POST"])
+def authority_page():
+    ensure_db()
+    db = get_db()
+    notice = (request.args.get("notice") or "").strip()
+    error_notice = (request.args.get("error") or "").strip()
+    if request.method == "POST":
+        action = (request.form.get("authority_action") or "").strip().lower()
+        try:
+            if action == "add_feed":
+                name = (request.form.get("feed_name") or "").strip()
+                url = (request.form.get("feed_url") or "").strip()
+                feed_type = (request.form.get("feed_type") or "rss").strip().lower()[:20] or "rss"
+                notes = (request.form.get("feed_notes") or "").strip()
+                is_active = 1 if (request.form.get("feed_is_active") or "").strip().lower() in {"1", "true", "yes", "on"} else 0
+                if not name:
+                    raise ValueError("Feed name is required.")
+                if not (url.startswith("http://") or url.startswith("https://")):
+                    raise ValueError("Feed URL must start with http:// or https://")
+                try:
+                    db.execute(
+                        """
+                        INSERT INTO authority_feeds (name, url, feed_type, notes, is_active, updated_at)
+                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (name[:120], url[:700], feed_type, notes[:1200], is_active),
+                    )
+                    notice = "Feed added."
+                except sqlite3.IntegrityError:
+                    db.execute(
+                        """
+                        UPDATE authority_feeds
+                        SET name = ?, feed_type = ?, notes = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE url = ?
+                        """,
+                        (name[:120], feed_type, notes[:1200], is_active, url[:700]),
+                    )
+                    notice = "Feed already existed. Existing feed updated."
+            elif action == "toggle_feed":
+                feed_id_raw = (request.form.get("feed_id") or "").strip()
+                next_state_raw = (request.form.get("next_state") or "").strip().lower()
+                if not feed_id_raw.isdigit():
+                    raise ValueError("Feed id is required.")
+                next_state = 1 if next_state_raw in {"1", "true", "yes", "on"} else 0
+                db.execute(
+                    """
+                    UPDATE authority_feeds
+                    SET is_active = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (next_state, int(feed_id_raw)),
+                )
+                notice = "Feed status updated."
+            elif action == "delete_feed":
+                feed_id_raw = (request.form.get("feed_id") or "").strip()
+                if not feed_id_raw.isdigit():
+                    raise ValueError("Feed id is required.")
+                db.execute("DELETE FROM authority_feeds WHERE id = ?", (int(feed_id_raw),))
+                notice = "Feed removed."
+            elif action == "run_research":
+                focus_topic = (request.form.get("focus_topic") or "").strip()
+                target_audience = (request.form.get("target_audience") or "").strip()
+                channel_focus = (request.form.get("channel_focus") or "").strip()
+                idea_count_raw = (request.form.get("idea_count") or "").strip()
+                selected_feed_ids = request.form.getlist("selected_feed_ids")
+                try:
+                    idea_count = int(idea_count_raw or "8")
+                except Exception:
+                    idea_count = 8
+                result = run_authority_research_once(
+                    db,
+                    focus_topic=focus_topic,
+                    target_audience=target_audience,
+                    channel_focus=channel_focus,
+                    requested_idea_count=idea_count,
+                    selected_feed_ids=selected_feed_ids,
+                )
+                notice = (
+                    f"Research run #{result.get('run_id')} completed. "
+                    f"Ideas: {result.get('ideas_inserted', 0)}, mode: {result.get('generation_mode', 'fallback')}."
+                )
+                if result.get("errors"):
+                    notice += f" Warnings: {len(result.get('errors') or [])}."
+            elif action == "update_idea":
+                idea_id_raw = (request.form.get("idea_id") or "").strip()
+                idea_status = (request.form.get("idea_status") or "").strip()
+                editor_notes = (request.form.get("editor_notes") or "").strip()
+                if not idea_id_raw.isdigit():
+                    raise ValueError("Idea id is required.")
+                if idea_status not in AUTHORITY_IDEA_STATUSES:
+                    raise ValueError("Invalid idea status.")
+                db.execute(
+                    """
+                    UPDATE authority_research_ideas
+                    SET status = ?, editor_notes = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (idea_status, editor_notes[:4000], int(idea_id_raw)),
+                )
+                notice = "Idea updated."
+            else:
+                raise ValueError("Unknown authority action.")
+            db.commit()
+            return redirect(url_for("authority_page", notice=notice))
+        except Exception as exc:
+            db.rollback()
+            log_app_error(
+                db,
+                source="authority_page",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="/authority",
+                status_code=500,
+            )
+            db.commit()
+            return redirect(url_for("authority_page", error=str(exc)))
+
+    feeds = db.execute(
+        """
+        SELECT id, name, url, feed_type, notes, is_active, last_fetched_at, last_fetch_status, last_fetch_error, created_at, updated_at
+        FROM authority_feeds
+        ORDER BY is_active DESC, id DESC
+        """
+    ).fetchall()
+    feed_rows = []
+    for row in feeds:
+        item = dict(row)
+        item["is_active"] = bool(item.get("is_active"))
+        feed_rows.append(item)
+
+    runs = db.execute(
+        """
+        SELECT r.id, r.status, r.focus_topic, r.target_audience, r.channel_focus, r.requested_idea_count,
+               r.prompt_json, r.summary_json, r.started_at, r.completed_at, r.created_at, r.updated_at,
+               (SELECT COUNT(*) FROM authority_research_ideas i WHERE i.run_id = r.id) AS ideas_count
+        FROM authority_research_runs r
+        ORDER BY r.id DESC
+        LIMIT 40
+        """
+    ).fetchall()
+    run_rows = []
+    for row in runs:
+        item = dict(row)
+        item["prompt_obj"] = parse_json_object(item.get("prompt_json") or "{}")
+        item["summary_obj"] = parse_json_object(item.get("summary_json") or "{}")
+        run_rows.append(item)
+
+    ideas = db.execute(
+        """
+        SELECT i.id, i.run_id, i.title, i.angle, i.target_audience, i.platform_primary, i.hook, i.thesis,
+               i.outline_json, i.cta, i.seo_keywords_json, i.sources_json, i.confidence, i.status, i.editor_notes, i.created_at, i.updated_at,
+               r.focus_topic, r.status AS run_status, r.created_at AS run_created_at
+        FROM authority_research_ideas i
+        LEFT JOIN authority_research_runs r ON r.id = i.run_id
+        ORDER BY i.id DESC
+        LIMIT 180
+        """
+    ).fetchall()
+    idea_rows = []
+    for row in ideas:
+        item = dict(row)
+        try:
+            outline = json.loads(item.get("outline_json") or "[]")
+        except Exception:
+            outline = []
+        try:
+            keywords = json.loads(item.get("seo_keywords_json") or "[]")
+        except Exception:
+            keywords = []
+        try:
+            sources = json.loads(item.get("sources_json") or "[]")
+        except Exception:
+            sources = []
+        item["outline_items"] = [str(x).strip() for x in outline if str(x).strip()]
+        item["seo_keywords"] = [str(x).strip() for x in keywords if str(x).strip()]
+        normalized_sources = []
+        for src in sources if isinstance(sources, list) else []:
+            if isinstance(src, dict):
+                source_title = str(src.get("title") or src.get("name") or "").strip()
+                source_url = str(src.get("url") or "").strip()
+            else:
+                source_title = str(src).strip()
+                source_url = ""
+            if source_title or source_url:
+                normalized_sources.append({"title": source_title, "url": source_url})
+        item["sources_list"] = normalized_sources
+        idea_rows.append(item)
+
+    return render_template(
+        "authority.html",
+        notice=notice,
+        error_notice=error_notice,
+        feeds=feed_rows,
+        runs=run_rows,
+        ideas=idea_rows,
+        audiences=AUTHORITY_AUDIENCES,
+        channels=AUTHORITY_CHANNELS,
+        idea_statuses=AUTHORITY_IDEA_STATUSES,
+    )
 
 
 def run_agent3_lead_watch_reconcile(db, limit=80):

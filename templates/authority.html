@@ -1,0 +1,292 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Authority - Phase 1 Researcher</h2>
+    <p>
+        Researcher-only workflow is active. This stage is fully local to DeepSift:
+        feed intake, idea generation, and manual review queue. No publishing APIs are used.
+    </p>
+    {% if notice %}
+    <div class="notice-banner">{{ notice }}</div>
+    {% endif %}
+    {% if error_notice %}
+    <div class="error-banner">{{ error_notice }}</div>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <h3>Feed Library</h3>
+    <form method="post" class="grid-form compact">
+        <input type="hidden" name="authority_action" value="add_feed">
+        <label>Feed Name
+            <input name="feed_name" placeholder="Example: HousingWire - News" required>
+        </label>
+        <label>Feed URL
+            <input name="feed_url" placeholder="https://example.com/feed.xml" required>
+        </label>
+        <label>Feed Type
+            <input name="feed_type" value="rss" placeholder="rss / atom / social / news">
+        </label>
+        <label>Active
+            <select name="feed_is_active">
+                <option value="1" selected>On</option>
+                <option value="0">Off</option>
+            </select>
+        </label>
+        <label class="span2">Notes
+            <textarea name="feed_notes" placeholder="Optional notes about source quality, bias, cadence, etc."></textarea>
+        </label>
+        <button type="submit">Add Feed</button>
+    </form>
+
+    <table class="authority-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>URL</th>
+                <th>Type</th>
+                <th>Active</th>
+                <th>Last Fetch</th>
+                <th>Fetch Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for feed in feeds %}
+            <tr>
+                <td>{{ feed.name }}</td>
+                <td>
+                    {% if feed.url %}
+                    <a href="{{ feed.url }}" target="_blank" rel="noopener">{{ feed.url }}</a>
+                    {% else %}
+                    -
+                    {% endif %}
+                </td>
+                <td>{{ feed.feed_type or '-' }}</td>
+                <td>
+                    {% if feed.is_active %}
+                    <span class="pill">On</span>
+                    {% else %}
+                    Off
+                    {% endif %}
+                </td>
+                <td>{{ feed.last_fetched_at|fmt_est_datetime if feed.last_fetched_at else '-' }}</td>
+                <td>
+                    {{ feed.last_fetch_status or '-' }}
+                    {% if feed.last_fetch_error %}
+                    <details>
+                        <summary>Error</summary>
+                        <p class="authority-detail">{{ feed.last_fetch_error }}</p>
+                    </details>
+                    {% endif %}
+                </td>
+                <td>
+                    <div class="inline-actions">
+                        <form method="post" class="inline-form">
+                            <input type="hidden" name="authority_action" value="toggle_feed">
+                            <input type="hidden" name="feed_id" value="{{ feed.id }}">
+                            <input type="hidden" name="next_state" value="{% if feed.is_active %}0{% else %}1{% endif %}">
+                            <button type="submit">{% if feed.is_active %}Turn Off{% else %}Turn On{% endif %}</button>
+                        </form>
+                        <form method="post" class="inline-form" onsubmit="return confirm('Delete this feed?');">
+                            <input type="hidden" name="authority_action" value="delete_feed">
+                            <input type="hidden" name="feed_id" value="{{ feed.id }}">
+                            <button type="submit" class="icon-btn" title="Delete">x</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7">No feeds configured yet.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="panel">
+    <h3>Run Researcher</h3>
+    <form method="post" class="grid-form compact">
+        <input type="hidden" name="authority_action" value="run_research">
+        <label>Focus Topic
+            <input name="focus_topic" placeholder="Example: NJ multifamily bridge-to-perm refinancing pressure">
+        </label>
+        <label>Target Audience
+            <select name="target_audience">
+                {% for audience in audiences %}
+                <option value="{{ audience }}">{{ audience }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>Primary Channel
+            <select name="channel_focus">
+                {% for channel in channels %}
+                <option value="{{ channel }}">{{ channel }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>Idea Count
+            <input type="number" min="1" max="25" name="idea_count" value="8">
+        </label>
+        <fieldset class="span2 authority-feed-picker">
+            <legend>Feeds To Use</legend>
+            {% for feed in feeds %}
+            <label>
+                <input type="checkbox" name="selected_feed_ids" value="{{ feed.id }}" {% if feed.is_active %}checked{% endif %}>
+                <span>{{ feed.name }}</span>
+            </label>
+            {% endfor %}
+        </fieldset>
+        <button type="submit">Run Research</button>
+    </form>
+    <p class="muted-text">If all feed boxes are unchecked, the run defaults to all active feeds.</p>
+</section>
+
+<section class="panel">
+    <h3>Recent Research Runs</h3>
+    <table class="authority-table">
+        <thead>
+            <tr>
+                <th>Run</th>
+                <th>Status</th>
+                <th>Topic</th>
+                <th>Audience / Channel</th>
+                <th>Ideas</th>
+                <th>Mode</th>
+                <th>Started</th>
+                <th>Completed</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for run in runs %}
+            <tr>
+                <td>#{{ run.id }}</td>
+                <td>{{ run.status }}</td>
+                <td>{{ run.focus_topic or '-' }}</td>
+                <td>{{ run.target_audience or '-' }} / {{ run.channel_focus or '-' }}</td>
+                <td>{{ run.ideas_count }}</td>
+                <td>{{ run.summary_obj.get('generation_mode', '-') if run.summary_obj else '-' }}</td>
+                <td>{{ run.started_at|fmt_est_datetime if run.started_at else '-' }}</td>
+                <td>{{ run.completed_at|fmt_est_datetime if run.completed_at else '-' }}</td>
+            </tr>
+            {% if run.summary_obj and run.summary_obj.get('errors') %}
+            <tr>
+                <td colspan="8">
+                    <details>
+                        <summary>Run {{ run.id }} warnings ({{ run.summary_obj.get('errors')|length }})</summary>
+                        <ul>
+                            {% for err in run.summary_obj.get('errors') %}
+                            <li>{{ err }}</li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                </td>
+            </tr>
+            {% endif %}
+            {% else %}
+            <tr><td colspan="8">No runs yet.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="panel">
+    <h3>Idea Queue</h3>
+    <table class="authority-table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Status</th>
+                <th>Title</th>
+                <th>Audience / Channel</th>
+                <th>Hook / Thesis</th>
+                <th>Sources</th>
+                <th>Update</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for idea in ideas %}
+            <tr>
+                <td>#{{ idea.id }}<br><span class="muted-text">Run {{ idea.run_id }}</span></td>
+                <td>{{ idea.status }}</td>
+                <td>
+                    <strong>{{ idea.title }}</strong>
+                    {% if idea.angle %}
+                    <div class="muted-text">{{ idea.angle }}</div>
+                    {% endif %}
+                </td>
+                <td>{{ idea.target_audience or '-' }} / {{ idea.platform_primary or '-' }}</td>
+                <td>
+                    <div>{{ idea.hook or '-' }}</div>
+                    <div class="muted-text">{{ idea.thesis or '-' }}</div>
+                </td>
+                <td>
+                    {% if idea.sources_list %}
+                    <ul>
+                        {% for src in idea.sources_list %}
+                        <li>
+                            {% if src.url %}
+                            <a href="{{ src.url }}" target="_blank" rel="noopener">{{ src.title or src.url }}</a>
+                            {% else %}
+                            {{ src.title }}
+                            {% endif %}
+                        </li>
+                        {% endfor %}
+                    </ul>
+                    {% else %}
+                    -
+                    {% endif %}
+                </td>
+                <td>
+                    <form method="post" class="authority-idea-form">
+                        <input type="hidden" name="authority_action" value="update_idea">
+                        <input type="hidden" name="idea_id" value="{{ idea.id }}">
+                        <select name="idea_status">
+                            {% for status in idea_statuses %}
+                            <option value="{{ status }}" {% if status == idea.status %}selected{% endif %}>{{ status }}</option>
+                            {% endfor %}
+                        </select>
+                        <textarea name="editor_notes" placeholder="Review notes">{{ idea.editor_notes or '' }}</textarea>
+                        <button type="submit">Save</button>
+                    </form>
+                </td>
+            </tr>
+            <tr>
+                <td colspan="7">
+                    <details>
+                        <summary>Expand detail</summary>
+                        <div class="authority-detail-grid">
+                            <div>
+                                <strong>CTA:</strong>
+                                <p class="authority-detail">{{ idea.cta or '-' }}</p>
+                            </div>
+                            <div>
+                                <strong>SEO Keywords:</strong>
+                                <p class="authority-detail">{{ idea.seo_keywords|join(', ') if idea.seo_keywords else '-' }}</p>
+                            </div>
+                            <div>
+                                <strong>Outline:</strong>
+                                {% if idea.outline_items %}
+                                <ul>
+                                    {% for point in idea.outline_items %}
+                                    <li>{{ point }}</li>
+                                    {% endfor %}
+                                </ul>
+                                {% else %}
+                                <p class="authority-detail">-</p>
+                                {% endif %}
+                            </div>
+                            <div>
+                                <strong>Confidence:</strong>
+                                <p class="authority-detail">{{ '%.2f'|format(idea.confidence or 0) }}</p>
+                            </div>
+                        </div>
+                    </details>
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7">No ideas yet.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

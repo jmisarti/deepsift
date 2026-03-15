@@ -7789,7 +7789,7 @@ def run_website_step1_hold_once():
         rows = db.execute(
             """
             SELECT id, lead_key, latest_address, latest_phone, latest_email, latest_name, latest_stage,
-                   hold_expires_at, step1_payload_json, reisift_property_uuid
+                   hold_expires_at, step1_payload_json, reisift_property_uuid, reisift_owner_uuid
             FROM website_lead_submissions
             WHERE status = 'pending_step2'
               AND hold_expires_at IS NOT NULL
@@ -7803,35 +7803,116 @@ def run_website_step1_hold_once():
         for row in rows:
             step1_payload = parse_json_object(row["step1_payload_json"] or "{}")
             fields = _extract_website_lead_fields(step1_payload) if isinstance(step1_payload, dict) else {}
+            merged_fields = {
+                "stage": (fields.get("stage") or row["latest_stage"] or "").strip(),
+                "address": (fields.get("address") or row["latest_address"] or "").strip(),
+                "street": (fields.get("street") or "").strip(),
+                "city": (fields.get("city") or "").strip(),
+                "state": (fields.get("state") or "").strip(),
+                "postal_code": (fields.get("postal_code") or "").strip(),
+                "seller_name": (fields.get("seller_name") or row["latest_name"] or "").strip(),
+                "phone": (fields.get("phone") or row["latest_phone"] or "").strip(),
+                "email": (fields.get("email") or row["latest_email"] or "").strip(),
+            }
+            created_uuid = str(row["reisift_property_uuid"] or "").strip()
+            owner_uuid = str(row["reisift_owner_uuid"] or "").strip()
+            create_result = None
+            contact_sync = None
+            note_sync = None
+            duplicate_existing = False
+            duplicate_reason = ""
+            mode = "step1_only_timeout"
+            if merged_fields["address"] and not created_uuid:
+                owner_name_split = _parse_seller_name_for_owner(merged_fields.get("seller_name") or "")
+                owner_payload = {}
+                if owner_name_split.get("first_name") or owner_name_split.get("last_name"):
+                    owner_payload["first_name"] = owner_name_split.get("first_name") or "Unknown"
+                    owner_payload["last_name"] = owner_name_split.get("last_name") or "Owner"
+                if merged_fields.get("email"):
+                    owner_payload["emails"] = [merged_fields.get("email")]
+                if merged_fields.get("phone"):
+                    owner_payload["phones"] = [{"number": merged_fields.get("phone"), "type": "UNKNOWN", "status": "UNKNOWN"}]
+                notes = _build_website_lead_notes(step1_payload, merged_fields, source_label="step1_timeout_worker")
+                additional_note = _build_website_additional_note(step1_payload)
+                create_payload = {
+                    "search": merged_fields.get("address") or "",
+                    "street": merged_fields.get("street") or "",
+                    "city": merged_fields.get("city") or "",
+                    "state": merged_fields.get("state") or "",
+                    "postal_code": merged_fields.get("postal_code") or "",
+                    "status": "new_lead",
+                    "lists": "Carrot",
+                    "tags": f"website,webhook,carrot,{merged_fields.get('stage') or 'stage_unknown'}",
+                    "notes": f"{notes}\n\n{additional_note}".strip() if additional_note else notes,
+                    "owner": owner_payload,
+                    "skip_map_lookup": True,
+                }
+                create_result = create_reisift_property_from_search(create_payload)
+                created_uuid = str(create_result.get("created_uuid") or "").strip()
+                owner_uuid = str(create_result.get("owner_uuid") or "").strip()
+                duplicate_existing = bool(create_result.get("duplicate_existing"))
+                duplicate_reason = str(create_result.get("duplicate_reason") or "").strip()
+                if duplicate_existing:
+                    mode = "step1_only_timeout_duplicate"
+                if created_uuid:
+                    token = reisift_get_access_token()
+                    if token and not owner_uuid:
+                        try:
+                            owner_uuid = _reisift_find_owner_uuid(fetch_reisift_property_payload(token, created_uuid)) or owner_uuid
+                        except Exception:
+                            pass
+                    if token and owner_uuid and (merged_fields.get("email") or merged_fields.get("phone")):
+                        contact_sync = reisift_upsert_owner_contacts(
+                            token,
+                            owner_uuid,
+                            [{"number": merged_fields.get("phone"), "type": "UNKNOWN"}] if merged_fields.get("phone") else [],
+                            [merged_fields.get("email")] if merged_fields.get("email") else [],
+                        )
+                    if token and created_uuid and additional_note:
+                        note_sync = reisift_append_property_note(token, created_uuid, additional_note)
+            sift_link = _sift_record_url(created_uuid)
             slack_lines = [
                 "Website Lead SIFT Handling",
-                f"Stage: {fields.get('stage') or row['latest_stage'] or '-'}",
+                f"Stage: {merged_fields.get('stage') or '-'}",
                 "Step Type: step1",
-                "Mode: step1_only_timeout",
-                f"Address: {fields.get('address') or row['latest_address'] or '-'}",
-                f"Name: {fields.get('seller_name') or row['latest_name'] or '-'}",
-                f"Phone: {fields.get('phone') or row['latest_phone'] or '-'}",
-                f"Email: {fields.get('email') or row['latest_email'] or '-'}",
-                "SIFT Record: -",
+                f"Mode: {mode}",
+                f"Address: {merged_fields.get('address') or '-'}",
+                f"Name: {merged_fields.get('seller_name') or '-'}",
+                f"Phone: {merged_fields.get('phone') or '-'}",
+                f"Email: {merged_fields.get('email') or '-'}",
+                f"SIFT Record: {sift_link or '-'}",
                 "Reason: Step-2 not received within 10 minutes.",
             ]
+            if duplicate_reason:
+                slack_lines.append(f"Reason Detail: {duplicate_reason}")
             send_slack_notification(db, "\n".join(slack_lines))
             db.execute(
                 """
                 UPDATE website_lead_submissions
                 SET status = 'timed_out_step1_only',
+                    reisift_property_uuid = COALESCE(NULLIF(?, ''), reisift_property_uuid),
+                    reisift_owner_uuid = COALESCE(NULLIF(?, ''), reisift_owner_uuid),
                     processed_at = ?,
                     processing_result_json = ?,
                     hold_expires_at = NULL
                 WHERE id = ?
                 """,
                 (
+                    created_uuid,
+                    owner_uuid,
                     now_utc,
                     json.dumps(
                         {
-                            "mode": "step1_only_timeout",
+                            "mode": mode,
                             "reason": "Step-2 not received within hold window",
                             "processed_at": now_utc,
+                            "created_uuid": created_uuid,
+                            "owner_uuid": owner_uuid,
+                            "duplicate_existing": duplicate_existing,
+                            "duplicate_reason": duplicate_reason,
+                            "create_result": create_result,
+                            "contact_sync": contact_sync,
+                            "note_sync": note_sync,
                         }
                     ),
                     int(row["id"]),
@@ -7844,9 +7925,13 @@ def run_website_step1_hold_once():
                 "Website lead processing result\nResult: timed_out\nMode: step1_only_timeout",
                 {
                     "lead_key": row["lead_key"],
-                    "latest_address": row["latest_address"],
-                    "latest_phone": row["latest_phone"],
-                    "latest_email": row["latest_email"],
+                    "latest_address": merged_fields.get("address") or "",
+                    "latest_phone": merged_fields.get("phone") or "",
+                    "latest_email": merged_fields.get("email") or "",
+                    "created_uuid": created_uuid,
+                    "owner_uuid": owner_uuid,
+                    "duplicate_existing": duplicate_existing,
+                    "duplicate_reason": duplicate_reason,
                     "hold_expires_at": row["hold_expires_at"],
                 },
             )

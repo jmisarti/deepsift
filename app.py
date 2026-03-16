@@ -169,6 +169,22 @@ SMS_ANALYSIS_WORKER_STARTED = False
 WEBSITE_LEADS_HOLD_WORKER_STARTED = False
 AGENT_REFRESH_WORKER_STARTED = False
 UNTITLED_LEADS_WORKER_STARTED = False
+UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
+UNTITLED_EMAIL_DRAIN_STATE = {
+    "running": False,
+    "started_at": "",
+    "updated_at": "",
+    "completed_at": "",
+    "batch_limit": 0,
+    "pause_seconds": 0,
+    "batches_run": 0,
+    "total_attempted": 0,
+    "total_processed": 0,
+    "total_successful_rows": 0,
+    "total_failed_validation_rows": 0,
+    "last_result": None,
+    "last_error": "",
+}
 SYSTEM_PHONE_CACHE = {"numbers": set(), "expires_at": None}
 AGENT_PIPELINE_LOCK = threading.RLock()
 NJ_COUNTIES = [
@@ -8130,6 +8146,85 @@ def build_untitled_processing_counts(db):
         "no_email_rows": int(counts.get("no_email_rows", 0)),
         "pending_rows": int(counts.get("pending_rows", 0)),
     }
+
+
+def _get_untitled_email_drain_state():
+    with UNTITLED_EMAIL_DRAIN_LOCK:
+        state = dict(UNTITLED_EMAIL_DRAIN_STATE)
+    last_result = state.get("last_result")
+    if isinstance(last_result, dict):
+        state["last_result"] = dict(last_result)
+    return state
+
+
+def _update_untitled_email_drain_state(**updates):
+    with UNTITLED_EMAIL_DRAIN_LOCK:
+        UNTITLED_EMAIL_DRAIN_STATE.update(updates)
+        UNTITLED_EMAIL_DRAIN_STATE["updated_at"] = format_db_time(datetime.utcnow())
+        return dict(UNTITLED_EMAIL_DRAIN_STATE)
+
+
+def start_untitled_email_drain_worker(batch_limit=5, pause_seconds=1.0):
+    try:
+        batch_limit = max(1, min(25, int(batch_limit)))
+    except Exception:
+        batch_limit = 5
+    try:
+        pause_seconds = max(0.25, min(10.0, float(pause_seconds)))
+    except Exception:
+        pause_seconds = 1.0
+    current = _get_untitled_email_drain_state()
+    if current.get("running"):
+        return current
+    started_at = format_db_time(datetime.utcnow())
+    _update_untitled_email_drain_state(
+        running=True,
+        started_at=started_at,
+        completed_at="",
+        batch_limit=batch_limit,
+        pause_seconds=pause_seconds,
+        batches_run=0,
+        total_attempted=0,
+        total_processed=0,
+        total_successful_rows=0,
+        total_failed_validation_rows=0,
+        last_result=None,
+        last_error="",
+    )
+
+    def worker():
+        while True:
+            try:
+                result = run_untitled_email_backfill_once(limit=batch_limit)
+                summary = result.get("summary") or {}
+                state = _get_untitled_email_drain_state()
+                _update_untitled_email_drain_state(
+                    batches_run=int(state.get("batches_run") or 0) + 1,
+                    total_attempted=int(state.get("total_attempted") or 0) + int(result.get("attempted") or 0),
+                    total_processed=int(state.get("total_processed") or 0) + int(result.get("processed") or 0),
+                    total_successful_rows=int(state.get("total_successful_rows") or 0) + int(summary.get("successful_rows") or 0),
+                    total_failed_validation_rows=int(state.get("total_failed_validation_rows") or 0) + int(summary.get("failed_validation_rows") or 0),
+                    last_result=result,
+                    last_error="",
+                )
+                if int(result.get("attempted") or 0) == 0:
+                    _update_untitled_email_drain_state(
+                        running=False,
+                        completed_at=format_db_time(datetime.utcnow()),
+                    )
+                    break
+            except Exception as exc:
+                _update_untitled_email_drain_state(
+                    running=False,
+                    completed_at=format_db_time(datetime.utcnow()),
+                    last_error=str(exc),
+                )
+                break
+            time.sleep(pause_seconds)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return _get_untitled_email_drain_state()
 
 
 def start_untitled_leads_worker():
@@ -24889,6 +24984,50 @@ def integrations_untitled_backfill_email_sync_api():
         )
         db.commit()
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/integrations/untitled/backfill-email-sync/start", methods=["POST"])
+def integrations_untitled_backfill_email_sync_start_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    batch_limit_raw = str(payload.get("batch_limit") or request.args.get("batch_limit") or "5").strip()
+    pause_seconds_raw = str(payload.get("pause_seconds") or request.args.get("pause_seconds") or "1").strip()
+    try:
+        batch_limit = max(1, min(25, int(batch_limit_raw)))
+    except ValueError:
+        batch_limit = 5
+    try:
+        pause_seconds = max(0.25, min(10.0, float(pause_seconds_raw)))
+    except ValueError:
+        pause_seconds = 1.0
+    state_before = _get_untitled_email_drain_state()
+    state = start_untitled_email_drain_worker(batch_limit=batch_limit, pause_seconds=pause_seconds)
+    return jsonify(
+        {
+            "ok": True,
+            "started": not bool(state_before.get("running")),
+            "state": state,
+        }
+    ), 200
+
+
+@app.route("/api/integrations/untitled/backfill-email-sync/status", methods=["GET"])
+def integrations_untitled_backfill_email_sync_status_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    processing_counts = build_untitled_processing_counts(db)
+    return jsonify(
+        {
+            "ok": True,
+            "state": _get_untitled_email_drain_state(),
+            "processing_counts": processing_counts,
+        }
+    ), 200
 
 
 @app.route("/api/app-errors", methods=["GET"])

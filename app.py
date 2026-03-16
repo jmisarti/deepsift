@@ -7897,6 +7897,100 @@ def run_untitled_leads_snapshot_once():
         db.close()
 
 
+def run_untitled_email_backfill_once(limit=25):
+    ensure_db()
+    db = open_sqlite_connection()
+    try:
+        try:
+            max_rows = max(1, min(500, int(limit)))
+        except Exception:
+            max_rows = 25
+        already_sent_emails = {
+            normalize_email(row["normalized_email"])
+            for row in db.execute(
+                "SELECT normalized_email FROM anonymous_email_campaign_registry WHERE COALESCE(status, 'already_sent') = 'already_sent'"
+            ).fetchall()
+            if normalize_email(row["normalized_email"])
+        }
+        candidate_rows = db.execute(
+            """
+            SELECT *
+            FROM untitled_sheet_current
+            WHERE COALESCE(is_active, 1) = 1
+              AND COALESCE(lead_stage, '') NOT IN ('step_2', 'thank_you')
+              AND (COALESCE(email, '') <> '' OR COALESCE(personal_email, '') <> '')
+            ORDER BY
+              CASE LOWER(COALESCE(lead_category, ''))
+                WHEN 'hot' THEN 0
+                WHEN 'warm' THEN 1
+                WHEN 'neutral' THEN 2
+                WHEN 'cool' THEN 3
+                WHEN 'cold' THEN 4
+                ELSE 5
+              END,
+              COALESCE(total_session_count, 0) DESC,
+              COALESCE(last_session_est_duration, 0) DESC,
+              COALESCE(last_session_total_pages_visited, 0) DESC,
+              COALESCE(last_seen_at, last_changed_at) DESC,
+              id DESC
+            LIMIT 500
+            """
+        ).fetchall()
+        snapshot_created_at = format_db_time(datetime.utcnow())
+        processed = []
+        skipped = Counter()
+        attempted = 0
+        for row in candidate_rows:
+            if attempted >= max_rows:
+                break
+            payload = {}
+            if str(row["payload_json"] or "").strip():
+                try:
+                    payload = json.loads(row["payload_json"] or "{}")
+                except Exception:
+                    payload = {}
+            prepared = _prepare_untitled_sheet_row(payload)
+            if not _untitled_is_monitor_candidate(prepared):
+                skipped["converted"] += 1
+                continue
+            candidate_emails = _untitled_campaign_emails(prepared)
+            if not candidate_emails:
+                skipped["missing_email"] += 1
+                continue
+            unsent_emails = [email for email in candidate_emails if email not in already_sent_emails]
+            if not unsent_emails:
+                skipped["already_sent"] += 1
+                continue
+            attempted += 1
+            result = sync_untitled_email_campaign_contact(
+                db,
+                prepared,
+                snapshot_created_at,
+                already_sent_emails=already_sent_emails,
+            )
+            processed.append(
+                {
+                    "record_key": prepared["record_key"],
+                    "display_label": prepared["display_label"],
+                    "lead_category": prepared["lead_category"],
+                    "candidate_emails": candidate_emails,
+                    "unsent_emails": unsent_emails,
+                    "result": result,
+                }
+            )
+        db.commit()
+        return {
+            "ok": True,
+            "attempted": attempted,
+            "processed": len(processed),
+            "processed_rows": processed,
+            "skipped": dict(skipped),
+            "snapshot_created_at": snapshot_created_at,
+        }
+    finally:
+        db.close()
+
+
 def start_untitled_leads_worker():
     global UNTITLED_LEADS_WORKER_STARTED
     if UNTITLED_LEADS_WORKER_STARTED:
@@ -24624,6 +24718,34 @@ def integrations_untitled_latest_api():
             "anonymous_email_registry_count": int(registry_count or 0),
         }
     ), 200
+
+
+@app.route("/api/integrations/untitled/backfill-email-sync", methods=["POST"])
+def integrations_untitled_backfill_email_sync_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    limit_raw = str(payload.get("limit") or request.args.get("limit") or "25").strip()
+    try:
+        limit = max(1, min(100, int(limit_raw)))
+    except ValueError:
+        limit = 25
+    try:
+        result = run_untitled_email_backfill_once(limit=limit)
+        return jsonify(result), 200
+    except Exception as exc:
+        log_app_error(
+            db,
+            source="untitled_email_backfill",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route=request.path,
+            status_code=500,
+        )
+        db.commit()
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/api/app-errors", methods=["GET"])

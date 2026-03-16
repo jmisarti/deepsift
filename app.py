@@ -24568,6 +24568,64 @@ def integrations_sms_analysis_run_once_api():
     return jsonify(result), status
 
 
+@app.route("/api/integrations/untitled/latest", methods=["GET"])
+def integrations_untitled_latest_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    limit_raw = (request.args.get("limit") or "10").strip()
+    try:
+        limit = max(1, min(50, int(limit_raw)))
+    except ValueError:
+        limit = 10
+    snapshot = db.execute(
+        """
+        SELECT id, worksheet_name, source_url, row_count, new_rows, updated_rows, removed_rows,
+               reappeared_rows, lead_event_rows, contact_change_rows, hot_alert_rows, created_at
+        FROM untitled_sheet_snapshots
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    email_rows = db.execute(
+        """
+        SELECT display_label, campaign_email, email_validation_status, emailoctopus_sync_status,
+               emailoctopus_contact_id, email_validation_checked_at, emailoctopus_synced_at, emailoctopus_last_error
+        FROM untitled_sheet_current
+        WHERE COALESCE(campaign_email, '') <> ''
+           OR COALESCE(email_validation_status, '') <> ''
+           OR COALESCE(emailoctopus_sync_status, '') <> ''
+        ORDER BY COALESCE(emailoctopus_synced_at, email_validation_checked_at, last_changed_at) DESC, id DESC
+        LIMIT ?
+        """
+        ,
+        (limit,),
+    ).fetchall()
+    changes = db.execute(
+        """
+        SELECT id, display_label, change_type, summary_text, created_at
+        FROM untitled_sheet_changes
+        ORDER BY id DESC
+        LIMIT ?
+        """
+        ,
+        (limit,),
+    ).fetchall()
+    registry_count = db.execute(
+        "SELECT COUNT(*) AS c FROM anonymous_email_campaign_registry WHERE COALESCE(status, 'already_sent') = 'already_sent'"
+    ).fetchone()["c"]
+    return jsonify(
+        {
+            "ok": True,
+            "snapshot": dict(snapshot) if snapshot else None,
+            "email_sync_rows": [dict(row) for row in email_rows],
+            "change_log": [dict(row) for row in changes],
+            "anonymous_email_registry_count": int(registry_count or 0),
+        }
+    ), 200
+
+
 @app.route("/api/app-errors", methods=["GET"])
 def api_app_errors():
     ensure_db()

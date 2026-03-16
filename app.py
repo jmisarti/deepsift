@@ -8091,6 +8091,48 @@ def run_untitled_email_backfill_once(limit=25):
         db.close()
 
 
+def build_untitled_processing_counts(db):
+    rows = db.execute(
+        """
+        SELECT lead_stage, email, personal_email, email_validation_status, emailoctopus_sync_status
+        FROM untitled_sheet_current
+        WHERE COALESCE(is_active, 1) = 1
+          AND COALESCE(lead_stage, '') NOT IN ('step_2', 'thank_you')
+        """
+    ).fetchall()
+    counts = Counter()
+    for row in rows:
+        emails = _normalize_untitled_email_values(row["email"] or "", row["personal_email"] or "")
+        if not emails:
+            counts["no_email_rows"] += 1
+            continue
+        validation_status = str(row["email_validation_status"] or "").strip().lower()
+        sync_status = str(row["emailoctopus_sync_status"] or "").strip().lower()
+        success = any(token in sync_status for token in ("created_", "updated_", "already_sent_emailoctopus", "recorded_already_sent"))
+        failure = (
+            "error" in validation_status
+            or "error" in sync_status
+            or "skipped_invalid" in sync_status
+            or "skipped_unknown" in sync_status
+            or "recorded_validation_" in sync_status
+        )
+        if success and failure:
+            counts["mixed_rows"] += 1
+        elif success:
+            counts["successful_rows"] += 1
+        elif failure:
+            counts["failed_validation_rows"] += 1
+        else:
+            counts["pending_rows"] += 1
+    return {
+        "successful_rows": int(counts.get("successful_rows", 0)),
+        "failed_validation_rows": int(counts.get("failed_validation_rows", 0)),
+        "mixed_rows": int(counts.get("mixed_rows", 0)),
+        "no_email_rows": int(counts.get("no_email_rows", 0)),
+        "pending_rows": int(counts.get("pending_rows", 0)),
+    }
+
+
 def start_untitled_leads_worker():
     global UNTITLED_LEADS_WORKER_STARTED
     if UNTITLED_LEADS_WORKER_STARTED:
@@ -24809,6 +24851,7 @@ def integrations_untitled_latest_api():
     registry_count = db.execute(
         "SELECT COUNT(*) AS c FROM anonymous_email_campaign_registry WHERE COALESCE(status, 'already_sent') = 'already_sent'"
     ).fetchone()["c"]
+    processing_counts = build_untitled_processing_counts(db)
     return jsonify(
         {
             "ok": True,
@@ -24816,6 +24859,7 @@ def integrations_untitled_latest_api():
             "email_sync_rows": [dict(row) for row in email_rows],
             "change_log": [dict(row) for row in changes],
             "anonymous_email_registry_count": int(registry_count or 0),
+            "processing_counts": processing_counts,
         }
     ), 200
 

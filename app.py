@@ -7973,7 +7973,6 @@ def run_untitled_email_backfill_once(limit=25):
               COALESCE(last_session_total_pages_visited, 0) DESC,
               COALESCE(last_seen_at, last_changed_at) DESC,
               id DESC
-            LIMIT 500
             """
         ).fetchall()
         snapshot_created_at = format_db_time(datetime.utcnow())

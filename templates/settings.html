@@ -119,11 +119,36 @@
             <label>Slack Agent Ops Channel (optional)
                 <input name="slack_agent_ops_channel" value="{{ slack_settings.agent_ops_channel }}" placeholder="#agent-ops">
             </label>
+            <label class="span2">EmailListVerify API Key
+                <input name="emaillistverify_api_key" value="{{ anonymous_email_settings.emaillistverify_api_key }}">
+            </label>
+            <label class="span2">EmailOctopus API Key
+                <input name="emailoctopus_api_key" value="{{ anonymous_email_settings.emailoctopus_api_key }}">
+            </label>
+            <label>EmailOctopus List ID
+                <input name="emailoctopus_list_id" value="{{ anonymous_email_settings.emailoctopus_list_id }}">
+            </label>
+            <label>EmailOctopus Contact Status
+                <select name="emailoctopus_contact_status">
+                    <option value="PENDING" {% if anonymous_email_settings.emailoctopus_contact_status == 'PENDING' %}selected{% endif %}>PENDING</option>
+                    <option value="SUBSCRIBED" {% if anonymous_email_settings.emailoctopus_contact_status == 'SUBSCRIBED' %}selected{% endif %}>SUBSCRIBED</option>
+                    <option value="UNSUBSCRIBED" {% if anonymous_email_settings.emailoctopus_contact_status == 'UNSUBSCRIBED' %}selected{% endif %}>UNSUBSCRIBED</option>
+                </select>
+            </label>
             <div class="inline-actions span2">
                 <button type="submit">Save Integration Settings</button>
                 <button type="submit" name="integration_action" value="test_slack">Save + Test Slack</button>
                 <button type="submit" name="integration_action" value="test_slack_agent_ops">Save + Test Agent Ops Slack</button>
             </div>
+        </form>
+        <p class="muted-text">Anonymous browse-stage leads are only validated/pushed when they remain outside <code>/step-2/</code> and <code>/thank-you/</code>. Imported EmailOctopus sent-email registry size: {{ anonymous_email_registry_count }}.</p>
+        <form method="post" enctype="multipart/form-data" class="grid-form" style="margin-top:0.75rem;">
+            <input type="hidden" name="settings_tab" value="integrations">
+            <input type="hidden" name="integration_action" value="import_emailoctopus_export">
+            <label class="span2">Import EmailOctopus Export CSV
+                <input type="file" name="emailoctopus_export_file" accept=".csv,text/csv">
+            </label>
+            <button type="submit">Import Already-Sent Emails</button>
         </form>
         <form method="post" class="inline-form" onsubmit="return confirm('Clear all unread items from the notification bar?');" style="margin-top:0.5rem;">
             <input type="hidden" name="settings_tab" value="integrations">
@@ -167,6 +192,23 @@
                         </td>
                     </tr>
                     <tr>
+                        <td><strong>Anonymous Lead Snapshot Monitor</strong></td>
+                        <td>Pulls the public Untitled <em>all</em> worksheet every few hours, saves a state snapshot, logs only what changed, validates eligible emails, and skips any address already recorded as sent to EmailOctopus.</td>
+                        <td>
+                            <form method="post" class="automation-toggle-form">
+                                <input type="hidden" name="settings_tab" value="automations">
+                                <input type="hidden" name="automation_key" value="untitled_leads">
+                                <label class="toggle-switch" title="Toggle Anonymous Lead Snapshot Monitor">
+                                    <input type="checkbox" name="automation_untitled_leads_enabled" value="1" {% if automation_settings.untitled_leads_enabled %}checked{% endif %} onchange="this.form.submit()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span class="toggle-text {% if automation_settings.untitled_leads_enabled %}on{% else %}off{% endif %}">
+                                    {% if automation_settings.untitled_leads_enabled %}On{% else %}Off{% endif %}
+                                </span>
+                            </form>
+                        </td>
+                    </tr>
+                    <tr>
                         <td><strong>ReiSift Automation</strong></td>
                         <td>Placeholder toggle for future ReiSift automation workflows and webhook-driven ingest. No processing logic is attached yet.</td>
                         <td>
@@ -204,6 +246,7 @@
             </table>
         </div>
         <p class="muted-text" style="margin-top:0.5rem;">Current poll interval: every {{ clever_poll_minutes }} minute{% if clever_poll_minutes != 1 %}s{% endif %}.</p>
+        <p class="muted-text" style="margin-top:0.25rem;">Anonymous lead monitor interval: every {{ untitled_poll_hours }} hour{% if untitled_poll_hours != 1 %}s{% endif %}.</p>
     {% else %}
         <h3>On-Market Checker (Beta Helper)</h3>
         <p>This helper generates fast lookup links for Zillow/Realtor/Redfin based on a property address. Use it to quickly verify whether a property appears as coming soon, active, pending, or sold.</p>
@@ -332,6 +375,112 @@
         </div>
         {% else %}
         <p style="margin-top:0.75rem;">No Clever webhook notes yet.</p>
+        {% endif %}
+    </details>
+
+    <details class="collapsed-section" style="margin-top: 1rem;" open>
+        <summary>Anonymous Lead Snapshot Runs</summary>
+        {% if untitled_snapshot_runs and untitled_snapshot_runs|length > 0 %}
+        <div class="table-wrap" style="margin-top: 0.75rem;">
+            <table class="compact-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Rows</th>
+                        <th>New</th>
+                        <th>Updated</th>
+                        <th>Contact Updates</th>
+                        <th>Removed</th>
+                        <th>Reappeared</th>
+                        <th>Lead URLs</th>
+                        <th>Hot Alerts</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in untitled_snapshot_runs %}
+                    <tr>
+                        <td>{{ row.created_at|fmt_est_datetime }}</td>
+                        <td>{{ row.row_count }}</td>
+                        <td>{{ row.new_rows }}</td>
+                        <td>{{ row.updated_rows }}</td>
+                        <td>{{ row.contact_change_rows }}</td>
+                        <td>{{ row.removed_rows }}</td>
+                        <td>{{ row.reappeared_rows }}</td>
+                        <td>{{ row.lead_event_rows }}</td>
+                        <td>{{ row.hot_alert_rows }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p style="margin-top:0.75rem;">No anonymous lead snapshots yet.</p>
+        {% endif %}
+    </details>
+
+    <details class="collapsed-section" style="margin-top: 1rem;" open>
+        <summary>Anonymous Lead Change Log</summary>
+        {% if untitled_change_log and untitled_change_log|length > 0 %}
+        <div class="table-wrap" style="margin-top: 0.75rem;">
+            <table class="compact-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Type</th>
+                        <th>Visitor</th>
+                        <th>Summary</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in untitled_change_log %}
+                    <tr>
+                        <td>{{ row.created_at|fmt_est_datetime }}</td>
+                        <td>{{ row.change_type }}</td>
+                        <td>{{ row.display_label or '-' }}</td>
+                        <td style="white-space: pre-wrap;">{{ row.summary_text }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p style="margin-top:0.75rem;">No anonymous lead changes logged yet.</p>
+        {% endif %}
+    </details>
+
+    <details class="collapsed-section" style="margin-top: 1rem;" open>
+        <summary>Anonymous Lead Email Sync Status</summary>
+        {% if untitled_email_sync_rows and untitled_email_sync_rows|length > 0 %}
+        <div class="table-wrap" style="margin-top: 0.75rem;">
+            <table class="compact-table">
+                <thead>
+                    <tr>
+                        <th>Visitor</th>
+                        <th>Campaign Email</th>
+                        <th>Validation</th>
+                        <th>EmailOctopus</th>
+                        <th>Validated</th>
+                        <th>Synced</th>
+                        <th>Error</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in untitled_email_sync_rows %}
+                    <tr>
+                        <td>{{ row.display_label or '-' }}</td>
+                        <td>{{ row.campaign_email or '-' }}</td>
+                        <td>{{ row.email_validation_status or '-' }}</td>
+                        <td>{{ row.emailoctopus_sync_status or '-' }}</td>
+                        <td>{{ row.email_validation_checked_at|fmt_est_datetime if row.email_validation_checked_at else '-' }}</td>
+                        <td>{{ row.emailoctopus_synced_at|fmt_est_datetime if row.emailoctopus_synced_at else '-' }}</td>
+                        <td style="white-space: pre-wrap;">{{ row.emailoctopus_last_error or '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p style="margin-top:0.75rem;">No anonymous lead email sync activity yet.</p>
         {% endif %}
     </details>
 </section>

@@ -18,6 +18,7 @@ import ssl
 import threading
 import time
 import traceback
+from collections import Counter
 from urllib.parse import quote, quote_plus, urlsplit
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
@@ -147,6 +148,14 @@ GOOGLE_SHEETS_POLL_SECONDS = max(int((os.getenv("GOOGLE_SHEETS_POLL_SECONDS") or
 GOOGLE_SHEETS_POLL_MODE = (os.getenv("GOOGLE_SHEETS_POLL_MODE") or "latest_only").strip().lower()
 CLEVER_LEADS_EVENT_SOURCE = "clever_leads_ingest"
 WEBSITE_LEADS_EVENT_SOURCE = "website_leads_ingest"
+UNTITLED_LEADS_SPREADSHEET_ID = (
+    os.getenv("UNTITLED_LEADS_SPREADSHEET_ID", "1HG9ZqmJPGWtccN1yA9ItZlaleFXUVjLkS46jDnutVoo").strip()
+)
+UNTITLED_LEADS_WORKSHEET_NAME = (os.getenv("UNTITLED_LEADS_WORKSHEET_NAME", "all") or "all").strip() or "all"
+UNTITLED_LEADS_POLL_SECONDS = max(int((os.getenv("UNTITLED_LEADS_POLL_SECONDS") or "10800").strip() or "10800"), 3600)
+UNTITLED_LEADS_EVENT_SOURCE = "untitled_leads_monitor"
+EMAILLISTVERIFY_BASE_URL = os.getenv("EMAILLISTVERIFY_BASE_URL", "https://apps.emaillistverify.com/api").strip()
+EMAILOCTOPUS_BASE_URL = os.getenv("EMAILOCTOPUS_BASE_URL", "https://emailoctopus.com/api/1.6").strip()
 try:
     EST_TZ = ZoneInfo("America/New_York")
 except ZoneInfoNotFoundError:
@@ -159,6 +168,7 @@ CALL_RECORDING_WORKER_STARTED = False
 SMS_ANALYSIS_WORKER_STARTED = False
 WEBSITE_LEADS_HOLD_WORKER_STARTED = False
 AGENT_REFRESH_WORKER_STARTED = False
+UNTITLED_LEADS_WORKER_STARTED = False
 SYSTEM_PHONE_CACHE = {"numbers": set(), "expires_at": None}
 AGENT_PIPELINE_LOCK = threading.RLock()
 NJ_COUNTIES = [
@@ -250,6 +260,7 @@ LEAD_ACTION_TYPES = [
 LEAD_CONTACT_CLASSIFICATIONS = ["", "buyer", "wholesaler", "spam", "realtor"]
 AUTHORITY_AUDIENCES = ["General Investors", "Accredited Investors", "Operators", "Brokers", "Title Agents"]
 AUTHORITY_CHANNELS = ["LinkedIn Long-Form", "X", "BiggerPockets", "Reddit"]
+EMAIL_RE = re.compile(r"[A-Z0-9._%+\-']+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
 AUTHORITY_IDEA_STATUSES = ["Draft", "Review", "Approved", "Rejected", "Backlog"]
 LEAD_STOP_STATUSES = {"not interested", "dnc", "opt out", "dead"}
 LEAD_NEGATIVE_INTENT_TOKENS = [
@@ -519,6 +530,7 @@ def require_login_if_enabled():
         start_bulk_sms_worker()
         start_email_poll_worker()
         start_clever_leads_worker()
+        start_untitled_leads_worker()
         start_website_leads_hold_worker()
         if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
             start_referral_on_market_worker()
@@ -1013,6 +1025,110 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_agent_refresh_queue_due ON agent_refresh_queue(status, run_after, id)")
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS untitled_sheet_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worksheet_name TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            row_count INTEGER NOT NULL DEFAULT 0,
+            new_rows INTEGER NOT NULL DEFAULT 0,
+            updated_rows INTEGER NOT NULL DEFAULT 0,
+            removed_rows INTEGER NOT NULL DEFAULT 0,
+            reappeared_rows INTEGER NOT NULL DEFAULT 0,
+            lead_event_rows INTEGER NOT NULL DEFAULT 0,
+            snapshot_hash TEXT,
+            summary_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_untitled_sheet_snapshots_created ON untitled_sheet_snapshots(id DESC)")
+    ensure_column(db, "untitled_sheet_snapshots", "contact_change_rows", "contact_change_rows INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "untitled_sheet_snapshots", "hot_alert_rows", "hot_alert_rows INTEGER NOT NULL DEFAULT 0")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS untitled_sheet_current (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_key TEXT NOT NULL UNIQUE,
+            record_uuid TEXT,
+            display_label TEXT,
+            row_hash TEXT NOT NULL,
+            lead_category TEXT,
+            lead_stage TEXT,
+            total_session_count INTEGER NOT NULL DEFAULT 0,
+            last_session_est_duration REAL NOT NULL DEFAULT 0,
+            last_session_total_pages_visited INTEGER NOT NULL DEFAULT 0,
+            last_session_entry_url TEXT,
+            last_session_entry_referral_url TEXT,
+            last_session_exit_url TEXT,
+            email TEXT,
+            business_email TEXT,
+            personal_email TEXT,
+            mobile_phone TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            personal_address TEXT,
+            personal_city TEXT,
+            personal_state TEXT,
+            personal_zip TEXT,
+            payload_json TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_untitled_sheet_current_active ON untitled_sheet_current(is_active, last_changed_at DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_untitled_sheet_current_stage ON untitled_sheet_current(lead_stage, lead_category)")
+    ensure_column(db, "untitled_sheet_current", "campaign_email", "campaign_email TEXT")
+    ensure_column(db, "untitled_sheet_current", "email_validation_status", "email_validation_status TEXT NOT NULL DEFAULT ''")
+    ensure_column(db, "untitled_sheet_current", "email_validation_raw", "email_validation_raw TEXT")
+    ensure_column(db, "untitled_sheet_current", "email_validation_checked_at", "email_validation_checked_at TEXT")
+    ensure_column(db, "untitled_sheet_current", "emailoctopus_sync_status", "emailoctopus_sync_status TEXT NOT NULL DEFAULT ''")
+    ensure_column(db, "untitled_sheet_current", "emailoctopus_contact_id", "emailoctopus_contact_id TEXT")
+    ensure_column(db, "untitled_sheet_current", "emailoctopus_synced_at", "emailoctopus_synced_at TEXT")
+    ensure_column(db, "untitled_sheet_current", "emailoctopus_last_error", "emailoctopus_last_error TEXT")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS untitled_sheet_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL,
+            record_key TEXT NOT NULL,
+            record_uuid TEXT,
+            display_label TEXT,
+            change_type TEXT NOT NULL,
+            summary_text TEXT NOT NULL,
+            changed_fields_json TEXT,
+            before_payload_json TEXT,
+            after_payload_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(snapshot_id) REFERENCES untitled_sheet_snapshots(id) ON DELETE CASCADE
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_untitled_sheet_changes_snapshot ON untitled_sheet_changes(snapshot_id, id DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_untitled_sheet_changes_type ON untitled_sheet_changes(change_type, id DESC)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS anonymous_email_campaign_registry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            normalized_email TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL DEFAULT 'manual_import',
+            source_identifier TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            status TEXT NOT NULL DEFAULT 'already_sent',
+            notes TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_anonymous_email_campaign_registry_status ON anonymous_email_campaign_registry(status, updated_at DESC)"
+    )
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS authority_feeds (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -1313,6 +1429,19 @@ def normalize_phone(value):
     if len(digits) >= 10:
         return digits[-10:]
     return digits
+
+
+def normalize_email(value):
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    raw = raw.strip(" \t\r\n,;<>\"'")
+    if not raw:
+        return ""
+    match = EMAIL_RE.search(raw)
+    if match:
+        return match.group(0).strip().lower()
+    return raw if "@" in raw else ""
 
 
 def est_day_start_utc(now_dt=None):
@@ -5518,6 +5647,30 @@ def get_email_settings(db):
     }
 
 
+def get_anonymous_email_marketing_settings(db):
+    contact_status = (
+        get_setting(db, "emailoctopus_contact_status", "")
+        or os.getenv("EMAILOCTOPUS_CONTACT_STATUS", "PENDING")
+    ).strip().upper() or "PENDING"
+    if contact_status not in {"PENDING", "SUBSCRIBED", "UNSUBSCRIBED"}:
+        contact_status = "PENDING"
+    return {
+        "emaillistverify_api_key": (
+            get_setting(db, "emaillistverify_api_key", "")
+            or os.getenv("EMAILLISTVERIFY_API_KEY", "")
+        ).strip(),
+        "emailoctopus_api_key": (
+            get_setting(db, "emailoctopus_api_key", "")
+            or os.getenv("EMAILOCTOPUS_API_KEY", "")
+        ).strip(),
+        "emailoctopus_list_id": (
+            get_setting(db, "emailoctopus_list_id", "")
+            or os.getenv("EMAILOCTOPUS_LIST_ID", "")
+        ).strip(),
+        "emailoctopus_contact_status": contact_status,
+    }
+
+
 def get_slack_settings(db):
     return {
         "webhook_url": get_setting(db, "slack_webhook_url", ""),
@@ -5534,10 +5687,12 @@ def get_automation_settings(db):
         clever_enabled_raw = get_setting(db, "automation_test_enabled", "1")
     reisift_placeholder_raw = get_setting(db, "automation_reisift_placeholder_enabled", "1")
     auto_send_realtors_raw = get_setting(db, "automation_auto_send_realtors_enabled", "1")
+    untitled_leads_raw = get_setting(db, "automation_untitled_leads_enabled", "1")
     return {
         "clever_leads_enabled": (clever_enabled_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
         "reisift_placeholder_enabled": (reisift_placeholder_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
         "auto_send_realtors_enabled": (auto_send_realtors_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
+        "untitled_leads_enabled": (untitled_leads_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
     }
 
 
@@ -5645,6 +5800,482 @@ def upsert_integration_event(db, source, event_key, payload):
         ((source or "").strip(), key, json.dumps(payload or {})),
     )
     return True
+
+
+def _untitled_campaign_email(prepared_row):
+    if not isinstance(prepared_row, dict):
+        return ""
+    for key in ("email", "personal_email", "business_email"):
+        email = normalize_email(prepared_row.get(key))
+        if email:
+            return email
+    return ""
+
+
+def _emailoctopus_member_id(email_address):
+    return hashlib.md5((normalize_email(email_address) or "").encode("utf-8")).hexdigest()
+
+
+def _safe_response_payload(response):
+    try:
+        return response.json()
+    except Exception:
+        return (response.text or "").strip()
+
+
+def verify_email_with_emaillistverify(api_key, email_address):
+    email_address = normalize_email(email_address)
+    if not api_key:
+        return {
+            "ok": False,
+            "provider": "emaillistverify",
+            "email": email_address,
+            "provider_status": "missing_api_key",
+            "normalized_status": "awaiting_emaillistverify_config",
+            "is_valid": False,
+            "raw": "",
+        }
+    if not email_address:
+        return {
+            "ok": False,
+            "provider": "emaillistverify",
+            "email": "",
+            "provider_status": "missing_email",
+            "normalized_status": "missing_email",
+            "is_valid": False,
+            "raw": "",
+        }
+    response = requests.get(
+        f"{EMAILLISTVERIFY_BASE_URL.rstrip('/')}/verifyEmail",
+        params={"secret": api_key, "email": email_address},
+        timeout=20,
+    )
+    raw_text = (response.text or "").strip()
+    provider_status = raw_text.strip().lower()
+    if not response.ok:
+        raise ValueError(f"EmailListVerify failed ({response.status_code}): {raw_text or 'Unknown error'}")
+    normalized_status = "error"
+    if provider_status in {"ok", "valid"}:
+        normalized_status = "valid"
+    elif provider_status in {"failed", "invalid", "incorrect"}:
+        normalized_status = "invalid"
+    elif provider_status == "unknown":
+        normalized_status = "unknown"
+    elif provider_status in {"key_not_valid", "missing_api_key"}:
+        normalized_status = "awaiting_emaillistverify_config"
+    elif "key" in provider_status and "valid" in provider_status:
+        normalized_status = "awaiting_emaillistverify_config"
+    return {
+        "ok": normalized_status in {"valid", "invalid", "unknown"},
+        "provider": "emaillistverify",
+        "email": email_address,
+        "provider_status": provider_status,
+        "normalized_status": normalized_status,
+        "is_valid": normalized_status == "valid",
+        "raw": raw_text,
+    }
+
+
+def emailoctopus_upsert_contact(api_key, list_id, email_address, contact_status="PENDING", tags=None):
+    email_address = normalize_email(email_address)
+    if not api_key:
+        raise ValueError("EmailOctopus API key is missing")
+    if not list_id:
+        raise ValueError("EmailOctopus list id is missing")
+    if not email_address:
+        raise ValueError("Email address is missing")
+    base_url = EMAILOCTOPUS_BASE_URL.rstrip("/")
+    create_payload = {
+        "api_key": api_key,
+        "email_address": email_address,
+        "status": (contact_status or "PENDING").strip().upper() or "PENDING",
+    }
+    clean_tags = [str(tag).strip() for tag in (tags or []) if str(tag).strip()]
+    if clean_tags:
+        create_payload["tags"] = list(dict.fromkeys(clean_tags))
+    response = requests.post(
+        f"{base_url}/lists/{quote_plus(list_id)}/contacts",
+        headers={"Content-Type": "application/json"},
+        json=create_payload,
+        timeout=20,
+    )
+    payload = _safe_response_payload(response)
+    if response.ok:
+        payload_dict = payload if isinstance(payload, dict) else {}
+        return {
+            "ok": True,
+            "action": "created",
+            "status": str(payload_dict.get("status") or create_payload["status"]).strip().upper(),
+            "contact_id": str(payload_dict.get("id") or payload_dict.get("contact_id") or _emailoctopus_member_id(email_address)),
+            "response": payload,
+        }
+    error_code = ""
+    if isinstance(payload, dict):
+        error_code = str(payload.get("code") or payload.get("error") or "").strip().upper()
+    if error_code == "MEMBER_EXISTS_WITH_EMAIL_ADDRESS" or response.status_code == 409:
+        update_payload = {
+            "api_key": api_key,
+            "status": create_payload["status"],
+        }
+        if clean_tags:
+            update_payload["tags"] = {tag: True for tag in clean_tags}
+        member_id = _emailoctopus_member_id(email_address)
+        update_response = requests.put(
+            f"{base_url}/lists/{quote_plus(list_id)}/contacts/{member_id}",
+            headers={"Content-Type": "application/json"},
+            json=update_payload,
+            timeout=20,
+        )
+        update_payload_body = _safe_response_payload(update_response)
+        if update_response.ok:
+            update_dict = update_payload_body if isinstance(update_payload_body, dict) else {}
+            return {
+                "ok": True,
+                "action": "updated",
+                "status": str(update_dict.get("status") or update_payload["status"]).strip().upper(),
+                "contact_id": str(update_dict.get("id") or update_dict.get("contact_id") or member_id),
+                "response": update_payload_body,
+            }
+        raise ValueError(
+            f"EmailOctopus update failed ({update_response.status_code}): {json.dumps(update_payload_body) if isinstance(update_payload_body, dict) else update_payload_body}"
+        )
+    raise ValueError(
+        f"EmailOctopus create failed ({response.status_code}): {json.dumps(payload) if isinstance(payload, dict) else payload}"
+    )
+
+
+def emailoctopus_set_contact_status(api_key, list_id, email_address, status="UNSUBSCRIBED"):
+    email_address = normalize_email(email_address)
+    if not api_key or not list_id or not email_address:
+        return {"ok": False, "skipped": "missing_config_or_email"}
+    member_id = _emailoctopus_member_id(email_address)
+    response = requests.put(
+        f"{EMAILOCTOPUS_BASE_URL.rstrip('/')}/lists/{quote_plus(list_id)}/contacts/{member_id}",
+        headers={"Content-Type": "application/json"},
+        json={"api_key": api_key, "status": (status or "UNSUBSCRIBED").strip().upper() or "UNSUBSCRIBED"},
+        timeout=20,
+    )
+    payload = _safe_response_payload(response)
+    if response.ok:
+        payload_dict = payload if isinstance(payload, dict) else {}
+        return {
+            "ok": True,
+            "status": str(payload_dict.get("status") or status).strip().upper(),
+            "contact_id": str(payload_dict.get("id") or payload_dict.get("contact_id") or member_id),
+            "response": payload,
+        }
+    if isinstance(payload, dict):
+        error_code = str(payload.get("code") or payload.get("error") or "").strip().upper()
+        if error_code in {"MEMBER_NOT_FOUND", "CONTACT_NOT_FOUND"}:
+            return {"ok": True, "status": "UNSUBSCRIBED", "contact_id": member_id, "response": payload}
+    raise ValueError(
+        f"EmailOctopus status update failed ({response.status_code}): {json.dumps(payload) if isinstance(payload, dict) else payload}"
+    )
+
+
+def upsert_anonymous_email_campaign_registry(db, normalized_email, source="manual_import", source_identifier="", first_name="", last_name="", status="already_sent", notes=""):
+    normalized_email = normalize_email(normalized_email)
+    if not normalized_email:
+        return False
+    timestamp = format_db_time(datetime.utcnow())
+    db.execute(
+        """
+        INSERT INTO anonymous_email_campaign_registry (
+            normalized_email, source, source_identifier, first_name, last_name, status, notes, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(normalized_email) DO UPDATE SET
+            source = excluded.source,
+            source_identifier = CASE
+                WHEN COALESCE(excluded.source_identifier, '') <> '' THEN excluded.source_identifier
+                ELSE anonymous_email_campaign_registry.source_identifier
+            END,
+            first_name = CASE
+                WHEN COALESCE(excluded.first_name, '') <> '' THEN excluded.first_name
+                ELSE anonymous_email_campaign_registry.first_name
+            END,
+            last_name = CASE
+                WHEN COALESCE(excluded.last_name, '') <> '' THEN excluded.last_name
+                ELSE anonymous_email_campaign_registry.last_name
+            END,
+            status = excluded.status,
+            notes = CASE
+                WHEN COALESCE(excluded.notes, '') <> '' THEN excluded.notes
+                ELSE anonymous_email_campaign_registry.notes
+            END,
+            updated_at = excluded.updated_at
+        """,
+        (
+            normalized_email,
+            (source or "manual_import").strip() or "manual_import",
+            (source_identifier or "").strip(),
+            (first_name or "").strip(),
+            (last_name or "").strip(),
+            (status or "already_sent").strip() or "already_sent",
+            (notes or "").strip(),
+            timestamp,
+            timestamp,
+        ),
+    )
+    return True
+
+
+def _import_emailoctopus_export_reader(db, reader, source="emailoctopus_export", source_label=""):
+    inserted = 0
+    rows_seen = 0
+    label = (source_label or source or "EmailOctopus export").strip()
+    for row in reader:
+        rows_seen += 1
+        email_address = normalize_email(row.get("Email address") or row.get("email") or "")
+        if not email_address:
+            continue
+        upsert_anonymous_email_campaign_registry(
+            db,
+            email_address,
+            source=source,
+            source_identifier=row.get("Identifier") or row.get("id") or "",
+            first_name=row.get("First name") or "",
+            last_name=row.get("Last name") or "",
+            status="already_sent",
+            notes=f"Imported from {label}",
+        )
+        inserted += 1
+    return {"ok": True, "rows_seen": rows_seen, "emails_imported": inserted, "source_label": label}
+
+
+def import_emailoctopus_export_csv(db, csv_path, source="emailoctopus_export"):
+    path = Path(csv_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"CSV not found: {path}")
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        result = _import_emailoctopus_export_reader(db, reader, source=source, source_label=path.name)
+    result["path"] = str(path)
+    return result
+
+
+def import_emailoctopus_export_upload(db, upload, source="emailoctopus_export_upload"):
+    if not upload:
+        raise ValueError("Choose an EmailOctopus export CSV to import.")
+    raw = upload.read()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8-sig", errors="ignore")
+    raw = raw or ""
+    reader = csv.DictReader(io.StringIO(raw))
+    result = _import_emailoctopus_export_reader(
+        db,
+        reader,
+        source=source,
+        source_label=getattr(upload, "filename", "") or "uploaded CSV",
+    )
+    result["filename"] = getattr(upload, "filename", "") or ""
+    return result
+
+
+def _untitled_email_tags(prepared_row):
+    tags = ["Untitled Anonymous Lead"]
+    lead_category = str(prepared_row.get("lead_category") or "").strip()
+    if lead_category:
+        tags.append(f"Untitled {lead_category.title()}")
+    return list(dict.fromkeys(tags))
+
+
+def _update_untitled_email_sync_state(
+    db,
+    record_key,
+    campaign_email="",
+    validation_status="",
+    validation_raw="",
+    validation_checked_at="",
+    sync_status="",
+    contact_id="",
+    synced_at="",
+    last_error="",
+):
+    db.execute(
+        """
+        UPDATE untitled_sheet_current
+        SET campaign_email = ?,
+            email_validation_status = ?,
+            email_validation_raw = ?,
+            email_validation_checked_at = ?,
+            emailoctopus_sync_status = ?,
+            emailoctopus_contact_id = ?,
+            emailoctopus_synced_at = ?,
+            emailoctopus_last_error = ?
+        WHERE record_key = ?
+        """,
+        (
+            normalize_email(campaign_email),
+            (validation_status or "").strip(),
+            validation_raw or "",
+            validation_checked_at or "",
+            (sync_status or "").strip(),
+            (contact_id or "").strip(),
+            synced_at or "",
+            last_error or "",
+            (record_key or "").strip(),
+        ),
+    )
+
+
+def sync_untitled_email_campaign_contact(db, prepared_row, snapshot_created_at, already_sent_emails=None):
+    record_key = str(prepared_row.get("record_key") or "").strip()
+    if not record_key:
+        return {"ok": False, "skipped": "missing_record_key"}
+    current = db.execute("SELECT * FROM untitled_sheet_current WHERE record_key = ?", (record_key,)).fetchone()
+    if not current:
+        return {"ok": False, "skipped": "missing_current_row"}
+    campaign_email = _untitled_campaign_email(prepared_row)
+    prior_campaign_email = normalize_email(current["campaign_email"] or "")
+    validation_status = str(current["email_validation_status"] or "").strip()
+    validation_raw = str(current["email_validation_raw"] or "")
+    validation_checked_at = str(current["email_validation_checked_at"] or "")
+    sync_status = str(current["emailoctopus_sync_status"] or "").strip()
+    contact_id = str(current["emailoctopus_contact_id"] or "")
+    synced_at = str(current["emailoctopus_synced_at"] or "")
+    last_error = str(current["emailoctopus_last_error"] or "")
+    email_changed = campaign_email != prior_campaign_email
+    if not campaign_email:
+        _update_untitled_email_sync_state(db, record_key)
+        return {"ok": True, "skipped": "missing_email"}
+    if already_sent_emails is not None and campaign_email in already_sent_emails:
+        _update_untitled_email_sync_state(
+            db,
+            record_key,
+            campaign_email=campaign_email,
+            validation_status=validation_status,
+            validation_raw=validation_raw,
+            validation_checked_at=validation_checked_at,
+            sync_status="already_sent_emailoctopus",
+            contact_id=contact_id,
+            synced_at=synced_at,
+            last_error="",
+        )
+        return {"ok": True, "skipped": "already_sent_emailoctopus"}
+
+    if email_changed:
+        validation_status = ""
+        validation_raw = ""
+        validation_checked_at = ""
+        sync_status = ""
+        contact_id = ""
+        synced_at = ""
+        last_error = ""
+
+    marketing_settings = get_anonymous_email_marketing_settings(db)
+    if not marketing_settings["emaillistverify_api_key"]:
+        validation_status = validation_status or "awaiting_emaillistverify_config"
+    elif not validation_status or validation_status in {"awaiting_emaillistverify_config", "error"} or email_changed:
+        validation_result = verify_email_with_emaillistverify(marketing_settings["emaillistverify_api_key"], campaign_email)
+        validation_status = validation_result["normalized_status"]
+        validation_raw = json.dumps(validation_result, ensure_ascii=True, sort_keys=True)
+        validation_checked_at = snapshot_created_at
+
+    if validation_status == "valid":
+        if campaign_email and already_sent_emails is not None and campaign_email in already_sent_emails:
+            sync_status = "already_sent_emailoctopus"
+            last_error = ""
+        elif not marketing_settings["emailoctopus_api_key"] or not marketing_settings["emailoctopus_list_id"]:
+            sync_status = "awaiting_emailoctopus_config"
+            last_error = ""
+        else:
+            try:
+                sync_result = emailoctopus_upsert_contact(
+                    marketing_settings["emailoctopus_api_key"],
+                    marketing_settings["emailoctopus_list_id"],
+                    campaign_email,
+                    contact_status=marketing_settings["emailoctopus_contact_status"],
+                    tags=_untitled_email_tags(prepared_row),
+                )
+                sync_status = f"{sync_result['action']}_{str(sync_result['status'] or marketing_settings['emailoctopus_contact_status']).lower()}"
+                contact_id = str(sync_result.get("contact_id") or "")
+                synced_at = snapshot_created_at
+                last_error = ""
+                upsert_anonymous_email_campaign_registry(
+                    db,
+                    campaign_email,
+                    source="deepsift_untitled_monitor",
+                    source_identifier=contact_id,
+                    first_name=prepared_row.get("first_name") or "",
+                    last_name=prepared_row.get("last_name") or "",
+                    status="already_sent",
+                    notes=f"Synced from Untitled monitor for {prepared_row.get('display_label') or campaign_email}",
+                )
+                if already_sent_emails is not None:
+                    already_sent_emails.add(campaign_email)
+            except Exception as sync_exc:
+                sync_status = "error"
+                last_error = str(sync_exc)
+    elif validation_status in {"invalid", "unknown"}:
+        sync_status = f"skipped_{validation_status}"
+        last_error = ""
+    elif validation_status == "awaiting_emaillistverify_config":
+        sync_status = sync_status or ""
+        last_error = ""
+    else:
+        sync_status = "error" if validation_status else sync_status
+
+    _update_untitled_email_sync_state(
+        db,
+        record_key,
+        campaign_email=campaign_email,
+        validation_status=validation_status,
+        validation_raw=validation_raw,
+        validation_checked_at=validation_checked_at,
+        sync_status=sync_status,
+        contact_id=contact_id,
+        synced_at=synced_at,
+        last_error=last_error,
+    )
+    return {
+        "ok": True,
+        "campaign_email": campaign_email,
+        "validation_status": validation_status,
+        "sync_status": sync_status,
+        "contact_id": contact_id,
+    }
+
+
+def exclude_untitled_email_from_marketing(db, existing_row, snapshot_created_at):
+    if not existing_row:
+        return {"ok": True, "skipped": "missing_row"}
+    record_key = str(existing_row["record_key"] or "").strip()
+    campaign_email = normalize_email(
+        existing_row["campaign_email"] or existing_row["email"] or existing_row["personal_email"] or existing_row["business_email"] or ""
+    )
+    sync_status = "excluded_converted_local_only"
+    contact_id = str(existing_row["emailoctopus_contact_id"] or "")
+    synced_at = str(existing_row["emailoctopus_synced_at"] or "")
+    last_error = ""
+    marketing_settings = get_anonymous_email_marketing_settings(db)
+    if campaign_email and marketing_settings["emailoctopus_api_key"] and marketing_settings["emailoctopus_list_id"]:
+        try:
+            exclusion = emailoctopus_set_contact_status(
+                marketing_settings["emailoctopus_api_key"],
+                marketing_settings["emailoctopus_list_id"],
+                campaign_email,
+                status="UNSUBSCRIBED",
+            )
+            sync_status = "excluded_converted"
+            contact_id = str(exclusion.get("contact_id") or contact_id)
+            synced_at = snapshot_created_at
+        except Exception as exc:
+            sync_status = "excluded_converted_error"
+            last_error = str(exc)
+    _update_untitled_email_sync_state(
+        db,
+        record_key,
+        campaign_email=campaign_email,
+        validation_status=str(existing_row["email_validation_status"] or ""),
+        validation_raw=str(existing_row["email_validation_raw"] or ""),
+        validation_checked_at=str(existing_row["email_validation_checked_at"] or ""),
+        sync_status=sync_status,
+        contact_id=contact_id,
+        synced_at=synced_at,
+        last_error=last_error,
+    )
+    return {"ok": True, "campaign_email": campaign_email, "sync_status": sync_status}
 
 
 def _row_value_by_keys(row_data, keys):
@@ -6463,6 +7094,714 @@ def fetch_google_sheet_rows():
         if any(str(v).strip() for v in row_map.values()):
             data_rows.append({"row_index": idx, "row_data": row_map})
     return data_rows
+
+
+def _public_google_sheet_csv_url(spreadsheet_id, worksheet_name):
+    sid = (spreadsheet_id or "").strip()
+    sheet = (worksheet_name or "").strip()
+    return (
+        f"https://docs.google.com/spreadsheets/d/{quote(sid, safe='')}/gviz/tq"
+        f"?tqx=out:csv&sheet={quote_plus(sheet)}"
+    )
+
+
+def fetch_public_google_sheet_csv_rows(spreadsheet_id, worksheet_name):
+    if not (spreadsheet_id or "").strip():
+        raise ValueError("Spreadsheet ID is required.")
+    if not (worksheet_name or "").strip():
+        raise ValueError("Worksheet name is required.")
+    source_url = _public_google_sheet_csv_url(spreadsheet_id, worksheet_name)
+    response = requests.get(source_url, timeout=30)
+    if not response.ok:
+        raise ValueError(f"Public Google Sheet CSV failed ({response.status_code}): {response.text[:400]}")
+    text = response.text.lstrip("\ufeff")
+    reader = csv.DictReader(io.StringIO(text))
+    data_rows = []
+    for idx, row in enumerate(reader, start=2):
+        row_map = {}
+        for key, value in (row or {}).items():
+            clean_key = str(key or "").strip()
+            if not clean_key:
+                continue
+            row_map[clean_key] = str(value or "").strip()
+        if any(str(v or "").strip() for v in row_map.values()):
+            data_rows.append({"row_index": idx, "row_data": row_map})
+    return data_rows
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(float(str(value or "").strip() or "0"))
+    except Exception:
+        return default
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(str(value or "").strip() or "0")
+    except Exception:
+        return default
+
+
+def _untitled_lead_stage_from_url(url):
+    txt = str(url or "").strip().lower()
+    if "/thank-you/" in txt:
+        return "thank_you"
+    if "/step-2/" in txt:
+        return "step_2"
+    return ""
+
+
+def _untitled_display_label(row):
+    row = row if isinstance(row, dict) else {}
+    name = " ".join(x for x in [str(row.get("first_name") or "").strip(), str(row.get("last_name") or "").strip()] if x).strip()
+    email = (
+        str(row.get("email") or "").strip()
+        or str(row.get("business_email") or "").strip()
+        or str(row.get("personal_email") or "").strip()
+    )
+    phone = str(row.get("mobile_phone") or "").strip()
+    address = str(row.get("personal_address") or "").strip()
+    base = name or email or phone or str(row.get("record_uuid") or "").strip() or str(row.get("hem") or "").strip() or "Anonymous visitor"
+    if address and address.lower() not in base.lower():
+        return f"{base} | {address}"
+    return base
+
+
+def _untitled_record_key(row):
+    row = row if isinstance(row, dict) else {}
+    record_uuid = str(row.get("record_uuid") or "").strip()
+    if record_uuid:
+        return f"record_uuid:{record_uuid}"
+    hem = str(row.get("hem") or "").strip()
+    if hem:
+        return f"hem:{hem}"
+    identity_bits = [
+        str(row.get("email") or "").strip().lower(),
+        str(row.get("business_email") or "").strip().lower(),
+        str(row.get("personal_email") or "").strip().lower(),
+        normalize_phone(row.get("mobile_phone") or ""),
+        _normalize_address_key(row.get("personal_address") or ""),
+        _normalize_address_key(row.get("company_address") or ""),
+        str(row.get("first_name") or "").strip().lower(),
+        str(row.get("last_name") or "").strip().lower(),
+    ]
+    identity = "|".join(bit for bit in identity_bits if bit)
+    if identity:
+        return "identity:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    payload_txt = json.dumps(row or {}, sort_keys=True, ensure_ascii=True, default=str)
+    return "payload:" + hashlib.sha256(payload_txt.encode("utf-8")).hexdigest()[:24]
+
+
+def _prepare_untitled_sheet_row(row_data, row_index=None):
+    raw = {str(k or "").strip(): str(v or "").strip() for k, v in (row_data or {}).items() if str(k or "").strip()}
+    payload_json = json.dumps(raw, sort_keys=True, ensure_ascii=True, default=str)
+    row_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    record_key = _untitled_record_key(raw)
+    return {
+        "record_key": record_key,
+        "record_uuid": str(raw.get("record_uuid") or "").strip(),
+        "display_label": _untitled_display_label(raw),
+        "lead_category": str(raw.get("lead_category") or "").strip().lower(),
+        "lead_stage": _untitled_lead_stage_from_url(raw.get("last_session_exit_url") or ""),
+        "total_session_count": _safe_int(raw.get("total_session_count")),
+        "last_session_est_duration": _safe_float(raw.get("last_session_est_duration")),
+        "last_session_total_pages_visited": _safe_int(raw.get("last_session_total_pages_visited")),
+        "last_session_entry_url": str(raw.get("last_session_entry_url") or "").strip(),
+        "last_session_entry_referral_url": str(raw.get("last_session_entry_referral_url") or "").strip(),
+        "last_session_exit_url": str(raw.get("last_session_exit_url") or "").strip(),
+        "email": str(raw.get("email") or "").strip(),
+        "business_email": str(raw.get("business_email") or "").strip(),
+        "personal_email": str(raw.get("personal_email") or "").strip(),
+        "mobile_phone": normalize_phone(raw.get("mobile_phone") or ""),
+        "first_name": str(raw.get("first_name") or "").strip(),
+        "last_name": str(raw.get("last_name") or "").strip(),
+        "personal_address": str(raw.get("personal_address") or "").strip(),
+        "personal_city": str(raw.get("personal_city") or "").strip(),
+        "personal_state": str(raw.get("personal_state") or "").strip(),
+        "personal_zip": str(raw.get("personal_zip") or "").strip(),
+        "payload_json": payload_json,
+        "row_hash": row_hash,
+        "row_index": row_index,
+    }
+
+
+def _untitled_diff_payloads(before_payload, after_payload):
+    before_payload = before_payload if isinstance(before_payload, dict) else {}
+    after_payload = after_payload if isinstance(after_payload, dict) else {}
+    diff = {}
+    for key in sorted(set(before_payload) | set(after_payload)):
+        before_val = str(before_payload.get(key) or "").strip()
+        after_val = str(after_payload.get(key) or "").strip()
+        if before_val != after_val:
+            diff[key] = {"before": before_val, "after": after_val}
+    return diff
+
+
+def _untitled_change_summary(change_type, display_label, diff_map, before_payload=None, after_payload=None):
+    before_payload = before_payload if isinstance(before_payload, dict) else {}
+    after_payload = after_payload if isinstance(after_payload, dict) else {}
+    label = (display_label or "").strip() or _untitled_display_label(after_payload or before_payload)
+    bits = []
+    if change_type == "new":
+        bits.append("New anonymous visitor row captured")
+    elif change_type == "removed":
+        bits.append("Row missing from the latest sheet snapshot")
+    elif change_type == "reappeared":
+        bits.append("Row reappeared after previously dropping out of the sheet")
+    else:
+        bits.append("Anonymous visitor row updated")
+
+    before_stage = _untitled_lead_stage_from_url(before_payload.get("last_session_exit_url") or "")
+    after_stage = _untitled_lead_stage_from_url(after_payload.get("last_session_exit_url") or "")
+    if after_stage and before_stage != after_stage:
+        bits.append(f"lead-stage -> {after_stage}")
+
+    for field in ["lead_category", "total_session_count", "last_session_est_duration", "last_session_total_pages_visited"]:
+        if field in diff_map:
+            before_val = diff_map[field]["before"] or "-"
+            after_val = diff_map[field]["after"] or "-"
+            bits.append(f"{field}: {before_val} -> {after_val}")
+
+    for field in ["mobile_phone", "email", "business_email", "personal_email"]:
+        if field in diff_map and diff_map[field]["after"]:
+            bits.append(f"{field} added/updated")
+
+    if "last_session_entry_url" in diff_map and diff_map["last_session_entry_url"]["after"]:
+        bits.append("entry page changed")
+    if "last_session_exit_url" in diff_map and diff_map["last_session_exit_url"]["after"]:
+        bits.append("exit page changed")
+
+    return f"{label}: " + " | ".join(bits[:8])
+
+
+def _untitled_is_monitor_candidate(prepared_row):
+    prepared_row = prepared_row if isinstance(prepared_row, dict) else {}
+    return (prepared_row.get("lead_stage") or "") not in {"step_2", "thank_you"}
+
+
+def _untitled_contact_change_fields():
+    return {
+        "email",
+        "business_email",
+        "personal_email",
+        "mobile_phone",
+        "first_name",
+        "last_name",
+        "personal_address",
+        "personal_city",
+        "personal_state",
+        "personal_zip",
+    }
+
+
+def _untitled_hot_contact_lines(prepared_row):
+    prepared_row = prepared_row if isinstance(prepared_row, dict) else {}
+    payload = {}
+    try:
+        payload = json.loads(prepared_row.get("payload_json") or "{}")
+    except Exception:
+        payload = {}
+    emails = []
+    for key in ["email", "business_email", "personal_email"]:
+        value = str(payload.get(key) or "").strip()
+        if value and value.lower() not in {e.lower() for e in emails}:
+            emails.append(value)
+    phone = normalize_phone(payload.get("mobile_phone") or "")
+    pretty_phone = phone
+    if len(phone) == 10:
+        pretty_phone = f"({phone[:3]}) {phone[3:6]}-{phone[6:]}"
+    lines = [
+        "Anonymous Lead Watch: Hot Lead",
+        f"Visitor: {prepared_row.get('display_label') or 'Anonymous visitor'}",
+        f"Lead Category: {prepared_row.get('lead_category') or '-'}",
+        f"Sessions: {prepared_row.get('total_session_count') or 0}",
+        f"Duration (sec): {prepared_row.get('last_session_est_duration') or 0}",
+        f"Pages Visited: {prepared_row.get('last_session_total_pages_visited') or 0}",
+        f"Entry URL: {prepared_row.get('last_session_entry_url') or '-'}",
+        f"Referral URL: {prepared_row.get('last_session_entry_referral_url') or '-'}",
+    ]
+    if pretty_phone:
+        lines.append(f"Phone: {pretty_phone}")
+    if emails:
+        lines.append(f"Emails: {', '.join(emails)}")
+    address_bits = [
+        str(payload.get("personal_address") or "").strip(),
+        str(payload.get("personal_city") or "").strip(),
+        str(payload.get("personal_state") or "").strip(),
+        str(payload.get("personal_zip") or "").strip(),
+    ]
+    address_line = ", ".join(bit for bit in address_bits if bit)
+    if address_line:
+        lines.append(f"Personal Address: {address_line}")
+    return lines
+
+
+def _untitled_should_notify_hot(existing_row, prepared_row, diff_map, change_type):
+    if not _untitled_is_monitor_candidate(prepared_row):
+        return False
+    if str(prepared_row.get("lead_category") or "").strip().lower() != "hot":
+        return False
+    if change_type in {"new", "reappeared"}:
+        return True
+    existing_category = str(existing_row["lead_category"] or "").strip().lower() if existing_row else ""
+    if existing_category != "hot":
+        return True
+    return bool(set(diff_map).intersection(_untitled_contact_change_fields()))
+
+
+def run_untitled_leads_snapshot_once():
+    ensure_db()
+    db = open_sqlite_connection()
+    try:
+        automation = get_automation_settings(db)
+        if not automation.get("untitled_leads_enabled"):
+            return {"ok": True, "skipped": "disabled"}
+        if not UNTITLED_LEADS_SPREADSHEET_ID:
+            return {"ok": True, "skipped": "missing_spreadsheet_id"}
+
+        rows = fetch_public_google_sheet_csv_rows(UNTITLED_LEADS_SPREADSHEET_ID, UNTITLED_LEADS_WORKSHEET_NAME)
+        source_url = _public_google_sheet_csv_url(UNTITLED_LEADS_SPREADSHEET_ID, UNTITLED_LEADS_WORKSHEET_NAME)
+        snapshot_created_at = format_db_time(datetime.utcnow())
+        snap_cur = db.execute(
+            """
+            INSERT INTO untitled_sheet_snapshots (worksheet_name, source_url, row_count, created_at)
+            VALUES (?, ?, 0, ?)
+            """,
+            (UNTITLED_LEADS_WORKSHEET_NAME, source_url, snapshot_created_at),
+        )
+        snapshot_id = snap_cur.lastrowid
+
+        existing_rows = db.execute("SELECT * FROM untitled_sheet_current").fetchall()
+        existing_by_key = {str(row["record_key"]): row for row in existing_rows}
+        already_sent_emails = {
+            normalize_email(row["normalized_email"])
+            for row in db.execute(
+                "SELECT normalized_email FROM anonymous_email_campaign_registry WHERE COALESCE(status, 'already_sent') = 'already_sent'"
+            ).fetchall()
+            if normalize_email(row["normalized_email"])
+        }
+        is_initial_baseline = len(existing_rows) == 0
+        all_seen_keys = set()
+        tracked_seen_keys = set()
+        category_counts = Counter()
+        stage_counts = Counter()
+        new_rows = 0
+        updated_rows = 0
+        removed_rows = 0
+        reappeared_rows = 0
+        contact_change_rows = 0
+        hot_alert_rows = 0
+
+        hash_parts = []
+        for item in rows:
+            prepared = _prepare_untitled_sheet_row(item.get("row_data") or {}, row_index=item.get("row_index"))
+            record_key = prepared["record_key"]
+            all_seen_keys.add(record_key)
+            category_counts[prepared["lead_category"] or "[blank]"] += 1
+            stage_counts[prepared["lead_stage"] or "browse_only"] += 1
+            hash_parts.append(f"{record_key}:{prepared['row_hash']}")
+
+            existing = existing_by_key.get(record_key)
+            before_payload = {}
+            if existing and str(existing["payload_json"] or "").strip():
+                try:
+                    before_payload = json.loads(existing["payload_json"] or "{}")
+                except Exception:
+                    before_payload = {}
+            after_payload = json.loads(prepared["payload_json"])
+            if not _untitled_is_monitor_candidate(prepared):
+                if existing and int(existing["is_active"] or 0) == 1:
+                    try:
+                        exclude_untitled_email_from_marketing(db, existing, snapshot_created_at)
+                    except Exception as exclusion_exc:
+                        log_app_error(
+                            db,
+                            source="untitled_leads_email_exclusion",
+                            error_message=str(exclusion_exc),
+                            details=traceback.format_exc(),
+                            route="run_untitled_leads_snapshot_once",
+                            status_code=500,
+                        )
+                    db.execute(
+                        """
+                        UPDATE untitled_sheet_current
+                        SET is_active = 0,
+                            last_seen_at = ?,
+                            last_changed_at = ?
+                        WHERE record_key = ?
+                        """,
+                        (snapshot_created_at, snapshot_created_at, record_key),
+                    )
+                continue
+
+            tracked_seen_keys.add(record_key)
+
+            if not existing:
+                new_rows += 1
+                diff_map = _untitled_diff_payloads({}, after_payload)
+                summary_text = _untitled_change_summary("new", prepared["display_label"], diff_map, {}, after_payload)
+                db.execute(
+                    """
+                    INSERT INTO untitled_sheet_current (
+                        record_key, record_uuid, display_label, row_hash, lead_category, lead_stage,
+                        total_session_count, last_session_est_duration, last_session_total_pages_visited,
+                        last_session_entry_url, last_session_entry_referral_url, last_session_exit_url,
+                        email, business_email, personal_email, mobile_phone, first_name, last_name,
+                        personal_address, personal_city, personal_state, personal_zip,
+                        payload_json, is_active, first_seen_at, last_seen_at, last_changed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (
+                        prepared["record_key"],
+                        prepared["record_uuid"],
+                        prepared["display_label"],
+                        prepared["row_hash"],
+                        prepared["lead_category"],
+                        prepared["lead_stage"],
+                        prepared["total_session_count"],
+                        prepared["last_session_est_duration"],
+                        prepared["last_session_total_pages_visited"],
+                        prepared["last_session_entry_url"],
+                        prepared["last_session_entry_referral_url"],
+                        prepared["last_session_exit_url"],
+                        prepared["email"],
+                        prepared["business_email"],
+                        prepared["personal_email"],
+                        prepared["mobile_phone"],
+                        prepared["first_name"],
+                        prepared["last_name"],
+                        prepared["personal_address"],
+                        prepared["personal_city"],
+                        prepared["personal_state"],
+                        prepared["personal_zip"],
+                        prepared["payload_json"],
+                        snapshot_created_at,
+                        snapshot_created_at,
+                        snapshot_created_at,
+                    ),
+                )
+                db.execute(
+                    """
+                    INSERT INTO untitled_sheet_changes (
+                        snapshot_id, record_key, record_uuid, display_label, change_type, summary_text,
+                        changed_fields_json, before_payload_json, after_payload_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        prepared["record_key"],
+                        prepared["record_uuid"],
+                        prepared["display_label"],
+                        summary_text,
+                        json.dumps(diff_map, ensure_ascii=True, sort_keys=True),
+                        json.dumps({}, ensure_ascii=True, sort_keys=True),
+                        prepared["payload_json"],
+                        snapshot_created_at,
+                    ),
+                )
+                if (not is_initial_baseline) and _untitled_should_notify_hot(None, prepared, diff_map, "new"):
+                    hot_event_key = f"{record_key}:hot:{prepared['row_hash'][:16]}"
+                    if upsert_integration_event(db, UNTITLED_LEADS_EVENT_SOURCE, hot_event_key, after_payload):
+                        try:
+                            send_slack_notification(db, "\n".join(_untitled_hot_contact_lines(prepared)))
+                            hot_alert_rows += 1
+                        except Exception as slack_exc:
+                            log_app_error(
+                                db,
+                                source="untitled_leads_hot_slack",
+                                error_message=str(slack_exc),
+                                details=traceback.format_exc(),
+                                route="run_untitled_leads_snapshot_once",
+                                status_code=500,
+                            )
+                if not is_initial_baseline:
+                    try:
+                        sync_untitled_email_campaign_contact(
+                            db,
+                            prepared,
+                            snapshot_created_at,
+                            already_sent_emails=already_sent_emails,
+                        )
+                    except Exception as sync_exc:
+                        log_app_error(
+                            db,
+                            source="untitled_leads_email_sync",
+                            error_message=str(sync_exc),
+                            details=traceback.format_exc(),
+                            route="run_untitled_leads_snapshot_once",
+                            status_code=500,
+                        )
+                continue
+
+            was_active = int(existing["is_active"] or 0) == 1
+            if str(existing["row_hash"] or "") != prepared["row_hash"] or not was_active:
+                change_type = "reappeared" if not was_active else "updated"
+                if change_type == "reappeared":
+                    reappeared_rows += 1
+                else:
+                    updated_rows += 1
+                diff_map = _untitled_diff_payloads(before_payload, after_payload)
+                summary_text = _untitled_change_summary(change_type, prepared["display_label"], diff_map, before_payload, after_payload)
+                db.execute(
+                    """
+                    UPDATE untitled_sheet_current
+                    SET record_uuid = ?,
+                        display_label = ?,
+                        row_hash = ?,
+                        lead_category = ?,
+                        lead_stage = ?,
+                        total_session_count = ?,
+                        last_session_est_duration = ?,
+                        last_session_total_pages_visited = ?,
+                        last_session_entry_url = ?,
+                        last_session_entry_referral_url = ?,
+                        last_session_exit_url = ?,
+                        email = ?,
+                        business_email = ?,
+                        personal_email = ?,
+                        mobile_phone = ?,
+                        first_name = ?,
+                        last_name = ?,
+                        personal_address = ?,
+                        personal_city = ?,
+                        personal_state = ?,
+                        personal_zip = ?,
+                        payload_json = ?,
+                        is_active = 1,
+                        last_seen_at = ?,
+                        last_changed_at = ?
+                    WHERE record_key = ?
+                    """,
+                    (
+                        prepared["record_uuid"],
+                        prepared["display_label"],
+                        prepared["row_hash"],
+                        prepared["lead_category"],
+                        prepared["lead_stage"],
+                        prepared["total_session_count"],
+                        prepared["last_session_est_duration"],
+                        prepared["last_session_total_pages_visited"],
+                        prepared["last_session_entry_url"],
+                        prepared["last_session_entry_referral_url"],
+                        prepared["last_session_exit_url"],
+                        prepared["email"],
+                        prepared["business_email"],
+                        prepared["personal_email"],
+                        prepared["mobile_phone"],
+                        prepared["first_name"],
+                        prepared["last_name"],
+                        prepared["personal_address"],
+                        prepared["personal_city"],
+                        prepared["personal_state"],
+                        prepared["personal_zip"],
+                        prepared["payload_json"],
+                        snapshot_created_at,
+                        snapshot_created_at,
+                        prepared["record_key"],
+                    ),
+                )
+                db.execute(
+                    """
+                    INSERT INTO untitled_sheet_changes (
+                        snapshot_id, record_key, record_uuid, display_label, change_type, summary_text,
+                        changed_fields_json, before_payload_json, after_payload_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        prepared["record_key"],
+                        prepared["record_uuid"],
+                        prepared["display_label"],
+                        change_type,
+                        summary_text,
+                        json.dumps(diff_map, ensure_ascii=True, sort_keys=True),
+                        json.dumps(before_payload, ensure_ascii=True, sort_keys=True),
+                        prepared["payload_json"],
+                        snapshot_created_at,
+                    ),
+                )
+                if set(diff_map).intersection(_untitled_contact_change_fields()):
+                    contact_change_rows += 1
+                if _untitled_should_notify_hot(existing, prepared, diff_map, change_type):
+                    hot_event_key = f"{record_key}:hot:{prepared['row_hash'][:16]}"
+                    if upsert_integration_event(db, UNTITLED_LEADS_EVENT_SOURCE, hot_event_key, after_payload):
+                        try:
+                            send_slack_notification(db, "\n".join(_untitled_hot_contact_lines(prepared)))
+                            hot_alert_rows += 1
+                        except Exception as slack_exc:
+                            log_app_error(
+                                db,
+                                source="untitled_leads_hot_slack",
+                                error_message=str(slack_exc),
+                                details=traceback.format_exc(),
+                                route="run_untitled_leads_snapshot_once",
+                                status_code=500,
+                            )
+                try:
+                    sync_untitled_email_campaign_contact(
+                        db,
+                        prepared,
+                        snapshot_created_at,
+                        already_sent_emails=already_sent_emails,
+                    )
+                except Exception as sync_exc:
+                    log_app_error(
+                        db,
+                        source="untitled_leads_email_sync",
+                        error_message=str(sync_exc),
+                        details=traceback.format_exc(),
+                        route="run_untitled_leads_snapshot_once",
+                        status_code=500,
+                    )
+            else:
+                db.execute(
+                    "UPDATE untitled_sheet_current SET is_active = 1, last_seen_at = ? WHERE record_key = ?",
+                    (snapshot_created_at, prepared["record_key"]),
+                )
+
+        for existing in existing_rows:
+            record_key = str(existing["record_key"] or "")
+            was_active = int(existing["is_active"] or 0) == 1
+            if not record_key or not was_active:
+                continue
+            if record_key in all_seen_keys and record_key not in tracked_seen_keys:
+                db.execute(
+                    """
+                    UPDATE untitled_sheet_current
+                    SET is_active = 0,
+                        last_seen_at = ?,
+                        last_changed_at = ?
+                    WHERE record_key = ?
+                    """,
+                    (snapshot_created_at, snapshot_created_at, record_key),
+                )
+                continue
+            if record_key in all_seen_keys:
+                continue
+            removed_rows += 1
+            before_payload = {}
+            try:
+                before_payload = json.loads(existing["payload_json"] or "{}")
+            except Exception:
+                before_payload = {}
+            summary_text = _untitled_change_summary(
+                "removed",
+                str(existing["display_label"] or ""),
+                {},
+                before_payload,
+                {},
+            )
+            db.execute(
+                """
+                UPDATE untitled_sheet_current
+                SET is_active = 0, last_changed_at = ?
+                WHERE record_key = ?
+                """,
+                (snapshot_created_at, record_key),
+            )
+            db.execute(
+                """
+                INSERT INTO untitled_sheet_changes (
+                    snapshot_id, record_key, record_uuid, display_label, change_type, summary_text,
+                    changed_fields_json, before_payload_json, after_payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, 'removed', ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    record_key,
+                    str(existing["record_uuid"] or ""),
+                    str(existing["display_label"] or ""),
+                    summary_text,
+                    json.dumps({}, ensure_ascii=True, sort_keys=True),
+                    json.dumps(before_payload, ensure_ascii=True, sort_keys=True),
+                    json.dumps({}, ensure_ascii=True, sort_keys=True),
+                    snapshot_created_at,
+                ),
+            )
+
+        snapshot_hash = hashlib.sha256("\n".join(sorted(hash_parts)).encode("utf-8")).hexdigest() if hash_parts else ""
+        summary = {
+            "worksheet_name": UNTITLED_LEADS_WORKSHEET_NAME,
+            "row_count": len(rows),
+            "new_rows": new_rows,
+            "updated_rows": updated_rows,
+            "removed_rows": removed_rows,
+            "reappeared_rows": reappeared_rows,
+            "lead_event_rows": stage_counts.get("step_2", 0) + stage_counts.get("thank_you", 0),
+            "contact_change_rows": contact_change_rows,
+            "hot_alert_rows": hot_alert_rows,
+            "lead_category_counts": dict(sorted(category_counts.items())),
+            "lead_stage_counts": dict(sorted(stage_counts.items())),
+            "source_url": source_url,
+        }
+        db.execute(
+            """
+            UPDATE untitled_sheet_snapshots
+            SET row_count = ?,
+                new_rows = ?,
+                updated_rows = ?,
+                removed_rows = ?,
+                reappeared_rows = ?,
+                lead_event_rows = ?,
+                contact_change_rows = ?,
+                hot_alert_rows = ?,
+                snapshot_hash = ?,
+                summary_json = ?
+            WHERE id = ?
+            """,
+            (
+                len(rows),
+                new_rows,
+                updated_rows,
+                removed_rows,
+                reappeared_rows,
+                summary["lead_event_rows"],
+                summary["contact_change_rows"],
+                summary["hot_alert_rows"],
+                snapshot_hash,
+                json.dumps(summary, ensure_ascii=True, sort_keys=True),
+                snapshot_id,
+            ),
+        )
+        db.commit()
+        return {"ok": True, "snapshot_id": snapshot_id, "summary": summary}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="untitled_leads_worker",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="run_untitled_leads_snapshot_once",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+def start_untitled_leads_worker():
+    global UNTITLED_LEADS_WORKER_STARTED
+    if UNTITLED_LEADS_WORKER_STARTED:
+        return
+    UNTITLED_LEADS_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                run_untitled_leads_snapshot_once()
+            except Exception:
+                pass
+            time.sleep(UNTITLED_LEADS_POLL_SECONDS)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
 
 
 def process_clever_lead_payload(db, payload, source_label="webhook"):
@@ -12526,7 +13865,9 @@ def fetch_reisift_property_log_rollup(token, property_uuid, max_rows=200):
 
 def summarize_reisift_property(payload):
     address = payload.get("address") or {}
-    full_address = ", ".join(
+    full_address = (
+        str(address.get("full_address") or "").strip()
+        or ", ".join(
         x
         for x in [
             address.get("street"),
@@ -12536,6 +13877,7 @@ def summarize_reisift_property(payload):
         ]
         if x
     )
+        )
     owner_names = []
     owner = payload.get("owner") or {}
     if owner:
@@ -12808,19 +14150,26 @@ def infer_on_market_status_from_web_listing(full_address):
     return {"status": "Unknown", "evidence": evidence[:5]}
 
 
-def upsert_reisift_referral(db, property_uuid, payload, is_active=1):
+def upsert_reisift_referral(db, property_uuid, payload, is_active=1, preserve_market_status=True):
     summary = summarize_reisift_property(payload)
     county = infer_county_from_reisift_payload(payload)
     payload_market_status = infer_on_market_status_from_payload(payload)
-    web_market = infer_on_market_status_from_web_listing(summary["full_address"])
-    on_market_status = web_market.get("status") or payload_market_status
-    if on_market_status == "Unknown":
-        on_market_status = payload_market_status
+    on_market_status = payload_market_status or "Unknown"
+    existing_market_status = "Unknown"
+    if preserve_market_status:
+        existing_row = db.execute(
+            "SELECT COALESCE(on_market_status, 'Unknown') AS on_market_status FROM reisift_referrals WHERE property_uuid = ?",
+            ((property_uuid or "").strip(),),
+        ).fetchone()
+        existing_market_status = str((existing_row["on_market_status"] if existing_row else "Unknown") or "Unknown").strip() or "Unknown"
+        if on_market_status == "Unknown" and existing_market_status != "Unknown":
+            on_market_status = existing_market_status
     merged_payload = dict(payload or {})
     merged_payload["market_status_inference"] = {
         "payload_status": payload_market_status,
-        "web_status": web_market.get("status"),
-        "web_evidence": web_market.get("evidence") or [],
+        "web_status": None,
+        "web_evidence": [],
+        "previous_local_status": existing_market_status if preserve_market_status else "",
         "resolved_status": on_market_status,
     }
     db.execute(
@@ -12968,14 +14317,11 @@ def refresh_reisift_referrals_cache(db):
         if not property_uuid:
             continue
         try:
-            details = fetch_reisift_property_payload(token, property_uuid)
-            upsert_reisift_referral(db, property_uuid, details, is_active=1)
+            upsert_reisift_referral(db, property_uuid, row, is_active=1, preserve_market_status=True)
             synced += 1
         except Exception as exc:
             errors.append(f"{property_uuid}: {exc}")
-            # Fallback to row payload when detail call fails.
-            upsert_reisift_referral(db, property_uuid, row, is_active=1)
-            synced += 1
+            continue
 
     queue_summary = queue_referral_auto_send_candidates(db)
     db.commit()
@@ -12985,6 +14331,7 @@ def refresh_reisift_referrals_cache(db):
         "synced": synced,
         "errors": errors,
         "queue_summary": queue_summary,
+        "mode": "search_only",
     }
 
 
@@ -18286,6 +19633,28 @@ def settings_page():
                     """
                 )
                 notice = f"Notification bar cleared. {int(cur.rowcount or 0)} unread item(s) marked as read."
+            elif test_action == "import_emailoctopus_export":
+                try:
+                    import_result = import_emailoctopus_export_upload(
+                        db,
+                        request.files.get("emailoctopus_export_file"),
+                        source="emailoctopus_export_upload",
+                    )
+                    notice = (
+                        f"EmailOctopus export imported. "
+                        f"Rows seen: {import_result['rows_seen']}, "
+                        f"emails marked already sent: {import_result['emails_imported']}."
+                    )
+                except Exception as exc:
+                    error_notice = f"EmailOctopus export import failed: {exc}"
+                    log_app_error(
+                        db,
+                        source="emailoctopus_export_import",
+                        error_message=str(exc),
+                        details=traceback.format_exc(),
+                        route="/settings",
+                        status_code=400,
+                    )
             else:
                 fields = {
                     "integration_api_key": request.form.get("integration_api_key", ""),
@@ -18294,6 +19663,10 @@ def settings_page():
                     "slack_default_channel": request.form.get("slack_default_channel", ""),
                     "slack_agent_ops_webhook_url": request.form.get("slack_agent_ops_webhook_url", ""),
                     "slack_agent_ops_channel": request.form.get("slack_agent_ops_channel", ""),
+                    "emaillistverify_api_key": request.form.get("emaillistverify_api_key", ""),
+                    "emailoctopus_api_key": request.form.get("emailoctopus_api_key", ""),
+                    "emailoctopus_list_id": request.form.get("emailoctopus_list_id", ""),
+                    "emailoctopus_contact_status": request.form.get("emailoctopus_contact_status", "PENDING"),
                 }
                 for key, value in fields.items():
                     set_setting(db, key, value)
@@ -18326,13 +19699,16 @@ def settings_page():
                         status_code=400,
                     )
             else:
-                if test_action != "clear_notifications":
+                if test_action not in {"clear_notifications", "import_emailoctopus_export"}:
                     notice = "Integrations settings saved."
         elif active_tab == "automations":
             automation_key = (request.form.get("automation_key") or "").strip().lower()
             if automation_key == "clever_leads":
                 clever_enabled = (request.form.get("automation_clever_leads_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
                 set_setting(db, "automation_clever_leads_enabled", "1" if clever_enabled else "0")
+            elif automation_key == "untitled_leads":
+                untitled_enabled = (request.form.get("automation_untitled_leads_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
+                set_setting(db, "automation_untitled_leads_enabled", "1" if untitled_enabled else "0")
             elif automation_key == "reisift_placeholder":
                 reisift_enabled = (request.form.get("automation_reisift_placeholder_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
                 set_setting(db, "automation_reisift_placeholder_enabled", "1" if reisift_enabled else "0")
@@ -18412,6 +19788,7 @@ def settings_page():
 
     settings = get_direct_mail_settings(db)
     email_settings = get_email_settings(db)
+    anonymous_email_settings = get_anonymous_email_marketing_settings(db)
     slack_settings = get_slack_settings(db)
     automation_settings = get_automation_settings(db)
     integration_api_key = get_integration_api_key(db)
@@ -18452,10 +19829,43 @@ def settings_page():
         LIMIT 50
         """
     ).fetchall()
+    untitled_snapshot_runs = db.execute(
+        """
+        SELECT id, worksheet_name, row_count, new_rows, updated_rows, removed_rows, reappeared_rows,
+               lead_event_rows, contact_change_rows, hot_alert_rows, created_at
+        FROM untitled_sheet_snapshots
+        ORDER BY id DESC
+        LIMIT 20
+        """
+    ).fetchall()
+    untitled_change_log = db.execute(
+        """
+        SELECT id, display_label, change_type, summary_text, created_at
+        FROM untitled_sheet_changes
+        ORDER BY id DESC
+        LIMIT 50
+        """
+    ).fetchall()
+    untitled_email_sync_rows = db.execute(
+        """
+        SELECT display_label, campaign_email, email_validation_status, emailoctopus_sync_status,
+               emailoctopus_contact_id, email_validation_checked_at, emailoctopus_synced_at, emailoctopus_last_error
+        FROM untitled_sheet_current
+        WHERE COALESCE(campaign_email, '') <> ''
+           OR COALESCE(email_validation_status, '') <> ''
+           OR COALESCE(emailoctopus_sync_status, '') <> ''
+        ORDER BY COALESCE(emailoctopus_synced_at, email_validation_checked_at, last_changed_at) DESC, id DESC
+        LIMIT 50
+        """
+    ).fetchall()
+    anonymous_email_registry_count = db.execute(
+        "SELECT COUNT(*) AS c FROM anonymous_email_campaign_registry WHERE COALESCE(status, 'already_sent') = 'already_sent'"
+    ).fetchone()["c"]
     return render_template(
         "settings.html",
         dm=settings,
         email_settings=email_settings,
+        anonymous_email_settings=anonymous_email_settings,
         slack_settings=slack_settings,
         automation_settings=automation_settings,
         integration_api_key=integration_api_key,
@@ -18470,6 +19880,11 @@ def settings_page():
         recent_errors=recent_errors,
         clever_webhook_notes=clever_webhook_notes,
         clever_poll_minutes=max(int(GOOGLE_SHEETS_POLL_SECONDS / 60), 1),
+        untitled_snapshot_runs=untitled_snapshot_runs,
+        untitled_change_log=untitled_change_log,
+        untitled_email_sync_rows=untitled_email_sync_rows,
+        anonymous_email_registry_count=anonymous_email_registry_count,
+        untitled_poll_hours=max(round(UNTITLED_LEADS_POLL_SECONDS / 3600, 1), 1),
         template_id=OPENLETTERCONNECT_TEMPLATE_ID,
         market_helper_address=market_helper_address,
         market_helper_result=market_helper_result,
@@ -23100,6 +24515,7 @@ if __name__ == "__main__":
         start_bulk_sms_worker()
         start_email_poll_worker()
         start_clever_leads_worker()
+        start_untitled_leads_worker()
         if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
             start_referral_on_market_worker()
         start_call_recording_worker()

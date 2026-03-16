@@ -7962,12 +7962,42 @@ def run_untitled_email_backfill_once(limit=25):
                 skipped["already_sent"] += 1
                 continue
             attempted += 1
-            result = sync_untitled_email_campaign_contact(
-                db,
-                prepared,
-                snapshot_created_at,
-                already_sent_emails=already_sent_emails,
-            )
+            try:
+                result = sync_untitled_email_campaign_contact(
+                    db,
+                    prepared,
+                    snapshot_created_at,
+                    already_sent_emails=already_sent_emails,
+                )
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "campaign_email": ", ".join(candidate_emails),
+                    "validation_status": "error",
+                    "sync_status": "error",
+                    "contact_id": "",
+                    "error": str(exc),
+                }
+                _update_untitled_email_sync_state(
+                    db,
+                    prepared["record_key"],
+                    campaign_email=", ".join(candidate_emails),
+                    validation_status="error",
+                    validation_raw="",
+                    validation_checked_at=snapshot_created_at,
+                    sync_status="error",
+                    contact_id="",
+                    synced_at="",
+                    last_error=str(exc),
+                )
+                log_app_error(
+                    db,
+                    source="untitled_email_backfill",
+                    error_message=str(exc),
+                    details=traceback.format_exc(),
+                    route="run_untitled_email_backfill_once",
+                    status_code=500,
+                )
             processed.append(
                 {
                     "record_key": prepared["record_key"],

@@ -6221,7 +6221,17 @@ def _untitled_email_state_summaries(details):
     }
 
 
-def sync_untitled_email_campaign_contact(db, prepared_row, snapshot_created_at, already_sent_emails=None):
+def _load_anonymous_email_registry_status_map(db):
+    return {
+        normalize_email(row["normalized_email"]): str(row["status"] or "").strip() or "already_sent"
+        for row in db.execute(
+            "SELECT normalized_email, status FROM anonymous_email_campaign_registry"
+        ).fetchall()
+        if normalize_email(row["normalized_email"])
+    }
+
+
+def sync_untitled_email_campaign_contact(db, prepared_row, snapshot_created_at, processed_email_statuses=None):
     record_key = str(prepared_row.get("record_key") or "").strip()
     if not record_key:
         return {"ok": False, "skipped": "missing_record_key"}
@@ -6245,8 +6255,11 @@ def sync_untitled_email_campaign_contact(db, prepared_row, snapshot_created_at, 
         synced_at = str(prior.get("synced_at") or "").strip()
         last_error = str(prior.get("last_error") or "").strip()
 
-        if already_sent_emails is not None and campaign_email in already_sent_emails:
-            sync_status = "already_sent_emailoctopus"
+        registry_status = ""
+        if processed_email_statuses is not None:
+            registry_status = str(processed_email_statuses.get(campaign_email) or "").strip()
+        if registry_status:
+            sync_status = "already_sent_emailoctopus" if registry_status == "already_sent" else f"recorded_{registry_status}"
             last_error = ""
         else:
             if not marketing_settings["emaillistverify_api_key"]:
@@ -6258,7 +6271,7 @@ def sync_untitled_email_campaign_contact(db, prepared_row, snapshot_created_at, 
                 validation_checked_at = snapshot_created_at
 
             if validation_status == "valid":
-                if already_sent_emails is not None and campaign_email in already_sent_emails:
+                if registry_status:
                     sync_status = "already_sent_emailoctopus"
                     last_error = ""
                 elif not marketing_settings["emailoctopus_api_key"] or not marketing_settings["emailoctopus_list_id"]:
@@ -6287,19 +6300,42 @@ def sync_untitled_email_campaign_contact(db, prepared_row, snapshot_created_at, 
                             status="already_sent",
                             notes=f"Synced from Untitled monitor for {prepared_row.get('display_label') or campaign_email}",
                         )
-                        if already_sent_emails is not None:
-                            already_sent_emails.add(campaign_email)
+                        if processed_email_statuses is not None:
+                            processed_email_statuses[campaign_email] = "already_sent"
                     except Exception as sync_exc:
                         sync_status = "error"
                         last_error = str(sync_exc)
             elif validation_status in {"invalid", "unknown"}:
                 sync_status = f"skipped_{validation_status}"
                 last_error = ""
+                upsert_anonymous_email_campaign_registry(
+                    db,
+                    campaign_email,
+                    source="deepsift_untitled_monitor",
+                    first_name=prepared_row.get("first_name") or "",
+                    last_name=prepared_row.get("last_name") or "",
+                    status=f"validation_{validation_status}",
+                    notes=f"Validation marked {validation_status} for {prepared_row.get('display_label') or campaign_email}",
+                )
+                if processed_email_statuses is not None:
+                    processed_email_statuses[campaign_email] = f"validation_{validation_status}"
             elif validation_status == "awaiting_emaillistverify_config":
                 sync_status = sync_status or ""
                 last_error = ""
             else:
                 sync_status = "error" if validation_status else sync_status
+                if validation_status == "error":
+                    upsert_anonymous_email_campaign_registry(
+                        db,
+                        campaign_email,
+                        source="deepsift_untitled_monitor",
+                        first_name=prepared_row.get("first_name") or "",
+                        last_name=prepared_row.get("last_name") or "",
+                        status="validation_error",
+                        notes=f"Validation error for {prepared_row.get('display_label') or campaign_email}",
+                    )
+                    if processed_email_statuses is not None:
+                        processed_email_statuses[campaign_email] = "validation_error"
 
         email_details[campaign_email] = {
             "validation_status": validation_status,
@@ -7485,13 +7521,7 @@ def run_untitled_leads_snapshot_once():
 
         existing_rows = db.execute("SELECT * FROM untitled_sheet_current").fetchall()
         existing_by_key = {str(row["record_key"]): row for row in existing_rows}
-        already_sent_emails = {
-            normalize_email(row["normalized_email"])
-            for row in db.execute(
-                "SELECT normalized_email FROM anonymous_email_campaign_registry WHERE COALESCE(status, 'already_sent') = 'already_sent'"
-            ).fetchall()
-            if normalize_email(row["normalized_email"])
-        }
+        processed_email_statuses = _load_anonymous_email_registry_status_map(db)
         is_initial_baseline = len(existing_rows) == 0
         all_seen_keys = set()
         tracked_seen_keys = set()
@@ -7634,7 +7664,7 @@ def run_untitled_leads_snapshot_once():
                             db,
                             prepared,
                             snapshot_created_at,
-                            already_sent_emails=already_sent_emails,
+                            processed_email_statuses=processed_email_statuses,
                         )
                     except Exception as sync_exc:
                         log_app_error(
@@ -7757,7 +7787,7 @@ def run_untitled_leads_snapshot_once():
                         db,
                         prepared,
                         snapshot_created_at,
-                        already_sent_emails=already_sent_emails,
+                        processed_email_statuses=processed_email_statuses,
                     )
                 except Exception as sync_exc:
                     log_app_error(
@@ -7905,13 +7935,17 @@ def run_untitled_email_backfill_once(limit=25):
             max_rows = max(1, min(500, int(limit)))
         except Exception:
             max_rows = 25
-        already_sent_emails = {
-            normalize_email(row["normalized_email"])
-            for row in db.execute(
-                "SELECT normalized_email FROM anonymous_email_campaign_registry WHERE COALESCE(status, 'already_sent') = 'already_sent'"
-            ).fetchall()
-            if normalize_email(row["normalized_email"])
-        }
+        processed_email_statuses = _load_anonymous_email_registry_status_map(db)
+        no_email_rows = db.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM untitled_sheet_current
+            WHERE COALESCE(is_active, 1) = 1
+              AND COALESCE(lead_stage, '') NOT IN ('step_2', 'thank_you')
+              AND COALESCE(email, '') = ''
+              AND COALESCE(personal_email, '') = ''
+            """
+        ).fetchone()["c"]
         candidate_rows = db.execute(
             """
             SELECT *
@@ -7946,6 +7980,8 @@ def run_untitled_email_backfill_once(limit=25):
         processed = []
         skipped = Counter()
         attempted = 0
+        success_count = 0
+        failed_validation_count = 0
         for row in candidate_rows:
             if attempted >= max_rows:
                 break
@@ -7963,9 +7999,9 @@ def run_untitled_email_backfill_once(limit=25):
             if not candidate_emails:
                 skipped["missing_email"] += 1
                 continue
-            unsent_emails = [email for email in candidate_emails if email not in already_sent_emails]
+            unsent_emails = [email for email in candidate_emails if email not in processed_email_statuses]
             if not unsent_emails:
-                skipped["already_sent"] += 1
+                skipped["already_processed"] += 1
                 continue
             attempted += 1
             try:
@@ -7973,7 +8009,7 @@ def run_untitled_email_backfill_once(limit=25):
                     db,
                     prepared,
                     snapshot_created_at,
-                    already_sent_emails=already_sent_emails,
+                    processed_email_statuses=processed_email_statuses,
                 )
             except Exception as exc:
                 result = {
@@ -7996,6 +8032,17 @@ def run_untitled_email_backfill_once(limit=25):
                     synced_at="",
                     last_error=str(exc),
                 )
+                for email in candidate_emails:
+                    upsert_anonymous_email_campaign_registry(
+                        db,
+                        email,
+                        source="deepsift_untitled_monitor",
+                        first_name=prepared.get("first_name") or "",
+                        last_name=prepared.get("last_name") or "",
+                        status="validation_error",
+                        notes=f"Backfill validation error for {prepared.get('display_label') or email}",
+                    )
+                    processed_email_statuses[email] = "validation_error"
                 log_app_error(
                     db,
                     source="untitled_email_backfill",
@@ -8014,6 +8061,18 @@ def run_untitled_email_backfill_once(limit=25):
                     "result": result,
                 }
             )
+            sync_status_text = str(result.get("sync_status") or "")
+            if "created_" in sync_status_text or "updated_" in sync_status_text:
+                success_count += 1
+            if (
+                str(result.get("validation_status") or "").strip() == "error"
+                or "validation_" in sync_status_text
+                or sync_status_text == "error"
+                or "skipped_invalid" in sync_status_text
+                or "skipped_unknown" in sync_status_text
+                or "recorded_validation_" in sync_status_text
+            ):
+                failed_validation_count += 1
         db.commit()
         return {
             "ok": True,
@@ -8021,6 +8080,11 @@ def run_untitled_email_backfill_once(limit=25):
             "processed": len(processed),
             "processed_rows": processed,
             "skipped": dict(skipped),
+            "summary": {
+                "successful_rows": success_count,
+                "failed_validation_rows": failed_validation_count,
+                "no_email_rows": int(no_email_rows or 0),
+            },
             "snapshot_created_at": snapshot_created_at,
         }
     finally:

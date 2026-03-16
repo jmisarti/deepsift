@@ -5802,14 +5802,35 @@ def upsert_integration_event(db, source, event_key, payload):
     return True
 
 
-def _untitled_campaign_email(prepared_row):
+def _normalize_untitled_email_values(*raw_values):
+    emails = []
+    seen = set()
+    for raw_value in raw_values:
+        if raw_value is None:
+            continue
+        if isinstance(raw_value, (list, tuple, set)):
+            candidates = raw_value
+        else:
+            candidates = re.split(r"[,;\n]+", str(raw_value))
+        for candidate in candidates:
+            email = normalize_email(candidate)
+            if email and email not in seen:
+                seen.add(email)
+                emails.append(email)
+    return emails
+
+
+def _format_untitled_email_values(*raw_values):
+    return ", ".join(_normalize_untitled_email_values(*raw_values))
+
+
+def _untitled_campaign_emails(prepared_row):
     if not isinstance(prepared_row, dict):
-        return ""
-    for key in ("email", "personal_email", "business_email"):
-        email = normalize_email(prepared_row.get(key))
-        if email:
-            return email
-    return ""
+        return []
+    return _normalize_untitled_email_values(
+        prepared_row.get("email"),
+        prepared_row.get("personal_email"),
+    )
 
 
 def _emailoctopus_member_id(email_address):
@@ -6106,7 +6127,7 @@ def _update_untitled_email_sync_state(
         WHERE record_key = ?
         """,
         (
-            normalize_email(campaign_email),
+            _format_untitled_email_values(campaign_email),
             (validation_status or "").strip(),
             validation_raw or "",
             validation_checked_at or "",
@@ -6119,6 +6140,87 @@ def _update_untitled_email_sync_state(
     )
 
 
+def _load_untitled_email_sync_details(current_row):
+    details = {}
+    if not current_row:
+        return details
+    raw_payload = str(current_row["email_validation_raw"] or "").strip()
+    if raw_payload:
+        try:
+            parsed = json.loads(raw_payload)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("emails"), dict):
+            for raw_email, raw_state in parsed["emails"].items():
+                email = normalize_email(raw_email)
+                if not email or not isinstance(raw_state, dict):
+                    continue
+                details[email] = {
+                    "validation_status": str(raw_state.get("validation_status") or "").strip(),
+                    "validation_raw": raw_state.get("validation_raw") or "",
+                    "validation_checked_at": str(raw_state.get("validation_checked_at") or "").strip(),
+                    "sync_status": str(raw_state.get("sync_status") or "").strip(),
+                    "contact_id": str(raw_state.get("contact_id") or "").strip(),
+                    "synced_at": str(raw_state.get("synced_at") or "").strip(),
+                    "last_error": str(raw_state.get("last_error") or "").strip(),
+                }
+    if details:
+        return details
+    legacy_emails = _normalize_untitled_email_values(current_row["campaign_email"] or "")
+    if legacy_emails:
+        details[legacy_emails[0]] = {
+            "validation_status": str(current_row["email_validation_status"] or "").strip(),
+            "validation_raw": current_row["email_validation_raw"] or "",
+            "validation_checked_at": str(current_row["email_validation_checked_at"] or "").strip(),
+            "sync_status": str(current_row["emailoctopus_sync_status"] or "").strip(),
+            "contact_id": str(current_row["emailoctopus_contact_id"] or "").strip(),
+            "synced_at": str(current_row["emailoctopus_synced_at"] or "").strip(),
+            "last_error": str(current_row["emailoctopus_last_error"] or "").strip(),
+        }
+    return details
+
+
+def _untitled_email_state_summaries(details):
+    emails = list(details.keys())
+    multi = len(emails) > 1
+    validation_parts = []
+    sync_parts = []
+    contact_parts = []
+    error_parts = []
+    validation_times = []
+    sync_times = []
+    for email in emails:
+        item = details[email]
+        validation_status = str(item.get("validation_status") or "").strip()
+        sync_status = str(item.get("sync_status") or "").strip()
+        contact_id = str(item.get("contact_id") or "").strip()
+        last_error = str(item.get("last_error") or "").strip()
+        validation_checked_at = str(item.get("validation_checked_at") or "").strip()
+        synced_at = str(item.get("synced_at") or "").strip()
+        if validation_status:
+            validation_parts.append(f"{email}: {validation_status}" if multi else validation_status)
+        if sync_status:
+            sync_parts.append(f"{email}: {sync_status}" if multi else sync_status)
+        if contact_id:
+            contact_parts.append(f"{email}: {contact_id}" if multi else contact_id)
+        if last_error:
+            error_parts.append(f"{email}: {last_error}" if multi else last_error)
+        if validation_checked_at:
+            validation_times.append(validation_checked_at)
+        if synced_at:
+            sync_times.append(synced_at)
+    return {
+        "campaign_email": ", ".join(emails),
+        "validation_status": "; ".join(validation_parts),
+        "validation_raw": json.dumps({"emails": details}, ensure_ascii=True, sort_keys=True),
+        "validation_checked_at": max(validation_times) if validation_times else "",
+        "sync_status": "; ".join(sync_parts),
+        "contact_id": "; ".join(contact_parts),
+        "synced_at": max(sync_times) if sync_times else "",
+        "last_error": "\n".join(error_parts),
+    }
+
+
 def sync_untitled_email_campaign_contact(db, prepared_row, snapshot_created_at, already_sent_emails=None):
     record_key = str(prepared_row.get("record_key") or "").strip()
     if not record_key:
@@ -6126,114 +6228,109 @@ def sync_untitled_email_campaign_contact(db, prepared_row, snapshot_created_at, 
     current = db.execute("SELECT * FROM untitled_sheet_current WHERE record_key = ?", (record_key,)).fetchone()
     if not current:
         return {"ok": False, "skipped": "missing_current_row"}
-    campaign_email = _untitled_campaign_email(prepared_row)
-    prior_campaign_email = normalize_email(current["campaign_email"] or "")
-    validation_status = str(current["email_validation_status"] or "").strip()
-    validation_raw = str(current["email_validation_raw"] or "")
-    validation_checked_at = str(current["email_validation_checked_at"] or "")
-    sync_status = str(current["emailoctopus_sync_status"] or "").strip()
-    contact_id = str(current["emailoctopus_contact_id"] or "")
-    synced_at = str(current["emailoctopus_synced_at"] or "")
-    last_error = str(current["emailoctopus_last_error"] or "")
-    email_changed = campaign_email != prior_campaign_email
-    if not campaign_email:
+    campaign_emails = _untitled_campaign_emails(prepared_row)
+    prior_details = _load_untitled_email_sync_details(current)
+    if not campaign_emails:
         _update_untitled_email_sync_state(db, record_key)
         return {"ok": True, "skipped": "missing_email"}
-    if already_sent_emails is not None and campaign_email in already_sent_emails:
-        _update_untitled_email_sync_state(
-            db,
-            record_key,
-            campaign_email=campaign_email,
-            validation_status=validation_status,
-            validation_raw=validation_raw,
-            validation_checked_at=validation_checked_at,
-            sync_status="already_sent_emailoctopus",
-            contact_id=contact_id,
-            synced_at=synced_at,
-            last_error="",
-        )
-        return {"ok": True, "skipped": "already_sent_emailoctopus"}
-
-    if email_changed:
-        validation_status = ""
-        validation_raw = ""
-        validation_checked_at = ""
-        sync_status = ""
-        contact_id = ""
-        synced_at = ""
-        last_error = ""
-
     marketing_settings = get_anonymous_email_marketing_settings(db)
-    if not marketing_settings["emaillistverify_api_key"]:
-        validation_status = validation_status or "awaiting_emaillistverify_config"
-    elif not validation_status or validation_status in {"awaiting_emaillistverify_config", "error"} or email_changed:
-        validation_result = verify_email_with_emaillistverify(marketing_settings["emaillistverify_api_key"], campaign_email)
-        validation_status = validation_result["normalized_status"]
-        validation_raw = json.dumps(validation_result, ensure_ascii=True, sort_keys=True)
-        validation_checked_at = snapshot_created_at
+    email_details = {}
+    for campaign_email in campaign_emails:
+        prior = prior_details.get(campaign_email, {})
+        validation_status = str(prior.get("validation_status") or "").strip()
+        validation_raw = prior.get("validation_raw") or ""
+        validation_checked_at = str(prior.get("validation_checked_at") or "").strip()
+        sync_status = str(prior.get("sync_status") or "").strip()
+        contact_id = str(prior.get("contact_id") or "").strip()
+        synced_at = str(prior.get("synced_at") or "").strip()
+        last_error = str(prior.get("last_error") or "").strip()
 
-    if validation_status == "valid":
-        if campaign_email and already_sent_emails is not None and campaign_email in already_sent_emails:
+        if already_sent_emails is not None and campaign_email in already_sent_emails:
             sync_status = "already_sent_emailoctopus"
             last_error = ""
-        elif not marketing_settings["emailoctopus_api_key"] or not marketing_settings["emailoctopus_list_id"]:
-            sync_status = "awaiting_emailoctopus_config"
-            last_error = ""
         else:
-            try:
-                sync_result = emailoctopus_upsert_contact(
-                    marketing_settings["emailoctopus_api_key"],
-                    marketing_settings["emailoctopus_list_id"],
-                    campaign_email,
-                    contact_status=marketing_settings["emailoctopus_contact_status"],
-                    tags=_untitled_email_tags(prepared_row),
-                )
-                sync_status = f"{sync_result['action']}_{str(sync_result['status'] or marketing_settings['emailoctopus_contact_status']).lower()}"
-                contact_id = str(sync_result.get("contact_id") or "")
-                synced_at = snapshot_created_at
+            if not marketing_settings["emaillistverify_api_key"]:
+                validation_status = validation_status or "awaiting_emaillistverify_config"
+            elif not validation_status or validation_status in {"awaiting_emaillistverify_config", "error"}:
+                validation_result = verify_email_with_emaillistverify(marketing_settings["emaillistverify_api_key"], campaign_email)
+                validation_status = validation_result["normalized_status"]
+                validation_raw = json.dumps(validation_result, ensure_ascii=True, sort_keys=True)
+                validation_checked_at = snapshot_created_at
+
+            if validation_status == "valid":
+                if already_sent_emails is not None and campaign_email in already_sent_emails:
+                    sync_status = "already_sent_emailoctopus"
+                    last_error = ""
+                elif not marketing_settings["emailoctopus_api_key"] or not marketing_settings["emailoctopus_list_id"]:
+                    sync_status = "awaiting_emailoctopus_config"
+                    last_error = ""
+                else:
+                    try:
+                        sync_result = emailoctopus_upsert_contact(
+                            marketing_settings["emailoctopus_api_key"],
+                            marketing_settings["emailoctopus_list_id"],
+                            campaign_email,
+                            contact_status=marketing_settings["emailoctopus_contact_status"],
+                            tags=_untitled_email_tags(prepared_row),
+                        )
+                        sync_status = f"{sync_result['action']}_{str(sync_result['status'] or marketing_settings['emailoctopus_contact_status']).lower()}"
+                        contact_id = str(sync_result.get("contact_id") or "")
+                        synced_at = snapshot_created_at
+                        last_error = ""
+                        upsert_anonymous_email_campaign_registry(
+                            db,
+                            campaign_email,
+                            source="deepsift_untitled_monitor",
+                            source_identifier=contact_id,
+                            first_name=prepared_row.get("first_name") or "",
+                            last_name=prepared_row.get("last_name") or "",
+                            status="already_sent",
+                            notes=f"Synced from Untitled monitor for {prepared_row.get('display_label') or campaign_email}",
+                        )
+                        if already_sent_emails is not None:
+                            already_sent_emails.add(campaign_email)
+                    except Exception as sync_exc:
+                        sync_status = "error"
+                        last_error = str(sync_exc)
+            elif validation_status in {"invalid", "unknown"}:
+                sync_status = f"skipped_{validation_status}"
                 last_error = ""
-                upsert_anonymous_email_campaign_registry(
-                    db,
-                    campaign_email,
-                    source="deepsift_untitled_monitor",
-                    source_identifier=contact_id,
-                    first_name=prepared_row.get("first_name") or "",
-                    last_name=prepared_row.get("last_name") or "",
-                    status="already_sent",
-                    notes=f"Synced from Untitled monitor for {prepared_row.get('display_label') or campaign_email}",
-                )
-                if already_sent_emails is not None:
-                    already_sent_emails.add(campaign_email)
-            except Exception as sync_exc:
-                sync_status = "error"
-                last_error = str(sync_exc)
-    elif validation_status in {"invalid", "unknown"}:
-        sync_status = f"skipped_{validation_status}"
-        last_error = ""
-    elif validation_status == "awaiting_emaillistverify_config":
-        sync_status = sync_status or ""
-        last_error = ""
-    else:
-        sync_status = "error" if validation_status else sync_status
+            elif validation_status == "awaiting_emaillistverify_config":
+                sync_status = sync_status or ""
+                last_error = ""
+            else:
+                sync_status = "error" if validation_status else sync_status
+
+        email_details[campaign_email] = {
+            "validation_status": validation_status,
+            "validation_raw": validation_raw,
+            "validation_checked_at": validation_checked_at,
+            "sync_status": sync_status,
+            "contact_id": contact_id,
+            "synced_at": synced_at,
+            "last_error": last_error,
+        }
+
+    summary = _untitled_email_state_summaries(email_details)
 
     _update_untitled_email_sync_state(
         db,
         record_key,
-        campaign_email=campaign_email,
-        validation_status=validation_status,
-        validation_raw=validation_raw,
-        validation_checked_at=validation_checked_at,
-        sync_status=sync_status,
-        contact_id=contact_id,
-        synced_at=synced_at,
-        last_error=last_error,
+        campaign_email=summary["campaign_email"],
+        validation_status=summary["validation_status"],
+        validation_raw=summary["validation_raw"],
+        validation_checked_at=summary["validation_checked_at"],
+        sync_status=summary["sync_status"],
+        contact_id=summary["contact_id"],
+        synced_at=summary["synced_at"],
+        last_error=summary["last_error"],
     )
     return {
         "ok": True,
-        "campaign_email": campaign_email,
-        "validation_status": validation_status,
-        "sync_status": sync_status,
-        "contact_id": contact_id,
+        "campaign_email": summary["campaign_email"],
+        "validation_status": summary["validation_status"],
+        "sync_status": summary["sync_status"],
+        "contact_id": summary["contact_id"],
     }
 
 
@@ -6241,41 +6338,55 @@ def exclude_untitled_email_from_marketing(db, existing_row, snapshot_created_at)
     if not existing_row:
         return {"ok": True, "skipped": "missing_row"}
     record_key = str(existing_row["record_key"] or "").strip()
-    campaign_email = normalize_email(
-        existing_row["campaign_email"] or existing_row["email"] or existing_row["personal_email"] or existing_row["business_email"] or ""
+    campaign_emails = _normalize_untitled_email_values(
+        existing_row["campaign_email"] or "",
+        existing_row["email"] or "",
+        existing_row["personal_email"] or "",
     )
-    sync_status = "excluded_converted_local_only"
-    contact_id = str(existing_row["emailoctopus_contact_id"] or "")
-    synced_at = str(existing_row["emailoctopus_synced_at"] or "")
-    last_error = ""
+    email_details = _load_untitled_email_sync_details(existing_row)
     marketing_settings = get_anonymous_email_marketing_settings(db)
-    if campaign_email and marketing_settings["emailoctopus_api_key"] and marketing_settings["emailoctopus_list_id"]:
-        try:
-            exclusion = emailoctopus_set_contact_status(
-                marketing_settings["emailoctopus_api_key"],
-                marketing_settings["emailoctopus_list_id"],
-                campaign_email,
-                status="UNSUBSCRIBED",
-            )
-            sync_status = "excluded_converted"
-            contact_id = str(exclusion.get("contact_id") or contact_id)
-            synced_at = snapshot_created_at
-        except Exception as exc:
-            sync_status = "excluded_converted_error"
-            last_error = str(exc)
+    for campaign_email in campaign_emails:
+        detail = email_details.get(campaign_email, {
+            "validation_status": "",
+            "validation_raw": "",
+            "validation_checked_at": "",
+            "sync_status": "",
+            "contact_id": "",
+            "synced_at": "",
+            "last_error": "",
+        })
+        detail["sync_status"] = "excluded_converted_local_only"
+        detail["last_error"] = ""
+        if marketing_settings["emailoctopus_api_key"] and marketing_settings["emailoctopus_list_id"]:
+            try:
+                exclusion = emailoctopus_set_contact_status(
+                    marketing_settings["emailoctopus_api_key"],
+                    marketing_settings["emailoctopus_list_id"],
+                    campaign_email,
+                    status="UNSUBSCRIBED",
+                )
+                detail["sync_status"] = "excluded_converted"
+                detail["contact_id"] = str(exclusion.get("contact_id") or detail.get("contact_id") or "")
+                detail["synced_at"] = snapshot_created_at
+            except Exception as exc:
+                detail["sync_status"] = "excluded_converted_error"
+                detail["last_error"] = str(exc)
+        email_details[campaign_email] = detail
+
+    summary = _untitled_email_state_summaries(email_details)
     _update_untitled_email_sync_state(
         db,
         record_key,
-        campaign_email=campaign_email,
-        validation_status=str(existing_row["email_validation_status"] or ""),
-        validation_raw=str(existing_row["email_validation_raw"] or ""),
-        validation_checked_at=str(existing_row["email_validation_checked_at"] or ""),
-        sync_status=sync_status,
-        contact_id=contact_id,
-        synced_at=synced_at,
-        last_error=last_error,
+        campaign_email=summary["campaign_email"],
+        validation_status=summary["validation_status"],
+        validation_raw=summary["validation_raw"],
+        validation_checked_at=summary["validation_checked_at"],
+        sync_status=summary["sync_status"],
+        contact_id=summary["contact_id"],
+        synced_at=summary["synced_at"],
+        last_error=summary["last_error"],
     )
-    return {"ok": True, "campaign_email": campaign_email, "sync_status": sync_status}
+    return {"ok": True, "campaign_email": summary["campaign_email"], "sync_status": summary["sync_status"]}
 
 
 def _row_value_by_keys(row_data, keys):

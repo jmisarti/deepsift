@@ -7920,6 +7920,12 @@ def run_untitled_email_backfill_once(limit=25):
               AND COALESCE(lead_stage, '') NOT IN ('step_2', 'thank_you')
               AND (COALESCE(email, '') <> '' OR COALESCE(personal_email, '') <> '')
             ORDER BY
+              CASE
+                WHEN LOWER(COALESCE(emailoctopus_sync_status, '')) LIKE '%error%'
+                  OR LOWER(COALESCE(email_validation_status, '')) LIKE '%error%'
+                THEN 1
+                ELSE 0
+              END,
               CASE LOWER(COALESCE(lead_category, ''))
                 WHEN 'hot' THEN 0
                 WHEN 'warm' THEN 1

@@ -872,7 +872,7 @@ bindEnter('addEmailForm', async (form) => {
   if (!res.ok || !res.data.id) return;
   const tr = document.createElement('tr');
   tr.dataset.touchpointId = res.data.id;
-  tr.innerHTML = `<td>${value}</td><td><select class="touch-status" data-id="${res.data.id}"><option>Correct</option><option>Incorrect</option><option>DNC</option><option>DNT</option><option>No Answer</option><option>Dead</option><option>Undeliverable</option><option>Not in service</option><option selected>Unknown</option></select></td><td><button type="button" class="icon-btn delete-touch" data-id="${res.data.id}">x</button></td>`;
+        tr.innerHTML = `<td>${value}</td><td><select class="touch-status" data-id="${res.data.id}"><option>Valid</option><option>Correct</option><option>Incorrect</option><option>DNC</option><option>DNT</option><option>No Answer</option><option>Dead</option><option>Undeliverable</option><option>Not in service</option><option selected>Unknown</option></select></td><td><button type="button" class="icon-btn delete-touch" data-id="${res.data.id}">x</button></td>`;
   tr.classList.add('fade-highlight');
   document.getElementById('emailRows').prepend(tr);
   form.reset();

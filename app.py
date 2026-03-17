@@ -129,6 +129,8 @@ SMS_ANALYSIS_WORKER_ENABLED = env_flag("SMS_ANALYSIS_WORKER_ENABLED", True)
 SMS_ANALYSIS_POLL_SECONDS = max(int((os.getenv("SMS_ANALYSIS_POLL_SECONDS") or "180").strip() or "180"), 30)
 AGENT_REFRESH_WORKER_ENABLED = env_flag("AGENT_REFRESH_WORKER_ENABLED", True)
 AGENT_REFRESH_POLL_SECONDS = max(int((os.getenv("AGENT_REFRESH_POLL_SECONDS") or "30").strip() or "30"), 10)
+EMAIL_VALIDATION_QUEUE_WORKER_ENABLED = env_flag("EMAIL_VALIDATION_QUEUE_WORKER_ENABLED", True)
+EMAIL_VALIDATION_QUEUE_POLL_SECONDS = max(int((os.getenv("EMAIL_VALIDATION_QUEUE_POLL_SECONDS") or "30").strip() or "30"), 5)
 SMS_DECISION_DELAY_SECONDS = max(int((os.getenv("SMS_DECISION_DELAY_SECONDS") or "300").strip() or "300"), 30)
 WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or "600").strip() or "600"), 60)
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
@@ -169,6 +171,7 @@ SMS_ANALYSIS_WORKER_STARTED = False
 WEBSITE_LEADS_HOLD_WORKER_STARTED = False
 AGENT_REFRESH_WORKER_STARTED = False
 UNTITLED_LEADS_WORKER_STARTED = False
+EMAIL_VALIDATION_QUEUE_WORKER_STARTED = False
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
     "running": False,
@@ -544,6 +547,7 @@ def require_login_if_enabled():
     if RUN_BACKGROUND_WORKERS:
         # Start idempotent worker threads when running under Gunicorn.
         start_bulk_sms_worker()
+        start_email_validation_queue_worker()
         start_email_poll_worker()
         start_clever_leads_worker()
         start_untitled_leads_worker()
@@ -1039,6 +1043,27 @@ def migrate_db(db):
         """
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_agent_refresh_queue_due ON agent_refresh_queue(status, run_after, id)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS email_validation_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            touchpoint_id INTEGER NOT NULL UNIQUE,
+            person_id INTEGER,
+            email_value TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'skiptrace',
+            queue_status TEXT NOT NULL DEFAULT 'Queued',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            run_after TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            validation_status TEXT,
+            validation_raw TEXT,
+            processed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(touchpoint_id) REFERENCES touchpoints(id) ON DELETE CASCADE
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_email_validation_queue_due ON email_validation_queue(queue_status, run_after, id)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS untitled_sheet_snapshots (
@@ -3204,12 +3229,19 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                 email = str(em or "").strip()
             if not email or touchpoint_exists(db, owner_person_id, "Email", email):
                 continue
-            db.execute(
+            cur = db.execute(
                 """
                 INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
                 VALUES (?, 'Email', 'Email', ?, 'Unknown', ?, ?)
                 """,
                 (owner_person_id, email, "Imported from SkipSherpa property owner payload", ""),
+            )
+            queue_touchpoint_email_validation(
+                db,
+                cur.lastrowid,
+                owner_person_id,
+                email,
+                source="skipsherpa_property_owner",
             )
             synced_email_items.append(email)
 
@@ -3965,12 +3997,19 @@ def import_skipsherpa_person_result(db, property_id, person_id, lookup_response)
             email = (em.get("email_address") or "").strip()
             if not email or touchpoint_exists(db, target_person_id, "Email", email):
                 continue
-            db.execute(
+            cur = db.execute(
                 """
                 INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
                 VALUES (?, 'Email', 'Email', ?, 'Unknown', ?, ?)
                 """,
                 (target_person_id, email, "Imported from SkipSherpa person lookup", ""),
+            )
+            queue_touchpoint_email_validation(
+                db,
+                cur.lastrowid,
+                target_person_id,
+                email,
+                source="skipsherpa_person_lookup",
             )
             emails_added += 1
 
@@ -5911,6 +5950,231 @@ def verify_email_with_emaillistverify(api_key, email_address):
         "is_valid": normalized_status == "valid",
         "raw": raw_text,
     }
+
+
+def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value, source="skiptrace"):
+    try:
+        touchpoint_id = int(touchpoint_id or 0)
+    except Exception:
+        touchpoint_id = 0
+    email_value = normalize_email(email_value)
+    if not touchpoint_id or not email_value:
+        return None
+    existing = db.execute(
+        """
+        SELECT id, queue_status
+        FROM email_validation_queue
+        WHERE touchpoint_id = ?
+        LIMIT 1
+        """,
+        (touchpoint_id,),
+    ).fetchone()
+    now_stamp = format_db_time(datetime.utcnow())
+    if existing:
+        db.execute(
+            """
+            UPDATE email_validation_queue
+            SET person_id = ?,
+                email_value = ?,
+                source = ?,
+                run_after = ?,
+                updated_at = CURRENT_TIMESTAMP,
+                queue_status = CASE
+                    WHEN lower(COALESCE(queue_status, '')) IN ('completed', 'skipped')
+                        THEN queue_status
+                    ELSE 'Queued'
+                END
+            WHERE id = ?
+            """,
+            (person_id, email_value, (source or "skiptrace").strip() or "skiptrace", now_stamp, existing["id"]),
+        )
+        return int(existing["id"])
+    cur = db.execute(
+        """
+        INSERT INTO email_validation_queue (touchpoint_id, person_id, email_value, source, queue_status, run_after)
+        VALUES (?, ?, ?, ?, 'Queued', ?)
+        """,
+        (touchpoint_id, person_id, email_value, (source or "skiptrace").strip() or "skiptrace", now_stamp),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def _append_touchpoint_note(existing_note, extra_line):
+    existing = (existing_note or "").strip()
+    extra = (extra_line or "").strip()
+    if not extra:
+        return existing
+    if not existing:
+        return extra
+    if extra in existing:
+        return existing
+    return f"{existing}\n{extra}"
+
+
+def run_touchpoint_email_validation_queue_once(limit=10):
+    ensure_db()
+    db = open_sqlite_connection()
+    processed = 0
+    updated = 0
+    try:
+        try:
+            limit = max(1, min(50, int(limit)))
+        except Exception:
+            limit = 10
+        settings = get_anonymous_email_marketing_settings(db)
+        api_key = (settings.get("emaillistverify_api_key") or "").strip()
+        if not api_key:
+            return {"ok": True, "skipped": "awaiting_emaillistverify_config", "attempted": 0, "updated": 0}
+        now_stamp = format_db_time(datetime.utcnow())
+        rows = db.execute(
+            """
+            SELECT q.id, q.touchpoint_id, q.person_id, q.email_value, q.attempts, q.source,
+                   t.status AS touchpoint_status, t.note AS touchpoint_note, t.value AS touchpoint_value
+            FROM email_validation_queue q
+            JOIN touchpoints t ON t.id = q.touchpoint_id
+            WHERE lower(COALESCE(t.channel_type, '')) = 'email'
+              AND lower(COALESCE(q.queue_status, 'queued')) IN ('queued', 'retry')
+              AND COALESCE(q.run_after, '') <= ?
+            ORDER BY q.id ASC
+            LIMIT ?
+            """,
+            (now_stamp, limit),
+        ).fetchall()
+        for row in rows:
+            processed += 1
+            queue_id = int(row["id"])
+            touchpoint_id = int(row["touchpoint_id"])
+            email_value = normalize_email(row["touchpoint_value"] or row["email_value"] or "")
+            touch_status = (row["touchpoint_status"] or "").strip()
+            touch_status_norm = touch_status.lower()
+            if not email_value:
+                db.execute(
+                    """
+                    UPDATE email_validation_queue
+                    SET queue_status = 'Skipped',
+                        validation_status = 'missing_email',
+                        validation_raw = '',
+                        processed_at = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (now_stamp, queue_id),
+                )
+                continue
+            if touch_status_norm == "valid":
+                db.execute(
+                    """
+                    UPDATE email_validation_queue
+                    SET queue_status = 'Completed',
+                        validation_status = 'valid',
+                        validation_raw = '',
+                        processed_at = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (now_stamp, queue_id),
+                )
+                continue
+            if touch_status_norm in BLOCKED_CONTACT_STATUSES:
+                db.execute(
+                    """
+                    UPDATE email_validation_queue
+                    SET queue_status = 'Skipped',
+                        validation_status = ?,
+                        validation_raw = '',
+                        processed_at = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (touch_status_norm or "blocked", now_stamp, queue_id),
+                )
+                continue
+            try:
+                validation_result = verify_email_with_emaillistverify(api_key, email_value)
+            except Exception as exc:
+                validation_result = {
+                    "ok": False,
+                    "provider": "emaillistverify",
+                    "email": email_value,
+                    "provider_status": "error",
+                    "normalized_status": "error",
+                    "is_valid": False,
+                    "raw": str(exc),
+                }
+            normalized_status = (validation_result.get("normalized_status") or "").strip().lower()
+            if normalized_status == "awaiting_emaillistverify_config":
+                db.execute(
+                    """
+                    UPDATE email_validation_queue
+                    SET queue_status = 'Retry',
+                        validation_status = ?,
+                        validation_raw = ?,
+                        attempts = COALESCE(attempts, 0) + 1,
+                        run_after = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        normalized_status,
+                        json.dumps(validation_result, ensure_ascii=True, sort_keys=True),
+                        format_db_time(datetime.utcnow() + timedelta(minutes=15)),
+                        queue_id,
+                    ),
+                )
+                continue
+            new_touch_status = "Valid" if normalized_status == "valid" else "Undeliverable"
+            provider_status = (validation_result.get("provider_status") or normalized_status or "error").strip()
+            note_line = (
+                f"EmailListVerify checked {now_stamp}: {provider_status}."
+                if new_touch_status == "Valid"
+                else f"EmailListVerify checked {now_stamp}: marked undeliverable ({provider_status})."
+            )
+            merged_note = _append_touchpoint_note(row["touchpoint_note"], note_line)
+            db.execute(
+                """
+                UPDATE touchpoints
+                SET status = ?,
+                    note = ?,
+                    value = ?
+                WHERE id = ?
+                """,
+                (new_touch_status, merged_note, email_value, touchpoint_id),
+            )
+            db.execute(
+                """
+                UPDATE email_validation_queue
+                SET queue_status = 'Completed',
+                    validation_status = ?,
+                    validation_raw = ?,
+                    processed_at = ?,
+                    attempts = COALESCE(attempts, 0) + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    normalized_status or ("valid" if new_touch_status == "Valid" else "error"),
+                    json.dumps(validation_result, ensure_ascii=True, sort_keys=True),
+                    now_stamp,
+                    queue_id,
+                ),
+            )
+            updated += 1
+        db.commit()
+        return {"ok": True, "attempted": processed, "updated": updated}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="email_validation_queue_worker",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="run_touchpoint_email_validation_queue_once",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "error": str(exc), "attempted": processed, "updated": updated}
+    finally:
+        db.close()
 
 
 def emailoctopus_upsert_contact(api_key, list_id, email_address, contact_status="PENDING", tags=None):
@@ -9482,6 +9746,24 @@ def start_bulk_sms_worker():
             except Exception:
                 pass
             time.sleep(20)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
+def start_email_validation_queue_worker():
+    global EMAIL_VALIDATION_QUEUE_WORKER_STARTED
+    if EMAIL_VALIDATION_QUEUE_WORKER_STARTED or not EMAIL_VALIDATION_QUEUE_WORKER_ENABLED:
+        return
+    EMAIL_VALIDATION_QUEUE_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                run_touchpoint_email_validation_queue_once(limit=10)
+            except Exception:
+                pass
+            time.sleep(EMAIL_VALIDATION_QUEUE_POLL_SECONDS)
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
@@ -25180,6 +25462,7 @@ if __name__ == "__main__":
     ensure_db()
     if (not debug_mode) or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         start_bulk_sms_worker()
+        start_email_validation_queue_worker()
         start_email_poll_worker()
         start_clever_leads_worker()
         start_untitled_leads_worker()

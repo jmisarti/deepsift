@@ -8148,6 +8148,74 @@ def build_untitled_processing_counts(db):
     }
 
 
+def build_untitled_address_validation_counts(db):
+    rows = db.execute(
+        """
+        SELECT lead_stage, personal_address, email, personal_email, email_validation_status, emailoctopus_sync_status
+        FROM untitled_sheet_current
+        WHERE COALESCE(is_active, 1) = 1
+          AND TRIM(COALESCE(personal_address, '')) <> ''
+        """
+    ).fetchall()
+    counts = Counter()
+    counts["all_address_rows"] = len(rows)
+    for row in rows:
+        lead_stage = str(row["lead_stage"] or "").strip().lower()
+        if lead_stage in {"step_2", "thank_you"}:
+            counts["excluded_converted_rows"] += 1
+            continue
+        counts["monitored_address_rows"] += 1
+        emails = _normalize_untitled_email_values(row["email"] or "", row["personal_email"] or "")
+        if not emails:
+            counts["no_email_rows"] += 1
+            continue
+        counts["with_email_rows"] += 1
+        validation_status = str(row["email_validation_status"] or "").strip().lower()
+        sync_status = str(row["emailoctopus_sync_status"] or "").strip().lower()
+        success = any(token in sync_status for token in ("created_", "updated_", "already_sent_emailoctopus", "recorded_already_sent"))
+        failure = (
+            "error" in validation_status
+            or "error" in sync_status
+            or "skipped_invalid" in sync_status
+            or "skipped_unknown" in sync_status
+            or "recorded_validation_" in sync_status
+        )
+        if success and failure:
+            counts["mixed_rows"] += 1
+        elif success:
+            counts["successful_rows"] += 1
+        elif failure:
+            counts["failed_validation_rows"] += 1
+        else:
+            counts["pending_rows"] += 1
+
+    def pct(numerator, denominator):
+        if not denominator:
+            return 0.0
+        return round((float(numerator) / float(denominator)) * 100.0, 1)
+
+    all_address_rows = int(counts.get("all_address_rows", 0))
+    monitored_address_rows = int(counts.get("monitored_address_rows", 0))
+    failed_validation_rows = int(counts.get("failed_validation_rows", 0))
+    mixed_rows = int(counts.get("mixed_rows", 0))
+    with_email_rows = int(counts.get("with_email_rows", 0))
+    return {
+        "all_address_rows": all_address_rows,
+        "excluded_converted_rows": int(counts.get("excluded_converted_rows", 0)),
+        "monitored_address_rows": monitored_address_rows,
+        "with_email_rows": with_email_rows,
+        "successful_rows": int(counts.get("successful_rows", 0)),
+        "failed_validation_rows": failed_validation_rows,
+        "mixed_rows": mixed_rows,
+        "no_email_rows": int(counts.get("no_email_rows", 0)),
+        "pending_rows": int(counts.get("pending_rows", 0)),
+        "failed_validation_pct_of_monitored_address_rows": pct(failed_validation_rows, monitored_address_rows),
+        "failed_or_mixed_pct_of_monitored_address_rows": pct(failed_validation_rows + mixed_rows, monitored_address_rows),
+        "failed_validation_pct_of_address_rows_with_email": pct(failed_validation_rows, with_email_rows),
+        "failed_or_mixed_pct_of_address_rows_with_email": pct(failed_validation_rows + mixed_rows, with_email_rows),
+    }
+
+
 def _get_untitled_email_drain_state():
     with UNTITLED_EMAIL_DRAIN_LOCK:
         state = dict(UNTITLED_EMAIL_DRAIN_STATE)
@@ -24954,6 +25022,32 @@ def integrations_untitled_latest_api():
             "change_log": [dict(row) for row in changes],
             "anonymous_email_registry_count": int(registry_count or 0),
             "processing_counts": processing_counts,
+        }
+    ), 200
+
+
+@app.route("/api/integrations/untitled/stats", methods=["GET"])
+def integrations_untitled_stats_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    snapshot = db.execute(
+        """
+        SELECT id, worksheet_name, row_count, created_at
+        FROM untitled_sheet_snapshots
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    processing_counts = build_untitled_processing_counts(db)
+    address_counts = build_untitled_address_validation_counts(db)
+    return jsonify(
+        {
+            "ok": True,
+            "snapshot": dict(snapshot) if snapshot else None,
+            "processing_counts": processing_counts,
+            "address_validation_counts": address_counts,
         }
     ), 200
 

@@ -340,11 +340,88 @@ const personMailPreviewSendBtn = document.getElementById('personMailPreviewSendB
 const personMailProofModal = document.getElementById('personMailProofModal');
 const personMailProofContent = document.getElementById('personMailProofContent');
 const personMailProofSendBtn = document.getElementById('personMailProofSendBtn');
+let personMailPreviewBasePath = '';
 let personMailSendPath = '';
 let personMailProofPath = '';
+let personMailTemplateMeta = null;
+let personMailTemplateOptions = [];
+let selectedPersonMailTemplateId = null;
 
 function personFullAddress(c) {
   return [c.address1, c.address2, `${c.city || ''}, ${c.state || ''} ${c.zip || ''}`.trim()].filter(Boolean).join(', ');
+}
+
+function buildPersonMailUrl(path, templateId, includeProofs=false) {
+  const url = new URL(path, window.location.origin);
+  if (templateId) url.searchParams.set('template_id', String(templateId));
+  if (includeProofs) url.searchParams.set('include_proofs', '1');
+  return `${url.pathname}${url.search}`;
+}
+
+function personTemplateDetailBits(template) {
+  if (!template || typeof template !== 'object') return [];
+  return [
+    template.paperSize,
+    template.productType,
+    template.postageType || template.deliveryType
+  ].filter((value) => value && String(value).trim());
+}
+
+function personTemplateDetailSummaryHtml(template) {
+  const bits = personTemplateDetailBits(template);
+  if (!bits.length) return '';
+  return `
+    <div class="mail-template-summary">
+      ${bits.map((bit) => `<span>${esc(String(bit))}</span>`).join('')}
+    </div>
+  `;
+}
+
+function findPersonTemplateOption(options, templateId) {
+  const targetId = Number(templateId || 0);
+  if (!targetId) return null;
+  const rows = Array.isArray(options) ? options : [];
+  return rows.find((opt) => Number(opt && opt.id) === targetId) || null;
+}
+
+function personTemplatePickerHtml(options, selectedId) {
+  const rows = Array.isArray(options) ? options.filter((opt) => opt && opt.id) : [];
+  if (!rows.length) return '';
+  return `
+    <div>
+      <p><strong>Choose Template:</strong></p>
+      <div class="mail-template-picker">
+        ${rows.map((opt) => {
+          const previewUrl = opt.thumbnailUrl || opt.backThumbnailUrl || '';
+          const selectedClass = Number(opt.id) === Number(selectedId) ? ' is-selected' : '';
+          return `
+            <button
+              type="button"
+              class="mail-template-card${selectedClass}"
+              data-person-mail-template-id="${esc(String(opt.id))}"
+              aria-pressed="${Number(opt.id) === Number(selectedId) ? 'true' : 'false'}"
+            >
+              <div class="mail-template-card-image">
+                ${previewUrl
+                  ? `<img src="${esc(previewUrl)}" alt="${esc(opt.title || `Template ${opt.id}`)} preview">`
+                  : '<div class="mail-template-card-empty">No preview available</div>'}
+              </div>
+              <div class="mail-template-card-title">${esc(opt.title || `Template ${opt.id}`)}</div>
+              ${personTemplateDetailSummaryHtml(opt)}
+            </button>
+          `;
+        }).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function personTemplatePreviewHtml(meta) {
+  if (!meta) return '';
+  const front = meta.thumbnailUrl ? `<img src="${esc(meta.thumbnailUrl)}" alt="Front preview">` : '';
+  const back = meta.backThumbnailUrl ? `<img src="${esc(meta.backThumbnailUrl)}" alt="Back preview">` : '';
+  if (!front && !back) return '';
+  return `<div class="mail-preview-images is-compact">${front}${back}</div>`;
 }
 
 function personProofImagesHtml(proofs) {
@@ -370,8 +447,12 @@ function closePersonMailPreview() {
   personMailPreviewModal.hidden = true;
   personMailPreviewSendBtn.disabled = false;
   personMailPreviewSendBtn.textContent = 'Review Proofs';
+  personMailPreviewBasePath = '';
   personMailSendPath = '';
   personMailProofPath = '';
+  personMailTemplateMeta = null;
+  personMailTemplateOptions = [];
+  selectedPersonMailTemplateId = null;
 }
 
 function closePersonMailProof() {
@@ -380,12 +461,13 @@ function closePersonMailProof() {
   personMailProofSendBtn.textContent = 'Approve and Pay';
 }
 
-async function openPersonMailPreview(previewPath, sendPath) {
+async function openPersonMailPreview(previewPath, sendPath, templateId=null) {
+  personMailPreviewBasePath = previewPath;
   personMailPreviewTitle.textContent = 'Direct Mail Preview - Mail This Person';
   personMailPreviewContent.innerHTML = '<p>Loading preview...</p>';
   personMailPreviewSendBtn.disabled = true;
   personMailPreviewModal.hidden = false;
-  const r = await fetch(previewPath);
+  const r = await fetch(buildPersonMailUrl(previewPath, templateId));
   const data = await r.json();
   if (!r.ok || !data.ok) {
     closePersonMailPreview();
@@ -395,15 +477,35 @@ async function openPersonMailPreview(previewPath, sendPath) {
   const payload = data.payload || {};
   const contacts = payload.contacts || [];
   const template = data.template_meta || {};
+  personMailTemplateOptions = Array.isArray(data.available_templates) ? data.available_templates : [];
+  selectedPersonMailTemplateId = Number(data.selected_template_id || template.id || templateId || 0) || null;
+  const selectedTemplate = Object.assign({}, findPersonTemplateOption(personMailTemplateOptions, selectedPersonMailTemplateId) || {}, template || {});
+  personMailTemplateMeta = selectedTemplate;
   personMailPreviewContent.innerHTML = `
-    <p><strong>Template:</strong> ${esc(template.title || `ID ${template.id || 'Unknown'}`)}</p>
+    ${personTemplatePickerHtml(personMailTemplateOptions, selectedPersonMailTemplateId)}
+    <div class="mail-template-current">
+      <p><strong>Template:</strong> ${esc(selectedTemplate.title || `ID ${selectedTemplate.id || 'Unknown'}`)}</p>
+      ${personTemplateDetailSummaryHtml(selectedTemplate)}
+      ${personTemplatePreviewHtml(selectedTemplate)}
+    </div>
     <p><strong>Recipients:</strong> ${contacts.length}</p>
     <table class="crm-table mail-preview-table"><thead><tr><th>First Name</th><th>Full Address</th></tr></thead><tbody>${contacts.map((c) => `<tr><td>${esc(c.firstName || '')}</td><td>${esc(personFullAddress(c))}</td></tr>`).join('')}</tbody></table>
     <details class="mail-preview-payload"><summary><strong>Raw Payload JSON</strong></summary><pre>${esc(JSON.stringify(payload, null, 2))}</pre></details>
   `;
   personMailSendPath = sendPath;
-  personMailProofPath = `${previewPath}${previewPath.includes('?') ? '&' : '?'}include_proofs=1`;
+  personMailProofPath = buildPersonMailUrl(previewPath, selectedPersonMailTemplateId, true);
+  personMailPreviewContent.querySelectorAll('[data-person-mail-template-id]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const nextTemplateId = Number(button.dataset.personMailTemplateId || 0) || null;
+      if (!nextTemplateId || nextTemplateId === Number(selectedPersonMailTemplateId || 0)) return;
+      selectedPersonMailTemplateId = nextTemplateId;
+      personMailPreviewSendBtn.disabled = true;
+      personMailPreviewSendBtn.textContent = 'Loading...';
+      await openPersonMailPreview(personMailPreviewBasePath, personMailSendPath, selectedPersonMailTemplateId);
+    });
+  });
   personMailPreviewSendBtn.disabled = false;
+  personMailPreviewSendBtn.textContent = 'Review Proofs';
 }
 
 async function openPersonMailProof() {
@@ -417,8 +519,16 @@ async function openPersonMailProof() {
   }
   const payload = data.payload || {};
   const contacts = payload.contacts || [];
+  personMailTemplateMeta = Object.assign(
+    {},
+    findPersonTemplateOption(personMailTemplateOptions, (data.template_meta || {}).id || (personMailTemplateMeta || {}).id || selectedPersonMailTemplateId) || {},
+    personMailTemplateMeta || {},
+    data.template_meta || {}
+  );
   personMailProofContent.innerHTML = `
     <p>Please verify each proof before purchase.</p>
+    <p><strong>Template:</strong> ${esc((personMailTemplateMeta && personMailTemplateMeta.title) || `ID ${(personMailTemplateMeta && personMailTemplateMeta.id) || 'Unknown'}`)}</p>
+    ${personTemplateDetailSummaryHtml(personMailTemplateMeta)}
     <p><strong>Recipients:</strong> ${contacts.length}</p>
     ${personProofImagesHtml(data.proofs || [])}
     <h4>Recipients</h4>
@@ -540,7 +650,7 @@ personMailProofSendBtn.addEventListener('click', async () => {
   if (!personMailSendPath) return;
   personMailProofSendBtn.disabled = true;
   personMailProofSendBtn.textContent = 'Sending...';
-  const res = await postJson(personMailSendPath, {});
+  const res = await postJson(personMailSendPath, selectedPersonMailTemplateId ? {template_id: selectedPersonMailTemplateId} : {});
   if (!res.ok) {
     personMailProofSendBtn.disabled = false;
     personMailProofSendBtn.textContent = 'Approve and Pay';

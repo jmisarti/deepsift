@@ -2588,6 +2588,27 @@ def fetch_openletterconnect_template(template_id):
     return payload
 
 
+def fetch_openletterconnect_templates():
+    response = requests.get(
+        f"{OPENLETTERCONNECT_BASE_URL}/templates",
+        headers=openletterconnect_headers(),
+        timeout=30,
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"raw_text": response.text}
+    if not response.ok:
+        raise ValueError(f"OpenLetterConnect templates fetch failed ({response.status_code}): {payload}")
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    if isinstance(data, dict):
+        rows = data.get("rows")
+        return rows if isinstance(rows, list) else []
+    if isinstance(data, list):
+        return data
+    return []
+
+
 def fetch_openletterconnect_products():
     response = requests.get(
         f"{OPENLETTERCONNECT_BASE_URL}/products",
@@ -2700,7 +2721,8 @@ def get_template_product_options(template_id):
     }
 
 
-def build_openletterconnect_order_payload(db, contacts, property_row, template_id=OPENLETTERCONNECT_TEMPLATE_ID, mode="property-relative-mail"):
+def build_openletterconnect_order_payload(db, contacts, property_row, template_id=None, mode="property-relative-mail"):
+    template_id = int(template_id or OPENLETTERCONNECT_TEMPLATE_ID)
     template = fetch_openletterconnect_template(template_id)
     template_data = template.get("data") if isinstance(template, dict) and isinstance(template.get("data"), dict) else template
     if not isinstance(template_data, dict):
@@ -2974,7 +2996,7 @@ def view_openletterconnect_proofs(order_payload):
     return proofs
 
 
-def place_openletterconnect_order(db, contacts, property_row, template_id=OPENLETTERCONNECT_TEMPLATE_ID, mode="property-relative-mail"):
+def place_openletterconnect_order(db, contacts, property_row, template_id=None, mode="property-relative-mail"):
     built = build_openletterconnect_order_payload(
         db,
         contacts,
@@ -5678,6 +5700,125 @@ def get_direct_mail_settings(db):
         "postage_type": get_setting(db, "dm_postage_type", ""),
         "envelope_type": get_setting(db, "dm_envelope_type", ""),
     }
+
+
+def get_direct_mail_template_id(db):
+    return OPENLETTERCONNECT_TEMPLATE_ID
+
+
+def build_openletterconnect_template_options(rows):
+    options = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        raw_id = (str(row.get("id") or "")).strip()
+        if not raw_id:
+            continue
+        try:
+            template_id = int(raw_id)
+        except ValueError:
+            continue
+        title = (row.get("title") or f"Template {template_id}").strip()
+        product = row.get("product") if isinstance(row.get("product"), dict) else {}
+        details = []
+        for value in (
+            product.get("productType"),
+            product.get("paperSize"),
+            product.get("postageType") or product.get("deliveryType"),
+        ):
+            text = (value or "").strip()
+            if text:
+                details.append(text)
+        label = f"{title} [{template_id}]"
+        if details:
+            label += " - " + " | ".join(details)
+        options.append(
+            {
+                "id": template_id,
+                "title": title,
+                "label": label,
+                "productType": (product.get("productType") or "").strip() or None,
+                "paperType": (product.get("paperType") or "").strip() or None,
+                "paperSize": (product.get("paperSize") or "").strip() or None,
+                "deliveryType": (product.get("deliveryType") or "").strip() or None,
+                "postageType": (product.get("postageType") or "").strip() or None,
+                "envelopeType": (product.get("envelopeType") or "").strip() or None,
+                "thumbnailUrl": (row.get("thumbnailUrl") or "").strip() or None,
+                "backThumbnailUrl": (row.get("backThumbnailUrl") or "").strip() or None,
+            }
+        )
+    options.sort(key=lambda item: ((item.get("title") or "").lower(), item.get("id") or 0))
+    return options
+
+
+def build_openletterconnect_template_meta(template_data):
+    template = template_data if isinstance(template_data, dict) else {}
+    product = template.get("product") if isinstance(template.get("product"), dict) else {}
+    return {
+        "id": template.get("id"),
+        "title": template.get("title"),
+        "thumbnailUrl": template.get("thumbnailUrl"),
+        "backThumbnailUrl": template.get("backThumbnailUrl"),
+        "fields": template.get("fields") or [],
+        "productType": (product.get("productType") or "").strip() or None,
+        "paperType": (product.get("paperType") or "").strip() or None,
+        "paperSize": (product.get("paperSize") or "").strip() or None,
+        "deliveryType": (product.get("deliveryType") or "").strip() or None,
+        "postageType": (product.get("postageType") or "").strip() or None,
+        "envelopeType": (product.get("envelopeType") or "").strip() or None,
+    }
+
+
+def normalize_direct_mail_template_id(value):
+    raw_value = (str(value or "")).strip()
+    if not raw_value:
+        return None
+    try:
+        template_id = int(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return template_id if template_id > 0 else None
+
+
+def resolve_direct_mail_template_id(db, *candidates):
+    for candidate in candidates:
+        template_id = normalize_direct_mail_template_id(candidate)
+        if template_id:
+            return template_id
+    return get_direct_mail_template_id(db)
+
+
+def get_direct_mail_available_templates(selected_template_id=None):
+    options = []
+    try:
+        options = build_openletterconnect_template_options(fetch_openletterconnect_templates())
+    except Exception:
+        options = []
+    selected_template_id = normalize_direct_mail_template_id(selected_template_id)
+    if selected_template_id and not any((opt.get("id") or 0) == selected_template_id for opt in options):
+        options.insert(
+            0,
+            {
+                "id": selected_template_id,
+                "title": f"Template {selected_template_id}",
+                "label": f"Template {selected_template_id}",
+                "productType": None,
+                "paperType": None,
+                "paperSize": None,
+                "deliveryType": None,
+                "postageType": None,
+                "envelopeType": None,
+                "thumbnailUrl": None,
+                "backThumbnailUrl": None,
+            },
+        )
+    return options
+
+
+def direct_mail_template_id_from_request(db):
+    payload = request.get_json(silent=True) if request.method != "GET" else None
+    body_template_id = payload.get("template_id") if isinstance(payload, dict) else None
+    return resolve_direct_mail_template_id(db, request.args.get("template_id"), request.form.get("template_id"), body_template_id)
 
 
 def get_deep_dive_sms_number(db):
@@ -20590,7 +20731,7 @@ def settings_page():
     options_error = ""
     if active_tab == "direct_mail":
         try:
-            options = get_template_product_options(OPENLETTERCONNECT_TEMPLATE_ID)
+            options = get_template_product_options(get_direct_mail_template_id(db))
             postage_options = options.get("postage_options") or []
             envelope_options = options.get("envelope_options") or []
         except Exception as exc:
@@ -20676,7 +20817,7 @@ def settings_page():
         untitled_email_sync_rows=untitled_email_sync_rows,
         anonymous_email_registry_count=anonymous_email_registry_count,
         untitled_poll_hours=max(round(UNTITLED_LEADS_POLL_SECONDS / 3600, 1), 1),
-        template_id=OPENLETTERCONNECT_TEMPLATE_ID,
+        template_id=get_direct_mail_template_id(db),
         market_helper_address=market_helper_address,
         market_helper_result=market_helper_result,
         reisift_add_result=reisift_add_result,
@@ -22787,6 +22928,7 @@ def skip_trace_property_route(property_id):
 def mail_single_relative_route(property_id, person_id):
     ensure_db()
     db = get_db()
+    template_id = direct_mail_template_id_from_request(db)
     prop = db.execute(
         """
         SELECT p.id, p.owner_person_id, a.street, a.city, a.state, a.postal_code
@@ -22810,7 +22952,7 @@ def mail_single_relative_route(property_id, person_id):
         return jsonify({"error": "No mailing address available for this person"}), 400
 
     try:
-        result = place_openletterconnect_order(db, [contact], prop, mode="mail-individual-relative")
+        result = place_openletterconnect_order(db, [contact], prop, template_id=template_id, mode="mail-individual-relative")
         res = result["response"] if isinstance(result, dict) else {}
         external_order_id = str(res.get("id") or res.get("orderId") or res.get("order_id") or "")
         status = str(res.get("status") or "")
@@ -22824,7 +22966,7 @@ def mail_single_relative_route(property_id, person_id):
                 property_id,
                 person_id,
                 "individual",
-                OPENLETTERCONNECT_TEMPLATE_ID,
+                template_id,
                 external_order_id,
                 status,
                 cost,
@@ -22837,7 +22979,7 @@ def mail_single_relative_route(property_id, person_id):
             db,
             person_id,
             "OpenLetterConnect",
-            f"Mailer order submitted (template {OPENLETTERCONNECT_TEMPLATE_ID}) for property {property_id}.",
+            f"Mailer order submitted (template {template_id}) for property {property_id}.",
             res,
         )
         db.execute(
@@ -22864,6 +23006,7 @@ def mail_single_relative_route(property_id, person_id):
 def mail_preview_single_relative_route(property_id, person_id):
     ensure_db()
     db = get_db()
+    template_id = direct_mail_template_id_from_request(db)
     prop = db.execute(
         """
         SELECT p.id, p.owner_person_id, a.street, a.city, a.state, a.postal_code
@@ -22890,7 +23033,7 @@ def mail_preview_single_relative_route(property_id, person_id):
         db,
         [contact],
         prop,
-        template_id=OPENLETTERCONNECT_TEMPLATE_ID,
+        template_id=template_id,
         mode="mail-individual-relative",
     )
     template_data = built.get("template") or {}
@@ -22900,16 +23043,12 @@ def mail_preview_single_relative_route(property_id, person_id):
         {
             "ok": True,
             "mode": "individual",
+            "selected_template_id": template_id,
+            "available_templates": get_direct_mail_available_templates(template_id),
             "recipient_count": 1,
             "payload": built["payload"],
             "proofs": proofs,
-            "template_meta": {
-                "id": template_data.get("id"),
-                "title": template_data.get("title"),
-                "thumbnailUrl": template_data.get("thumbnailUrl"),
-                "backThumbnailUrl": template_data.get("backThumbnailUrl"),
-                "fields": template_data.get("fields") or [],
-            },
+            "template_meta": build_openletterconnect_template_meta(template_data),
         }
     )
 
@@ -22918,6 +23057,7 @@ def mail_preview_single_relative_route(property_id, person_id):
 def mail_all_relatives_route(property_id):
     ensure_db()
     db = get_db()
+    template_id = direct_mail_template_id_from_request(db)
     prop = db.execute(
         """
         SELECT p.id, p.owner_person_id, a.street, a.city, a.state, a.postal_code
@@ -22973,7 +23113,7 @@ def mail_all_relatives_route(property_id):
         return jsonify({"error": "No mailable relatives with addresses found"}), 400
 
     try:
-        result = place_openletterconnect_order(db, contacts, prop, mode="mail-all-relatives")
+        result = place_openletterconnect_order(db, contacts, prop, template_id=template_id, mode="mail-all-relatives")
         res = result["response"] if isinstance(result, dict) else {}
         external_order_id = str(res.get("id") or res.get("orderId") or res.get("order_id") or "")
         status = str(res.get("status") or "")
@@ -22986,7 +23126,7 @@ def mail_all_relatives_route(property_id):
             (
                 property_id,
                 "all_relatives",
-                OPENLETTERCONNECT_TEMPLATE_ID,
+                template_id,
                 external_order_id,
                 status,
                 cost,
@@ -23019,6 +23159,7 @@ def mail_all_relatives_route(property_id):
 def mail_preview_all_relatives_route(property_id):
     ensure_db()
     db = get_db()
+    template_id = direct_mail_template_id_from_request(db)
     prop = db.execute(
         """
         SELECT p.id, p.owner_person_id, a.street, a.city, a.state, a.postal_code
@@ -23076,7 +23217,7 @@ def mail_preview_all_relatives_route(property_id):
         db,
         contacts,
         prop,
-        template_id=OPENLETTERCONNECT_TEMPLATE_ID,
+        template_id=template_id,
         mode="mail-all-relatives",
     )
     template_data = built.get("template") or {}
@@ -23086,16 +23227,12 @@ def mail_preview_all_relatives_route(property_id):
         {
             "ok": True,
             "mode": "all",
+            "selected_template_id": template_id,
+            "available_templates": get_direct_mail_available_templates(template_id),
             "recipient_count": len(contacts),
             "payload": built["payload"],
             "proofs": proofs,
-            "template_meta": {
-                "id": template_data.get("id"),
-                "title": template_data.get("title"),
-                "thumbnailUrl": template_data.get("thumbnailUrl"),
-                "backThumbnailUrl": template_data.get("backThumbnailUrl"),
-                "fields": template_data.get("fields") or [],
-            },
+            "template_meta": build_openletterconnect_template_meta(template_data),
         }
     )
 

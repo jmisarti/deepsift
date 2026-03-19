@@ -301,19 +301,27 @@ const mailPreviewSendBtn = document.getElementById('mailPreviewSendBtn');
 const mailProofModal = document.getElementById('mailProofModal');
 const mailProofContent = document.getElementById('mailProofContent');
 const mailProofSendBtn = document.getElementById('mailProofSendBtn');
+let mailPreviewBasePath = '';
 let mailPreviewSendPath = '';
 let mailPreviewProofPath = '';
+let pendingPreviewModeLabel = '';
 let pendingPreviewPayload = null;
 let pendingTemplateMeta = null;
+let pendingTemplateOptions = [];
+let selectedMailTemplateId = null;
 
 function closeMailPreview() {
   mailPreviewModal.hidden = true;
   mailPreviewSendBtn.disabled = false;
   mailPreviewSendBtn.textContent = 'Review Proofs';
+  mailPreviewBasePath = '';
   mailPreviewSendPath = '';
   mailPreviewProofPath = '';
+  pendingPreviewModeLabel = '';
   pendingPreviewPayload = null;
   pendingTemplateMeta = null;
+  pendingTemplateOptions = [];
+  selectedMailTemplateId = null;
 }
 
 function closeMailProof() {
@@ -324,6 +332,71 @@ function closeMailProof() {
 
 function fullAddress(c) {
   return [c.address1, c.address2, `${c.city || ''}, ${c.state || ''} ${c.zip || ''}`.trim()].filter(Boolean).join(', ');
+}
+
+function buildMailPreviewUrl(path, templateId, includeProofs=false) {
+  const url = new URL(path, window.location.origin);
+  if (templateId) url.searchParams.set('template_id', String(templateId));
+  if (includeProofs) url.searchParams.set('include_proofs', '1');
+  return `${url.pathname}${url.search}`;
+}
+
+function templateDetailBits(template) {
+  if (!template || typeof template !== 'object') return [];
+  return [
+    template.paperSize,
+    template.productType,
+    template.postageType || template.deliveryType
+  ].filter((value) => value && String(value).trim());
+}
+
+function templateDetailSummaryHtml(template) {
+  const bits = templateDetailBits(template);
+  if (!bits.length) return '';
+  return `
+    <div class="mail-template-summary">
+      ${bits.map((bit) => `<span>${esc(String(bit))}</span>`).join('')}
+    </div>
+  `;
+}
+
+function findTemplateOption(options, templateId) {
+  const targetId = Number(templateId || 0);
+  if (!targetId) return null;
+  const rows = Array.isArray(options) ? options : [];
+  return rows.find((opt) => Number(opt && opt.id) === targetId) || null;
+}
+
+function templatePickerHtml(options, selectedId, pickerId) {
+  const rows = Array.isArray(options) ? options.filter((opt) => opt && opt.id) : [];
+  if (!rows.length) return '';
+  return `
+    <div>
+      <p><strong>Choose Template:</strong></p>
+      <div class="mail-template-picker" id="${pickerId}">
+        ${rows.map((opt) => {
+          const previewUrl = opt.thumbnailUrl || opt.backThumbnailUrl || '';
+          const selectedClass = Number(opt.id) === Number(selectedId) ? ' is-selected' : '';
+          return `
+            <button
+              type="button"
+              class="mail-template-card${selectedClass}"
+              data-mail-template-id="${esc(String(opt.id))}"
+              aria-pressed="${Number(opt.id) === Number(selectedId) ? 'true' : 'false'}"
+            >
+              <div class="mail-template-card-image">
+                ${previewUrl
+                  ? `<img src="${esc(previewUrl)}" alt="${esc(opt.title || `Template ${opt.id}`)} preview">`
+                  : '<div class="mail-template-card-empty">No preview available</div>'}
+              </div>
+              <div class="mail-template-card-title">${esc(opt.title || `Template ${opt.id}`)}</div>
+              ${templateDetailSummaryHtml(opt)}
+            </button>
+          `;
+        }).join('')}
+      </div>
+    </div>
+  `;
 }
 
 function contactRowsHtml(contacts) {
@@ -466,15 +539,23 @@ function showMailPreview(modeLabel, preview, sendPath) {
   const contacts = payload.contacts || [];
   const meta = preview.template_meta || {};
   const proofs = preview.proofs || [];
+  const templateOptions = Array.isArray(preview.available_templates) ? preview.available_templates : [];
   const templateFields = parseTemplateFields(meta);
+  selectedMailTemplateId = Number(preview.selected_template_id || meta.id || selectedMailTemplateId || 0) || null;
+  const selectedTemplate = Object.assign({}, findTemplateOption(templateOptions, selectedMailTemplateId) || {}, meta || {});
   pendingPreviewPayload = payload;
-  pendingTemplateMeta = meta;
+  pendingTemplateMeta = selectedTemplate;
   pendingTemplateMeta._proofs = proofs;
+  pendingTemplateOptions = templateOptions;
   mailPreviewTitle.textContent = `Direct Mail Preview - ${modeLabel}`;
   mailPreviewContent.innerHTML = `
-    <p><strong>Template:</strong> ${esc(meta.title || `ID ${meta.id || 'Unknown'}`)}</p>
+    ${templatePickerHtml(templateOptions, selectedMailTemplateId, 'mailTemplatePicker')}
+    <div class="mail-template-current">
+      <p><strong>Template:</strong> ${esc(selectedTemplate.title || `ID ${selectedTemplate.id || 'Unknown'}`)}</p>
+      ${templateDetailSummaryHtml(selectedTemplate)}
+      ${previewImagesHtml(selectedTemplate, [], true)}
+    </div>
     <p><strong>Recipients:</strong> ${contacts.length}</p>
-    ${previewImagesHtml(meta, [], true)}
     <h4>Required Variables Check</h4>
     ${requiredVarsHtml(templateFields, contacts, payload)}
     <h4>Recipient Variables</h4>
@@ -486,16 +567,29 @@ function showMailPreview(modeLabel, preview, sendPath) {
   `;
   mailPreviewSendPath = sendPath;
   mailPreviewModal.hidden = false;
+  mailPreviewContent.querySelectorAll('[data-mail-template-id]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const nextTemplateId = Number(button.dataset.mailTemplateId || 0) || null;
+      if (!nextTemplateId || nextTemplateId === Number(selectedMailTemplateId || 0)) return;
+      selectedMailTemplateId = nextTemplateId;
+      mailPreviewSendBtn.disabled = true;
+      mailPreviewSendBtn.textContent = 'Loading...';
+      await openMailPreview(mailPreviewBasePath, mailPreviewSendPath, pendingPreviewModeLabel, selectedMailTemplateId);
+    });
+  });
   flash(mailPreviewContent);
 }
 
-async function openMailPreview(previewPath, sendPath, modeLabel) {
+async function openMailPreview(previewPath, sendPath, modeLabel, templateId=null) {
+  mailPreviewBasePath = previewPath;
+  pendingPreviewModeLabel = modeLabel;
   mailPreviewTitle.textContent = `Direct Mail Preview - ${modeLabel}`;
   mailPreviewContent.innerHTML = '<p>Loading preview...</p>';
   mailPreviewSendBtn.disabled = true;
+  mailPreviewSendBtn.textContent = 'Review Proofs';
   mailPreviewModal.hidden = false;
   try {
-    const res = await fetch(previewPath);
+    const res = await fetch(buildMailPreviewUrl(previewPath, templateId));
     const data = await res.json();
     if (!res.ok || !data.ok) {
       closeMailPreview();
@@ -503,8 +597,10 @@ async function openMailPreview(previewPath, sendPath, modeLabel) {
       return;
     }
     showMailPreview(modeLabel, data, sendPath);
-    mailPreviewProofPath = `${previewPath}${previewPath.includes('?') ? '&' : '?'}include_proofs=1`;
+    selectedMailTemplateId = Number(data.selected_template_id || (data.template_meta || {}).id || templateId || 0) || selectedMailTemplateId;
+    mailPreviewProofPath = buildMailPreviewUrl(previewPath, selectedMailTemplateId, true);
     mailPreviewSendBtn.disabled = false;
+    mailPreviewSendBtn.textContent = 'Review Proofs';
   } catch (err) {
     closeMailPreview();
     alert('Failed to load mail preview.');
@@ -530,11 +626,18 @@ async function openProofConfirm() {
     const payload = data.payload || pendingPreviewPayload;
     const contacts = payload.contacts || [];
     const proofs = data.proofs || [];
-    pendingTemplateMeta = pendingTemplateMeta || {};
+    const proofTemplate = Object.assign(
+      {},
+      findTemplateOption(pendingTemplateOptions, (data.template_meta || {}).id || (pendingTemplateMeta || {}).id || selectedMailTemplateId) || {},
+      pendingTemplateMeta || {},
+      data.template_meta || {}
+    );
+    pendingTemplateMeta = proofTemplate;
     pendingTemplateMeta._proofs = proofs;
     mailProofContent.innerHTML = `
       <p>Please verify each proof before purchase.</p>
       <p><strong>Template:</strong> ${esc((pendingTemplateMeta && pendingTemplateMeta.title) || `ID ${(pendingTemplateMeta && pendingTemplateMeta.id) || 'Unknown'}`)}</p>
+      ${templateDetailSummaryHtml(pendingTemplateMeta)}
       <p><strong>Recipients:</strong> ${contacts.length}</p>
       ${previewImagesHtml(pendingTemplateMeta || {}, proofs, false)}
       ${proofs.length ? '' : '<p class="warn-line">No proof images were returned yet. Please try again in a moment.</p>'}
@@ -662,7 +765,7 @@ mailProofSendBtn.addEventListener('click', async () => {
   if (!mailPreviewSendPath) return;
   mailProofSendBtn.disabled = true;
   mailProofSendBtn.textContent = 'Sending...';
-  const res = await postJson(mailPreviewSendPath, {});
+  const res = await postJson(mailPreviewSendPath, selectedMailTemplateId ? {template_id: selectedMailTemplateId} : {});
   if (!res.ok) {
     mailProofSendBtn.disabled = false;
     mailProofSendBtn.textContent = 'Approve and Pay';

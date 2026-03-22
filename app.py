@@ -214,6 +214,93 @@ NJ_COUNTIES = [
     "Warren",
 ]
 
+US_STATE_NAME_TO_ABBR = {
+    "alabama": "AL",
+    "alaska": "AK",
+    "arizona": "AZ",
+    "arkansas": "AR",
+    "california": "CA",
+    "colorado": "CO",
+    "connecticut": "CT",
+    "delaware": "DE",
+    "district of columbia": "DC",
+    "florida": "FL",
+    "georgia": "GA",
+    "hawaii": "HI",
+    "idaho": "ID",
+    "illinois": "IL",
+    "indiana": "IN",
+    "iowa": "IA",
+    "kansas": "KS",
+    "kentucky": "KY",
+    "louisiana": "LA",
+    "maine": "ME",
+    "maryland": "MD",
+    "massachusetts": "MA",
+    "michigan": "MI",
+    "minnesota": "MN",
+    "mississippi": "MS",
+    "missouri": "MO",
+    "montana": "MT",
+    "nebraska": "NE",
+    "nevada": "NV",
+    "new hampshire": "NH",
+    "new jersey": "NJ",
+    "new mexico": "NM",
+    "new york": "NY",
+    "north carolina": "NC",
+    "north dakota": "ND",
+    "ohio": "OH",
+    "oklahoma": "OK",
+    "oregon": "OR",
+    "pennsylvania": "PA",
+    "rhode island": "RI",
+    "south carolina": "SC",
+    "south dakota": "SD",
+    "tennessee": "TN",
+    "texas": "TX",
+    "utah": "UT",
+    "vermont": "VT",
+    "virginia": "VA",
+    "washington": "WA",
+    "west virginia": "WV",
+    "wisconsin": "WI",
+    "wyoming": "WY",
+}
+US_STATE_ABBREVIATIONS = set(US_STATE_NAME_TO_ABBR.values())
+ADDRESS_TOKEN_NORMALIZATION = {
+    "street": "st",
+    "st": "st",
+    "avenue": "ave",
+    "ave": "ave",
+    "road": "rd",
+    "rd": "rd",
+    "drive": "dr",
+    "dr": "dr",
+    "lane": "ln",
+    "ln": "ln",
+    "court": "ct",
+    "ct": "ct",
+    "boulevard": "blvd",
+    "blvd": "blvd",
+    "place": "pl",
+    "pl": "pl",
+    "terrace": "ter",
+    "ter": "ter",
+    "parkway": "pkwy",
+    "pkwy": "pkwy",
+    "circle": "cir",
+    "cir": "cir",
+    "north": "n",
+    "south": "s",
+    "east": "e",
+    "west": "w",
+    "northeast": "ne",
+    "northwest": "nw",
+    "southeast": "se",
+    "southwest": "sw",
+}
+
 AGENT_DEFINITIONS = [
     {
         "key": "conversation_closer",
@@ -704,6 +791,10 @@ def migrate_db(db):
     ensure_column(db, "person_relationships", "relationship_order", "relationship_order INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "properties", "attom_last_sold_date", "attom_last_sold_date TEXT")
     ensure_column(db, "properties", "attom_last_sold_price", "attom_last_sold_price REAL")
+    ensure_column(db, "properties", "is_d4d", "is_d4d INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "properties", "d4d_added_at", "d4d_added_at TEXT")
+    ensure_column(db, "properties", "d4d_added_by", "d4d_added_by TEXT")
+    ensure_column(db, "properties", "d4d_source", "d4d_source TEXT")
     ensure_column(db, "reisift_referrals", "referral_status", "referral_status TEXT NOT NULL DEFAULT 'Untouched'")
     ensure_column(db, "reisift_referrals", "winning_realtor_id", "winning_realtor_id INTEGER")
     ensure_column(db, "reisift_referrals", "referral_notes", "referral_notes TEXT")
@@ -724,6 +815,7 @@ def migrate_db(db):
         )
         """
     )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_properties_is_d4d ON properties(is_d4d, id DESC)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS obituary_expansion_runs (
@@ -1307,6 +1399,98 @@ def create_person(db, first_name, last_name, middle_name="", phone="", email="",
         ),
     )
     return cur.lastrowid
+
+
+def normalize_whitespace(value):
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def normalize_state_code(value):
+    raw = normalize_whitespace(value).replace(".", "")
+    if not raw:
+        return ""
+    upper = raw.upper()
+    if upper in US_STATE_ABBREVIATIONS:
+        return upper
+    return US_STATE_NAME_TO_ABBR.get(raw.lower(), "")
+
+
+def normalize_postal_code(value):
+    raw = normalize_whitespace(value)
+    match = re.search(r"\d{5}(?:-\d{4})?", raw)
+    return match.group(0) if match else ""
+
+
+def normalize_address_match_text(value):
+    raw = normalize_whitespace(value).lower().replace("#", " ")
+    raw = re.sub(r"[^\w\s]", " ", raw)
+    tokens = [ADDRESS_TOKEN_NORMALIZATION.get(token, token) for token in raw.split()]
+    return " ".join(tokens)
+
+
+def format_property_address_line(street, city, state, postal_code):
+    parts = [normalize_whitespace(street), normalize_whitespace(city)]
+    tail = " ".join([x for x in [normalize_state_code(state) or normalize_whitespace(state), normalize_postal_code(postal_code)] if x])
+    if tail:
+        parts.append(tail)
+    return ", ".join([p for p in parts if p])
+
+
+def append_note_line(existing_notes, note_line):
+    base = (existing_notes or "").strip()
+    addition = normalize_whitespace(note_line)
+    if not addition:
+        return base
+    if addition in base:
+        return base
+    return f"{base}\n{addition}" if base else addition
+
+
+def parse_freeform_property_address(raw_text):
+    text = normalize_whitespace(raw_text)
+    if not text:
+        raise ValueError("Address is required.")
+
+    parts = [normalize_whitespace(part) for part in text.split(",") if normalize_whitespace(part)]
+    street = ""
+    city = ""
+    state = ""
+    postal_code = ""
+
+    if len(parts) >= 3:
+        street = parts[0]
+        city = parts[1]
+        tail = normalize_whitespace(" ".join(parts[2:]))
+        match = re.match(r"^(?P<state>[A-Za-z][A-Za-z .'-]*?)(?:\s+(?P<postal>\d{5}(?:-\d{4})?))?$", tail)
+        if not match:
+            raise ValueError("Use address format `Street, City, ST ZIP`.")
+        state = normalize_state_code(match.group("state"))
+        postal_code = normalize_postal_code(match.group("postal") or "")
+    elif len(parts) == 2:
+        street = parts[0]
+        tail = parts[1]
+        match = re.match(
+            r"^(?P<city>.+?)\s+(?P<state>[A-Za-z]{2}|[A-Za-z][A-Za-z .'-]*?)(?:\s+(?P<postal>\d{5}(?:-\d{4})?))?$",
+            tail,
+        )
+        if not match:
+            raise ValueError("Use address format `Street, City, ST ZIP`.")
+        city = normalize_whitespace(match.group("city"))
+        state = normalize_state_code(match.group("state"))
+        postal_code = normalize_postal_code(match.group("postal") or "")
+    else:
+        raise ValueError("Use address format `Street, City, ST ZIP`.")
+
+    street = normalize_whitespace(street)
+    city = normalize_whitespace(city)
+    if not street or not city or not state:
+        raise ValueError("Could not parse address. Use `Street, City, ST ZIP`.")
+    return {
+        "street": street,
+        "city": city,
+        "state": state,
+        "postal_code": postal_code,
+    }
 
 
 def person_name(person_row):
@@ -15706,6 +15890,11 @@ def extract_payload_address(payload):
 def find_local_property_by_address(db, street, city, state, postal_code):
     if not street or not city:
         return None
+    normalized_street = normalize_address_match_text(street)
+    normalized_city = normalize_address_match_text(city)
+    normalized_state = normalize_state_code(state)
+    normalized_postal = normalize_postal_code(postal_code)
+
     row = db.execute(
         """
         SELECT p.id
@@ -15720,7 +15909,178 @@ def find_local_property_by_address(db, street, city, state, postal_code):
         """,
         (street, city, state, postal_code),
     ).fetchone()
-    return row["id"] if row else None
+    if row:
+        return row["id"]
+
+    candidate_rows = db.execute(
+        """
+        SELECT p.id, a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE lower(a.city) = lower(?)
+          AND lower(a.state) = lower(?)
+        ORDER BY p.id DESC
+        """,
+        (city, normalized_state or state),
+    ).fetchall()
+    for candidate in candidate_rows:
+        if normalize_address_match_text(candidate["street"]) != normalized_street:
+            continue
+        if normalize_address_match_text(candidate["city"]) != normalized_city:
+            continue
+        if normalize_state_code(candidate["state"]) != normalized_state:
+            continue
+        if normalized_postal and normalize_postal_code(candidate["postal_code"]) != normalized_postal:
+            continue
+        return candidate["id"]
+    return None
+
+
+def ensure_property_in_d4d(db, address, added_by="", source="Slack command", raw_input=""):
+    street = normalize_whitespace(address.get("street"))
+    city = normalize_whitespace(address.get("city"))
+    state = normalize_state_code(address.get("state"))
+    postal_code = normalize_postal_code(address.get("postal_code"))
+    if not street or not city or not state:
+        raise ValueError("street, city, and state are required")
+
+    property_id = find_local_property_by_address(db, street, city, state, postal_code)
+    now_text = format_db_time(datetime.utcnow())
+    actor = normalize_whitespace(added_by) or "Slack"
+    note_line = f"D4D lead flagged via {source} on {now_text} by {actor}."
+    payload = {
+        "address": {
+            "street": street,
+            "city": city,
+            "state": state,
+            "postal_code": postal_code,
+        },
+        "source": source,
+        "added_by": actor,
+        "raw_input": raw_input,
+    }
+
+    if property_id:
+        existing = db.execute(
+            """
+            SELECT id, owner_person_id, notes, COALESCE(is_d4d, 0) AS is_d4d
+            FROM properties
+            WHERE id = ?
+            """,
+            (property_id,),
+        ).fetchone()
+        was_marked = int(existing["is_d4d"] or 0) == 0
+        if was_marked:
+            db.execute(
+                """
+                UPDATE properties
+                SET is_d4d = 1,
+                    d4d_added_at = COALESCE(NULLIF(d4d_added_at, ''), ?),
+                    d4d_added_by = COALESCE(NULLIF(d4d_added_by, ''), ?),
+                    d4d_source = COALESCE(NULLIF(d4d_source, ''), ?),
+                    notes = ?
+                WHERE id = ?
+                """,
+                (
+                    now_text,
+                    actor,
+                    source,
+                    append_note_line(existing["notes"], note_line),
+                    property_id,
+                ),
+            )
+            db.execute(
+                """
+                INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    property_id,
+                    existing["owner_person_id"],
+                    "D4D Intake",
+                    "Existing property marked for D4D",
+                    json.dumps(payload),
+                ),
+            )
+        return {
+            "property_id": property_id,
+            "created": False,
+            "marked_for_d4d": was_marked,
+            "already_d4d": not was_marked,
+            "owner_person_id": existing["owner_person_id"],
+        }
+
+    address_id = create_address(db, street, city, state, postal_code)
+    property_notes = note_line
+    cur = db.execute(
+        """
+        INSERT INTO properties (
+            property_address_id,
+            owner_person_id,
+            resident_person_id,
+            status,
+            notes,
+            is_d4d,
+            d4d_added_at,
+            d4d_added_by,
+            d4d_source
+        )
+        VALUES (?, NULL, NULL, ?, ?, 1, ?, ?, ?)
+        """,
+        (
+            address_id,
+            "Untouched",
+            property_notes,
+            now_text,
+            actor,
+            source,
+        ),
+    )
+    property_id = cur.lastrowid
+    db.execute(
+        """
+        INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+        VALUES (?, NULL, ?, ?, ?)
+        """,
+        (
+            property_id,
+            "D4D Intake",
+            "New D4D property created",
+            json.dumps(payload),
+        ),
+    )
+    return {
+        "property_id": property_id,
+        "created": True,
+        "marked_for_d4d": True,
+        "already_d4d": False,
+        "owner_person_id": None,
+    }
+
+
+def run_property_skip_trace_lookup(db, property_id):
+    prop = db.execute(
+        """
+        SELECT p.id, a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        """,
+        (property_id,),
+    ).fetchone()
+    if not prop:
+        raise ValueError("property not found")
+    lookup_pkg = call_skipsherpa_property_lookup(
+        street=prop["street"],
+        city=prop["city"],
+        state=prop["state"],
+        zipcode=prop["postal_code"],
+    )
+    summary = import_skipsherpa_property_result(db, property_id, lookup_pkg)
+    return {
+        "summary": summary,
+        "raw": lookup_pkg.get("response") if isinstance(lookup_pkg, dict) else {},
+    }
 
 
 def build_market_status_helper(address_text):
@@ -18095,6 +18455,70 @@ def dashboard():
         counts=counts,
         status_filter=status_filter,
         q=q,
+    )
+
+
+@app.route("/d4d")
+def d4d_dashboard():
+    ensure_db()
+    db = get_db()
+
+    status_filter = request.args.get("status", "").strip()
+    q = request.args.get("q", "").strip()
+    notice = (request.args.get("notice") or "").strip()
+    error = (request.args.get("error") or "").strip()
+
+    where = ["COALESCE(p.is_d4d, 0) = 1"]
+    params = []
+    if status_filter:
+        where.append("p.status = ?")
+        params.append(status_filter)
+    if q:
+        where.append("lower(a.street || ' ' || a.city || ' ' || a.state || ' ' || a.postal_code) LIKE ?")
+        params.append(f"%{q.lower()}%")
+    where_sql = "WHERE " + " AND ".join(where)
+
+    properties = db.execute(
+        f"""
+        SELECT p.id,
+               p.status,
+               p.notes,
+               p.created_at,
+               p.owner_person_id,
+               p.d4d_added_at,
+               p.d4d_added_by,
+               p.d4d_source,
+               a.street,
+               a.city,
+               a.state,
+               a.postal_code,
+               op.first_name AS owner_first,
+               op.middle_name AS owner_middle,
+               op.last_name AS owner_last
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        LEFT JOIN people op ON op.id = p.owner_person_id
+        {where_sql}
+        ORDER BY datetime(COALESCE(p.d4d_added_at, p.created_at)) DESC, p.id DESC
+        """,
+        tuple(params),
+    ).fetchall()
+
+    counts = {
+        "properties": db.execute("SELECT COUNT(*) AS c FROM properties WHERE COALESCE(is_d4d, 0) = 1").fetchone()["c"],
+        "untouched": db.execute("SELECT COUNT(*) AS c FROM properties WHERE COALESCE(is_d4d, 0) = 1 AND status = 'Untouched'").fetchone()["c"],
+        "with_owner": db.execute("SELECT COUNT(*) AS c FROM properties WHERE COALESCE(is_d4d, 0) = 1 AND owner_person_id IS NOT NULL").fetchone()["c"],
+        "without_owner": db.execute("SELECT COUNT(*) AS c FROM properties WHERE COALESCE(is_d4d, 0) = 1 AND owner_person_id IS NULL").fetchone()["c"],
+    }
+
+    return render_template(
+        "d4d.html",
+        properties=properties,
+        counts=counts,
+        status_filter=status_filter,
+        q=q,
+        notice=notice,
+        error=error,
     )
 
 
@@ -23558,6 +23982,7 @@ def slack_command_webhook():
     text = (request.form.get("text") or "").strip()
     cmd = (request.form.get("command") or "").strip()
     user_name = (request.form.get("user_name") or "").strip()
+    user_id = (request.form.get("user_id") or "").strip()
     low = text.lower()
     tokens = [t for t in re.split(r"\s+", low) if t]
     sub = tokens[0] if tokens else "help"
@@ -23570,11 +23995,138 @@ def slack_command_webhook():
                     "• `status` - agent pipeline snapshot\n"
                     "• `queue` - pending Agent 2 actions\n"
                     "• `unresolved` - unresolved lead-watch items\n"
+                    "• `d4d <street>, <city>, <state> <zip>` - add or flag a Driving For Dollars lead\n"
                     "• `health` - agent endpoint health\n"
                     "• `help` - command list"
                 ),
             }
         )
+    if sub == "d4d":
+        address_text = text.partition(" ")[2].strip()
+        if not address_text:
+            return jsonify(
+                {
+                    "response_type": "ephemeral",
+                    "text": "Use `d4d 123 Main St, Newark, NJ 07102`.",
+                }
+            )
+        try:
+            parsed = parse_freeform_property_address(address_text)
+            intake = ensure_property_in_d4d(
+                db,
+                parsed,
+                added_by=user_name or user_id,
+                source="Slack D4D",
+                raw_input=text,
+            )
+            commit_with_retry(db)
+
+            skip_trace_result = None
+            skip_trace_error = ""
+            should_skip_trace = bool(intake.get("created")) or not intake.get("owner_person_id")
+            if should_skip_trace:
+                try:
+                    skip_trace_result = run_property_skip_trace_lookup(db, intake["property_id"])
+                    commit_with_retry(db)
+                except Exception as exc:
+                    db.rollback()
+                    skip_trace_error = str(exc)
+                    existing = db.execute("SELECT notes, owner_person_id FROM properties WHERE id = ?", (intake["property_id"],)).fetchone()
+                    db.execute(
+                        "UPDATE properties SET notes = ? WHERE id = ?",
+                        (
+                            append_note_line(
+                                existing["notes"] if existing else "",
+                                f"D4D auto skip trace failed: {skip_trace_error}",
+                            ),
+                            intake["property_id"],
+                        ),
+                    )
+                    db.execute(
+                        """
+                        INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            intake["property_id"],
+                            existing["owner_person_id"] if existing else None,
+                            "D4D Intake",
+                            "Property auto skip trace failed",
+                            json.dumps({"error": skip_trace_error, "address": parsed, "raw_input": text}),
+                        ),
+                    )
+                    commit_with_retry(db)
+
+            prop_row = db.execute(
+                """
+                SELECT p.id,
+                       p.status,
+                       p.owner_person_id,
+                       a.street,
+                       a.city,
+                       a.state,
+                       a.postal_code,
+                       op.first_name AS owner_first,
+                       op.middle_name AS owner_middle,
+                       op.last_name AS owner_last
+                FROM properties p
+                JOIN addresses a ON a.id = p.property_address_id
+                LEFT JOIN people op ON op.id = p.owner_person_id
+                WHERE p.id = ?
+                """,
+                (intake["property_id"],),
+            ).fetchone()
+            owner_name = ""
+            if prop_row and prop_row["owner_person_id"]:
+                owner_name = " ".join(
+                    [
+                        x
+                        for x in [
+                            (prop_row["owner_first"] or "").strip(),
+                            (prop_row["owner_middle"] or "").strip(),
+                            (prop_row["owner_last"] or "").strip(),
+                        ]
+                        if x
+                    ]
+                ).strip()
+            property_url = url_for("property_detail", property_id=intake["property_id"], _external=True)
+            d4d_url = url_for("d4d_dashboard", _external=True)
+            address_line = format_property_address_line(
+                parsed["street"],
+                parsed["city"],
+                parsed["state"],
+                parsed["postal_code"],
+            )
+            if intake.get("created"):
+                headline = f"New D4D lead created in SIFT as property #{intake['property_id']}."
+            elif intake.get("marked_for_d4d"):
+                headline = f"Existing property #{intake['property_id']} found in SIFT and added to D4D."
+            else:
+                headline = f"Property #{intake['property_id']} already exists in SIFT and is already tracked in D4D."
+            lines = [
+                headline,
+                f"Address: {address_line}",
+                f"Status: {(prop_row['status'] if prop_row else 'Untouched') or 'Untouched'}",
+            ]
+            if skip_trace_result and owner_name:
+                lines.append(f"Auto skip trace complete. Owner: {owner_name}")
+            elif skip_trace_result:
+                lines.append("Auto skip trace complete.")
+            elif skip_trace_error:
+                lines.append(f"Auto skip trace failed: {skip_trace_error}")
+            elif owner_name:
+                lines.append(f"Owner already on file: {owner_name}")
+            lines.append(f"Open lead: <{property_url}|Property #{intake['property_id']}>")
+            lines.append(f"D4D dashboard: <{d4d_url}|Open D4D queue>")
+            return jsonify({"response_type": "ephemeral", "text": "\n".join(lines)})
+        except Exception as exc:
+            db.rollback()
+            return jsonify(
+                {
+                    "response_type": "ephemeral",
+                    "text": f"Could not add D4D lead: {exc}\nUse `d4d 123 Main St, Newark, NJ 07102`.",
+                }
+            )
     if sub in {"status", "overview"}:
         snap = build_agent_advisor_snapshot(db, window_hours=72)
         signals = snap.get("signals", {})

@@ -19,9 +19,19 @@
             </div>
         </details>
     </div>
+    {% if prop.is_d4d %}
+    <p><span class="pill">D4D Lead</span>
+        {% if prop.d4d_added_at %} Added {{ prop.d4d_added_at }}{% endif %}
+        {% if prop.d4d_added_by %} by {{ prop.d4d_added_by }}{% endif %}
+    </p>
+    {% endif %}
     <p>
         <strong>Owner:</strong>
+        {% if owner %}
         <a href="{{ url_for('person_detail', person_id=owner.id, property_id=prop.id) }}" id="ownerLink">{{ prop.owner_first }} {{ prop.owner_middle or '' }} {{ prop.owner_last }}</a>
+        {% else %}
+        <span>No owner record yet. Run <strong>Skip Trace Property (Owners)</strong> to load owner information.</span>
+        {% endif %}
     </p>
     <p><strong>Last Sold Date:</strong> {{ prop.attom_last_sold_date or '-' }}</p>
     <p><strong>Last Sale Price:</strong> {% if prop.attom_last_sold_price is not none %}${{ "{:,.0f}".format(prop.attom_last_sold_price) }}{% else %}-{% endif %}</p>
@@ -218,7 +228,7 @@
 
 <section class="panel"><details><summary><strong>Activity Log</strong></summary><table><thead><tr><th>Date</th><th>Person ID</th><th>Type</th><th>Outcome</th><th>Note</th></tr></thead><tbody>{% for a in activities %}<tr><td>{{ a.created_at }}</td><td>{{ a.person_id }}</td><td>{{ a.activity_type }}</td><td>{{ a.outcome }}</td><td>{{ a.note }}</td></tr>{% endfor %}</tbody></table></details></section>
 
-<section class="panel"><details><summary><strong>Obituary Import</strong></summary><div class="split"><div><form id="obitAiImportForm" method="post" action="{{ url_for('import_obituary_ai_route', property_id=prop.id) }}" class="grid-form compact"><input type="hidden" name="subject_person_id" value="{{ prop.owner_person_id }}"><label class="span2">Subject Person <input value="{{ prop.owner_first }} {{ prop.owner_middle or '' }} {{ prop.owner_last }}" readonly></label><label class="span2">Obituary URL <input name="obituary_url" placeholder="https://www.legacy.com/..." required></label><button type="submit">AI Import Relationships</button></form></div><div><table><thead><tr><th>Date</th><th>Source</th><th>Excerpt</th></tr></thead><tbody>{% for row in obituary_imports %}<tr><td>{{ row.created_at }}</td><td><a href="{{ row.source_url }}" target="_blank">Source</a></td><td>{{ row.raw_text[:160] }}...</td></tr>{% endfor %}</tbody></table></div></div></details></section>
+<section class="panel"><details><summary><strong>Obituary Import</strong></summary>{% if prop.owner_person_id %}<div class="split"><div><form id="obitAiImportForm" method="post" action="{{ url_for('import_obituary_ai_route', property_id=prop.id) }}" class="grid-form compact"><input type="hidden" name="subject_person_id" value="{{ prop.owner_person_id }}"><label class="span2">Subject Person <input value="{{ prop.owner_first }} {{ prop.owner_middle or '' }} {{ prop.owner_last }}" readonly></label><label class="span2">Obituary URL <input name="obituary_url" placeholder="https://www.legacy.com/..." required></label><button type="submit">AI Import Relationships</button></form></div><div><table><thead><tr><th>Date</th><th>Source</th><th>Excerpt</th></tr></thead><tbody>{% for row in obituary_imports %}<tr><td>{{ row.created_at }}</td><td><a href="{{ row.source_url }}" target="_blank">Source</a></td><td>{{ row.raw_text[:160] }}...</td></tr>{% endfor %}</tbody></table></div></div>{% else %}<p>Add or skip trace an owner before running obituary import.</p>{% endif %}</details></section>
 
 <section class="panel"><details><summary><strong>Upload Phone/Email CSV</strong></summary><p><a href="{{ url_for('phone_email_template') }}">Download template</a></p><form method="post" action="{{ url_for('upload_owner_contacts', property_id=prop.id) }}" enctype="multipart/form-data" class="grid-form compact"><label class="span2">CSV File <input type="file" name="contacts_file" accept=".csv" required></label><button type="submit">Upload Contacts</button></form></details></section>
 

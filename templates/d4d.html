@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="cards">
+    <article><h3>D4D Leads</h3><p>{{ counts.properties }}</p></article>
+    <article><h3>Untouched</h3><p>{{ counts.untouched }}</p></article>
+    <article><h3>With Owner</h3><p>{{ counts.with_owner }}</p></article>
+    <article><h3>No Owner Yet</h3><p>{{ counts.without_owner }}</p></article>
+</section>
+
+<section class="panel">
+    <h2>Driving For Dollars</h2>
+    {% if notice %}<p class="ok-line">{{ notice }}</p>{% endif %}
+    {% if error %}<p class="warn-line">{{ error }}</p>{% endif %}
+    <p>Slack intake format: <code>d4d 123 Main St, Newark, NJ 07102</code></p>
+    <p>New D4D properties are created in SIFT, tagged for D4D monitoring, and auto skip-traced so owner data is loaded when possible.</p>
+    <form id="d4dFilterForm" method="get" class="grid-form compact">
+        <label>Status
+            <select id="d4dStatusFilter" name="status">
+                <option value="">All</option>
+                {% for s in ['Untouched','Interested','Not Interested','Sold','Listed','DNC','Opt Out','Follow Up'] %}
+                <option value="{{ s }}" {% if status_filter == s %}selected{% endif %}>{{ s }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>Search Address <input id="d4dAddressSearch" name="q" value="{{ q }}" placeholder="e.g. Main St, West Orange"></label>
+    </form>
+
+    <table>
+        <thead><tr><th>Property</th><th>Owner</th><th>Status</th><th>Added</th><th>Source</th><th></th></tr></thead>
+        <tbody>
+            {% for p in properties %}
+            <tr>
+                <td>{{ p.street }}, {{ p.city }}, {{ p.state }} {{ p.postal_code }}</td>
+                <td>
+                    {% if p.owner_person_id %}
+                    {{ p.owner_first }} {{ p.owner_middle or '' }} {{ p.owner_last }}
+                    {% else %}
+                    <span class="warn-line">No owner yet</span>
+                    {% endif %}
+                </td>
+                <td><span class="pill">{{ p.status }}</span></td>
+                <td>{{ p.d4d_added_at or p.created_at }}</td>
+                <td>{{ p.d4d_source or '-' }}{% if p.d4d_added_by %}<br><small>{{ p.d4d_added_by }}</small>{% endif %}</td>
+                <td><a href="{{ url_for('property_detail', property_id=p.id) }}">Open</a></td>
+            </tr>
+            {% endfor %}
+            {% if not properties %}
+            <tr><td colspan="6">No D4D leads yet.</td></tr>
+            {% endif %}
+        </tbody>
+    </table>
+</section>
+
+<script>
+const d4dFilterForm = document.getElementById('d4dFilterForm');
+const d4dStatusFilter = document.getElementById('d4dStatusFilter');
+const d4dAddressSearch = document.getElementById('d4dAddressSearch');
+if (d4dStatusFilter) d4dStatusFilter.addEventListener('change', () => d4dFilterForm.requestSubmit());
+if (d4dAddressSearch) {
+    d4dAddressSearch.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            d4dFilterForm.requestSubmit();
+        }
+    });
+}
+</script>
+{% endblock %}

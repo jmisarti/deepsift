@@ -6224,6 +6224,27 @@ def send_agent_ops_notification(db, text, blocks=None, channel=""):
     return {"ok": True}
 
 
+def send_slack_response_url(response_url, text, response_type="in_channel", replace_original=False):
+    target = (response_url or "").strip()
+    if not target:
+        return {"ok": False, "error": "Slack response_url missing"}
+    payload = {
+        "response_type": response_type or "in_channel",
+        "text": (text or "").strip() or "Notification",
+    }
+    if replace_original:
+        payload["replace_original"] = True
+    response = requests.post(
+        target,
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=15,
+    )
+    if not response.ok:
+        raise ValueError(f"Slack response_url failed ({response.status_code}): {response.text}")
+    return {"ok": True}
+
+
 def verify_slack_signature(req, signing_secret):
     secret = (signing_secret or "").strip()
     if not secret:
@@ -16170,6 +16191,187 @@ def run_property_skip_trace_lookup(db, property_id):
     }
 
 
+def build_d4d_property_url(base_url, property_id):
+    root = (base_url or "").strip().rstrip("/")
+    return f"{root}/property/{int(property_id)}" if root else f"/property/{int(property_id)}"
+
+
+def build_d4d_dashboard_url(base_url):
+    root = (base_url or "").strip().rstrip("/")
+    return f"{root}/d4d" if root else "/d4d"
+
+
+def build_d4d_completion_lines(db, property_id, intake, parsed, skip_trace_result=None, skip_trace_error="", base_url=""):
+    prop_row = db.execute(
+        """
+        SELECT p.id,
+               p.status,
+               p.owner_person_id,
+               a.street,
+               a.city,
+               a.state,
+               a.postal_code,
+               op.first_name AS owner_first,
+               op.middle_name AS owner_middle,
+               op.last_name AS owner_last
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        LEFT JOIN people op ON op.id = p.owner_person_id
+        WHERE p.id = ?
+        """,
+        (property_id,),
+    ).fetchone()
+
+    owner_name = ""
+    owner_phone_numbers = []
+    if prop_row and prop_row["owner_person_id"]:
+        owner_name = " ".join(
+            [
+                x
+                for x in [
+                    (prop_row["owner_first"] or "").strip(),
+                    (prop_row["owner_middle"] or "").strip(),
+                    (prop_row["owner_last"] or "").strip(),
+                ]
+                if x
+            ]
+        ).strip()
+        owner_phone_numbers = [
+            format_phone_display(number)
+            for number in get_display_phone_numbers_for_person(db, prop_row["owner_person_id"])
+        ]
+
+    address_line = format_property_address_line(
+        parsed.get("street"),
+        parsed.get("city"),
+        parsed.get("state"),
+        parsed.get("postal_code"),
+    )
+    property_url = build_d4d_property_url(base_url, property_id)
+    d4d_url = build_d4d_dashboard_url(base_url)
+
+    if intake.get("created"):
+        headline = f"New D4D lead created in SIFT as property #{property_id}."
+    elif intake.get("marked_for_d4d"):
+        headline = f"Existing property #{property_id} found in SIFT and added to D4D."
+    else:
+        headline = f"Property #{property_id} already exists in SIFT and is already tracked in D4D."
+
+    lines = [
+        headline,
+        f"Address: {address_line}",
+        f"Status: {(prop_row['status'] if prop_row else 'Untouched') or 'Untouched'}",
+    ]
+    if skip_trace_result and owner_name:
+        lines.append(f"Retrieve complete. Owner: {owner_name}")
+    elif skip_trace_result:
+        lines.append("Retrieve complete.")
+    elif skip_trace_error:
+        lines.append(f"Retrieve failed: {skip_trace_error}")
+    elif owner_name:
+        lines.append(f"Owner already on file: {owner_name}")
+    if owner_phone_numbers:
+        lines.append(f"Phones: {', '.join(owner_phone_numbers[:5])}")
+    elif owner_name:
+        lines.append("Phones: none on file yet.")
+    lines.append(f"SIFT record: <{property_url}|Open property #{property_id}>")
+    lines.append(f"D4D queue: <{d4d_url}|Open D4D queue>")
+    return lines
+
+
+def process_d4d_slack_intake(response_url, address_text, raw_text="", added_by="", base_url=""):
+    db = open_sqlite_connection()
+    try:
+        parsed = parse_freeform_property_address(address_text)
+        intake = ensure_property_in_d4d(
+            db,
+            parsed,
+            added_by=added_by,
+            source="Slack D4D",
+            raw_input=raw_text,
+        )
+        commit_with_retry(db)
+
+        skip_trace_result = None
+        skip_trace_error = ""
+        should_skip_trace = bool(intake.get("created")) or not intake.get("owner_person_id")
+        if should_skip_trace:
+            try:
+                skip_trace_result = run_property_skip_trace_lookup(db, intake["property_id"])
+                commit_with_retry(db)
+            except Exception as exc:
+                db.rollback()
+                skip_trace_error = str(exc)
+                existing = db.execute("SELECT notes, owner_person_id FROM properties WHERE id = ?", (intake["property_id"],)).fetchone()
+                db.execute(
+                    "UPDATE properties SET notes = ? WHERE id = ?",
+                    (
+                        append_note_line(
+                            existing["notes"] if existing else "",
+                            f"D4D auto skip trace failed: {skip_trace_error}",
+                        ),
+                        intake["property_id"],
+                    ),
+                )
+                db.execute(
+                    """
+                    INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intake["property_id"],
+                        existing["owner_person_id"] if existing else None,
+                        "D4D Intake",
+                        "Property auto skip trace failed",
+                        json.dumps({"error": skip_trace_error, "address": parsed, "raw_input": raw_text}),
+                    ),
+                )
+                commit_with_retry(db)
+
+        lines = build_d4d_completion_lines(
+            db,
+            intake["property_id"],
+            intake,
+            parsed,
+            skip_trace_result=skip_trace_result,
+            skip_trace_error=skip_trace_error,
+            base_url=base_url,
+        )
+        if response_url:
+            send_slack_response_url(response_url, "\n".join(lines), response_type="in_channel", replace_original=True)
+        return {"ok": True, "property_id": intake["property_id"], "lines": lines}
+    except Exception as exc:
+        db.rollback()
+        message = (
+            f"Could not add D4D lead: {exc}\n"
+            "Use `d4d 123 Main St, Newark, NJ 07102` or `d4d 123 Main St Newark NJ`."
+        )
+        if response_url:
+            try:
+                send_slack_response_url(response_url, message, response_type="in_channel", replace_original=True)
+            except Exception:
+                pass
+        return {"ok": False, "error": str(exc), "message": message}
+    finally:
+        db.close()
+
+
+def launch_d4d_slack_intake(response_url, address_text, raw_text="", added_by="", base_url=""):
+    worker = threading.Thread(
+        target=process_d4d_slack_intake,
+        kwargs={
+            "response_url": response_url,
+            "address_text": address_text,
+            "raw_text": raw_text,
+            "added_by": added_by,
+            "base_url": base_url,
+        },
+        daemon=True,
+    )
+    worker.start()
+    return worker
+
+
 def build_market_status_helper(address_text):
     address = " ".join((address_text or "").strip().split())
     if not address:
@@ -24070,6 +24272,8 @@ def slack_command_webhook():
     cmd = (request.form.get("command") or "").strip()
     user_name = (request.form.get("user_name") or "").strip()
     user_id = (request.form.get("user_id") or "").strip()
+    response_url = (request.form.get("response_url") or "").strip()
+    base_url = (request.url_root or "").strip().rstrip("/")
     low = text.lower()
     tokens = [t for t in re.split(r"\s+", low) if t]
     sub = tokens[0] if tokens else "help"
@@ -24093,133 +24297,41 @@ def slack_command_webhook():
         if not address_text:
             return jsonify(
                 {
-                    "response_type": "ephemeral",
+                    "response_type": "in_channel",
                     "text": "Use `d4d 123 Main St, Newark, NJ 07102` or `d4d 123 Main St Newark NJ`.",
                 }
             )
-        try:
-            parsed = parse_freeform_property_address(address_text)
-            intake = ensure_property_in_d4d(
-                db,
-                parsed,
+        if response_url:
+            launch_d4d_slack_intake(
+                response_url=response_url,
+                address_text=address_text,
+                raw_text=text,
                 added_by=user_name or user_id,
-                source="Slack D4D",
-                raw_input=text,
+                base_url=base_url,
             )
-            commit_with_retry(db)
-
-            skip_trace_result = None
-            skip_trace_error = ""
-            should_skip_trace = bool(intake.get("created")) or not intake.get("owner_person_id")
-            if should_skip_trace:
-                try:
-                    skip_trace_result = run_property_skip_trace_lookup(db, intake["property_id"])
-                    commit_with_retry(db)
-                except Exception as exc:
-                    db.rollback()
-                    skip_trace_error = str(exc)
-                    existing = db.execute("SELECT notes, owner_person_id FROM properties WHERE id = ?", (intake["property_id"],)).fetchone()
-                    db.execute(
-                        "UPDATE properties SET notes = ? WHERE id = ?",
-                        (
-                            append_note_line(
-                                existing["notes"] if existing else "",
-                                f"D4D auto skip trace failed: {skip_trace_error}",
-                            ),
-                            intake["property_id"],
-                        ),
-                    )
-                    db.execute(
-                        """
-                        INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            intake["property_id"],
-                            existing["owner_person_id"] if existing else None,
-                            "D4D Intake",
-                            "Property auto skip trace failed",
-                            json.dumps({"error": skip_trace_error, "address": parsed, "raw_input": text}),
-                        ),
-                    )
-                    commit_with_retry(db)
-
-            prop_row = db.execute(
-                """
-                SELECT p.id,
-                       p.status,
-                       p.owner_person_id,
-                       a.street,
-                       a.city,
-                       a.state,
-                       a.postal_code,
-                       op.first_name AS owner_first,
-                       op.middle_name AS owner_middle,
-                       op.last_name AS owner_last
-                FROM properties p
-                JOIN addresses a ON a.id = p.property_address_id
-                LEFT JOIN people op ON op.id = p.owner_person_id
-                WHERE p.id = ?
-                """,
-                (intake["property_id"],),
-            ).fetchone()
-            owner_name = ""
-            owner_phone_numbers = []
-            if prop_row and prop_row["owner_person_id"]:
-                owner_name = " ".join(
-                    [
-                        x
-                        for x in [
-                            (prop_row["owner_first"] or "").strip(),
-                            (prop_row["owner_middle"] or "").strip(),
-                            (prop_row["owner_last"] or "").strip(),
-                        ]
-                        if x
-                    ]
-                ).strip()
-                owner_phone_numbers = get_display_phone_numbers_for_person(db, prop_row["owner_person_id"])
-            property_url = url_for("property_detail", property_id=intake["property_id"], _external=True)
-            d4d_url = url_for("d4d_dashboard", _external=True)
-            address_line = format_property_address_line(
-                parsed["street"],
-                parsed["city"],
-                parsed["state"],
-                parsed["postal_code"],
-            )
-            if intake.get("created"):
-                headline = f"New D4D lead created in SIFT as property #{intake['property_id']}."
-            elif intake.get("marked_for_d4d"):
-                headline = f"Existing property #{intake['property_id']} found in SIFT and added to D4D."
-            else:
-                headline = f"Property #{intake['property_id']} already exists in SIFT and is already tracked in D4D."
-            lines = [
-                headline,
-                f"Address: {address_line}",
-                f"Status: {(prop_row['status'] if prop_row else 'Untouched') or 'Untouched'}",
-            ]
-            if skip_trace_result and owner_name:
-                lines.append(f"Auto skip trace complete. Owner: {owner_name}")
-            elif skip_trace_result:
-                lines.append("Auto skip trace complete.")
-            elif skip_trace_error:
-                lines.append(f"Auto skip trace failed: {skip_trace_error}")
-            elif owner_name:
-                lines.append(f"Owner already on file: {owner_name}")
-            if owner_phone_numbers:
-                lines.append(f"Phones: {', '.join(owner_phone_numbers[:5])}")
-            elif owner_name:
-                lines.append("Phones: none on file yet.")
-            lines.append(f"Open lead: <{property_url}|Property #{intake['property_id']}>")
-            lines.append(f"D4D dashboard: <{d4d_url}|Open D4D queue>")
-            return jsonify({"response_type": "ephemeral", "text": "\n".join(lines)})
-        except Exception as exc:
-            db.rollback()
             return jsonify(
                 {
-                    "response_type": "ephemeral",
-                    "text": f"Could not add D4D lead: {exc}\nUse `d4d 123 Main St, Newark, NJ 07102` or `d4d 123 Main St Newark NJ`.",
+                    "response_type": "in_channel",
+                    "text": (
+                        "D4D intake started.\n"
+                        f"Address received: {address_text}\n"
+                        "Checking SIFT, retrieving owner details if needed, and I’ll update this message when it finishes."
+                    ),
                 }
             )
+        result = process_d4d_slack_intake(
+            response_url="",
+            address_text=address_text,
+            raw_text=text,
+            added_by=user_name or user_id,
+            base_url=base_url,
+        )
+        return jsonify(
+            {
+                "response_type": "in_channel",
+                "text": "\n".join(result.get("lines") or [result.get("message") or "D4D intake finished."]),
+            }
+        )
     if sub in {"status", "overview"}:
         snap = build_agent_advisor_snapshot(db, window_hours=72)
         signals = snap.get("signals", {})

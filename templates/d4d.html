@@ -26,7 +26,7 @@
     </form>
 
     <table>
-        <thead><tr><th>Property</th><th>Owner</th><th>Status</th><th>Added</th><th>Source</th><th></th></tr></thead>
+        <thead><tr><th>Property</th><th>Owner</th><th>Status</th><th>Added</th><th>Source</th><th>SIFT Record</th></tr></thead>
         <tbody>
             {% for p in properties %}
             <tr>
@@ -41,7 +41,7 @@
                 <td><span class="pill">{{ p.status }}</span></td>
                 <td>{{ p.d4d_added_at or p.created_at }}</td>
                 <td>{{ p.d4d_source or '-' }}{% if p.d4d_added_by %}<br><small>{{ p.d4d_added_by }}</small>{% endif %}</td>
-                <td><a href="{{ url_for('property_detail', property_id=p.id) }}">Open</a></td>
+                <td><a href="{{ url_for('property_detail', property_id=p.id, _external=True) }}" target="_blank">Open property #{{ p.id }}</a></td>
             </tr>
             {% endfor %}
             {% if not properties %}

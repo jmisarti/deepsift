@@ -300,6 +300,10 @@ ADDRESS_TOKEN_NORMALIZATION = {
     "southeast": "se",
     "southwest": "sw",
 }
+ADDRESS_STREET_SUFFIX_RE = (
+    r"(?:st|street|ave|avenue|rd|road|dr|drive|ln|lane|ct|court|blvd|boulevard|"
+    r"pl|place|ter|terrace|pkwy|parkway|cir|circle|way|trl|trail|hwy|highway)"
+)
 
 AGENT_DEFINITIONS = [
     {
@@ -1428,6 +1432,25 @@ def normalize_address_match_text(value):
     return " ".join(tokens)
 
 
+def split_freeform_street_city(raw_text):
+    text = normalize_whitespace(raw_text).strip(",")
+    if not text:
+        return "", ""
+
+    comma_parts = [normalize_whitespace(part) for part in text.split(",") if normalize_whitespace(part)]
+    if len(comma_parts) >= 2:
+        return comma_parts[0], " ".join(comma_parts[1:])
+
+    match = re.match(
+        rf"^(?P<street>.+?\b{ADDRESS_STREET_SUFFIX_RE}\b(?:\s+(?:apt|unit|suite|ste|#)\s*[\w-]+)?(?:\s+(?:n|s|e|w|ne|nw|se|sw))?)(?:\s+)(?P<city>[A-Za-z].+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return normalize_whitespace(match.group("street")), normalize_whitespace(match.group("city"))
+    return "", ""
+
+
 def format_property_address_line(street, city, state, postal_code):
     parts = [normalize_whitespace(street), normalize_whitespace(city)]
     tail = " ".join([x for x in [normalize_state_code(state) or normalize_whitespace(state), normalize_postal_code(postal_code)] if x])
@@ -1478,13 +1501,37 @@ def parse_freeform_property_address(raw_text):
         city = normalize_whitespace(match.group("city"))
         state = normalize_state_code(match.group("state"))
         postal_code = normalize_postal_code(match.group("postal") or "")
-    else:
-        raise ValueError("Use address format `Street, City, ST ZIP`.")
+    if not street or not city or not state:
+        body = text
+        trailing_zip = re.search(r"\b\d{5}(?:-\d{4})?$", body)
+        if trailing_zip:
+            postal_code = normalize_postal_code(trailing_zip.group(0))
+            body = normalize_whitespace(body[:trailing_zip.start()].strip(" ,"))
+
+        tokens = body.split()
+        trailing_state = ""
+        for token_count in (3, 2, 1):
+            if len(tokens) < token_count + 2:
+                continue
+            candidate = " ".join(tokens[-token_count:])
+            state_code = normalize_state_code(candidate)
+            if not state_code:
+                continue
+            trailing_state = state_code
+            body = normalize_whitespace(" ".join(tokens[:-token_count]).strip(" ,"))
+            break
+
+        if trailing_state:
+            street_guess, city_guess = split_freeform_street_city(body)
+            if street_guess and city_guess:
+                street = street_guess
+                city = city_guess
+                state = trailing_state
 
     street = normalize_whitespace(street)
     city = normalize_whitespace(city)
     if not street or not city or not state:
-        raise ValueError("Could not parse address. Use `Street, City, ST ZIP`.")
+        raise ValueError("Could not parse address. Try `123 Main St, Newark, NJ` or `123 Main St Newark NJ`.")
     return {
         "street": street,
         "city": city,
@@ -5131,6 +5178,46 @@ def get_manual_sms_targets_for_person(db, person_id):
             continue
         if not is_sms_touchpoint_allowed(r["channel_label"], r["status"]):
             continue
+        keep.append(value)
+    return keep
+
+
+def get_display_phone_numbers_for_person(db, person_id):
+    rows = db.execute(
+        """
+        SELECT value, channel_label
+        FROM touchpoints
+        WHERE person_id = ? AND lower(channel_type) = 'phone' AND trim(COALESCE(value,'')) <> ''
+        ORDER BY
+            CASE
+                WHEN lower(COALESCE(channel_label,'')) = 'mobile' THEN 0
+                WHEN lower(COALESCE(channel_label,'')) = 'unknown' THEN 1
+                WHEN lower(COALESCE(channel_label,'')) = 'voip' THEN 2
+                WHEN lower(COALESCE(channel_label,'')) = 'landline' THEN 3
+                ELSE 4
+            END,
+            id DESC
+        """,
+        (person_id,),
+    ).fetchall()
+
+    keep = []
+    seen = set()
+
+    primary_row = db.execute("SELECT primary_phone FROM people WHERE id = ?", (person_id,)).fetchone()
+    primary_phone = (primary_row["primary_phone"] or "").strip() if primary_row else ""
+    if primary_phone:
+        primary_norm = normalize_phone(primary_phone)
+        if primary_norm:
+            keep.append(primary_phone)
+            seen.add(primary_norm)
+
+    for row in rows:
+        value = (row["value"] or "").strip()
+        norm = normalize_phone(value)
+        if not value or not norm or norm in seen:
+            continue
+        seen.add(norm)
         keep.append(value)
     return keep
 
@@ -23995,7 +24082,7 @@ def slack_command_webhook():
                     "• `status` - agent pipeline snapshot\n"
                     "• `queue` - pending Agent 2 actions\n"
                     "• `unresolved` - unresolved lead-watch items\n"
-                    "• `d4d <street>, <city>, <state> <zip>` - add or flag a Driving For Dollars lead\n"
+                    "• `d4d <address>` - add or flag a Driving For Dollars lead\n"
                     "• `health` - agent endpoint health\n"
                     "• `help` - command list"
                 ),
@@ -24007,7 +24094,7 @@ def slack_command_webhook():
             return jsonify(
                 {
                     "response_type": "ephemeral",
-                    "text": "Use `d4d 123 Main St, Newark, NJ 07102`.",
+                    "text": "Use `d4d 123 Main St, Newark, NJ 07102` or `d4d 123 Main St Newark NJ`.",
                 }
             )
         try:
@@ -24077,6 +24164,7 @@ def slack_command_webhook():
                 (intake["property_id"],),
             ).fetchone()
             owner_name = ""
+            owner_phone_numbers = []
             if prop_row and prop_row["owner_person_id"]:
                 owner_name = " ".join(
                     [
@@ -24089,6 +24177,7 @@ def slack_command_webhook():
                         if x
                     ]
                 ).strip()
+                owner_phone_numbers = get_display_phone_numbers_for_person(db, prop_row["owner_person_id"])
             property_url = url_for("property_detail", property_id=intake["property_id"], _external=True)
             d4d_url = url_for("d4d_dashboard", _external=True)
             address_line = format_property_address_line(
@@ -24116,6 +24205,10 @@ def slack_command_webhook():
                 lines.append(f"Auto skip trace failed: {skip_trace_error}")
             elif owner_name:
                 lines.append(f"Owner already on file: {owner_name}")
+            if owner_phone_numbers:
+                lines.append(f"Phones: {', '.join(owner_phone_numbers[:5])}")
+            elif owner_name:
+                lines.append("Phones: none on file yet.")
             lines.append(f"Open lead: <{property_url}|Property #{intake['property_id']}>")
             lines.append(f"D4D dashboard: <{d4d_url}|Open D4D queue>")
             return jsonify({"response_type": "ephemeral", "text": "\n".join(lines)})
@@ -24124,7 +24217,7 @@ def slack_command_webhook():
             return jsonify(
                 {
                     "response_type": "ephemeral",
-                    "text": f"Could not add D4D lead: {exc}\nUse `d4d 123 Main St, Newark, NJ 07102`.",
+                    "text": f"Could not add D4D lead: {exc}\nUse `d4d 123 Main St, Newark, NJ 07102` or `d4d 123 Main St Newark NJ`.",
                 }
             )
     if sub in {"status", "overview"}:

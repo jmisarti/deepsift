@@ -11,7 +11,7 @@
     <h2>Driving For Dollars</h2>
     {% if notice %}<p class="ok-line">{{ notice }}</p>{% endif %}
     {% if error %}<p class="warn-line">{{ error }}</p>{% endif %}
-    <p>Slack intake format: <code>d4d 123 Main St, Newark, NJ 07102</code></p>
+    <p>Slack intake format: <code>d4d 123 Main St, Newark, NJ 07102</code> or <code>d4d 123 Main St Newark NJ</code>. Zip is optional.</p>
     <p>New D4D properties are created in SIFT, tagged for D4D monitoring, and auto skip-traced so owner data is loaded when possible.</p>
     <form id="d4dFilterForm" method="get" class="grid-form compact">
         <label>Status

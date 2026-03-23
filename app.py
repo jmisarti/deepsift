@@ -3393,8 +3393,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
     primary_owner_id = prop["owner_person_id"] if prop else None
     owners_created = 0
     co_owner_links = 0
-    synced_phone_items = []
-    synced_email_items = []
+    processed_owner_ids = set()
 
     for idx, owner_entry in enumerate(property_payload.get("owners") or []):
         person_payload = owner_entry.get("person") or {}
@@ -3415,6 +3414,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
             last,
             notes=f"Imported from SkipSherpa property lookup for property {property_id}",
         )
+        processed_owner_ids.add(int(owner_person_id))
         if full_name:
             db.execute(
                 "UPDATE people SET notes = trim(coalesce(notes,'') || ' ' || ?) WHERE id = ?",
@@ -3496,7 +3496,6 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                 email,
                 source="skipsherpa_property_owner",
             )
-            synced_email_items.append(email)
 
         for ph in person_payload.get("phone_numbers") or []:
             number = (ph.get("e164_format") or ph.get("local_format") or "").strip()
@@ -3517,7 +3516,6 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                     "",
                 ),
             )
-            synced_phone_items.append({"number": number, "type": _reisift_phone_type_from_touchpoint(label)})
 
         if primary_owner_id is None:
             db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (owner_person_id, property_id))
@@ -3562,11 +3560,15 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
         ),
     )
 
+    sync_phone_items, sync_email_items = collect_person_contact_items_for_reisift_sync(
+        db,
+        sorted(processed_owner_ids or ([primary_owner_id] if primary_owner_id else [])),
+    )
     skiptrace_sync = sync_skiptrace_contacts_to_reisift_owner(
         db,
         property_id,
-        phone_items=synced_phone_items,
-        email_items=synced_email_items,
+        phone_items=sync_phone_items,
+        email_items=sync_email_items,
     )
 
     return {
@@ -4515,30 +4517,10 @@ def import_skipsherpa_person_result(db, property_id, person_id, lookup_response)
     )
     cleanup_person_contact_and_relationship_duplicates(db, person_id)
 
-    sync_phone_items = []
-    sync_email_items = []
-    if touched_person_ids:
-        placeholders = ",".join(["?"] * len(touched_person_ids))
-        tp_rows = db.execute(
-            f"""
-            SELECT person_id, channel_type, channel_label, value
-            FROM touchpoints
-            WHERE person_id IN ({placeholders})
-              AND lower(channel_type) IN ('phone', 'email')
-            """,
-            tuple(sorted(touched_person_ids)),
-        ).fetchall()
-        for tp in tp_rows:
-            ctype = str(tp["channel_type"] or "").strip().lower()
-            if ctype == "phone":
-                sync_phone_items.append(
-                    {
-                        "number": str(tp["value"] or "").strip(),
-                        "type": _reisift_phone_type_from_touchpoint(tp["channel_label"]),
-                    }
-                )
-            elif ctype == "email":
-                sync_email_items.append(str(tp["value"] or "").strip())
+    sync_phone_items, sync_email_items = collect_person_contact_items_for_reisift_sync(
+        db,
+        sorted(touched_person_ids),
+    )
     skiptrace_sync = sync_skiptrace_contacts_to_reisift_owner(
         db,
         property_id,
@@ -14558,6 +14540,84 @@ def _property_address_string(db, property_id):
     ).strip(", ").strip()
 
 
+def collect_person_contact_items_for_reisift_sync(db, person_ids):
+    clean_ids = []
+    seen_ids = set()
+    for pid in person_ids or []:
+        try:
+            val = int(pid or 0)
+        except Exception:
+            continue
+        if val <= 0 or val in seen_ids:
+            continue
+        seen_ids.add(val)
+        clean_ids.append(val)
+
+    if not clean_ids:
+        return [], []
+
+    phone_items = []
+    email_items = []
+    seen_phone = set()
+    seen_email = set()
+    placeholders = ",".join(["?"] * len(clean_ids))
+
+    people_rows = db.execute(
+        f"""
+        SELECT id, primary_phone, primary_email
+        FROM people
+        WHERE id IN ({placeholders})
+        """,
+        tuple(clean_ids),
+    ).fetchall()
+    for row in people_rows:
+        primary_phone = str(row["primary_phone"] or "").strip()
+        primary_email = str(row["primary_email"] or "").strip()
+        phone_norm = normalize_phone(primary_phone)
+        email_norm = primary_email.lower()
+        if phone_norm and phone_norm not in seen_phone:
+            seen_phone.add(phone_norm)
+            phone_items.append({"number": primary_phone, "type": "UNKNOWN"})
+        if primary_email and email_norm not in seen_email:
+            seen_email.add(email_norm)
+            email_items.append(primary_email)
+
+    tp_rows = db.execute(
+        f"""
+        SELECT person_id, channel_type, channel_label, value
+        FROM touchpoints
+        WHERE person_id IN ({placeholders})
+          AND lower(channel_type) IN ('phone', 'email')
+        ORDER BY id ASC
+        """,
+        tuple(clean_ids),
+    ).fetchall()
+    for tp in tp_rows:
+        ctype = str(tp["channel_type"] or "").strip().lower()
+        value = str(tp["value"] or "").strip()
+        if not value:
+            continue
+        if ctype == "phone":
+            phone_norm = normalize_phone(value)
+            if not phone_norm or phone_norm in seen_phone:
+                continue
+            seen_phone.add(phone_norm)
+            phone_items.append(
+                {
+                    "number": value,
+                    "type": _reisift_phone_type_from_touchpoint(tp["channel_label"]),
+                }
+            )
+        elif ctype == "email":
+            email_norm = value.lower()
+            if email_norm in seen_email:
+                continue
+            seen_email.add(email_norm)
+            email_items.append(value)
+
+    return phone_items, email_items
+
+
 def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, email_items=None):
     property_id = int(property_id or 0)
     phones_in = phone_items if isinstance(phone_items, list) else []
@@ -18774,6 +18834,7 @@ def d4d_dashboard():
                p.notes,
                p.created_at,
                p.owner_person_id,
+               p.reisift_property_uuid,
                p.d4d_added_at,
                p.d4d_added_by,
                p.d4d_source,
@@ -18808,6 +18869,7 @@ def d4d_dashboard():
         q=q,
         notice=notice,
         error=error,
+        sift_record_url=_sift_record_url,
     )
 
 
@@ -22211,6 +22273,7 @@ def property_detail(property_id):
     return render_template(
         "property_detail.html",
         prop=prop,
+        sift_record_url=_sift_record_url,
         owner=owner,
         owner_touchpoints=owner_touchpoints,
         owner_primary_phone=owner_primary_phone,

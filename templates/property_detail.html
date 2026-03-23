@@ -33,7 +33,14 @@
         <span>No owner record yet. Run <strong>Skip Trace Property (Owners)</strong> to load owner information.</span>
         {% endif %}
     </p>
-    <p><strong>SIFT Record Link:</strong> <a href="{{ url_for('property_detail', property_id=prop.id, _external=True) }}" target="_blank">Open direct record link</a></p>
+    <p>
+        <strong>SIFT Record Link:</strong>
+        {% if prop.reisift_property_uuid %}
+        <a href="{{ sift_record_url(prop.reisift_property_uuid) }}" target="_blank" rel="noopener noreferrer">Open ReiSift record</a>
+        {% else %}
+        <span>No ReiSift record linked yet.</span>
+        {% endif %}
+    </p>
     <p><strong>Last Sold Date:</strong> {{ prop.attom_last_sold_date or '-' }}</p>
     <p><strong>Last Sale Price:</strong> {% if prop.attom_last_sold_price is not none %}${{ "{:,.0f}".format(prop.attom_last_sold_price) }}{% else %}-{% endif %}</p>
     <h4>Confirmed / Verified Contacts</h4>

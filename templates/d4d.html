@@ -41,7 +41,13 @@
                 <td><span class="pill">{{ p.status }}</span></td>
                 <td>{{ p.d4d_added_at or p.created_at }}</td>
                 <td>{{ p.d4d_source or '-' }}{% if p.d4d_added_by %}<br><small>{{ p.d4d_added_by }}</small>{% endif %}</td>
-                <td><a href="{{ url_for('property_detail', property_id=p.id, _external=True) }}" target="_blank">Open property #{{ p.id }}</a></td>
+                <td>
+                    {% if p.reisift_property_uuid %}
+                    <a href="{{ sift_record_url(p.reisift_property_uuid) }}" target="_blank" rel="noopener noreferrer">Open ReiSift record</a>
+                    {% else %}
+                    <span>-</span>
+                    {% endif %}
+                </td>
             </tr>
             {% endfor %}
             {% if not properties %}

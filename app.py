@@ -3394,6 +3394,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
     owners_created = 0
     co_owner_links = 0
     processed_owner_ids = set()
+    now_stamp = datetime.now(EST_TZ).strftime("%Y-%m-%d %I:%M %p ET")
 
     for idx, owner_entry in enumerate(property_payload.get("owners") or []):
         person_payload = owner_entry.get("person") or {}
@@ -3480,20 +3481,13 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                 email = (em.get("email_address") or "").strip()
             else:
                 email = str(em or "").strip()
-            if not email or touchpoint_exists(db, owner_person_id, "Email", email):
+            if not email:
                 continue
-            cur = db.execute(
-                """
-                INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
-                VALUES (?, 'Email', 'Email', ?, 'Unknown', ?, ?)
-                """,
-                (owner_person_id, email, "Imported from SkipSherpa property owner payload", ""),
-            )
-            queue_touchpoint_email_validation(
+            upsert_email_touchpoint_and_queue_validation(
                 db,
-                cur.lastrowid,
                 owner_person_id,
                 email,
+                note="Imported from SkipSherpa property owner payload",
                 source="skipsherpa_property_owner",
             )
 
@@ -3559,7 +3553,6 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
             json.dumps(lookup_pkg),
         ),
     )
-
     sync_phone_items, sync_email_items = collect_person_contact_items_for_reisift_sync(
         db,
         sorted(processed_owner_ids or ([primary_owner_id] if primary_owner_id else [])),
@@ -3570,6 +3563,24 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
         phone_items=sync_phone_items,
         email_items=sync_email_items,
     )
+    if primary_owner_id:
+        add_person_note(
+            db,
+            primary_owner_id,
+            "SkipSherpa Property",
+            f"Property owner skip trace completed on {now_stamp} for Property {property_id}.",
+            {
+                "summary": {
+                    "owners_processed": owners_created,
+                    "co_owner_links": co_owner_links,
+                    "attom_last_sold_date": last_sold_date,
+                    "attom_last_sold_price": last_sold_price,
+                    "reisift_contact_sync": skiptrace_sync,
+                },
+                "request": (lookup_pkg or {}).get("request") if isinstance(lookup_pkg, dict) else {},
+                "response": (lookup_pkg or {}).get("response") if isinstance(lookup_pkg, dict) else {},
+            },
+        )
 
     return {
         "owners_processed": owners_created,
@@ -3592,6 +3603,71 @@ def touchpoint_exists(db, person_id, channel_type, value):
         return any(normalize_phone(r["value"]) == target for r in rows)
     target = value.strip().lower()
     return any((r["value"] or "").strip().lower() == target for r in rows)
+
+
+def find_touchpoint_row_by_value(db, person_id, channel_type, value):
+    if not value:
+        return None
+    rows = db.execute(
+        "SELECT * FROM touchpoints WHERE person_id = ? AND lower(channel_type) = lower(?) ORDER BY id DESC",
+        (person_id, channel_type),
+    ).fetchall()
+    if str(channel_type or "").strip().lower() == "phone":
+        target = normalize_phone(value)
+        for row in rows:
+            if normalize_phone(row["value"]) == target:
+                return row
+        return None
+    target = normalize_email(value)
+    for row in rows:
+        if normalize_email(row["value"]) == target:
+            return row
+    return None
+
+
+def upsert_email_touchpoint_and_queue_validation(db, person_id, email_value, note="", source="manual_touchpoint"):
+    email = normalize_email(email_value)
+    if not person_id or not email:
+        return {"touchpoint_id": 0, "created": False, "queued": False}
+
+    existing = find_touchpoint_row_by_value(db, person_id, "Email", email)
+    if existing:
+        touchpoint_id = int(existing["id"])
+        merged_note = _append_touchpoint_note(existing["note"], note) if note else (existing["note"] or "")
+        db.execute(
+            """
+            UPDATE touchpoints
+            SET value = ?,
+                note = ?
+            WHERE id = ?
+            """,
+            (email, merged_note, touchpoint_id),
+        )
+        queue_touchpoint_email_validation(
+            db,
+            touchpoint_id,
+            person_id,
+            email,
+            source=source,
+        )
+        return {"touchpoint_id": touchpoint_id, "created": False, "queued": True}
+
+    cur = db.execute(
+        """
+        INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
+        VALUES (?, 'Email', 'Email', ?, 'Unknown', ?, ?)
+        """,
+        (person_id, email, note or "", ""),
+    )
+    touchpoint_id = int(cur.lastrowid or 0)
+    queue_touchpoint_email_validation(
+        db,
+        touchpoint_id,
+        person_id,
+        email,
+        source=source,
+    )
+    return {"touchpoint_id": touchpoint_id, "created": True, "queued": True}
 
 
 def _touchpoint_key(channel_type, value):
@@ -4250,23 +4326,17 @@ def import_skipsherpa_person_result(db, property_id, person_id, lookup_response)
 
         for em in payload_person.get("emails") or []:
             email = (em.get("email_address") or "").strip()
-            if not email or touchpoint_exists(db, target_person_id, "Email", email):
+            if not email:
                 continue
-            cur = db.execute(
-                """
-                INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
-                VALUES (?, 'Email', 'Email', ?, 'Unknown', ?, ?)
-                """,
-                (target_person_id, email, "Imported from SkipSherpa person lookup", ""),
-            )
-            queue_touchpoint_email_validation(
+            email_sync = upsert_email_touchpoint_and_queue_validation(
                 db,
-                cur.lastrowid,
                 target_person_id,
                 email,
+                note="Imported from SkipSherpa person lookup",
                 source="skipsherpa_person_lookup",
             )
-            emails_added += 1
+            if email_sync.get("created"):
+                emails_added += 1
 
         for a in payload_person.get("addresses") or []:
             us = a.get("us_address") or {}
@@ -5265,20 +5335,20 @@ def get_manual_email_targets_for_person(db, person_id):
         if status in BLOCKED_CONTACT_STATUSES:
             blocked.add(key)
             continue
-        if not is_likely_valid_email(value):
+        if not is_valid_email_format(value):
             continue
         keep.append(value)
     p = db.execute("SELECT primary_email FROM people WHERE id = ?", (person_id,)).fetchone()
     primary = (p["primary_email"] or "").strip() if p else ""
     pkey = primary.lower()
-    if primary and pkey not in seen and pkey not in blocked and is_likely_valid_email(primary):
+    if primary and pkey not in seen and pkey not in blocked and is_valid_email_format(primary):
         keep.append(primary)
     return keep
 
 
 def validate_email_recipient_for_person(db, person_id, to_email):
     email = (to_email or "").strip()
-    if not is_likely_valid_email(email):
+    if not is_valid_email_format(email):
         return False, "invalid email format"
     if not person_id:
         return True, ""
@@ -9319,13 +9389,21 @@ def extract_bounce_target_email(body_text, known_emails):
 EMAIL_RE = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.IGNORECASE)
 
 
-def is_likely_valid_email(raw):
+def is_valid_email_format(raw):
     email = (raw or "").strip()
     if not email or not EMAIL_RE.match(email):
         return False
     domain = email.split("@", 1)[1].strip().lower()
     if not domain or "." not in domain:
         return False
+    return True
+
+
+def is_likely_valid_email(raw):
+    email = (raw or "").strip()
+    if not is_valid_email_format(email):
+        return False
+    domain = email.split("@", 1)[1].strip().lower()
     try:
         socket.getaddrinfo(domain, 25)
     except Exception:
@@ -22584,21 +22662,32 @@ def add_person_address(person_id):
 def add_person_touchpoint(person_id):
     ensure_db()
     db = get_db()
-    db.execute(
-        """
-        INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
+    channel_type = request.form.get("channel_type", "Phone")
+    value = request.form.get("value", "")
+    if str(channel_type or "").strip().lower() == "email":
+        upsert_email_touchpoint_and_queue_validation(
+            db,
             person_id,
-            request.form.get("channel_type", "Phone"),
-            request.form.get("channel_label", ""),
-            request.form.get("value", ""),
-            request.form.get("status", "Pending"),
-            request.form.get("note", ""),
-            request.form.get("last_attempted", ""),
-        ),
-    )
+            value,
+            note=request.form.get("note", ""),
+            source="manual_touchpoint_form",
+        )
+    else:
+        db.execute(
+            """
+            INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                person_id,
+                channel_type,
+                request.form.get("channel_label", ""),
+                value,
+                request.form.get("status", "Pending"),
+                request.form.get("note", ""),
+                request.form.get("last_attempted", ""),
+            ),
+        )
     db.commit()
     return redirect(url_for("person_detail", person_id=person_id))
 
@@ -22864,15 +22953,26 @@ def add_person_touchpoint_api(person_id):
     if not value:
         return jsonify({"error": "value is required"}), 400
 
-    cur = db.execute(
-        """
-        INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (person_id, channel_type, channel_label, value, payload.get("status", "Unknown"), payload.get("note", ""), ""),
-    )
-    db.commit()
-    row = db.execute("SELECT * FROM touchpoints WHERE id = ?", (cur.lastrowid,)).fetchone()
+    if str(channel_type or "").strip().lower() == "email":
+        sync = upsert_email_touchpoint_and_queue_validation(
+            db,
+            person_id,
+            value,
+            note=payload.get("note", ""),
+            source="manual_touchpoint_api",
+        )
+        db.commit()
+        row = db.execute("SELECT * FROM touchpoints WHERE id = ?", (sync.get("touchpoint_id") or 0,)).fetchone()
+    else:
+        cur = db.execute(
+            """
+            INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (person_id, channel_type, channel_label, value, payload.get("status", "Unknown"), payload.get("note", ""), ""),
+        )
+        db.commit()
+        row = db.execute("SELECT * FROM touchpoints WHERE id = ?", (cur.lastrowid,)).fetchone()
     return jsonify(dict(row)), 201
 
 

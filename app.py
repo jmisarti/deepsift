@@ -795,6 +795,8 @@ def migrate_db(db):
     ensure_column(db, "person_relationships", "relationship_order", "relationship_order INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "properties", "attom_last_sold_date", "attom_last_sold_date TEXT")
     ensure_column(db, "properties", "attom_last_sold_price", "attom_last_sold_price REAL")
+    ensure_column(db, "properties", "reisift_property_uuid", "reisift_property_uuid TEXT")
+    ensure_column(db, "properties", "reisift_owner_uuid", "reisift_owner_uuid TEXT")
     ensure_column(db, "properties", "is_d4d", "is_d4d INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "properties", "d4d_added_at", "d4d_added_at TEXT")
     ensure_column(db, "properties", "d4d_added_by", "d4d_added_by TEXT")
@@ -1888,6 +1890,26 @@ def _set_local_property_uuid(db, property_id, property_uuid):
             SET reisift_property_uuid = ?
             WHERE id = ?
               AND (reisift_property_uuid IS NULL OR trim(reisift_property_uuid) = '')
+            """,
+            (uid, pid),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _set_local_owner_uuid(db, property_id, owner_uuid):
+    pid = int(property_id or 0)
+    uid = normalize_uuid(owner_uuid or "")
+    if pid <= 0 or not uid:
+        return False
+    try:
+        db.execute(
+            """
+            UPDATE properties
+            SET reisift_owner_uuid = ?
+            WHERE id = ?
+              AND (reisift_owner_uuid IS NULL OR trim(reisift_owner_uuid) = '')
             """,
             (uid, pid),
         )
@@ -16304,6 +16326,119 @@ def ensure_property_in_d4d(db, address, added_by="", source="Slack command", raw
     }
 
 
+def ensure_local_property_for_reisift_sync(
+    db,
+    property_uuid,
+    owner_uuid="",
+    address=None,
+    source="ReiSift one-off sync",
+    added_by="System",
+):
+    property_uuid = normalize_uuid(property_uuid or "")
+    owner_uuid = normalize_uuid(owner_uuid or "")
+    address = address or {}
+    street = normalize_whitespace(address.get("street"))
+    city = normalize_whitespace(address.get("city"))
+    state = normalize_state_code(address.get("state"))
+    postal_code = normalize_postal_code(address.get("postal_code"))
+    if not street or not city or not state:
+        raise ValueError("street, city, and state are required to create local property context")
+
+    property_id = None
+    if property_uuid and _table_has_column(db, "properties", "reisift_property_uuid"):
+        row = db.execute(
+            "SELECT id FROM properties WHERE reisift_property_uuid = ? ORDER BY id DESC LIMIT 1",
+            (property_uuid,),
+        ).fetchone()
+        if row:
+            property_id = int(row["id"])
+    if not property_id:
+        property_id = find_local_property_by_address(db, street, city, state, postal_code)
+
+    now_text = format_db_time(datetime.utcnow())
+    actor = normalize_whitespace(added_by) or "System"
+    property_note = f"Local property context created via {source} on {now_text} by {actor}."
+    payload = {
+        "reisift_property_uuid": property_uuid,
+        "reisift_owner_uuid": owner_uuid,
+        "address": {
+            "street": street,
+            "city": city,
+            "state": state,
+            "postal_code": postal_code,
+        },
+        "source": source,
+        "added_by": actor,
+    }
+
+    created = False
+    if property_id:
+        row = db.execute(
+            "SELECT notes, owner_person_id FROM properties WHERE id = ? LIMIT 1",
+            (property_id,),
+        ).fetchone()
+        db.execute(
+            "UPDATE properties SET notes = ? WHERE id = ?",
+            (append_note_line((row["notes"] if row else ""), property_note), property_id),
+        )
+        db.execute(
+            """
+            INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                property_id,
+                row["owner_person_id"] if row else None,
+                "ReiSift Sync Intake",
+                "Existing property linked for one-off sync",
+                json.dumps(payload),
+            ),
+        )
+    else:
+        address_id = create_address(db, street, city, state, postal_code)
+        cur = db.execute(
+            """
+            INSERT INTO properties (property_address_id, owner_person_id, resident_person_id, status, notes)
+            VALUES (?, NULL, NULL, ?, ?)
+            """,
+            (
+                address_id,
+                "Untouched",
+                property_note,
+            ),
+        )
+        property_id = int(cur.lastrowid or 0)
+        created = True
+        db.execute(
+            """
+            INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+            VALUES (?, NULL, ?, ?, ?)
+            """,
+            (
+                property_id,
+                "ReiSift Sync Intake",
+                "Local property created for one-off sync",
+                json.dumps(payload),
+            ),
+        )
+
+    if property_uuid:
+        _set_local_property_uuid(db, property_id, property_uuid)
+    if owner_uuid:
+        _set_local_owner_uuid(db, property_id, owner_uuid)
+
+    return {
+        "property_id": property_id,
+        "created": created,
+        "address": {
+            "street": street,
+            "city": city,
+            "state": state,
+            "postal_code": postal_code,
+        },
+    }
+
+
 def run_property_skip_trace_lookup(db, property_id):
     prop = db.execute(
         """
@@ -16326,6 +16461,52 @@ def run_property_skip_trace_lookup(db, property_id):
     return {
         "summary": summary,
         "raw": lookup_pkg.get("response") if isinstance(lookup_pkg, dict) else {},
+    }
+
+
+def run_reisift_uuid_skiptrace_sync(db, property_uuid, added_by="System", source="Integration one-off sync"):
+    property_uuid = normalize_uuid(property_uuid or "")
+    if not property_uuid:
+        raise ValueError("property_uuid is required")
+
+    token = reisift_get_access_token()
+    reisift_payload = fetch_reisift_property_payload(token, property_uuid)
+    owner_uuid = _reisift_find_owner_uuid(reisift_payload)
+    address = extract_payload_address(reisift_payload)
+    if not address.get("street") or not address.get("city"):
+        address = _reisift_find_first_address_dict(reisift_payload)
+    intake = ensure_local_property_for_reisift_sync(
+        db,
+        property_uuid,
+        owner_uuid=owner_uuid,
+        address=address,
+        source=source,
+        added_by=added_by,
+    )
+    property_id = int(intake["property_id"])
+    if property_uuid:
+        _set_local_property_uuid(db, property_id, property_uuid)
+    if owner_uuid:
+        _set_local_owner_uuid(db, property_id, owner_uuid)
+
+    lookup_pkg = call_skipsherpa_property_lookup(
+        street=intake["address"]["street"],
+        city=intake["address"]["city"],
+        state=intake["address"]["state"],
+        zipcode=intake["address"]["postal_code"],
+    )
+    summary = import_skipsherpa_property_result(db, property_id, lookup_pkg)
+    if owner_uuid:
+        _set_local_owner_uuid(db, property_id, owner_uuid)
+    return {
+        "property_id": property_id,
+        "local_created": bool(intake.get("created")),
+        "reisift_property_uuid": property_uuid,
+        "reisift_owner_uuid": owner_uuid,
+        "address": intake["address"],
+        "summary": summary,
+        "raw": lookup_pkg.get("response") if isinstance(lookup_pkg, dict) else {},
+        "reisift_record_url": _sift_record_url(property_uuid),
     }
 
 
@@ -21117,6 +21298,39 @@ def integrations_reisift_create_property_api():
         )
         db.commit()
         return jsonify({"ok": False, "error": err_text}), 500
+
+
+@app.route("/api/integrations/reisift/skiptrace-sync", methods=["POST"])
+def integrations_reisift_skiptrace_sync_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    property_uuid = normalize_uuid(payload.get("property_uuid") or payload.get("uuid") or "")
+    if not property_uuid:
+        return jsonify({"ok": False, "error": "property_uuid is required"}), 400
+    try:
+        result = run_reisift_uuid_skiptrace_sync(
+            db,
+            property_uuid,
+            added_by=(payload.get("added_by") or "Integration").strip() or "Integration",
+            source=(payload.get("source") or "Integration API").strip() or "Integration API",
+        )
+        db.commit()
+        return jsonify({"ok": True, **result})
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="integrations_reisift_skiptrace_sync_api",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/api/integrations/reisift/skiptrace-sync",
+            status_code=500,
+        )
+        db.commit()
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/api/integrations/google-sheets/row-added", methods=["POST"])

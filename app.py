@@ -356,7 +356,7 @@ AGENT_DEFINITIONS = [
         "status": "In Progress",
     },
 ]
-REFERRAL_STATUSES = ["Untouched", "Referred", "Appointment Set", "Under Contract", "Closed", "Dead", "Other"]
+REFERRAL_STATUSES = ["Untouched", "Referred", "On Market", "Appointment Set", "Under Contract", "Closed", "Dead", "Other"]
 LEAD_ACTION_STATUSES = ["Pending", "Approved", "Completed", "Dismissed"]
 LEAD_ACTION_PRIORITIES = ["Low", "Medium", "High"]
 LEAD_ACTION_TYPES = [
@@ -20640,7 +20640,7 @@ def referral_dashboard():
             bucket["_seen_props"].add(prop_uuid)
             row_status = str(row["referral_status"] or "").strip() or "Untouched"
             winner_id = int(row["winning_realtor_id"]) if str(row["winning_realtor_id"] or "").isdigit() else None
-            show_status = winner_id == realtor_id and row_status in {"Appointment Set", "Under Contract", "Closed"}
+            show_status = winner_id == realtor_id and row_status in {"On Market", "Appointment Set", "Under Contract", "Closed"}
             bucket["properties"].append(
                 {
                     "property_uuid": prop_uuid,

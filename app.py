@@ -15714,8 +15714,13 @@ def refresh_reisift_referrals_cache(db):
         property_uuid = (row.get("uuid") or "").strip()
         if not property_uuid:
             continue
+        detail_payload = row
         try:
-            upsert_reisift_referral(db, property_uuid, row, is_active=1, preserve_market_status=True)
+            detail_payload = fetch_reisift_property_payload(token, property_uuid)
+        except Exception as exc:
+            errors.append(f"{property_uuid}: {exc}")
+        try:
+            upsert_reisift_referral(db, property_uuid, detail_payload, is_active=1, preserve_market_status=True)
             synced += 1
         except Exception as exc:
             errors.append(f"{property_uuid}: {exc}")
@@ -20673,7 +20678,7 @@ def referral_refresh():
         q = data.get("queue_summary") or {}
         notice += f" Queue: {q.get('queued', 0)} queued, {q.get('no_realtor', 0)} with no realtor."
         if data["errors"]:
-            notice += f" {len(data['errors'])} rows used fallback payload."
+            notice += f" {len(data['errors'])} detail calls used fallback payload."
     except Exception as exc:
         return redirect(url_for("referral_dashboard", notice=f"Refresh failed: {exc}"))
     return redirect(url_for("referral_dashboard", notice=notice))
@@ -20908,20 +20913,34 @@ def referral_property_detail(property_uuid):
     ensure_db()
     db = get_db()
     notice = (request.args.get("notice") or "").strip()
-    row = db.execute(
-        """
-        SELECT property_uuid, status, full_address, owner_names, payload_json, last_synced_at,
-               COALESCE(referral_status, 'Untouched') AS referral_status,
-               winning_realtor_id,
-               referral_notes,
-               county,
-               COALESCE(on_market_status, 'Unknown') AS on_market_status,
-               source_override_json
-        FROM reisift_referrals
-        WHERE property_uuid = ?
-        """,
-        (property_uuid,),
-    ).fetchone()
+    def _load_referral_row():
+        return db.execute(
+            """
+            SELECT property_uuid, status, full_address, owner_names, payload_json, last_synced_at,
+                   COALESCE(referral_status, 'Untouched') AS referral_status,
+                   winning_realtor_id,
+                   referral_notes,
+                   county,
+                   COALESCE(on_market_status, 'Unknown') AS on_market_status,
+                   source_override_json
+            FROM reisift_referrals
+            WHERE property_uuid = ?
+            """,
+            (property_uuid,),
+        ).fetchone()
+
+    row = _load_referral_row()
+    if row is None:
+        try:
+            token = reisift_get_access_token()
+            details = fetch_reisift_property_payload(token, property_uuid)
+            upsert_reisift_referral(db, property_uuid, details, is_active=1, preserve_market_status=True)
+            db.commit()
+            row = _load_referral_row()
+            if not notice:
+                notice = "Referral cache refreshed from SIFT."
+        except Exception:
+            row = None
     if row is None:
         return redirect(url_for("referral_dashboard", notice=f"Referral UUID not found locally: {property_uuid}"))
 
@@ -20935,6 +20954,24 @@ def referral_property_detail(property_uuid):
             payload_json_pretty = row["payload_json"]
 
     phones, emails = extract_owner_contacts_from_payload(payload)
+    if not phones and not emails:
+        try:
+            token = reisift_get_access_token()
+            details = fetch_reisift_property_payload(token, property_uuid)
+            refreshed_phones, refreshed_emails = extract_owner_contacts_from_payload(details)
+            if refreshed_phones or refreshed_emails:
+                upsert_reisift_referral(db, property_uuid, details, is_active=1, preserve_market_status=True)
+                db.commit()
+                row = _load_referral_row()
+                payload = details
+                payload_json_pretty = json.dumps(details, indent=2)
+                phones = refreshed_phones
+                emails = refreshed_emails
+                if not notice:
+                    notice = "Referral contact data refreshed from SIFT."
+        except Exception:
+            pass
+
     owner_names = extract_owner_names_from_payload(payload)
     if not owner_names and str(row["owner_names"] or "").strip():
         owner_names = [x.strip() for x in str(row["owner_names"]).split(",") if x.strip()]

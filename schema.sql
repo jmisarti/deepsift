@@ -210,6 +210,9 @@ CREATE TABLE IF NOT EXISTS reisift_referrals (
     referral_status TEXT NOT NULL DEFAULT 'Untouched',
     winning_realtor_id INTEGER,
     referral_notes TEXT,
+    county TEXT,
+    on_market_status TEXT NOT NULL DEFAULT 'Unknown',
+    source_override_json TEXT,
     is_active INTEGER NOT NULL DEFAULT 1,
     last_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

@@ -30,6 +30,8 @@
                 <th>Status</th>
                 <th>On-Market</th>
                 <th>Owners</th>
+                <th>Phone(s)</th>
+                <th>Email(s)</th>
                 <th>Sift Link</th>
             </tr>
         </thead>
@@ -51,6 +53,24 @@
                 <td><span class="pill">{{ row.on_market_status or "Unknown" }}</span></td>
                 <td>{{ row.owner_names or "-" }}</td>
                 <td>
+                    {% if row.phones %}
+                        {% for phone in row.phones %}
+                            {{ phone.value|fmt_phone }}{% if not loop.last %}, {% endif %}
+                        {% endfor %}
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+                <td>
+                    {% if row.emails %}
+                        {% for email in row.emails %}
+                            {{ email.value }}{% if not loop.last %}, {% endif %}
+                        {% endfor %}
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+                <td>
                     <a href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener">
                         Open in Sift
                     </a>
@@ -58,7 +78,7 @@
             </tr>
             {% else %}
             <tr>
-                <td colspan="7">No records found.</td>
+                <td colspan="9">No records found.</td>
             </tr>
             {% endfor %}
         </tbody>

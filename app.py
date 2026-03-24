@@ -1,4 +1,5 @@
 ﻿
+import copy
 import csv
 import base64
 import hmac
@@ -806,6 +807,7 @@ def migrate_db(db):
     ensure_column(db, "reisift_referrals", "referral_notes", "referral_notes TEXT")
     ensure_column(db, "reisift_referrals", "county", "county TEXT")
     ensure_column(db, "reisift_referrals", "on_market_status", "on_market_status TEXT NOT NULL DEFAULT 'Unknown'")
+    ensure_column(db, "reisift_referrals", "source_override_json", "source_override_json TEXT")
     ensure_column(db, "reisift_followups", "events_json", "events_json TEXT")
     ensure_column(db, "reisift_followups", "tasks_json", "tasks_json TEXT")
     db.execute(
@@ -15535,26 +15537,38 @@ def infer_on_market_status_from_web_listing(full_address):
 
 
 def upsert_reisift_referral(db, property_uuid, payload, is_active=1, preserve_market_status=True):
-    summary = summarize_reisift_property(payload)
-    county = infer_county_from_reisift_payload(payload)
-    payload_market_status = infer_on_market_status_from_payload(payload)
-    on_market_status = payload_market_status or "Unknown"
+    merged_payload = dict(payload or {})
+    source_override = {}
     existing_market_status = "Unknown"
     if preserve_market_status:
         existing_row = db.execute(
-            "SELECT COALESCE(on_market_status, 'Unknown') AS on_market_status FROM reisift_referrals WHERE property_uuid = ?",
+            """
+            SELECT
+                COALESCE(on_market_status, 'Unknown') AS on_market_status,
+                source_override_json
+            FROM reisift_referrals
+            WHERE property_uuid = ?
+            """,
             ((property_uuid or "").strip(),),
         ).fetchone()
         existing_market_status = str((existing_row["on_market_status"] if existing_row else "Unknown") or "Unknown").strip() or "Unknown"
-        if on_market_status == "Unknown" and existing_market_status != "Unknown":
-            on_market_status = existing_market_status
-    merged_payload = dict(payload or {})
+        source_override = parse_json_object((existing_row["source_override_json"] if existing_row else "") or "{}")
+    if source_override:
+        merged_payload = apply_referral_source_override(merged_payload, source_override)
+    summary = summarize_reisift_property(merged_payload)
+    county = infer_county_from_reisift_payload(merged_payload)
+    payload_market_status = infer_on_market_status_from_payload(merged_payload)
+    override_market_status = str(source_override.get("on_market_status") or "").strip() if isinstance(source_override, dict) else ""
+    on_market_status = override_market_status or payload_market_status or "Unknown"
+    if on_market_status == "Unknown" and existing_market_status != "Unknown":
+        on_market_status = existing_market_status
     merged_payload["market_status_inference"] = {
         "payload_status": payload_market_status,
         "web_status": None,
         "web_evidence": [],
         "previous_local_status": existing_market_status if preserve_market_status else "",
         "resolved_status": on_market_status,
+        "override_status": override_market_status,
     }
     db.execute(
         """
@@ -16086,45 +16100,168 @@ def parse_followup_json_list(raw_value):
         return []
 
 
-def extract_owner_contacts_from_payload(payload):
-    owner = payload.get("owner") if isinstance(payload, dict) else {}
-    if not isinstance(owner, dict):
-        return [], []
+def iter_reisift_payload_owners(payload):
+    if not isinstance(payload, dict):
+        return []
+    owners = []
+    owner = payload.get("owner")
+    if isinstance(owner, dict):
+        owners.append(owner)
+    owner_list = payload.get("owners")
+    if isinstance(owner_list, list):
+        for item in owner_list:
+            if isinstance(item, dict):
+                owners.append(item)
+    return owners
 
+
+def extract_owner_names_from_payload(payload):
+    names = []
+    seen = set()
+    for owner in iter_reisift_payload_owners(payload):
+        full_name = (owner.get("full_name") or owner.get("name") or "").strip()
+        if not full_name:
+            first = (owner.get("first_name") or "").strip()
+            last = (owner.get("last_name") or "").strip()
+            full_name = " ".join(x for x in [first, last] if x).strip()
+        key = full_name.lower()
+        if not full_name or key in seen:
+            continue
+        seen.add(key)
+        names.append(full_name)
+    return names
+
+
+def extract_owner_contacts_from_payload(payload):
     phones = []
     seen_phones = set()
-    for p in owner.get("phones") or []:
-        value = ""
-        p_type = "Unknown"
-        p_status = "Unknown"
-        if isinstance(p, dict):
-            value = (p.get("number") or p.get("phone") or "").strip()
-            p_type = (p.get("type") or "Unknown").strip() or "Unknown"
-            p_status = (p.get("status") or "Unknown").strip() or "Unknown"
-        else:
-            value = str(p or "").strip()
-        key = normalize_phone(value) or value
-        if not value or key in seen_phones:
-            continue
-        seen_phones.add(key)
-        phones.append({"value": value, "type": p_type, "status": p_status})
-
     emails = []
     seen_emails = set()
-    for e in owner.get("emails") or []:
-        value = ""
-        status = "Unknown"
-        if isinstance(e, dict):
-            value = (e.get("email") or "").strip()
-            status = (e.get("status") or "Unknown").strip() or "Unknown"
-        else:
-            value = str(e or "").strip()
-        key = value.lower()
-        if not value or key in seen_emails:
-            continue
-        seen_emails.add(key)
-        emails.append({"value": value, "status": status})
+    for owner in iter_reisift_payload_owners(payload):
+        for p in owner.get("phones") or []:
+            value = ""
+            p_type = "Unknown"
+            p_status = "Unknown"
+            if isinstance(p, dict):
+                value = (p.get("number") or p.get("phone") or "").strip()
+                p_type = (p.get("type") or "Unknown").strip() or "Unknown"
+                p_status = (p.get("status") or "Unknown").strip() or "Unknown"
+            else:
+                value = str(p or "").strip()
+            key = normalize_phone(value) or value
+            if not value or key in seen_phones:
+                continue
+            seen_phones.add(key)
+            phones.append({"value": value, "type": p_type, "status": p_status})
+
+        for e in owner.get("emails") or []:
+            value = ""
+            status = "Unknown"
+            if isinstance(e, dict):
+                value = (e.get("email") or e.get("value") or "").strip()
+                status = (e.get("status") or "Unknown").strip() or "Unknown"
+            else:
+                value = str(e or "").strip()
+            key = value.lower()
+            if not value or key in seen_emails:
+                continue
+            seen_emails.add(key)
+            emails.append({"value": value, "status": status})
     return phones, emails
+
+
+def _split_referral_multivalue_text(raw_text, allow_comma=True):
+    text = str(raw_text or "")
+    pattern = r"[\r\n,;]+" if allow_comma else r"[\r\n;]+"
+    values = []
+    seen = set()
+    for part in re.split(pattern, text):
+        value = str(part or "").strip()
+        key = value.lower()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        values.append(value)
+    return values
+
+
+def _build_referral_source_override(form):
+    return {
+        "status": str(form.get("source_status") or "").strip(),
+        "full_address": str(form.get("source_full_address") or "").strip(),
+        "county": str(form.get("source_county") or "").strip(),
+        "on_market_status": str(form.get("source_on_market_status") or "").strip() or "Unknown",
+        "owner_names": _split_referral_multivalue_text(form.get("source_owner_names"), allow_comma=False),
+        "phones": _split_referral_multivalue_text(form.get("source_phones"), allow_comma=True),
+        "emails": _split_referral_multivalue_text(form.get("source_emails"), allow_comma=True),
+    }
+
+
+def _owner_dict_with_name(base_owner, full_name):
+    owner = copy.deepcopy(base_owner) if isinstance(base_owner, dict) else {}
+    normalized_name = " ".join(str(full_name or "").split()).strip()
+    parsed = _reisift_parse_owner_name({"full_name": normalized_name})
+    owner["first_name"] = parsed["first_name"]
+    owner["last_name"] = parsed["last_name"]
+    if normalized_name:
+        owner["full_name"] = normalized_name
+        owner["name"] = normalized_name
+    else:
+        owner.pop("full_name", None)
+        owner.pop("name", None)
+    return owner
+
+
+def apply_referral_source_override(payload, override):
+    merged = copy.deepcopy(payload) if isinstance(payload, dict) else {}
+    override = override if isinstance(override, dict) else {}
+    if not override:
+        return merged
+
+    status = str(override.get("status") or "").strip()
+    if status:
+        merged["status"] = status
+
+    address = merged.get("address") if isinstance(merged.get("address"), dict) else {}
+    address["full_address"] = str(override.get("full_address") or "").strip()
+    county = str(override.get("county") or "").strip()
+    if county:
+        address["county"] = county
+    else:
+        address.pop("county", None)
+    if address:
+        merged["address"] = address
+
+    owner_names = [str(x).strip() for x in (override.get("owner_names") or []) if str(x).strip()]
+    phone_values = [normalize_phone(x) or str(x).strip() for x in (override.get("phones") or []) if str(x).strip()]
+    email_values = [str(x).strip() for x in (override.get("emails") or []) if str(x).strip()]
+    base_owner = iter_reisift_payload_owners(merged)[0] if iter_reisift_payload_owners(merged) else {}
+
+    owners = []
+    if owner_names:
+        for idx, name in enumerate(owner_names):
+            owner = _owner_dict_with_name(base_owner if idx == 0 else {}, name)
+            if idx == 0:
+                owner["phones"] = [{"number": phone, "type": "MANUAL", "tags": [], "status": "MANUAL"} for phone in phone_values]
+                owner["emails"] = list(email_values)
+            else:
+                owner["phones"] = []
+                owner["emails"] = []
+            owners.append(owner)
+    elif base_owner or phone_values or email_values:
+        owner = _owner_dict_with_name(base_owner, "")
+        owner["phones"] = [{"number": phone, "type": "MANUAL", "tags": [], "status": "MANUAL"} for phone in phone_values]
+        owner["emails"] = list(email_values)
+        owners.append(owner)
+
+    if owners:
+        merged["owner"] = owners[0]
+        merged["owners"] = owners
+    else:
+        merged.pop("owner", None)
+        merged["owners"] = []
+
+    return merged
 
 
 def extract_property_lists(payload):
@@ -20400,7 +20537,15 @@ def run_agent3_lead_watch_resolve_route():
 def referral_dashboard():
     ensure_db()
     db = get_db()
-    referrals = get_cached_referrals(db)
+    raw_referrals = get_cached_referrals(db)
+    referrals = []
+    for row in raw_referrals:
+        item = dict(row)
+        payload = parse_json_object(item.get("payload_json") or "{}")
+        phones, emails = extract_owner_contacts_from_payload(payload)
+        item["phones"] = phones
+        item["emails"] = emails
+        referrals.append(item)
     total_count = len(referrals)
     error = ""
     notice = request.args.get("notice", "").strip()
@@ -20409,7 +20554,15 @@ def referral_dashboard():
         try:
             data = refresh_reisift_referrals_cache(db)
             status_slug = data["status_slug"]
-            referrals = get_cached_referrals(db)
+            raw_referrals = get_cached_referrals(db)
+            referrals = []
+            for row in raw_referrals:
+                item = dict(row)
+                payload = parse_json_object(item.get("payload_json") or "{}")
+                phones, emails = extract_owner_contacts_from_payload(payload)
+                item["phones"] = phones
+                item["emails"] = emails
+                referrals.append(item)
             total_count = len(referrals)
             notice = f"Referral cache initialized ({data['synced']} synced)."
         except Exception as exc:
@@ -20760,7 +20913,10 @@ def referral_property_detail(property_uuid):
         SELECT property_uuid, status, full_address, owner_names, payload_json, last_synced_at,
                COALESCE(referral_status, 'Untouched') AS referral_status,
                winning_realtor_id,
-               referral_notes
+               referral_notes,
+               county,
+               COALESCE(on_market_status, 'Unknown') AS on_market_status,
+               source_override_json
         FROM reisift_referrals
         WHERE property_uuid = ?
         """,
@@ -20778,49 +20934,16 @@ def referral_property_detail(property_uuid):
         except json.JSONDecodeError:
             payload_json_pretty = row["payload_json"]
 
-    phones = []
-    emails = []
-
-    owner = payload.get("owner") if isinstance(payload, dict) else {}
-    if isinstance(owner, dict):
-        for p in owner.get("phones") or []:
-            number = (p.get("number") or "").strip()
-            if not number:
-                continue
-            phones.append(
-                {
-                    "number": number,
-                    "type": (p.get("type") or "UNKNOWN").strip(),
-                    "status": (p.get("status") or "UNKNOWN").strip(),
-                }
-            )
-        for e in owner.get("emails") or []:
-            if isinstance(e, str):
-                value = e.strip()
-            else:
-                value = (e.get("email") or "").strip()
-            if value:
-                emails.append(value)
-
-    seen_phone = set()
-    dedup_phones = []
-    for p in phones:
-        key = p["number"]
-        if key in seen_phone:
-            continue
-        seen_phone.add(key)
-        dedup_phones.append(p)
-    phones = dedup_phones
-
-    seen_email = set()
-    dedup_emails = []
-    for e in emails:
-        key = e.lower()
-        if key in seen_email:
-            continue
-        seen_email.add(key)
-        dedup_emails.append(e)
-    emails = dedup_emails
+    phones, emails = extract_owner_contacts_from_payload(payload)
+    owner_names = extract_owner_names_from_payload(payload)
+    if not owner_names and str(row["owner_names"] or "").strip():
+        owner_names = [x.strip() for x in str(row["owner_names"]).split(",") if x.strip()]
+    source_status = str(payload.get("status") or row["status"] or "").strip()
+    source_address = payload.get("address") if isinstance(payload.get("address"), dict) else {}
+    source_full_address = str(source_address.get("full_address") or row["full_address"] or "").strip()
+    source_county = infer_county_from_reisift_payload(payload) or str(row["county"] or "").strip()
+    source_on_market_status = str(row["on_market_status"] or "Unknown").strip() or "Unknown"
+    source_override = parse_json_object(row["source_override_json"] or "{}")
 
     market_filter = (request.args.get("market") or "").strip()
     realtor_where = ["1=1"]
@@ -20870,6 +20993,14 @@ def referral_property_detail(property_uuid):
         nj_counties=NJ_COUNTIES,
         referral_statuses=REFERRAL_STATUSES,
         winning_realtor=winning_realtor,
+        source_status=source_status,
+        source_full_address=source_full_address,
+        source_owner_names="\n".join(owner_names),
+        source_phones="\n".join(p["value"] for p in phones),
+        source_emails="\n".join(e["value"] for e in emails),
+        source_county=source_county,
+        source_on_market_status=source_on_market_status,
+        source_override=source_override,
     )
 
 
@@ -20910,43 +21041,69 @@ def referral_manage_detail(property_uuid):
     return redirect(url_for("referral_property_detail", property_uuid=property_uuid, notice="Referral management updated."))
 
 
+@app.route("/referral/<string:property_uuid>/source", methods=["POST"])
+def referral_update_source(property_uuid):
+    ensure_db()
+    db = get_db()
+    row = db.execute(
+        """
+        SELECT property_uuid, payload_json
+        FROM reisift_referrals
+        WHERE property_uuid = ?
+        """,
+        (property_uuid,),
+    ).fetchone()
+    if not row:
+        return redirect(url_for("referral_dashboard", notice="Referral property not found."))
+
+    payload = parse_json_object(row["payload_json"] or "{}")
+    override = _build_referral_source_override(request.form)
+    merged_payload = apply_referral_source_override(payload, override)
+    summary = summarize_reisift_property(merged_payload)
+    county = str(override.get("county") or "").strip() or infer_county_from_reisift_payload(merged_payload)
+    on_market_status = str(override.get("on_market_status") or "").strip() or infer_on_market_status_from_payload(merged_payload)
+
+    db.execute(
+        """
+        UPDATE reisift_referrals
+        SET status = ?,
+            full_address = ?,
+            owner_names = ?,
+            county = ?,
+            on_market_status = ?,
+            payload_json = ?,
+            source_override_json = ?
+        WHERE property_uuid = ?
+        """,
+        (
+            summary["status"],
+            summary["full_address"],
+            summary["owner_names"],
+            county,
+            on_market_status or "Unknown",
+            json.dumps(merged_payload),
+            json.dumps(override),
+            property_uuid,
+        ),
+    )
+    db.commit()
+    return redirect(url_for("referral_property_detail", property_uuid=property_uuid, notice="Referral source updated."))
+
+
 def get_referral_property_summary(payload):
-    full_address = ""
-    contact_phone = ""
-    owner_name = ""
-    contact_email = ""
     if not isinstance(payload, dict):
         return {"full_address": "", "contact_phone": "", "owner_name": "", "contact_email": ""}
     full_address = (payload.get("full_address") or "").strip()
     if not full_address:
         a = payload.get("address") if isinstance(payload.get("address"), dict) else {}
         full_address = ", ".join(
-            x for x in [a.get("street"), a.get("city"), a.get("state"), a.get("zip")] if x
+            x for x in [a.get("street"), a.get("city"), a.get("state"), a.get("postal_code") or a.get("zip")] if x
         ).strip(", ")
-    owner = payload.get("owner") if isinstance(payload.get("owner"), dict) else {}
-    owner_name = (owner.get("name") or owner.get("full_name") or "").strip()
-    if not owner_name:
-        first = (owner.get("first_name") or "").strip()
-        last = (owner.get("last_name") or "").strip()
-        owner_name = " ".join(x for x in [first, last] if x).strip()
-    phones = owner.get("phones") if isinstance(owner.get("phones"), list) else []
-    for p in phones:
-        if isinstance(p, dict):
-            val = (p.get("number") or "").strip()
-        else:
-            val = str(p or "").strip()
-        if val:
-            contact_phone = val
-            break
-    emails = owner.get("emails") if isinstance(owner.get("emails"), list) else []
-    for e in emails:
-        if isinstance(e, dict):
-            val = (e.get("email") or "").strip()
-        else:
-            val = str(e or "").strip()
-        if val:
-            contact_email = val
-            break
+    owner_names = extract_owner_names_from_payload(payload)
+    owner_name = owner_names[0] if owner_names else ""
+    phones, emails = extract_owner_contacts_from_payload(payload)
+    contact_phone = phones[0]["value"] if phones else ""
+    contact_email = emails[0]["value"] if emails else ""
     return {
         "full_address": full_address,
         "contact_phone": contact_phone,

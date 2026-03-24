@@ -12,12 +12,50 @@
             <tr><th>Status</th><td><span class="pill">{{ referral.status or "-" }}</span></td></tr>
             <tr><th>Referral Status</th><td>{{ referral.referral_status or 'Untouched' }}</td></tr>
             <tr><th>Owners</th><td>{{ referral.owner_names or "-" }}</td></tr>
-            <tr><th>Phone(s)</th><td>{% if phones %}{% for p in phones %}{{ p.number|fmt_phone }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}-{% endif %}</td></tr>
-            <tr><th>Email(s)</th><td>{% if emails %}{{ emails|join(', ') }}{% else %}-{% endif %}</td></tr>
+            <tr><th>Phone(s)</th><td>{% if phones %}{% for p in phones %}{{ p.value|fmt_phone }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}-{% endif %}</td></tr>
+            <tr><th>Email(s)</th><td>{% if emails %}{% for e in emails %}{{ e.value }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}-{% endif %}</td></tr>
             <tr><th>Winning Realtor</th><td>{% if winning_realtor %}{{ winning_realtor.first_name }} {{ winning_realtor.last_name }}{% if winning_realtor.brokerage %} ({{ winning_realtor.brokerage }}){% endif %}{% else %}-{% endif %}</td></tr>
             <tr><th>Last Synced</th><td>{{ referral.last_synced_at|fmt_est_datetime }}</td></tr>
         </tbody>
     </table>
+</section>
+
+<section class="panel">
+    <h3>Edit Referral Source</h3>
+    <p>These local overrides stay on the referral record even after a refresh from SIFT. The UUID is read-only.</p>
+    <form method="post" action="{{ url_for('referral_update_source', property_uuid=referral.property_uuid) }}" class="grid-form compact">
+        <label>UUID
+            <input type="text" value="{{ referral.property_uuid }}" readonly>
+        </label>
+        <label>Status
+            <input type="text" name="source_status" value="{{ source_status or '' }}" placeholder="refer_lead">
+        </label>
+        <label class="span2">Full Address
+            <input type="text" name="source_full_address" value="{{ source_full_address or '' }}" placeholder="123 Main St, Newark, NJ 07102">
+        </label>
+        <label>County
+            <input type="text" name="source_county" value="{{ source_county or '' }}" placeholder="Essex">
+        </label>
+        <label>On-Market Status
+            <input type="text" name="source_on_market_status" value="{{ source_on_market_status or '' }}" placeholder="Unknown">
+        </label>
+        <label class="span2">Owner Name(s)
+            <textarea name="source_owner_names" rows="3" placeholder="One owner per line">{{ source_owner_names or '' }}</textarea>
+        </label>
+        <label class="span2">Phone Number(s)
+            <textarea name="source_phones" rows="3" placeholder="One phone per line">{{ source_phones or '' }}</textarea>
+        </label>
+        <label class="span2">Email Address(es)
+            <textarea name="source_emails" rows="3" placeholder="One email per line">{{ source_emails or '' }}</textarea>
+        </label>
+        <button type="submit">Save Source Edits</button>
+    </form>
+    {% if source_override %}
+    <details style="margin-top:0.75rem;">
+        <summary><strong>Saved Override Snapshot</strong></summary>
+        <pre class="json-block">{{ source_override|tojson(indent=2) }}</pre>
+    </details>
+    {% endif %}
 </section>
 
 <section class="panel">

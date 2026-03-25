@@ -120,6 +120,7 @@ SKIPSHERPA_API_KEY = os.getenv("SKIPSHERPA_API_KEY", "").strip()
 REISIFT_BASE_URL = os.getenv("REISIFT_BASE_URL", "https://apiv2.reisift.io")
 REISIFT_MAP_BASE_URL = os.getenv("REISIFT_MAP_BASE_URL", "https://map.reisift.io")
 REISIFT_UI_VERSION = "2022.02.01.7"
+REISIFT_UNTITLED_TASK_ASSIGNED_TO_USER = "54b27291-93e4-443c-8d2f-e9779955fcd1"
 REISIFT_FOLLOWUPS_EXCLUDE_TAG = os.getenv("REISIFT_FOLLOWUPS_EXCLUDE_TAG", "3cf5a950-ac8f-47b0-87e1-bcea2604e2e1").strip()
 REISIFT_DISABLE_MAP_LOOKUP = env_flag("REISIFT_DISABLE_MAP_LOOKUP", True)
 OPENLETTERCONNECT_BASE_URL = os.getenv("OPENLETTERCONNECT_BASE_URL", "https://api.openletterconnect.com/api/v1")
@@ -8805,6 +8806,7 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
 
     address_line = format_property_address_line(prop["street"], prop["city"], prop["state"], prop["postal_code"])
     create_result = None
+    task_result = None
     token = None
     target_status_slug = "cold_lead"
     target_status_label = "Cold Lead"
@@ -8841,6 +8843,16 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
 
     token = reisift_get_access_token()
     status_result = reisift_update_property_status(token, property_uuid, target_status_slug)
+    if create_result:
+        task_result = reisift_create_task(
+            token,
+            title="Call New GetUntitledAi Lead",
+            address=address_line,
+            assigned_to_property=property_uuid,
+            assigned_to_user=REISIFT_UNTITLED_TASK_ASSIGNED_TO_USER,
+            due_date=_reisift_due_tomorrow_noon_utc_text(),
+            all_day=True,
+        )
 
     _set_local_property_uuid(db, property_id, property_uuid)
     details = {}
@@ -8893,6 +8905,7 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
                     "record_key": record_key,
                     "create_result": create_result,
                     "status_result": status_result,
+                    "task_result": task_result,
                     "contact_sync": contact_sync,
                 },
                 default=str,
@@ -8905,6 +8918,7 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
         "owner_uuid": owner_uuid,
         "create_result": create_result,
         "status_result": status_result,
+        "task_result": task_result,
         "contact_sync": contact_sync,
     }
 
@@ -14809,6 +14823,62 @@ def ensure_reisift_task_writes_enabled():
         )
 
 
+def _reisift_due_tomorrow_noon_utc_text(now_dt=None):
+    now_et = (now_dt or datetime.utcnow().replace(tzinfo=timezone.utc)).astimezone(EST_TZ)
+    due_local = (now_et + timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+    due_utc = due_local.astimezone(timezone.utc)
+    return due_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def reisift_create_task(
+    token,
+    *,
+    title,
+    address,
+    assigned_to_property,
+    assigned_to_user,
+    due_date=None,
+    all_day=False,
+    notes=None,
+):
+    task_payload = {
+        "title": str(title or "").strip(),
+        "all_day": bool(all_day),
+        "round_robin": False,
+        "address": str(address or "").strip(),
+        "event_type": "task",
+        "assigned_to_property": str(assigned_to_property or "").strip(),
+        "assigned_to_role": None,
+        "assigned_to_user": str(assigned_to_user or "").strip(),
+        "assigned_to_users": None,
+        "due_date": str(due_date or _reisift_due_tomorrow_noon_utc_text()).strip(),
+        "recurrence": None,
+        "notes": notes if notes else None,
+    }
+    if not task_payload["title"]:
+        raise ValueError("Task title is required.")
+    if not task_payload["address"]:
+        raise ValueError("Task address is required.")
+    if not task_payload["assigned_to_property"]:
+        raise ValueError("Task assigned_to_property is required.")
+    if not task_payload["assigned_to_user"]:
+        raise ValueError("Task assigned_to_user is required.")
+
+    response = requests.post(
+        f"{REISIFT_BASE_URL}/api/internal/task/",
+        headers=reisift_auth_headers(token),
+        json=task_payload,
+        timeout=30,
+    )
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_text": response.text}
+    if not response.ok:
+        raise ValueError(f"ReiSift task create failed ({response.status_code}): {body}")
+    return {"request": task_payload, "response": body}
+
+
 def parse_csv_list(value):
     if isinstance(value, list):
         return [str(x).strip() for x in value if str(x).strip()]
@@ -20229,6 +20299,8 @@ def anon_track_route(record_key):
         message = "Lead tracked as Cold Lead"
         if property_id:
             message += f" and linked to property #{property_id}"
+        if result.get("task_result"):
+            message += "; task created"
         if property_uuid:
             message += "."
         return _anon_redirect_with_message(target_url, "notice", message)

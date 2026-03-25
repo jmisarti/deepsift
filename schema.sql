@@ -261,6 +261,18 @@ CREATE TABLE IF NOT EXISTS referral_realtors (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS buyers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    business_name TEXT,
+    email TEXT,
+    phone TEXT,
+    notes TEXT,
+    target_counties TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS referral_push_activity (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     property_uuid TEXT NOT NULL,

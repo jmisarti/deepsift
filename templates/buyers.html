@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Buyers</h2>
+    <p>Capture buyer contacts, organize them by county, and keep notes in one place.</p>
+    {% if notice %}
+    <div class="notice-banner">{{ notice }}</div>
+    {% endif %}
+
+    <details open>
+        <summary><strong>Add Buyer</strong></summary>
+        <form method="post" class="grid-form compact">
+            <label>First Name <input name="first_name" required></label>
+            <label>Last Name <input name="last_name" required></label>
+            <label>Business Name <input name="business_name"></label>
+            <label>Email <input name="email"></label>
+            <label>Phone <input name="phone"></label>
+            <label class="span2">Notes <textarea name="notes" rows="3"></textarea></label>
+            <fieldset class="span2 county-toggle-grid">
+                <legend>Target Counties</legend>
+                {% for county_name in nj_counties %}
+                <label class="county-toggle-item">
+                    <span class="county-name">{{ county_name }}</span>
+                    <span class="county-toggle-controls">
+                        <span class="toggle-switch">
+                            <input type="checkbox" name="target_counties" value="{{ county_name }}">
+                            <span class="toggle-slider"></span>
+                        </span>
+                        <span class="county-toggle-state">Off</span>
+                    </span>
+                </label>
+                {% endfor %}
+            </fieldset>
+            <button type="submit">Add Buyer</button>
+        </form>
+    </details>
+
+    <details>
+        <summary><strong>Upload Buyers CSV</strong></summary>
+        <p><a href="{{ url_for('buyers_template') }}">Download Buyer CSV Template</a></p>
+        <form method="post" action="{{ url_for('buyers_upload') }}" enctype="multipart/form-data" class="grid-form compact">
+            <label class="span2">CSV file
+                <input type="file" name="buyers_file" accept=".csv" required>
+            </label>
+            <fieldset class="span2 county-toggle-grid">
+                <legend>Default Target Counties</legend>
+                {% for county_name in nj_counties %}
+                <label class="county-toggle-item">
+                    <span class="county-name">{{ county_name }}</span>
+                    <span class="county-toggle-controls">
+                        <span class="toggle-switch">
+                            <input type="checkbox" name="target_counties" value="{{ county_name }}">
+                            <span class="toggle-slider"></span>
+                        </span>
+                        <span class="county-toggle-state">Off</span>
+                    </span>
+                </label>
+                {% endfor %}
+            </fieldset>
+            <button type="submit">Upload CSV</button>
+        </form>
+    </details>
+</section>
+
+<section class="panel">
+    <h3>Buyer Table</h3>
+    <form method="get" class="grid-form compact">
+        <label>Name / Business / Contact
+            <input name="q" value="{{ q }}" placeholder="partial name, business, email, phone">
+        </label>
+        <label>County
+            <select name="county">
+                <option value="">All</option>
+                {% for county_name in nj_counties %}
+                <option value="{{ county_name }}" {% if county == county_name %}selected{% endif %}>{{ county_name }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <button type="submit">Apply</button>
+    </form>
+    <table>
+        <thead>
+            <tr><th>Name</th><th>Business</th><th>Email</th><th>Phone</th><th>Counties</th><th>Notes</th><th></th></tr>
+        </thead>
+        <tbody>
+            {% for b in buyers %}
+            <tr>
+                <td>{{ b.first_name }} {{ b.last_name }}</td>
+                <td>{{ b.business_name or '-' }}</td>
+                <td>{{ b.email or '-' }}</td>
+                <td>{{ b.phone|fmt_phone if b.phone else '-' }}</td>
+                <td>{{ b.target_counties or '-' }}</td>
+                <td>{{ b.notes or '-' }}</td>
+                <td>
+                    <div class="inline-actions">
+                        <a href="#edit-buyer-{{ b.id }}">Edit</a>
+                        <form method="post" action="{{ url_for('buyer_delete', buyer_id=b.id) }}" onsubmit="return confirm('Delete this buyer? This cannot be undone.');">
+                            <input type="hidden" name="_q" value="{{ q }}">
+                            <input type="hidden" name="_county" value="{{ county }}">
+                            <button type="submit" class="icon-btn" title="Delete buyer">x</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            <tr id="edit-buyer-{{ b.id }}">
+                <td colspan="7">
+                    <details>
+                        <summary><strong>Edit {{ b.first_name }} {{ b.last_name }}</strong></summary>
+                        <form method="post" action="{{ url_for('buyer_update', buyer_id=b.id) }}" class="grid-form compact">
+                            <input type="hidden" name="_q" value="{{ q }}">
+                            <input type="hidden" name="_county" value="{{ county }}">
+                            <label>First Name <input name="first_name" value="{{ b.first_name }}" required></label>
+                            <label>Last Name <input name="last_name" value="{{ b.last_name }}" required></label>
+                            <label>Business Name <input name="business_name" value="{{ b.business_name or '' }}"></label>
+                            <label>Email <input name="email" value="{{ b.email or '' }}"></label>
+                            <label>Phone <input name="phone" value="{{ b.phone or '' }}"></label>
+                            <label class="span2">Notes <textarea name="notes" rows="3">{{ b.notes or '' }}</textarea></label>
+                            <fieldset class="span2 county-toggle-grid">
+                                <legend>Target Counties</legend>
+                                {% for county_name in nj_counties %}
+                                <label class="county-toggle-item">
+                                    <span class="county-name">{{ county_name }}</span>
+                                    <span class="county-toggle-controls">
+                                        <span class="toggle-switch">
+                                            <input type="checkbox" name="target_counties" value="{{ county_name }}" {% if county_name in b.target_counties_list %}checked{% endif %}>
+                                            <span class="toggle-slider"></span>
+                                        </span>
+                                        <span class="county-toggle-state">{% if county_name in b.target_counties_list %}On{% else %}Off{% endif %}</span>
+                                    </span>
+                                </label>
+                                {% endfor %}
+                            </fieldset>
+                            <button type="submit">Save</button>
+                        </form>
+                    </details>
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7">No buyers found.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+    const boxes = document.querySelectorAll('.county-toggle-item input[type="checkbox"][name="target_counties"]');
+    boxes.forEach(function (box) {
+        const wrapper = box.closest(".county-toggle-item");
+        if (!wrapper) return;
+        const state = wrapper.querySelector(".county-toggle-state");
+        const apply = function () {
+            if (!state) return;
+            state.textContent = box.checked ? "On" : "Off";
+            state.classList.toggle("on", box.checked);
+            state.classList.toggle("off", !box.checked);
+        };
+        box.addEventListener("change", apply);
+        apply();
+    });
+});
+</script>
+{% endblock %}

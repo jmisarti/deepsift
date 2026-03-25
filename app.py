@@ -823,7 +823,23 @@ def migrate_db(db):
         )
         """
     )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS buyers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL,
+            business_name TEXT,
+            email TEXT,
+            phone TEXT,
+            notes TEXT,
+            target_counties TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     db.execute("CREATE INDEX IF NOT EXISTS idx_properties_is_d4d ON properties(is_d4d, id DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_buyers_name ON buyers(lower(last_name), lower(first_name), id DESC)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS obituary_expansion_runs (
@@ -21960,6 +21976,176 @@ def referral_realtors_page():
     )
 
 
+@app.route("/buyers", methods=["GET", "POST"])
+def buyers_page():
+    ensure_db()
+    db = get_db()
+    notice = (request.args.get("notice") or "").strip()
+    if request.method == "POST":
+        first_name = (request.form.get("first_name") or "").strip()
+        last_name = (request.form.get("last_name") or "").strip()
+        if not first_name or not last_name:
+            notice = "First and last name are required."
+        else:
+            counties = join_markets(request.form.getlist("target_counties"))
+            db.execute(
+                """
+                INSERT INTO buyers (first_name, last_name, business_name, email, phone, notes, target_counties)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    first_name,
+                    last_name,
+                    (request.form.get("business_name") or "").strip(),
+                    (request.form.get("email") or "").strip(),
+                    (request.form.get("phone") or "").strip(),
+                    (request.form.get("notes") or "").strip(),
+                    counties,
+                ),
+            )
+            db.commit()
+            notice = "Buyer added."
+
+    q = (request.args.get("q") or "").strip()
+    county = (request.args.get("county") or "").strip()
+    params = []
+    where = ["1=1"]
+    if q:
+        where.append(
+            """
+            (
+                lower(first_name || ' ' || last_name) LIKE ?
+                OR lower(COALESCE(business_name, '')) LIKE ?
+                OR lower(COALESCE(email, '')) LIKE ?
+                OR lower(COALESCE(phone, '')) LIKE ?
+            )
+            """
+        )
+        params.extend([f"%{q.lower()}%", f"%{q.lower()}%", f"%{q.lower()}%", f"%{q.lower()}%"])
+    if county:
+        where.append("lower(COALESCE(target_counties, '')) LIKE ?")
+        params.append(f"%{county.lower()}%")
+    rows = db.execute(
+        f"""
+        SELECT *
+        FROM buyers
+        WHERE {' AND '.join(where)}
+        ORDER BY lower(last_name), lower(first_name), id DESC
+        """,
+        tuple(params),
+    ).fetchall()
+    buyers = []
+    for row in rows:
+        item = dict(row)
+        item["target_counties_list"] = split_markets(item.get("target_counties"))
+        buyers.append(item)
+    return render_template(
+        "buyers.html",
+        buyers=buyers,
+        q=q,
+        county=county,
+        notice=notice,
+        nj_counties=NJ_COUNTIES,
+    )
+
+
+@app.route("/buyers/upload", methods=["POST"])
+def buyers_upload():
+    ensure_db()
+    db = get_db()
+    file = request.files.get("buyers_file")
+    default_counties = request.form.getlist("target_counties")
+    if not file or not file.filename:
+        return redirect(url_for("buyers_page", q="", county="", notice="No file selected."))
+    try:
+        text = file.read().decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+    except Exception:
+        return redirect(url_for("buyers_page", notice="Could not read CSV file."))
+
+    added = 0
+    for row in reader:
+        first = (row.get("First Name") or row.get("Buyer First") or row.get("first_name") or "").strip()
+        last = (row.get("Last Name") or row.get("Buyer Last") or row.get("last_name") or "").strip()
+        if not first or not last:
+            continue
+        business_name = (row.get("Business Name") or row.get("Company") or row.get("business_name") or "").strip()
+        email = (row.get("Email") or row.get("email") or "").strip()
+        phone = (row.get("Phone") or row.get("phone") or "").strip()
+        notes = (row.get("Notes") or row.get("notes") or "").strip()
+        row_counties = (
+            row.get("Target Counties")
+            or row.get("Target County")
+            or row.get("County")
+            or row.get("target_counties")
+            or ""
+        ).strip()
+        counties = split_markets(row_counties) if row_counties else default_counties
+        db.execute(
+            """
+            INSERT INTO buyers (first_name, last_name, business_name, email, phone, notes, target_counties)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (first, last, business_name, email, phone, notes, join_markets(counties)),
+        )
+        added += 1
+    db.commit()
+    return redirect(url_for("buyers_page", notice=f"Upload complete. {added} buyers added."))
+
+
+@app.route("/buyers/<int:buyer_id>/update", methods=["POST"])
+def buyer_update(buyer_id):
+    ensure_db()
+    db = get_db()
+    row = db.execute("SELECT id FROM buyers WHERE id = ?", (buyer_id,)).fetchone()
+    q = (request.form.get("_q") or "").strip()
+    county = (request.form.get("_county") or "").strip()
+    if not row:
+        return redirect(url_for("buyers_page", q=q, county=county, notice="Buyer not found."))
+
+    first_name = (request.form.get("first_name") or "").strip()
+    last_name = (request.form.get("last_name") or "").strip()
+    if not first_name or not last_name:
+        return redirect(url_for("buyers_page", q=q, county=county, notice="First and last name are required."))
+
+    selected_counties = request.form.getlist("target_counties")
+    counties = join_markets(selected_counties) if selected_counties else join_markets(split_markets(request.form.get("target_counties", "")))
+    db.execute(
+        """
+        UPDATE buyers
+        SET first_name = ?, last_name = ?, business_name = ?, email = ?, phone = ?, notes = ?, target_counties = ?
+        WHERE id = ?
+        """,
+        (
+            first_name,
+            last_name,
+            (request.form.get("business_name") or "").strip(),
+            (request.form.get("email") or "").strip(),
+            (request.form.get("phone") or "").strip(),
+            (request.form.get("notes") or "").strip(),
+            counties,
+            buyer_id,
+        ),
+    )
+    db.commit()
+    return redirect(url_for("buyers_page", q=q, county=county, notice="Buyer updated."))
+
+
+@app.route("/buyers/<int:buyer_id>/delete", methods=["POST"])
+def buyer_delete(buyer_id):
+    ensure_db()
+    db = get_db()
+    q = (request.form.get("_q") or "").strip()
+    county = (request.form.get("_county") or "").strip()
+    row = db.execute("SELECT id FROM buyers WHERE id = ?", (buyer_id,)).fetchone()
+    if not row:
+        return redirect(url_for("buyers_page", q=q, county=county, notice="Buyer not found."))
+
+    db.execute("DELETE FROM buyers WHERE id = ?", (buyer_id,))
+    db.commit()
+    return redirect(url_for("buyers_page", q=q, county=county, notice="Buyer deleted."))
+
+
 @app.route("/referral/realtors/upload", methods=["POST"])
 def referral_realtors_upload():
     ensure_db()
@@ -23213,6 +23399,20 @@ def referral_realtors_template():
         template,
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=referral-realtors-template.csv"},
+    )
+
+
+@app.route("/templates/buyers-template.csv")
+def buyers_template():
+    template = (
+        "First Name,Last Name,Business Name,Email,Phone,Notes,Target Counties\n"
+        "Jamie,Doe,Acme Homes,jamie@acmehomes.com,(973)555-1212,Prefers off-market duplexes,\"Essex, Union\"\n"
+        "Alex,Smith,,alex@example.com,(201)555-3434,Looking for light rehab single families,Bergen\n"
+    )
+    return app.response_class(
+        template,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=buyers-template.csv"},
     )
 
 

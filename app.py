@@ -15307,10 +15307,11 @@ def reisift_update_property_status(token, property_uuid, status_slug):
         raise ValueError("property_uuid is required for status update.")
     if not status_slug:
         raise ValueError("status_slug is required for status update.")
+    status_label = _reisift_status_label(status_slug, default="New Lead")
     response = requests.post(
         f"{REISIFT_BASE_URL}/api/internal/property/{property_uuid}/status/",
         headers=reisift_auth_headers(token),
-        json={"status": status_slug},
+        json={"status": status_label},
         timeout=30,
     )
     try:
@@ -15319,7 +15320,7 @@ def reisift_update_property_status(token, property_uuid, status_slug):
         body = {"raw_text": response.text}
     if not response.ok:
         raise ValueError(f"ReiSift status update failed ({response.status_code}): {body}")
-    return {"request": {"status": status_slug}, "response": body}
+    return {"request": {"status": status_label}, "response": body}
 
 
 def reisift_upsert_owner_contacts(token, owner_uuid, phones, emails):
@@ -20017,6 +20018,20 @@ def _anon_redirect_with_message(target_url, key, value):
     return redirect(f"{target_url}{separator}{key}={quote_plus(str(value))}")
 
 
+def _anon_json_response(ok, *, notice="", error="", property_id=0, property_uuid="", local_property_url="", extra=None, status_code=200):
+    payload = {
+        "ok": bool(ok),
+        "notice": str(notice or "").strip(),
+        "error": str(error or "").strip(),
+        "property_id": int(property_id or 0),
+        "property_uuid": str(property_uuid or "").strip(),
+        "local_property_url": str(local_property_url or "").strip(),
+    }
+    if isinstance(extra, dict):
+        payload.update(extra)
+    return jsonify(payload), status_code
+
+
 @app.route("/anon")
 def anon_dashboard():
     ensure_db()
@@ -20290,12 +20305,15 @@ def anon_track_route(record_key):
     target_url = _anon_return_target()
     row = db.execute("SELECT * FROM untitled_sheet_current WHERE record_key = ? LIMIT 1", (record_key,)).fetchone()
     if not row:
+        if _is_ajax_request(request):
+            return _anon_json_response(False, error="Anonymous lead not found.", status_code=404)
         return _anon_redirect_with_message(target_url, "error", "Anonymous lead not found.")
     try:
         result = track_untitled_lead_in_sift(db, dict(row), actor="CRM user", source="Anon queue")
         db.commit()
         property_id = int(result.get("property_id") or 0)
         property_uuid = result.get("property_uuid") or ""
+        local_property_url = url_for("property_detail", property_id=property_id) if property_id > 0 else ""
         message = "Lead tracked as Cold Lead"
         if property_id:
             message += f" and linked to property #{property_id}"
@@ -20303,11 +20321,22 @@ def anon_track_route(record_key):
             message += "; task created"
         if property_uuid:
             message += "."
+        if _is_ajax_request(request):
+            return _anon_json_response(
+                True,
+                notice=message,
+                property_id=property_id,
+                property_uuid=property_uuid,
+                local_property_url=local_property_url,
+                extra={"task_created": bool(result.get("task_result"))},
+            )
         return _anon_redirect_with_message(target_url, "notice", message)
     except Exception as exc:
         db.rollback()
         _update_untitled_current_row_state(db, record_key, last_action_error=str(exc))
         db.commit()
+        if _is_ajax_request(request):
+            return _anon_json_response(False, error=str(exc), status_code=400)
         return _anon_redirect_with_message(target_url, "error", str(exc))
 
 
@@ -20318,31 +20347,58 @@ def anon_skip_trace_once_route(record_key):
     target_url = _anon_return_target()
     row = db.execute("SELECT * FROM untitled_sheet_current WHERE record_key = ? LIMIT 1", (record_key,)).fetchone()
     if not row:
+        if _is_ajax_request(request):
+            return _anon_json_response(False, error="Anonymous lead not found.", status_code=404)
         return _anon_redirect_with_message(target_url, "error", "Anonymous lead not found.")
     try:
         result = run_untitled_lead_skip_trace_once(db, dict(row), actor="CRM user", source="Anon queue")
         db.commit()
+        property_id = int(result.get("property_id") or 0)
+        local_property_url = url_for("property_detail", property_id=property_id) if property_id > 0 else ""
         if result.get("already_done"):
+            notice = "Skip trace already completed for this anonymous lead."
+            if _is_ajax_request(request):
+                return _anon_json_response(
+                    True,
+                    notice=notice,
+                    property_id=property_id,
+                    local_property_url=local_property_url,
+                    extra={"already_done": True},
+                )
             return _anon_redirect_with_message(target_url, "notice", "Skip trace already completed for this anonymous lead.")
         summary = result.get("summary") or {}
         message_bits = []
         if result.get("track_result"):
             property_id = int((result.get("track_result") or {}).get("property_id") or 0)
             if property_id:
-                message_bits.append(f"Created local property #{property_id} and pushed to SIFT as cold lead.")
+                local_property_url = url_for("property_detail", property_id=property_id)
+                message_bits.append(f"Created local property #{property_id} and pushed to SIFT as Cold Lead.")
             else:
-                message_bits.append("Created local property and pushed to SIFT as cold lead.")
+                message_bits.append("Created local property and pushed to SIFT as Cold Lead.")
         message_bits.append(
             f"Skip trace complete. Owners {summary.get('owners_processed') or 0}, "
             f"phones synced {((summary.get('reisift_contact_sync') or {}).get('phones_attempted') or 0)}, "
             f"emails synced {((summary.get('reisift_contact_sync') or {}).get('emails_attempted') or 0)}."
         )
         message = " ".join(message_bits)
+        if _is_ajax_request(request):
+            return _anon_json_response(
+                True,
+                notice=message,
+                property_id=property_id,
+                local_property_url=local_property_url,
+                extra={
+                    "summary": summary,
+                    "tracked_now": bool(result.get("track_result")),
+                },
+            )
         return _anon_redirect_with_message(target_url, "notice", message)
     except Exception as exc:
         db.rollback()
         _update_untitled_current_row_state(db, record_key, last_action_error=str(exc))
         db.commit()
+        if _is_ajax_request(request):
+            return _anon_json_response(False, error=str(exc), status_code=400)
         return _anon_redirect_with_message(target_url, "error", str(exc))
 
 

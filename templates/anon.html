@@ -11,6 +11,7 @@
     <h2>Anon Lead Queue</h2>
     {% if notice %}<p class="ok-line">{{ notice }}</p>{% endif %}
     {% if error %}<p class="warn-line">{{ error }}</p>{% endif %}
+    <div id="anonAsyncMessage"></div>
     <p>Queue view mirrors the source sheet more closely. `Skip` is the intake action when the row has full contact address data; once a local property exists, the queue switches to the local-record link.</p>
     <form id="anonFilterForm" method="get"></form>
     <table class="crm-table anon-compact-table">
@@ -109,7 +110,7 @@
                 </td>
             </tr>
             {% for row in rows %}
-            <tr>
+            <tr data-record-key="{{ row.record_key }}">
                 <td>
                     {% if row.lead_category %}
                     <span class="pill anon-category-pill anon-category-cell">{{ row.lead_category }}</span>
@@ -119,7 +120,7 @@
                 </td>
                 <td class="anon-action-cell">
                     {% if row.can_skip %}
-                    <form method="post" action="{{ url_for('anon_skip_trace_once_route', record_key=row.record_key) }}">
+                    <form method="post" action="{{ url_for('anon_skip_trace_once_route', record_key=row.record_key) }}" class="anon-skip-form">
                         <input type="hidden" name="next" value="{{ return_to }}">
                         <button type="submit">Skip</button>
                     </form>
@@ -149,7 +150,7 @@
                     <span class="anon-muted">-</span>
                     {% endif %}
                 </td>
-                <td title="{{ row.last_action_error or '' }}">
+                <td class="anon-tracking-cell" title="{{ row.last_action_error or '' }}">
                     {% if row.selected %}
                     <a href="{{ row.local_property_url }}">Open local record</a>
                     {% else %}
@@ -191,15 +192,94 @@
 <script>
 (function () {
   const form = document.getElementById('anonFilterForm');
-  if (!form) return;
-  form.querySelectorAll('select').forEach((el) => {
-    el.addEventListener('change', () => form.requestSubmit());
-  });
-  form.querySelectorAll('input').forEach((el) => {
-    el.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        form.requestSubmit();
+  const messageHost = document.getElementById('anonAsyncMessage');
+
+  function renderMessage(type, text) {
+    if (!messageHost) return;
+    if (!text) {
+      messageHost.innerHTML = '';
+      return;
+    }
+    const className = type === 'error' ? 'warn-line' : 'ok-line';
+    messageHost.innerHTML = `<p class="${className}">${text}</p>`;
+  }
+
+  if (form) {
+    form.querySelectorAll('select').forEach((el) => {
+      el.addEventListener('change', () => form.requestSubmit());
+    });
+    form.querySelectorAll('input').forEach((el) => {
+      el.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          form.requestSubmit();
+        }
+      });
+    });
+  }
+
+  document.querySelectorAll('.anon-skip-form').forEach((skipForm) => {
+    skipForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (skipForm.dataset.busy === '1') return;
+      skipForm.dataset.busy = '1';
+      const row = skipForm.closest('tr');
+      const trackingCell = row ? row.querySelector('.anon-tracking-cell') : null;
+      const submitButton = skipForm.querySelector('button[type="submit"]');
+      const originalTrackingHtml = trackingCell ? trackingCell.innerHTML : '';
+      const originalButtonHtml = submitButton ? submitButton.innerHTML : '';
+
+      renderMessage('', '');
+      if (submitButton) {
+        submitButton.disabled = true;
+        submitButton.classList.add('anon-loading-button');
+        submitButton.innerHTML = '<span class="busy-spinner anon-inline-spinner" aria-hidden="true"></span><span>Running</span>';
+      }
+      if (trackingCell) {
+        trackingCell.innerHTML = '<span class="anon-progress"><span class="busy-spinner anon-inline-spinner" aria-hidden="true"></span><span>Creating local record...</span></span>';
+      }
+
+      try {
+        const response = await fetch(skipForm.action, {
+          method: 'POST',
+          body: new FormData(skipForm),
+          headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json'
+          }
+        });
+        let payload = {};
+        try {
+          payload = await response.json();
+        } catch (jsonError) {
+          payload = {};
+        }
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.error || 'Skip trace failed.');
+        }
+
+        renderMessage('notice', payload.notice || 'Skip trace completed.');
+        skipForm.outerHTML = '<span class="anon-muted">-</span>';
+        if (trackingCell) {
+          if (payload.local_property_url) {
+            trackingCell.innerHTML = `<a href="${payload.local_property_url}">Open local record</a>`;
+          } else {
+            trackingCell.innerHTML = '<span class="anon-muted">Tracked</span>';
+          }
+          trackingCell.removeAttribute('title');
+        }
+      } catch (error) {
+        renderMessage('error', error.message || 'Skip trace failed.');
+        if (trackingCell) {
+          trackingCell.innerHTML = originalTrackingHtml;
+        }
+        if (submitButton) {
+          submitButton.disabled = false;
+          submitButton.classList.remove('anon-loading-button');
+          submitButton.innerHTML = originalButtonHtml;
+        }
+      } finally {
+        delete skipForm.dataset.busy;
       }
     });
   });

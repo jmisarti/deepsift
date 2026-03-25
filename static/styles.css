@@ -968,6 +968,28 @@ button:hover { filter: brightness(1.05); }
     overflow: visible !important;
 }
 
+.anon-loading-button {
+    align-items: center;
+    display: inline-flex;
+    gap: 0.35rem;
+    justify-content: center;
+    min-width: 5.75rem;
+}
+
+.anon-inline-spinner {
+    border-width: 2px;
+    height: 12px;
+    width: 12px;
+}
+
+.anon-progress {
+    align-items: center;
+    color: #1f3f68;
+    display: inline-flex;
+    gap: 0.35rem;
+    font-weight: 600;
+}
+
 .anon-name {
     font-weight: 600;
 }

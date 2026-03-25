@@ -8562,6 +8562,10 @@ def _sync_untitled_tracking_from_property(db, record_key, property_id):
     )
 
 
+def _join_nonempty_messages(messages):
+    return "; ".join(str(msg).strip() for msg in (messages or []) if str(msg or "").strip())
+
+
 def ensure_local_property_for_untitled_lead(db, row, actor="", source="Anon queue"):
     row = row if isinstance(row, dict) else {}
     record_key = str(row.get("record_key") or "").strip()
@@ -8807,69 +8811,96 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
     address_line = format_property_address_line(prop["street"], prop["city"], prop["state"], prop["postal_code"])
     create_result = None
     task_result = None
+    status_result = None
+    contact_sync = None
     token = None
     target_status_slug = "cold_lead"
     target_status_label = "Cold Lead"
+    warnings = []
 
     if not property_uuid:
-        create_result = create_reisift_property_from_search(
-            {
-                "search": address_line,
-                "street": prop["street"],
-                "city": prop["city"],
-                "state": prop["state"],
-                "postal_code": prop["postal_code"],
-                "status": target_status_label,
-                "lists": "GetUntitledAI",
-                "tags": "Untitled Anonymous Lead,Anon Queue",
-                "notes": f"Selected from anonymous lead queue ({record_key}).",
-                "owner": {
-                    "first_name": owner_first,
-                    "last_name": owner_last,
-                    "address_street": prop["street"],
-                    "address_city": prop["city"],
-                    "address_state": prop["state"],
-                    "address_postal_code": prop["postal_code"],
-                    "emails": email_items,
-                    "phones": phone_items,
-                },
-            }
-        )
-        property_uuid = normalize_uuid(create_result.get("created_uuid") or "")
-        owner_uuid = normalize_uuid(create_result.get("owner_uuid") or "")
+        try:
+            create_result = create_reisift_property_from_search(
+                {
+                    "search": address_line,
+                    "street": prop["street"],
+                    "city": prop["city"],
+                    "state": prop["state"],
+                    "postal_code": prop["postal_code"],
+                    "status": target_status_label,
+                    "lists": "GetUntitledAI",
+                    "tags": "Untitled Anonymous Lead,Anon Queue",
+                    "notes": f"Selected from anonymous lead queue ({record_key}).",
+                    "owner": {
+                        "first_name": owner_first,
+                        "last_name": owner_last,
+                        "address_street": prop["street"],
+                        "address_city": prop["city"],
+                        "address_state": prop["state"],
+                        "address_postal_code": prop["postal_code"],
+                        "emails": email_items,
+                        "phones": phone_items,
+                    },
+                }
+            )
+            property_uuid = normalize_uuid(create_result.get("created_uuid") or "")
+            owner_uuid = normalize_uuid(create_result.get("owner_uuid") or "")
+        except Exception as exc:
+            warnings.append(f"ReiSift create failed: {exc}")
 
-    if not property_uuid:
-        raise ValueError("ReiSift did not return a property UUID for this anonymous lead.")
+    if property_uuid:
+        try:
+            token = reisift_get_access_token()
+        except Exception as exc:
+            warnings.append(f"ReiSift auth failed: {exc}")
+            token = None
 
-    token = reisift_get_access_token()
-    status_result = reisift_update_property_status(token, property_uuid, target_status_slug)
-    if create_result:
-        task_result = reisift_create_task(
-            token,
-            title="Call New GetUntitledAi Lead",
-            address=address_line,
-            assigned_to_property=property_uuid,
-            assigned_to_user=REISIFT_UNTITLED_TASK_ASSIGNED_TO_USER,
-            due_date=_reisift_due_tomorrow_noon_utc_text(),
-            all_day=True,
-        )
+        _set_local_property_uuid(db, property_id, property_uuid)
 
-    _set_local_property_uuid(db, property_id, property_uuid)
-    details = {}
-    try:
-        details = fetch_reisift_property_payload(token, property_uuid)
-    except Exception:
-        details = {}
-    owner_uuid = normalize_uuid(owner_uuid or _reisift_find_owner_uuid(details) or "")
-    if owner_uuid:
-        _set_local_owner_uuid(db, property_id, owner_uuid)
+        if token:
+            try:
+                status_result = reisift_update_property_status(token, property_uuid, target_status_slug)
+            except Exception as exc:
+                warnings.append(f"ReiSift status update failed: {exc}")
 
-    contact_sync = sync_skiptrace_contacts_to_reisift_owner(
-        db,
-        property_id,
-        phone_items=phone_items,
-        email_items=email_items,
-    )
+            if create_result:
+                try:
+                    task_result = reisift_create_task(
+                        token,
+                        title="Call New GetUntitledAi Lead",
+                        address=address_line,
+                        assigned_to_property=property_uuid,
+                        assigned_to_user=REISIFT_UNTITLED_TASK_ASSIGNED_TO_USER,
+                        due_date=_reisift_due_tomorrow_noon_utc_text(),
+                        all_day=True,
+                    )
+                except Exception as exc:
+                    warnings.append(f"ReiSift task create failed: {exc}")
+
+            details = {}
+            try:
+                details = fetch_reisift_property_payload(token, property_uuid)
+            except Exception as exc:
+                warnings.append(f"ReiSift detail fetch failed: {exc}")
+                details = {}
+            owner_uuid = normalize_uuid(owner_uuid or _reisift_find_owner_uuid(details) or "")
+            if owner_uuid:
+                _set_local_owner_uuid(db, property_id, owner_uuid)
+
+            try:
+                contact_sync = sync_skiptrace_contacts_to_reisift_owner(
+                    db,
+                    property_id,
+                    phone_items=phone_items,
+                    email_items=email_items,
+                )
+            except Exception as exc:
+                warnings.append(f"ReiSift contact sync failed: {exc}")
+        else:
+            warnings.append("ReiSift sync skipped because authentication was unavailable.")
+    else:
+        warnings.append("ReiSift property UUID was not available; local record was still created.")
+
     _sync_untitled_tracking_from_property(db, record_key, property_id)
     prop_refresh = db.execute(
         "SELECT reisift_property_uuid, reisift_owner_uuid FROM properties WHERE id = ? LIMIT 1",
@@ -8878,6 +8909,7 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
     property_uuid = normalize_uuid((prop_refresh["reisift_property_uuid"] if prop_refresh else "") or property_uuid)
     owner_uuid = normalize_uuid((prop_refresh["reisift_owner_uuid"] if prop_refresh else "") or owner_uuid)
     now_text = format_db_time(datetime.utcnow())
+    warning_text = _join_nonempty_messages(warnings)
     _update_untitled_current_row_state(
         db,
         record_key,
@@ -8886,9 +8918,9 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
         selected_by=row.get("selected_by") or (normalize_whitespace(actor) or "Anon Queue"),
         reisift_property_uuid=property_uuid,
         reisift_owner_uuid=owner_uuid,
-        reisift_status=target_status_label,
-        reisift_pushed_at=now_text,
-        last_action_error="",
+        reisift_status=target_status_label if property_uuid else (row.get("reisift_status") or ""),
+        reisift_pushed_at=now_text if property_uuid else (row.get("reisift_pushed_at") or ""),
+        last_action_error=warning_text,
     )
     db.execute(
         """
@@ -8899,7 +8931,7 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
             property_id,
             owner_person_id or None,
             "Anon Lead Intake",
-            "Tracked in ReiSift as cold lead",
+            "Tracked in ReiSift as Cold Lead" if property_uuid else "Local property created from anonymous lead",
             json.dumps(
                 {
                     "record_key": record_key,
@@ -8907,6 +8939,7 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
                     "status_result": status_result,
                     "task_result": task_result,
                     "contact_sync": contact_sync,
+                    "warnings": warnings,
                 },
                 default=str,
             ),
@@ -8920,6 +8953,7 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
         "status_result": status_result,
         "task_result": task_result,
         "contact_sync": contact_sync,
+        "warnings": warnings,
     }
 
 
@@ -8933,16 +8967,25 @@ def run_untitled_lead_skip_trace_once(db, row, actor="", source="Anon queue"):
 
     property_id = int(row.get("local_property_id") or 0)
     track_result = None
+    warnings = []
     if property_id <= 0:
         if not _untitled_has_full_property_contact_address(row):
             raise ValueError("This row needs first name, last name, street, city, state, and ZIP before skip trace can run.")
         track_result = track_untitled_lead_in_sift(db, row, actor=actor, source=source)
         property_id = int(track_result.get("property_id") or 0)
+        warnings.extend(track_result.get("warnings") or [])
     if property_id <= 0:
         raise ValueError("Could not prepare a local property for anonymous lead skip trace.")
 
-    result = run_property_skip_trace_lookup(db, property_id)
     now_text = format_db_time(datetime.utcnow())
+    result = {}
+    skiptrace_error = ""
+    try:
+        result = run_property_skip_trace_lookup(db, property_id)
+    except Exception as exc:
+        skiptrace_error = str(exc)
+        warnings.append(f"Skip trace failed: {skiptrace_error}")
+
     _sync_untitled_tracking_from_property(db, record_key, property_id)
     prop = db.execute(
         "SELECT reisift_property_uuid, reisift_owner_uuid FROM properties WHERE id = ? LIMIT 1",
@@ -8954,9 +8997,9 @@ def run_untitled_lead_skip_trace_once(db, row, actor="", source="Anon queue"):
         local_property_id=property_id,
         reisift_property_uuid=normalize_uuid((prop["reisift_property_uuid"] if prop else "") or ""),
         reisift_owner_uuid=normalize_uuid((prop["reisift_owner_uuid"] if prop else "") or ""),
-        skiptrace_completed_at=now_text,
-        skiptrace_summary_json=json.dumps(result.get("summary") or {}, default=str),
-        last_action_error="",
+        skiptrace_completed_at=now_text if not skiptrace_error else (row.get("skiptrace_completed_at") or ""),
+        skiptrace_summary_json=json.dumps(result.get("summary") or {}, default=str) if not skiptrace_error else (row.get("skiptrace_summary_json") or ""),
+        last_action_error=_join_nonempty_messages(warnings),
     )
     db.execute(
         """
@@ -8966,8 +9009,8 @@ def run_untitled_lead_skip_trace_once(db, row, actor="", source="Anon queue"):
         (
             property_id,
             "Anon Lead Skip Trace",
-            f"One-time skip trace completed via {source}",
-            json.dumps({"record_key": record_key, "actor": actor, "result": result}, default=str),
+            f"One-time skip trace completed via {source}" if not skiptrace_error else f"One-time skip trace partially completed via {source}",
+            json.dumps({"record_key": record_key, "actor": actor, "result": result, "skiptrace_error": skiptrace_error, "warnings": warnings}, default=str),
         ),
     )
     return {
@@ -8976,6 +9019,8 @@ def run_untitled_lead_skip_trace_once(db, row, actor="", source="Anon queue"):
         "property_id": property_id,
         "summary": result.get("summary") or {},
         "track_result": track_result,
+        "warnings": warnings,
+        "skiptrace_error": skiptrace_error,
     }
 
 
@@ -20032,6 +20077,26 @@ def _anon_json_response(ok, *, notice="", error="", property_id=0, property_uuid
     return jsonify(payload), status_code
 
 
+def _anon_partial_progress(db, record_key):
+    row = db.execute(
+        """
+        SELECT local_property_id, reisift_property_uuid
+        FROM untitled_sheet_current
+        WHERE record_key = ?
+        LIMIT 1
+        """,
+        ((record_key or "").strip(),),
+    ).fetchone()
+    property_id = int((row["local_property_id"] if row else 0) or 0)
+    property_uuid = normalize_uuid((row["reisift_property_uuid"] if row else "") or "")
+    local_property_url = url_for("property_detail", property_id=property_id) if property_id > 0 else ""
+    return {
+        "property_id": property_id,
+        "property_uuid": property_uuid,
+        "local_property_url": local_property_url,
+    }
+
+
 @app.route("/anon")
 def anon_dashboard():
     ensure_db()
@@ -20314,12 +20379,22 @@ def anon_track_route(record_key):
         property_id = int(result.get("property_id") or 0)
         property_uuid = result.get("property_uuid") or ""
         local_property_url = url_for("property_detail", property_id=property_id) if property_id > 0 else ""
-        message = "Lead tracked as Cold Lead"
-        if property_id:
-            message += f" and linked to property #{property_id}"
-        if result.get("task_result"):
-            message += "; task created"
+        message_bits = []
         if property_uuid:
+            message_bits.append("Lead tracked in ReiSift as Cold Lead")
+        elif property_id:
+            message_bits.append(f"Local property #{property_id} created")
+        else:
+            message_bits.append("Anonymous lead processed")
+        if property_id and property_uuid:
+            message_bits.append(f"linked to property #{property_id}")
+        if result.get("task_result"):
+            message_bits.append("task created")
+        warning_text = _join_nonempty_messages(result.get("warnings") or [])
+        if warning_text:
+            message_bits.append(f"warning: {warning_text}")
+        message = ". ".join(bit.rstrip(".") for bit in message_bits if bit).strip()
+        if message and not message.endswith("."):
             message += "."
         if _is_ajax_request(request):
             return _anon_json_response(
@@ -20328,10 +20403,25 @@ def anon_track_route(record_key):
                 property_id=property_id,
                 property_uuid=property_uuid,
                 local_property_url=local_property_url,
-                extra={"task_created": bool(result.get("task_result"))},
+                extra={"task_created": bool(result.get("task_result")), "warnings": result.get("warnings") or []},
             )
         return _anon_redirect_with_message(target_url, "notice", message)
     except Exception as exc:
+        progress = _anon_partial_progress(db, record_key)
+        if progress["property_id"] > 0:
+            _update_untitled_current_row_state(db, record_key, last_action_error=str(exc))
+            db.commit()
+            partial_notice = f"Local property #{progress['property_id']} was created, but a later step failed: {exc}"
+            if _is_ajax_request(request):
+                return _anon_json_response(
+                    True,
+                    notice=partial_notice,
+                    property_id=progress["property_id"],
+                    property_uuid=progress["property_uuid"],
+                    local_property_url=progress["local_property_url"],
+                    extra={"warnings": [str(exc)]},
+                )
+            return _anon_redirect_with_message(target_url, "notice", partial_notice)
         db.rollback()
         _update_untitled_current_row_state(db, record_key, last_action_error=str(exc))
         db.commit()
@@ -20375,11 +20465,18 @@ def anon_skip_trace_once_route(record_key):
                 message_bits.append(f"Created local property #{property_id} and pushed to SIFT as Cold Lead.")
             else:
                 message_bits.append("Created local property and pushed to SIFT as Cold Lead.")
-        message_bits.append(
-            f"Skip trace complete. Owners {summary.get('owners_processed') or 0}, "
-            f"phones synced {((summary.get('reisift_contact_sync') or {}).get('phones_attempted') or 0)}, "
-            f"emails synced {((summary.get('reisift_contact_sync') or {}).get('emails_attempted') or 0)}."
-        )
+        if result.get("skiptrace_error"):
+            message_bits.append("Local record preserved, but skip trace did not fully complete.")
+            message_bits.append(f"Warning: {result['skiptrace_error']}")
+        else:
+            message_bits.append(
+                f"Skip trace complete. Owners {summary.get('owners_processed') or 0}, "
+                f"phones synced {((summary.get('reisift_contact_sync') or {}).get('phones_attempted') or 0)}, "
+                f"emails synced {((summary.get('reisift_contact_sync') or {}).get('emails_attempted') or 0)}."
+            )
+        warning_text = _join_nonempty_messages(result.get("warnings") or [])
+        if warning_text and warning_text not in message_bits:
+            message_bits.append(f"Warning: {warning_text}")
         message = " ".join(message_bits)
         if _is_ajax_request(request):
             return _anon_json_response(
@@ -20390,10 +20487,27 @@ def anon_skip_trace_once_route(record_key):
                 extra={
                     "summary": summary,
                     "tracked_now": bool(result.get("track_result")),
+                    "warnings": result.get("warnings") or [],
+                    "skiptrace_error": result.get("skiptrace_error") or "",
                 },
             )
         return _anon_redirect_with_message(target_url, "notice", message)
     except Exception as exc:
+        progress = _anon_partial_progress(db, record_key)
+        if progress["property_id"] > 0:
+            _update_untitled_current_row_state(db, record_key, last_action_error=str(exc))
+            db.commit()
+            partial_notice = f"Local property #{progress['property_id']} was preserved, but a later step failed: {exc}"
+            if _is_ajax_request(request):
+                return _anon_json_response(
+                    True,
+                    notice=partial_notice,
+                    property_id=progress["property_id"],
+                    property_uuid=progress["property_uuid"],
+                    local_property_url=progress["local_property_url"],
+                    extra={"warnings": [str(exc)], "skiptrace_error": str(exc)},
+                )
+            return _anon_redirect_with_message(target_url, "notice", partial_notice)
         db.rollback()
         _update_untitled_current_row_state(db, record_key, last_action_error=str(exc))
         db.commit()

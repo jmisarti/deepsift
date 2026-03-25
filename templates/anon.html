@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="cards">
+    <article><h3>Active Leads</h3><p>{{ counts.active }}</p></article>
+    <article><h3>Hot Leads</h3><p>{{ counts.hot }}</p></article>
+    <article><h3>Tracked</h3><p>{{ counts.tracked }}</p></article>
+    <article><h3>Skip Traced</h3><p>{{ counts.skiptraced }}</p></article>
+</section>
+
+<section class="panel">
+    <h2>Anon Lead Queue</h2>
+    {% if notice %}<p class="ok-line">{{ notice }}</p>{% endif %}
+    {% if error %}<p class="warn-line">{{ error }}</p>{% endif %}
+    <p>Use this queue to choose which anonymous browse-stage leads become normal working records. Once a row is tracked, it links into the standard property workflow for notes, communications, skip trace, and mail.</p>
+    <form id="anonFilterForm" method="get"></form>
+    <table class="crm-table">
+        <thead>
+            <tr>
+                <th>Lead</th>
+                <th>Address</th>
+                <th>Category</th>
+                <th>Stage</th>
+                <th>Contact</th>
+                <th>Tracking</th>
+                <th>Actions</th>
+            </tr>
+            <tr class="table-filter-row">
+                <th>
+                    <input form="anonFilterForm" name="q" value="{{ q }}" placeholder="Name, email, phone, address">
+                </th>
+                <th>
+                    <select form="anonFilterForm" name="active">
+                        <option value="active" {% if active_filter == 'active' %}selected{% endif %}>Active only</option>
+                        <option value="all" {% if active_filter == 'all' %}selected{% endif %}>All rows</option>
+                        <option value="inactive" {% if active_filter == 'inactive' %}selected{% endif %}>Inactive only</option>
+                    </select>
+                </th>
+                <th>
+                    <select form="anonFilterForm" name="lead_category">
+                        <option value="">All categories</option>
+                        {% for option in category_options %}
+                        <option value="{{ option }}" {% if lead_category == option %}selected{% endif %}>{{ option.title() }}</option>
+                        {% endfor %}
+                    </select>
+                </th>
+                <th>
+                    <select form="anonFilterForm" name="lead_stage">
+                        <option value="">All stages</option>
+                        {% for option in stage_options %}
+                        <option value="{{ option }}" {% if lead_stage == option %}selected{% endif %}>{{ option }}</option>
+                        {% endfor %}
+                    </select>
+                </th>
+                <th></th>
+                <th>
+                    <select form="anonFilterForm" name="tracked">
+                        <option value="">All</option>
+                        <option value="tracked" {% if tracked == 'tracked' %}selected{% endif %}>Tracked</option>
+                        <option value="untracked" {% if tracked == 'untracked' %}selected{% endif %}>Not tracked</option>
+                    </select>
+                </th>
+                <th class="anon-filter-actions">
+                    <button type="submit" form="anonFilterForm">Filter</button>
+                    <a href="{{ url_for('anon_dashboard') }}">Reset</a>
+                </th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr>
+                <td>
+                    <strong>{{ row.display_label or 'Anonymous visitor' }}</strong><br>
+                    <small>Sessions {{ row.total_session_count or 0 }} | Pages {{ row.last_session_total_pages_visited or 0 }}</small><br>
+                    <small>Changed {{ row.last_changed_at or row.last_seen_at or row.first_seen_at }}</small>
+                </td>
+                <td>{{ row.address_line }}</td>
+                <td>
+                    <span class="pill">{{ row.lead_category or 'unknown' }}</span>
+                </td>
+                <td>{{ row.lead_stage or '-' }}</td>
+                <td>
+                    <div><strong>Phone:</strong> {{ row.source_phone_display }}</div>
+                    <div><strong>Email:</strong> {{ row.source_email_display }}</div>
+                </td>
+                <td>
+                    {% if row.selected %}
+                    <div><span class="pill">Tracked</span></div>
+                    <div><small>Property #{{ row.local_property_id }}</small></div>
+                    {% if row.local_owner_name %}<div><small>{{ row.local_owner_name }}</small></div>{% endif %}
+                    {% if row.reisift_property_uuid or row.local_reisift_property_uuid %}
+                    <div><small>SIFT: {{ row.reisift_status or 'linked' }}</small></div>
+                    {% endif %}
+                    {% if row.skiptrace_completed_at %}
+                    <div><small>Skip traced {{ row.skiptrace_completed_at }}</small></div>
+                    {% endif %}
+                    {% if row.mail_order_count %}
+                    <div><small>Mail orders {{ row.mail_order_count }}</small></div>
+                    {% endif %}
+                    {% else %}
+                    <span class="warn-line">Not tracked yet</span>
+                    {% endif %}
+                    {% if row.last_action_error %}
+                    <div class="warn-line"><small>{{ row.last_action_error }}</small></div>
+                    {% endif %}
+                </td>
+                <td>
+                    <div class="inline-actions">
+                        <form method="post" action="{{ url_for('anon_track_route', record_key=row.record_key) }}">
+                            <input type="hidden" name="next" value="{{ return_to }}">
+                            <button type="submit" {% if row.address_line == '-' %}disabled{% endif %}>
+                                {% if row.selected %}Refresh SIFT{% else %}Track In SIFT{% endif %}
+                            </button>
+                        </form>
+                        <form method="post" action="{{ url_for('anon_skip_trace_once_route', record_key=row.record_key) }}">
+                            <input type="hidden" name="next" value="{{ return_to }}">
+                            <button type="submit" {% if not row.selected or row.skiptrace_completed_at %}disabled{% endif %}>Skip Trace Once</button>
+                        </form>
+                        {% if row.local_property_url %}
+                        <a href="{{ row.local_property_url }}">Open Local</a>
+                        <a href="{{ row.mail_url }}">Mail</a>
+                        {% endif %}
+                        {% if row.sift_record_url %}
+                        <a href="{{ row.sift_record_url }}" target="_blank" rel="noopener">Open SIFT</a>
+                        {% endif %}
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+            {% if not rows %}
+            <tr><td colspan="7">No anonymous leads matched this filter.</td></tr>
+            {% endif %}
+        </tbody>
+    </table>
+</section>
+
+<script>
+(function () {
+  const form = document.getElementById('anonFilterForm');
+  if (!form) return;
+  form.querySelectorAll('select').forEach((el) => {
+    el.addEventListener('change', () => form.requestSubmit());
+  });
+  form.querySelectorAll('input').forEach((el) => {
+    el.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        form.requestSubmit();
+      }
+    });
+  });
+})();
+</script>
+{% endblock %}

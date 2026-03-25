@@ -1229,6 +1229,17 @@ def migrate_db(db):
     ensure_column(db, "untitled_sheet_current", "emailoctopus_contact_id", "emailoctopus_contact_id TEXT")
     ensure_column(db, "untitled_sheet_current", "emailoctopus_synced_at", "emailoctopus_synced_at TEXT")
     ensure_column(db, "untitled_sheet_current", "emailoctopus_last_error", "emailoctopus_last_error TEXT")
+    ensure_column(db, "untitled_sheet_current", "local_property_id", "local_property_id INTEGER")
+    ensure_column(db, "untitled_sheet_current", "selected_at", "selected_at TEXT")
+    ensure_column(db, "untitled_sheet_current", "selected_by", "selected_by TEXT")
+    ensure_column(db, "untitled_sheet_current", "reisift_property_uuid", "reisift_property_uuid TEXT")
+    ensure_column(db, "untitled_sheet_current", "reisift_owner_uuid", "reisift_owner_uuid TEXT")
+    ensure_column(db, "untitled_sheet_current", "reisift_status", "reisift_status TEXT")
+    ensure_column(db, "untitled_sheet_current", "reisift_pushed_at", "reisift_pushed_at TEXT")
+    ensure_column(db, "untitled_sheet_current", "skiptrace_completed_at", "skiptrace_completed_at TEXT")
+    ensure_column(db, "untitled_sheet_current", "skiptrace_summary_json", "skiptrace_summary_json TEXT")
+    ensure_column(db, "untitled_sheet_current", "last_action_error", "last_action_error TEXT")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_untitled_sheet_current_local_property ON untitled_sheet_current(local_property_id)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS untitled_sheet_changes (
@@ -8286,6 +8297,492 @@ def _untitled_should_notify_hot(existing_row, prepared_row, diff_map, change_typ
     return bool(set(diff_map).intersection(_untitled_contact_change_fields()))
 
 
+def _untitled_source_emails(row):
+    row = row if isinstance(row, dict) else {}
+    return _normalize_untitled_email_values(
+        row.get("email"),
+        row.get("business_email"),
+        row.get("personal_email"),
+    )
+
+
+def _untitled_source_phones(row):
+    row = row if isinstance(row, dict) else {}
+    phone = normalize_phone(row.get("mobile_phone") or "")
+    return [phone] if phone else []
+
+
+def _untitled_source_address(row):
+    row = row if isinstance(row, dict) else {}
+    return {
+        "street": normalize_whitespace(row.get("personal_address") or ""),
+        "city": normalize_whitespace(row.get("personal_city") or ""),
+        "state": normalize_state_code(row.get("personal_state") or ""),
+        "postal_code": normalize_postal_code(row.get("personal_zip") or ""),
+    }
+
+
+def _untitled_owner_name_parts(row):
+    row = row if isinstance(row, dict) else {}
+    first = normalize_whitespace(row.get("first_name") or "")
+    last = normalize_whitespace(row.get("last_name") or "")
+    if first or last:
+        return {"first_name": first, "last_name": last}
+
+    label = normalize_whitespace(row.get("display_label") or "")
+    if label and "@" not in label and not normalize_phone(label):
+        parts = [p for p in label.split() if p]
+        if len(parts) >= 2:
+            return {"first_name": parts[0], "last_name": " ".join(parts[1:])}
+        if len(parts) == 1 and parts[0].lower() not in {"anonymous", "visitor", "lead"}:
+            return {"first_name": parts[0], "last_name": "Lead"}
+    return {"first_name": "", "last_name": ""}
+
+
+def _update_untitled_current_row_state(db, record_key, **fields):
+    allowed = {
+        "local_property_id",
+        "selected_at",
+        "selected_by",
+        "reisift_property_uuid",
+        "reisift_owner_uuid",
+        "reisift_status",
+        "reisift_pushed_at",
+        "skiptrace_completed_at",
+        "skiptrace_summary_json",
+        "last_action_error",
+    }
+    assignments = []
+    params = []
+    for key, value in fields.items():
+        if key not in allowed:
+            continue
+        assignments.append(f"{key} = ?")
+        params.append(value)
+    if not assignments:
+        return
+    params.append((record_key or "").strip())
+    db.execute(
+        f"UPDATE untitled_sheet_current SET {', '.join(assignments)} WHERE record_key = ?",
+        tuple(params),
+    )
+
+
+def _sync_untitled_tracking_from_property(db, record_key, property_id):
+    property_id = int(property_id or 0)
+    if property_id <= 0:
+        return
+    prop = db.execute(
+        """
+        SELECT id, reisift_property_uuid, reisift_owner_uuid
+        FROM properties
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if not prop:
+        return
+    _update_untitled_current_row_state(
+        db,
+        record_key,
+        local_property_id=property_id,
+        reisift_property_uuid=normalize_uuid(prop["reisift_property_uuid"] or ""),
+        reisift_owner_uuid=normalize_uuid(prop["reisift_owner_uuid"] or ""),
+    )
+
+
+def ensure_local_property_for_untitled_lead(db, row, actor="", source="Anon queue"):
+    row = row if isinstance(row, dict) else {}
+    record_key = str(row.get("record_key") or "").strip()
+    if not record_key:
+        raise ValueError("Anonymous lead record key is required.")
+
+    address = _untitled_source_address(row)
+    street = address["street"]
+    city = address["city"]
+    state = address["state"]
+    postal_code = address["postal_code"]
+    if not street or not city or not state:
+        raise ValueError("This anonymous lead does not have a usable mailing address yet.")
+
+    actor = normalize_whitespace(actor) or "Anon Queue"
+    now_text = format_db_time(datetime.utcnow())
+    property_id = int(row.get("local_property_id") or 0)
+    if property_id > 0:
+        existing = db.execute(
+            """
+            SELECT p.id, p.owner_person_id, p.notes
+            FROM properties p
+            WHERE p.id = ?
+            LIMIT 1
+            """,
+            (property_id,),
+        ).fetchone()
+        if not existing:
+            property_id = 0
+        else:
+            _sync_untitled_tracking_from_property(db, record_key, property_id)
+    if property_id <= 0:
+        property_id = find_local_property_by_address(db, street, city, state, postal_code) or 0
+
+    payload = parse_json_object(row.get("payload_json") or "{}")
+    note_line = f"Anon lead selected via {source} on {now_text} by {actor}."
+    property_created = False
+    owner_created = False
+
+    if property_id > 0:
+        prop = db.execute(
+            "SELECT id, owner_person_id, notes FROM properties WHERE id = ? LIMIT 1",
+            (property_id,),
+        ).fetchone()
+        owner_person_id = int(prop["owner_person_id"] or 0) if prop else 0
+        db.execute(
+            "UPDATE properties SET notes = ? WHERE id = ?",
+            (append_note_line((prop["notes"] if prop else ""), note_line), property_id),
+        )
+    else:
+        address_id = create_address(db, street, city, state, postal_code)
+        cur = db.execute(
+            """
+            INSERT INTO properties (property_address_id, owner_person_id, resident_person_id, status, notes)
+            VALUES (?, NULL, NULL, ?, ?)
+            """,
+            (
+                address_id,
+                "Untouched",
+                note_line,
+            ),
+        )
+        property_id = int(cur.lastrowid or 0)
+        owner_person_id = 0
+        property_created = True
+        db.execute(
+            """
+            INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+            VALUES (?, NULL, ?, ?, ?)
+            """,
+            (
+                property_id,
+                "Anon Lead Intake",
+                "Local property created from anonymous lead",
+                json.dumps({"record_key": record_key, "source": source, "payload": payload}),
+            ),
+        )
+
+    emails = _untitled_source_emails(row)
+    phones = _untitled_source_phones(row)
+    name_parts = _untitled_owner_name_parts(row)
+    if not owner_person_id and (name_parts["first_name"] or name_parts["last_name"] or emails or phones):
+        first_name = name_parts["first_name"] or "Anonymous"
+        last_name = name_parts["last_name"] or "Lead"
+        if name_parts["first_name"] or name_parts["last_name"]:
+            owner_person_id = int(
+                find_or_create_person_by_name_parts(
+                    db,
+                    first_name,
+                    last_name,
+                    notes=f"Created from anonymous lead row {record_key}.",
+                )
+            )
+        else:
+            owner_person_id = int(
+                create_person(
+                    db,
+                    first_name,
+                    last_name,
+                    phone=phones[0] if phones else "",
+                    email=emails[0] if emails else "",
+                    notes=f"Created from anonymous lead row {record_key}.",
+                )
+            )
+        owner_created = True
+        db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (owner_person_id, property_id))
+
+    if owner_person_id:
+        person = db.execute(
+            "SELECT id, primary_phone, primary_email FROM people WHERE id = ? LIMIT 1",
+            (owner_person_id,),
+        ).fetchone()
+        if person:
+            if phones and not normalize_phone(person["primary_phone"] or ""):
+                db.execute("UPDATE people SET primary_phone = ? WHERE id = ?", (phones[0], owner_person_id))
+            if emails and not normalize_email(person["primary_email"] or ""):
+                db.execute("UPDATE people SET primary_email = ? WHERE id = ?", (emails[0], owner_person_id))
+
+        for phone in phones:
+            if touchpoint_exists(db, owner_person_id, "Phone", phone):
+                continue
+            db.execute(
+                """
+                INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
+                VALUES (?, 'Phone', 'Mobile', ?, 'Unknown', ?, ?)
+                """,
+                (
+                    owner_person_id,
+                    phone,
+                    f"Imported from anonymous lead row {record_key}.",
+                    "",
+                ),
+            )
+
+        for email in emails:
+            upsert_email_touchpoint_and_queue_validation(
+                db,
+                owner_person_id,
+                email,
+                note=f"Imported from anonymous lead row {record_key}.",
+                source="untitled_anonymous_lead",
+            )
+
+        if street and city and state:
+            existing_addr = db.execute(
+                """
+                SELECT pa.id
+                FROM person_addresses pa
+                JOIN addresses a ON a.id = pa.address_id
+                WHERE pa.person_id = ?
+                  AND lower(a.street) = lower(?)
+                  AND lower(a.city) = lower(?)
+                  AND lower(a.state) = lower(?)
+                  AND lower(COALESCE(a.postal_code, '')) = lower(?)
+                LIMIT 1
+                """,
+                (owner_person_id, street, city, state, postal_code),
+            ).fetchone()
+            if not existing_addr:
+                addr_id = create_address(db, street, city, state, postal_code)
+                db.execute(
+                    "INSERT INTO person_addresses (person_id, address_id, label) VALUES (?, ?, ?)",
+                    (owner_person_id, addr_id, "Anon Lead Address"),
+                )
+
+        if not row.get("selected_at"):
+            add_person_note(
+                db,
+                owner_person_id,
+                "Anon Lead Intake",
+                f"Anonymous lead selected on {now_text}.",
+                {
+                    "record_key": record_key,
+                    "source": source,
+                    "display_label": row.get("display_label"),
+                    "payload": payload,
+                },
+            )
+
+    _update_untitled_current_row_state(
+        db,
+        record_key,
+        local_property_id=property_id,
+        selected_at=row.get("selected_at") or now_text,
+        selected_by=row.get("selected_by") or actor,
+        last_action_error="",
+    )
+    _sync_untitled_tracking_from_property(db, record_key, property_id)
+    return {
+        "property_id": property_id,
+        "owner_person_id": owner_person_id or None,
+        "property_created": property_created,
+        "owner_created": owner_created,
+        "address": address,
+    }
+
+
+def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
+    row = row if isinstance(row, dict) else {}
+    record_key = str(row.get("record_key") or "").strip()
+    if not record_key:
+        raise ValueError("Anonymous lead record key is required.")
+
+    local_ctx = ensure_local_property_for_untitled_lead(db, row, actor=actor, source=source)
+    property_id = int(local_ctx["property_id"] or 0)
+    if property_id <= 0:
+        raise ValueError("Could not prepare a local property for this anonymous lead.")
+
+    prop = db.execute(
+        """
+        SELECT p.id, p.owner_person_id, p.reisift_property_uuid, p.reisift_owner_uuid,
+               a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if not prop:
+        raise ValueError("Local property not found after anon lead intake.")
+
+    property_uuid = normalize_uuid((row.get("reisift_property_uuid") or prop["reisift_property_uuid"] or ""))
+    owner_uuid = normalize_uuid((row.get("reisift_owner_uuid") or prop["reisift_owner_uuid"] or ""))
+    owner_person_id = int(prop["owner_person_id"] or 0)
+    phone_items, email_items = collect_person_contact_items_for_reisift_sync(db, [owner_person_id] if owner_person_id else [])
+
+    owner_first = "Anonymous"
+    owner_last = "Lead"
+    if owner_person_id:
+        owner_row = db.execute(
+            "SELECT first_name, last_name FROM people WHERE id = ? LIMIT 1",
+            (owner_person_id,),
+        ).fetchone()
+        if owner_row:
+            owner_first = normalize_whitespace(owner_row["first_name"] or "") or owner_first
+            owner_last = normalize_whitespace(owner_row["last_name"] or "") or owner_last
+    else:
+        owner_parts = _untitled_owner_name_parts(row)
+        owner_first = owner_parts["first_name"] or owner_first
+        owner_last = owner_parts["last_name"] or owner_last
+
+    address_line = format_property_address_line(prop["street"], prop["city"], prop["state"], prop["postal_code"])
+    create_result = None
+    token = None
+    target_status_slug = "cold_lead"
+    target_status_label = "cold lead"
+
+    if not property_uuid:
+        create_result = create_reisift_property_from_search(
+            {
+                "search": address_line,
+                "street": prop["street"],
+                "city": prop["city"],
+                "state": prop["state"],
+                "postal_code": prop["postal_code"],
+                "status": target_status_slug,
+                "tags": "Untitled Anonymous Lead,Anon Queue",
+                "notes": f"Selected from anonymous lead queue ({record_key}).",
+                "owner": {
+                    "first_name": owner_first,
+                    "last_name": owner_last,
+                    "address_street": prop["street"],
+                    "address_city": prop["city"],
+                    "address_state": prop["state"],
+                    "address_postal_code": prop["postal_code"],
+                    "emails": email_items,
+                    "phones": phone_items,
+                },
+            }
+        )
+        property_uuid = normalize_uuid(create_result.get("created_uuid") or "")
+        owner_uuid = normalize_uuid(create_result.get("owner_uuid") or "")
+
+    if not property_uuid:
+        raise ValueError("ReiSift did not return a property UUID for this anonymous lead.")
+
+    token = reisift_get_access_token()
+    status_result = reisift_update_property_status(token, property_uuid, target_status_slug)
+
+    _set_local_property_uuid(db, property_id, property_uuid)
+    details = {}
+    try:
+        details = fetch_reisift_property_payload(token, property_uuid)
+    except Exception:
+        details = {}
+    owner_uuid = normalize_uuid(owner_uuid or _reisift_find_owner_uuid(details) or "")
+    if owner_uuid:
+        _set_local_owner_uuid(db, property_id, owner_uuid)
+
+    contact_sync = sync_skiptrace_contacts_to_reisift_owner(
+        db,
+        property_id,
+        phone_items=phone_items,
+        email_items=email_items,
+    )
+    _sync_untitled_tracking_from_property(db, record_key, property_id)
+    prop_refresh = db.execute(
+        "SELECT reisift_property_uuid, reisift_owner_uuid FROM properties WHERE id = ? LIMIT 1",
+        (property_id,),
+    ).fetchone()
+    property_uuid = normalize_uuid((prop_refresh["reisift_property_uuid"] if prop_refresh else "") or property_uuid)
+    owner_uuid = normalize_uuid((prop_refresh["reisift_owner_uuid"] if prop_refresh else "") or owner_uuid)
+    now_text = format_db_time(datetime.utcnow())
+    _update_untitled_current_row_state(
+        db,
+        record_key,
+        local_property_id=property_id,
+        selected_at=row.get("selected_at") or now_text,
+        selected_by=row.get("selected_by") or (normalize_whitespace(actor) or "Anon Queue"),
+        reisift_property_uuid=property_uuid,
+        reisift_owner_uuid=owner_uuid,
+        reisift_status=target_status_label,
+        reisift_pushed_at=now_text,
+        last_action_error="",
+    )
+    db.execute(
+        """
+        INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            property_id,
+            owner_person_id or None,
+            "Anon Lead Intake",
+            "Tracked in ReiSift as cold lead",
+            json.dumps(
+                {
+                    "record_key": record_key,
+                    "create_result": create_result,
+                    "status_result": status_result,
+                    "contact_sync": contact_sync,
+                },
+                default=str,
+            ),
+        ),
+    )
+    return {
+        "property_id": property_id,
+        "property_uuid": property_uuid,
+        "owner_uuid": owner_uuid,
+        "create_result": create_result,
+        "status_result": status_result,
+        "contact_sync": contact_sync,
+    }
+
+
+def run_untitled_lead_skip_trace_once(db, row, actor="", source="Anon queue"):
+    row = row if isinstance(row, dict) else {}
+    record_key = str(row.get("record_key") or "").strip()
+    if not record_key:
+        raise ValueError("Anonymous lead record key is required.")
+    if row.get("skiptrace_completed_at"):
+        return {"ok": True, "already_done": True, "property_id": int(row.get("local_property_id") or 0), "summary": {}}
+
+    property_id = int(row.get("local_property_id") or 0)
+    if property_id <= 0:
+        raise ValueError("Push this lead into SIFT first so it has a local property record.")
+
+    result = run_property_skip_trace_lookup(db, property_id)
+    now_text = format_db_time(datetime.utcnow())
+    _sync_untitled_tracking_from_property(db, record_key, property_id)
+    prop = db.execute(
+        "SELECT reisift_property_uuid, reisift_owner_uuid FROM properties WHERE id = ? LIMIT 1",
+        (property_id,),
+    ).fetchone()
+    _update_untitled_current_row_state(
+        db,
+        record_key,
+        local_property_id=property_id,
+        reisift_property_uuid=normalize_uuid((prop["reisift_property_uuid"] if prop else "") or ""),
+        reisift_owner_uuid=normalize_uuid((prop["reisift_owner_uuid"] if prop else "") or ""),
+        skiptrace_completed_at=now_text,
+        skiptrace_summary_json=json.dumps(result.get("summary") or {}, default=str),
+        last_action_error="",
+    )
+    db.execute(
+        """
+        INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+        VALUES (?, NULL, ?, ?, ?)
+        """,
+        (
+            property_id,
+            "Anon Lead Skip Trace",
+            f"One-time skip trace completed via {source}",
+            json.dumps({"record_key": record_key, "actor": actor, "result": result}, default=str),
+        ),
+    )
+    return {"ok": True, "already_done": False, "property_id": property_id, "summary": result.get("summary") or {}}
+
+
 def run_untitled_leads_snapshot_once():
     ensure_db()
     db = open_sqlite_connection()
@@ -11229,6 +11726,30 @@ def _normalize_reisift_status(status_value):
         "refer_lead": "refer lead",
     }
     return aliases.get(raw, raw)
+
+
+def _reisift_status_slug(status_value, default="new_lead"):
+    raw = str(status_value or "").strip().lower().replace("-", " ").replace("_", " ")
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        return default
+    aliases = {
+        "new lead": "new_lead",
+        "no contact new lead": "no_contact_new_lead",
+        "nurture new lead": "nurture_new_lead",
+        "hot lead": "hot_lead",
+        "warm lead": "warm_lead",
+        "cold lead": "cold_lead",
+        "ghosting lead": "ghosting_lead",
+        "dead lead": "dead_lead",
+        "dead leads": "dead_lead",
+        "not interested": "not_interested",
+        "opt out": "opt_out",
+        "opt-out": "opt_out",
+        "listed": "listed",
+        "refer lead": "refer_lead",
+    }
+    return aliases.get(raw, raw.replace(" ", "_"))
 
 
 def _playbook_priority_for_action(property_status, action_type, fallback_priority):
@@ -14314,8 +14835,7 @@ def _reisift_build_property_create_payload(address_info_payload, input_payload):
 
     lists = parse_csv_list(input_payload.get("lists"))
     tags = parse_csv_list(input_payload.get("tags"))
-    # Per workflow, new inserts should always enter ReiSift as new_lead.
-    status = "new_lead"
+    status = _reisift_status_slug(input_payload.get("status") or input_payload.get("reisift_status"), default="new_lead")
     notes = (input_payload.get("notes") or "").strip()
 
     owner_payload = {
@@ -14460,7 +14980,7 @@ def _reisift_build_property_create_payload_from_input(input_payload):
     notes = (input_payload.get("notes") or "").strip()
     return {
         "address": property_address,
-        "status": "new_lead",
+        "status": _reisift_status_slug(input_payload.get("status") or input_payload.get("reisift_status"), default="new_lead"),
         "lists": lists,
         "tags": tags,
         "notes": notes,
@@ -19206,6 +19726,234 @@ def dashboard():
         status_filter=status_filter,
         q=q,
     )
+
+
+def _anon_return_target():
+    next_target = str(request.form.get("next") or request.args.get("next") or "").strip()
+    if next_target.startswith("/") and not next_target.startswith("//") and next_target.startswith("/anon"):
+        return next_target
+    if request.query_string:
+        return request.full_path.rstrip("?")
+    return url_for("anon_dashboard")
+
+
+def _anon_redirect_with_message(target_url, key, value):
+    if not value:
+        return redirect(target_url)
+    separator = "&" if "?" in target_url else "?"
+    return redirect(f"{target_url}{separator}{key}={quote_plus(str(value))}")
+
+
+@app.route("/anon")
+def anon_dashboard():
+    ensure_db()
+    db = get_db()
+
+    q = (request.args.get("q") or "").strip()
+    lead_category = (request.args.get("lead_category") or "").strip().lower()
+    lead_stage = (request.args.get("lead_stage") or "").strip()
+    tracked = (request.args.get("tracked") or "").strip().lower()
+    active_filter = (request.args.get("active") or "active").strip().lower()
+    notice = (request.args.get("notice") or "").strip()
+    error = (request.args.get("error") or "").strip()
+
+    where = []
+    params = []
+    if active_filter == "active":
+        where.append("COALESCE(u.is_active, 1) = 1")
+    elif active_filter == "inactive":
+        where.append("COALESCE(u.is_active, 1) = 0")
+    if lead_category:
+        where.append("lower(COALESCE(u.lead_category, '')) = ?")
+        params.append(lead_category)
+    if lead_stage:
+        where.append("COALESCE(u.lead_stage, '') = ?")
+        params.append(lead_stage)
+    if tracked == "tracked":
+        where.append("COALESCE(u.local_property_id, 0) > 0")
+    elif tracked == "untracked":
+        where.append("COALESCE(u.local_property_id, 0) = 0")
+    if q:
+        like = f"%{q.lower()}%"
+        where.append(
+            """
+            (
+                lower(COALESCE(u.display_label, '')) LIKE ?
+                OR lower(COALESCE(u.personal_address, '')) LIKE ?
+                OR lower(COALESCE(u.personal_city, '')) LIKE ?
+                OR lower(COALESCE(u.personal_state, '')) LIKE ?
+                OR lower(COALESCE(u.email, '')) LIKE ?
+                OR lower(COALESCE(u.business_email, '')) LIKE ?
+                OR lower(COALESCE(u.personal_email, '')) LIKE ?
+                OR lower(COALESCE(u.mobile_phone, '')) LIKE ?
+            )
+            """
+        )
+        params.extend([like, like, like, like, like, like, like, like])
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+    rows = db.execute(
+        f"""
+        SELECT u.*,
+               p.status AS local_property_status,
+               p.owner_person_id AS local_owner_person_id,
+               p.reisift_property_uuid AS local_reisift_property_uuid,
+               p.reisift_owner_uuid AS local_reisift_owner_uuid,
+               op.first_name AS local_owner_first,
+               op.middle_name AS local_owner_middle,
+               op.last_name AS local_owner_last,
+               (
+                   SELECT COUNT(*)
+                   FROM mail_orders mo
+                   WHERE mo.property_id = p.id
+               ) AS mail_order_count
+        FROM untitled_sheet_current u
+        LEFT JOIN properties p ON p.id = u.local_property_id
+        LEFT JOIN people op ON op.id = p.owner_person_id
+        {where_sql}
+        ORDER BY
+            CASE WHEN lower(COALESCE(u.lead_category, '')) = 'hot' THEN 0 ELSE 1 END,
+            datetime(COALESCE(u.last_changed_at, u.last_seen_at, u.first_seen_at)) DESC,
+            u.id DESC
+        LIMIT 500
+        """,
+        tuple(params),
+    ).fetchall()
+
+    category_options = [
+        row["lead_category"]
+        for row in db.execute(
+            """
+            SELECT DISTINCT lower(COALESCE(lead_category, '')) AS lead_category
+            FROM untitled_sheet_current
+            WHERE trim(COALESCE(lead_category, '')) <> ''
+            ORDER BY lower(lead_category) ASC
+            """
+        ).fetchall()
+        if row["lead_category"]
+    ]
+    stage_options = [
+        row["lead_stage"]
+        for row in db.execute(
+            """
+            SELECT DISTINCT COALESCE(lead_stage, '') AS lead_stage
+            FROM untitled_sheet_current
+            WHERE trim(COALESCE(lead_stage, '')) <> ''
+            ORDER BY lead_stage ASC
+            """
+        ).fetchall()
+        if row["lead_stage"]
+    ]
+
+    counts = {
+        "active": db.execute("SELECT COUNT(*) AS c FROM untitled_sheet_current WHERE COALESCE(is_active, 1) = 1").fetchone()["c"],
+        "hot": db.execute(
+            "SELECT COUNT(*) AS c FROM untitled_sheet_current WHERE COALESCE(is_active, 1) = 1 AND lower(COALESCE(lead_category, '')) = 'hot'"
+        ).fetchone()["c"],
+        "tracked": db.execute("SELECT COUNT(*) AS c FROM untitled_sheet_current WHERE COALESCE(local_property_id, 0) > 0").fetchone()["c"],
+        "skiptraced": db.execute("SELECT COUNT(*) AS c FROM untitled_sheet_current WHERE trim(COALESCE(skiptrace_completed_at, '')) <> ''").fetchone()["c"],
+    }
+
+    anon_rows = []
+    for row in rows:
+        item = dict(row)
+        emails = _untitled_source_emails(item)
+        phones = _untitled_source_phones(item)
+        address = _untitled_source_address(item)
+        local_property_id = int(item.get("local_property_id") or 0)
+        local_uuid = normalize_uuid(item.get("local_reisift_property_uuid") or item.get("reisift_property_uuid") or "")
+        item["source_emails"] = emails
+        item["source_email_display"] = ", ".join(emails) if emails else "-"
+        item["source_phone_display"] = format_phone_pretty(phones[0]) if phones else "-"
+        item["address_line"] = format_property_address_line(
+            address.get("street"),
+            address.get("city"),
+            address.get("state"),
+            address.get("postal_code"),
+        ) or "-"
+        item["selected"] = local_property_id > 0
+        item["local_property_url"] = url_for("property_detail", property_id=local_property_id) if local_property_id > 0 else ""
+        item["mail_url"] = url_for("property_detail", property_id=local_property_id, mail=1) if local_property_id > 0 else ""
+        item["sift_record_url"] = _sift_record_url(local_uuid) if local_uuid else ""
+        item["local_owner_name"] = " ".join(
+            x
+            for x in [
+                normalize_whitespace(item.get("local_owner_first") or ""),
+                normalize_whitespace(item.get("local_owner_middle") or ""),
+                normalize_whitespace(item.get("local_owner_last") or ""),
+            ]
+            if x
+        ).strip()
+        anon_rows.append(item)
+
+    return render_template(
+        "anon.html",
+        rows=anon_rows,
+        counts=counts,
+        q=q,
+        lead_category=lead_category,
+        lead_stage=lead_stage,
+        tracked=tracked,
+        active_filter=active_filter,
+        category_options=category_options,
+        stage_options=stage_options,
+        notice=notice,
+        error=error,
+        return_to=request.full_path.rstrip("?") if request.query_string else request.path,
+    )
+
+
+@app.route("/anon/<string:record_key>/track", methods=["POST"])
+def anon_track_route(record_key):
+    ensure_db()
+    db = get_db()
+    target_url = _anon_return_target()
+    row = db.execute("SELECT * FROM untitled_sheet_current WHERE record_key = ? LIMIT 1", (record_key,)).fetchone()
+    if not row:
+        return _anon_redirect_with_message(target_url, "error", "Anonymous lead not found.")
+    try:
+        result = track_untitled_lead_in_sift(db, dict(row), actor="CRM user", source="Anon queue")
+        db.commit()
+        property_id = int(result.get("property_id") or 0)
+        property_uuid = result.get("property_uuid") or ""
+        message = f"Lead tracked as cold lead"
+        if property_id:
+            message += f" and linked to property #{property_id}"
+        if property_uuid:
+            message += "."
+        return _anon_redirect_with_message(target_url, "notice", message)
+    except Exception as exc:
+        db.rollback()
+        _update_untitled_current_row_state(db, record_key, last_action_error=str(exc))
+        db.commit()
+        return _anon_redirect_with_message(target_url, "error", str(exc))
+
+
+@app.route("/anon/<string:record_key>/skip-trace-once", methods=["POST"])
+def anon_skip_trace_once_route(record_key):
+    ensure_db()
+    db = get_db()
+    target_url = _anon_return_target()
+    row = db.execute("SELECT * FROM untitled_sheet_current WHERE record_key = ? LIMIT 1", (record_key,)).fetchone()
+    if not row:
+        return _anon_redirect_with_message(target_url, "error", "Anonymous lead not found.")
+    try:
+        result = run_untitled_lead_skip_trace_once(db, dict(row), actor="CRM user", source="Anon queue")
+        db.commit()
+        if result.get("already_done"):
+            return _anon_redirect_with_message(target_url, "notice", "Skip trace already completed for this anonymous lead.")
+        summary = result.get("summary") or {}
+        message = (
+            f"Skip trace complete. Owners {summary.get('owners_processed') or 0}, "
+            f"phones synced {((summary.get('reisift_contact_sync') or {}).get('phones_attempted') or 0)}, "
+            f"emails synced {((summary.get('reisift_contact_sync') or {}).get('emails_attempted') or 0)}."
+        )
+        return _anon_redirect_with_message(target_url, "notice", message)
+    except Exception as exc:
+        db.rollback()
+        _update_untitled_current_row_state(db, record_key, last_action_error=str(exc))
+        db.commit()
+        return _anon_redirect_with_message(target_url, "error", str(exc))
 
 
 @app.route("/d4d")

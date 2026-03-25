@@ -15,6 +15,7 @@
             <div class="entity-integrations-menu">
                 <button type="button" id="propertySkipTraceBtn">Skip Trace Property (Owners)</button>
                 <button type="button" id="bulkSmsBtn">Bulk Text This Property</button>
+                <button type="button" id="mailAllRelativesBtn" {% if not prop.owner_person_id %}disabled{% endif %}>Mail All Relatives</button>
                 <a href="{{ url_for('sequences_page') }}">Sequence Automation</a>
             </div>
         </details>
@@ -765,6 +766,17 @@ if (mailAllRelativesBtn) {
       'Mail All Relatives'
     );
   });
+}
+
+const propertyMailParams = new URLSearchParams(window.location.search);
+if (propertyMailParams.get('mail') === '1' && mailAllRelativesBtn && !mailAllRelativesBtn.disabled) {
+  setTimeout(() => {
+    mailAllRelativesBtn.click();
+    propertyMailParams.delete('mail');
+    const nextQuery = propertyMailParams.toString();
+    const nextUrl = `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}${window.location.hash || ''}`;
+    window.history.replaceState({}, '', nextUrl);
+  }, 0);
 }
 
 mailPreviewModal.addEventListener('click', (e) => {

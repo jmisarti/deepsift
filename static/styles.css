@@ -915,6 +915,21 @@ button:hover { filter: brightness(1.05); }
     flex-wrap: wrap;
 }
 
+.table-filter-row th {
+    background: #f8fafc;
+    vertical-align: top;
+}
+
+.table-filter-row input,
+.table-filter-row select {
+    width: 100%;
+    min-width: 0;
+}
+
+.anon-filter-actions {
+    white-space: nowrap;
+}
+
 .inline-check {
     display: inline-flex !important;
     flex-direction: row !important;

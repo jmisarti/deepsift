@@ -8807,7 +8807,7 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
     create_result = None
     token = None
     target_status_slug = "cold_lead"
-    target_status_label = "cold lead"
+    target_status_label = "Cold Lead"
 
     if not property_uuid:
         create_result = create_reisift_property_from_search(
@@ -8817,7 +8817,8 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
                 "city": prop["city"],
                 "state": prop["state"],
                 "postal_code": prop["postal_code"],
-                "status": target_status_slug,
+                "status": target_status_label,
+                "lists": "GetUntitledAI",
                 "tags": "Untitled Anonymous Lead,Anon Queue",
                 "notes": f"Selected from anonymous lead queue ({record_key}).",
                 "owner": {
@@ -11933,6 +11934,27 @@ def _reisift_status_slug(status_value, default="new_lead"):
     return aliases.get(raw, raw.replace(" ", "_"))
 
 
+def _reisift_status_label(status_value, default="New Lead"):
+    normalized = _normalize_reisift_status(status_value)
+    if not normalized:
+        normalized = _normalize_reisift_status(default)
+    aliases = {
+        "new lead": "New Lead",
+        "no contact new lead": "No Contact New Lead",
+        "nurture new lead": "Nurture New Lead",
+        "hot lead": "Hot Lead",
+        "warm lead": "Warm Lead",
+        "cold lead": "Cold Lead",
+        "ghosting lead": "Ghosting Lead",
+        "dead lead": "Dead Lead",
+        "not interested": "Not Interested",
+        "opt-out": "Opt-Out",
+        "listed": "Listed",
+        "refer lead": "Refer Lead",
+    }
+    return aliases.get(normalized, " ".join(part.capitalize() for part in normalized.split()) or default)
+
+
 def _playbook_priority_for_action(property_status, action_type, fallback_priority):
     status_key = _normalize_reisift_status(property_status)
     row = REISIFT_PLAYBOOK_PRIORITY.get(status_key, {})
@@ -15016,7 +15038,7 @@ def _reisift_build_property_create_payload(address_info_payload, input_payload):
 
     lists = parse_csv_list(input_payload.get("lists"))
     tags = parse_csv_list(input_payload.get("tags"))
-    status = _reisift_status_slug(input_payload.get("status") or input_payload.get("reisift_status"), default="new_lead")
+    status = _reisift_status_label(input_payload.get("status") or input_payload.get("reisift_status"), default="New Lead")
     notes = (input_payload.get("notes") or "").strip()
 
     owner_payload = {
@@ -15161,7 +15183,7 @@ def _reisift_build_property_create_payload_from_input(input_payload):
     notes = (input_payload.get("notes") or "").strip()
     return {
         "address": property_address,
-        "status": _reisift_status_slug(input_payload.get("status") or input_payload.get("reisift_status"), default="new_lead"),
+        "status": _reisift_status_label(input_payload.get("status") or input_payload.get("reisift_status"), default="New Lead"),
         "lists": lists,
         "tags": tags,
         "notes": notes,
@@ -20204,7 +20226,7 @@ def anon_track_route(record_key):
         db.commit()
         property_id = int(result.get("property_id") or 0)
         property_uuid = result.get("property_uuid") or ""
-        message = f"Lead tracked as cold lead"
+        message = "Lead tracked as Cold Lead"
         if property_id:
             message += f" and linked to property #{property_id}"
         if property_uuid:

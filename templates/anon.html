@@ -14,8 +14,21 @@
     <p>Queue view mirrors the source sheet more closely. `Skip` is the intake action when the row has full contact address data; once a local property exists, the queue switches to the local-record link.</p>
     <form id="anonFilterForm" method="get"></form>
     <table class="crm-table anon-compact-table">
+        <colgroup>
+            <col style="width:7%">
+            <col style="width:6%">
+            <col style="width:11%">
+            <col style="width:18%">
+            <col style="width:13%">
+            <col style="width:9%">
+            <col style="width:7%">
+            <col style="width:12%">
+            <col style="width:11%">
+            <col style="width:6%">
+        </colgroup>
         <thead>
             <tr>
+                <th>Category</th>
                 <th>Skip</th>
                 <th>Name</th>
                 <th>Address</th>
@@ -26,44 +39,57 @@
                 <th>Exit URL</th>
                 <th>Tracking</th>
             </tr>
-            <tr class="table-filter-row">
-                <th></th>
-                <th>
-                    <input form="anonFilterForm" name="q" value="{{ q }}" placeholder="Name, email, phone, address">
+        </thead>
+        <tbody>
+            <tr class="table-filter-row anon-filter-row">
+                <td>
                     <select form="anonFilterForm" name="lead_category">
                         <option value="">All categories</option>
                         {% for option in category_options %}
                         <option value="{{ option }}" {% if lead_category == option %}selected{% endif %}>{{ option.title() }}</option>
                         {% endfor %}
                     </select>
-                </th>
-                <th>
+                </td>
+                <td></td>
+                <td>
+                    <input form="anonFilterForm" name="q" value="{{ q }}" placeholder="Name, phone, address">
+                </td>
+                <td>
                     <select form="anonFilterForm" name="active">
                         <option value="active" {% if active_filter == 'active' %}selected{% endif %}>Active only</option>
                         <option value="all" {% if active_filter == 'all' %}selected{% endif %}>All rows</option>
                         <option value="inactive" {% if active_filter == 'inactive' %}selected{% endif %}>Inactive only</option>
                     </select>
-                </th>
-                <th>
+                </td>
+                <td>
                     <select form="anonFilterForm" name="sort">
                         <option value="last_seen_desc" {% if sort == 'last_seen_desc' %}selected{% endif %}>Newest first</option>
                         <option value="last_seen_asc" {% if sort == 'last_seen_asc' %}selected{% endif %}>Oldest first</option>
                         <option value="category_asc" {% if sort == 'category_asc' %}selected{% endif %}>Category A-Z</option>
                         <option value="category_desc" {% if sort == 'category_desc' %}selected{% endif %}>Category Z-A</option>
                     </select>
-                </th>
-                <th>
+                </td>
+                <td>
+                    <select form="anonFilterForm" name="time_on_page">
+                        <option value="">Any duration</option>
+                        <option value="30s" {% if time_on_page == '30s' %}selected{% endif %}>30s+</option>
+                        <option value="1m" {% if time_on_page == '1m' %}selected{% endif %}>1m+</option>
+                        <option value="3m" {% if time_on_page == '3m' %}selected{% endif %}>3m+</option>
+                        <option value="5m" {% if time_on_page == '5m' %}selected{% endif %}>5m+</option>
+                        <option value="10m" {% if time_on_page == '10m' %}selected{% endif %}>10m+</option>
+                    </select>
+                </td>
+                <td>
                     <select form="anonFilterForm" name="lead_stage">
                         <option value="">All stages</option>
                         {% for option in stage_options %}
                         <option value="{{ option }}" {% if lead_stage == option %}selected{% endif %}>{{ option }}</option>
                         {% endfor %}
                     </select>
-                </th>
-                <th></th>
-                <th></th>
-                <th></th>
-                <th class="anon-filter-actions">
+                </td>
+                <td></td>
+                <td></td>
+                <td class="anon-filter-actions">
                     <select form="anonFilterForm" name="tracked">
                         <option value="">All</option>
                         <option value="tracked" {% if tracked == 'tracked' %}selected{% endif %}>Tracked</option>
@@ -73,12 +99,17 @@
                         <button type="submit" form="anonFilterForm">Apply</button>
                         <a href="{{ url_for('anon_dashboard') }}">Reset</a>
                     </div>
-                </th>
+                </td>
             </tr>
-        </thead>
-        <tbody>
             {% for row in rows %}
             <tr>
+                <td>
+                    {% if row.lead_category %}
+                    <span class="pill anon-category-pill anon-category-cell">{{ row.lead_category }}</span>
+                    {% else %}
+                    <span class="anon-muted">-</span>
+                    {% endif %}
+                </td>
                 <td class="anon-action-cell">
                     {% if row.can_skip %}
                     <form method="post" action="{{ url_for('anon_skip_trace_once_route', record_key=row.record_key) }}">
@@ -90,10 +121,7 @@
                     {% endif %}
                 </td>
                 <td>
-                    <span class="anon-name">{{ row.display_label or 'Anonymous visitor' }}</span>
-                    {% if row.lead_category %}
-                    <span class="pill anon-category-pill">{{ row.lead_category }}</span>
-                    {% endif %}
+                    <span class="anon-name">{{ row.name_display }}</span>
                 </td>
                 <td title="{{ row.address_line }}">{{ row.address_line }}</td>
                 <td>{{ row.last_seen_display }}</td>
@@ -123,7 +151,7 @@
             </tr>
             {% endfor %}
             {% if not rows %}
-            <tr><td colspan="9">No anonymous leads matched this filter.</td></tr>
+            <tr><td colspan="10">No anonymous leads matched this filter.</td></tr>
             {% endif %}
         </tbody>
     </table>

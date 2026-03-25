@@ -936,9 +936,10 @@ button:hover { filter: brightness(1.05); }
 
 .anon-compact-table th,
 .anon-compact-table td {
-    font-size: 0.83rem;
+    font-size: 0.74rem;
     white-space: nowrap;
     vertical-align: middle;
+    line-height: 1.15;
 }
 
 .anon-compact-table td {
@@ -946,9 +947,21 @@ button:hover { filter: brightness(1.05); }
     text-overflow: ellipsis;
 }
 
+.anon-compact-table thead th {
+    font-size: 0.72rem;
+}
+
+.anon-compact-table .table-filter-row td {
+    background: transparent !important;
+    border-top: 0;
+    padding-top: 0.35rem;
+    padding-bottom: 0.35rem;
+}
+
 .anon-compact-table .table-filter-row input,
 .anon-compact-table .table-filter-row select {
-    font-size: 0.78rem;
+    font-size: 0.7rem;
+    padding: 0.2rem 0.28rem;
 }
 
 .anon-action-cell {
@@ -960,8 +973,11 @@ button:hover { filter: brightness(1.05); }
 }
 
 .anon-category-pill {
-    margin-left: 0.3rem;
-    font-size: 0.72rem;
+    font-size: 0.66rem;
+}
+
+.anon-category-cell {
+    margin-left: 0;
 }
 
 .anon-url-cell a {
@@ -974,6 +990,10 @@ button:hover { filter: brightness(1.05); }
 
 .anon-muted {
     color: var(--muted);
+}
+
+.anon-filter-row .inline-actions {
+    margin-top: 0.2rem;
 }
 
 .inline-check {

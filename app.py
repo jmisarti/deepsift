@@ -8400,6 +8400,54 @@ def _short_url_path(url_value):
     return raw
 
 
+def _untitled_last_session_date_value(row):
+    row = row if isinstance(row, dict) else {}
+    for key in ["last_session_date", "last_session_datetime", "last_session_at"]:
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    payload = parse_json_object(row.get("payload_json") or "{}")
+    if isinstance(payload, dict):
+        for key in ["last_session_date", "last_session_datetime", "last_session_at"]:
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _compact_est_datetime(value):
+    text = str(value or "").strip()
+    dt = parse_flexible_datetime(value)
+    if dt is None:
+        return text or "-"
+    if re.search(r"(Z|[+-]\d{2}:\d{2})$", text):
+        dt_est = dt.replace(tzinfo=timezone.utc).astimezone(EST_TZ)
+        return f"{dt_est.strftime('%Y-%m-%d %I:%M %p')} ET"
+    return dt.strftime("%Y-%m-%d %I:%M %p")
+
+
+def _untitled_last_seen_sort_dt(row):
+    row = row if isinstance(row, dict) else {}
+    for candidate in [
+        _untitled_last_session_date_value(row),
+        row.get("last_seen_at"),
+        row.get("last_changed_at"),
+        row.get("first_seen_at"),
+    ]:
+        dt = parse_flexible_datetime(candidate)
+        if dt is not None:
+            return dt
+    return datetime.min
+
+
+def _untitled_name_display(row):
+    row = row if isinstance(row, dict) else {}
+    first = normalize_whitespace(row.get("first_name") or "")
+    last = normalize_whitespace(row.get("last_name") or "")
+    full_name = " ".join(part for part in [first, last] if part).strip()
+    return full_name or "Anonymous visitor"
+
+
 def _update_untitled_current_row_state(db, record_key, **fields):
     allowed = {
         "local_property_id",
@@ -19825,6 +19873,7 @@ def anon_dashboard():
     q = (request.args.get("q") or "").strip()
     lead_category = (request.args.get("lead_category") or "").strip().lower()
     lead_stage = (request.args.get("lead_stage") or "").strip()
+    time_on_page = (request.args.get("time_on_page") or "").strip().lower()
     tracked = (request.args.get("tracked") or "").strip().lower()
     active_filter = (request.args.get("active") or "active").strip().lower()
     sort = (request.args.get("sort") or "last_seen_desc").strip().lower()
@@ -19843,6 +19892,16 @@ def anon_dashboard():
     if lead_stage:
         where.append("COALESCE(u.lead_stage, '') = ?")
         params.append(lead_stage)
+    duration_thresholds = {
+        "30s": 30,
+        "1m": 60,
+        "3m": 180,
+        "5m": 300,
+        "10m": 600,
+    }
+    if time_on_page in duration_thresholds:
+        where.append("COALESCE(u.last_session_est_duration, 0) >= ?")
+        params.append(duration_thresholds[time_on_page])
     if tracked == "tracked":
         where.append("COALESCE(u.local_property_id, 0) > 0")
     elif tracked == "untracked":
@@ -19865,13 +19924,6 @@ def anon_dashboard():
         )
         params.extend([like, like, like, like, like, like, like, like])
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-    order_sql = "datetime(COALESCE(u.last_seen_at, u.last_changed_at, u.first_seen_at)) DESC, u.id DESC"
-    if sort == "category_asc":
-        order_sql = "lower(COALESCE(u.lead_category, '')) ASC, datetime(COALESCE(u.last_seen_at, u.last_changed_at, u.first_seen_at)) DESC, u.id DESC"
-    elif sort == "category_desc":
-        order_sql = "lower(COALESCE(u.lead_category, '')) DESC, datetime(COALESCE(u.last_seen_at, u.last_changed_at, u.first_seen_at)) DESC, u.id DESC"
-    elif sort == "last_seen_asc":
-        order_sql = "datetime(COALESCE(u.last_seen_at, u.last_changed_at, u.first_seen_at)) ASC, u.id ASC"
 
     rows = db.execute(
         f"""
@@ -19892,8 +19944,8 @@ def anon_dashboard():
         LEFT JOIN properties p ON p.id = u.local_property_id
         LEFT JOIN people op ON op.id = p.owner_person_id
         {where_sql}
-        ORDER BY {order_sql}
-        LIMIT 500
+        ORDER BY u.id DESC
+        LIMIT 2000
         """,
         tuple(params),
     ).fetchall()
@@ -19949,6 +20001,7 @@ def anon_dashboard():
             address.get("state"),
             address.get("postal_code"),
         ) or "-"
+        item["name_display"] = _untitled_name_display(item)
         item["selected"] = local_property_id > 0
         item["can_skip"] = (local_property_id <= 0) and _untitled_has_full_property_contact_address(item)
         item["local_property_url"] = url_for("property_detail", property_id=local_property_id) if local_property_id > 0 else ""
@@ -19962,11 +20015,25 @@ def anon_dashboard():
             ]
             if x
         ).strip()
-        item["last_seen_display"] = item.get("last_seen_at") or item.get("last_changed_at") or item.get("first_seen_at") or "-"
+        item["last_session_date_value"] = _untitled_last_session_date_value(item)
+        item["last_seen_display"] = _compact_est_datetime(item["last_session_date_value"] or item.get("last_seen_at") or item.get("last_changed_at") or item.get("first_seen_at") or "")
+        item["last_seen_sort_dt"] = _untitled_last_seen_sort_dt(item)
         item["time_on_page_display"] = _short_duration_label(item.get("last_session_est_duration") or 0)
         item["entry_url_short"] = _short_url_path(item.get("last_session_entry_url") or "")
         item["exit_url_short"] = _short_url_path(item.get("last_session_exit_url") or "")
         anon_rows.append(item)
+
+    if sort == "category_asc":
+        anon_rows.sort(key=lambda item: item.get("last_seen_sort_dt", datetime.min), reverse=True)
+        anon_rows.sort(key=lambda item: str(item.get("lead_category") or "").lower())
+    elif sort == "category_desc":
+        anon_rows.sort(key=lambda item: item.get("last_seen_sort_dt", datetime.min), reverse=True)
+        anon_rows.sort(key=lambda item: str(item.get("lead_category") or "").lower(), reverse=True)
+    elif sort == "last_seen_asc":
+        anon_rows.sort(key=lambda item: item.get("last_seen_sort_dt", datetime.min))
+    else:
+        anon_rows.sort(key=lambda item: item.get("last_seen_sort_dt", datetime.min), reverse=True)
+    anon_rows = anon_rows[:500]
 
     return render_template(
         "anon.html",
@@ -19975,6 +20042,7 @@ def anon_dashboard():
         q=q,
         lead_category=lead_category,
         lead_stage=lead_stage,
+        time_on_page=time_on_page,
         tracked=tracked,
         active_filter=active_filter,
         sort=sort,

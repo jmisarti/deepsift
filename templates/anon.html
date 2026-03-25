@@ -165,6 +165,29 @@
     </table>
 </section>
 
+{% if pagination and pagination.total_rows %}
+<section class="panel anon-pagination-panel">
+    <div class="anon-pagination">
+        <span>Showing {{ pagination.start_row }}-{{ pagination.end_row }} of {{ pagination.total_rows }}</span>
+        <div class="inline-actions">
+            {% if pagination.has_prev %}
+            <a href="{{ pagination.prev_url }}">Previous</a>
+            {% endif %}
+            {% for page_link in pagination.page_links %}
+                {% if page_link.current %}
+                <span class="pill">{{ page_link.number }}</span>
+                {% else %}
+                <a href="{{ page_link.url }}">{{ page_link.number }}</a>
+                {% endif %}
+            {% endfor %}
+            {% if pagination.has_next %}
+            <a href="{{ pagination.next_url }}">Next</a>
+            {% endif %}
+        </div>
+    </div>
+</section>
+{% endif %}
+
 <script>
 (function () {
   const form = document.getElementById('anonFilterForm');

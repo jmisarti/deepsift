@@ -19926,6 +19926,11 @@ def anon_dashboard():
     db = get_db()
 
     q = (request.args.get("q") or "").strip()
+    try:
+        page = max(1, int((request.args.get("page") or "1").strip() or "1"))
+    except Exception:
+        page = 1
+    per_page = 200
     lead_category = (request.args.get("lead_category") or "").strip().lower()
     lead_stage = (request.args.get("lead_stage") or "").strip()
     has_name = (request.args.get("has_name") or "").strip().lower()
@@ -19938,7 +19943,6 @@ def anon_dashboard():
 
     where = []
     params = []
-    where.append("COALESCE(u.is_active, 1) = 1")
     if lead_category:
         where.append("lower(COALESCE(u.lead_category, '')) = ?")
         params.append(lead_category)
@@ -20012,7 +20016,6 @@ def anon_dashboard():
         LEFT JOIN people op ON op.id = p.owner_person_id
         {where_sql}
         ORDER BY u.id DESC
-        LIMIT 2000
         """,
         tuple(params),
     ).fetchall()
@@ -20122,12 +20125,51 @@ def anon_dashboard():
         anon_rows.sort(key=lambda item: item.get("last_seen_sort_dt", datetime.min))
     else:
         anon_rows.sort(key=lambda item: item.get("last_seen_sort_dt", datetime.min), reverse=True)
-    anon_rows = anon_rows[:500]
+    total_rows = len(anon_rows)
+    page_count = max(1, (total_rows + per_page - 1) // per_page)
+    if page > page_count:
+        page = page_count
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    anon_rows = anon_rows[start_idx:end_idx]
+
+    base_args = request.args.to_dict(flat=True)
+    def _anon_page_url(target_page):
+        args = dict(base_args)
+        if int(target_page or 1) <= 1:
+            args.pop("page", None)
+        else:
+            args["page"] = str(int(target_page))
+        return url_for("anon_dashboard", **args)
+
+    page_window_start = max(1, page - 2)
+    page_window_end = min(page_count, page + 2)
+    pagination = {
+        "page": page,
+        "per_page": per_page,
+        "total_rows": total_rows,
+        "page_count": page_count,
+        "has_prev": page > 1,
+        "has_next": page < page_count,
+        "prev_url": _anon_page_url(page - 1) if page > 1 else "",
+        "next_url": _anon_page_url(page + 1) if page < page_count else "",
+        "page_links": [
+            {
+                "number": n,
+                "url": _anon_page_url(n),
+                "current": n == page,
+            }
+            for n in range(page_window_start, page_window_end + 1)
+        ],
+        "start_row": start_idx + 1 if total_rows else 0,
+        "end_row": min(end_idx, total_rows),
+    }
 
     return render_template(
         "anon.html",
         rows=anon_rows,
         counts=counts,
+        pagination=pagination,
         q=q,
         lead_category=lead_category,
         lead_stage=lead_stage,

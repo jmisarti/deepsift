@@ -370,6 +370,34 @@ LEAD_ACTION_TYPES = [
     "AgentDiagnosisReview",
 ]
 LEAD_CONTACT_CLASSIFICATIONS = ["", "buyer", "wholesaler", "spam", "realtor"]
+BUYER_ROLE_OPTIONS = [
+    "Wholesaler",
+    "Rehabber",
+    "Builder",
+    "HM Lender",
+    "Priv Lender",
+    "Lawyer",
+    "Title",
+    "Realtor",
+    "Contractor",
+    "Other",
+]
+BUYER_PROPERTY_TYPE_OPTIONS = ["SFR", "MF", "Land", "Mobile", "Commercial"]
+BUYER_ROLE_ALIASES = {
+    "hard money lender": "hm lender",
+    "hard-money lender": "hm lender",
+    "hard money": "hm lender",
+    "private lender": "priv lender",
+    "private money lender": "priv lender",
+}
+BUYER_PROPERTY_TYPE_ALIASES = {
+    "single family": "sfr",
+    "single family residence": "sfr",
+    "single-family": "sfr",
+    "multifamily": "mf",
+    "multi family": "mf",
+    "multi-family": "mf",
+}
 AUTHORITY_AUDIENCES = ["General Investors", "Accredited Investors", "Operators", "Brokers", "Title Agents"]
 AUTHORITY_CHANNELS = ["LinkedIn Long-Form", "X", "BiggerPockets", "Reddit"]
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-']+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
@@ -839,6 +867,8 @@ def migrate_db(db):
         )
         """
     )
+    ensure_column(db, "buyers", "buyer_categories", "buyer_categories TEXT")
+    ensure_column(db, "buyers", "property_types", "property_types TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS idx_properties_is_d4d ON properties(is_d4d, id DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_buyers_name ON buyers(lower(last_name), lower(first_name), id DESC)")
     db.execute(
@@ -10964,6 +10994,25 @@ def join_markets(markets):
         if s and s not in vals:
             vals.append(s)
     return ", ".join(vals)
+
+
+def normalize_option_csv(values, allowed_options, aliases=None):
+    option_map = {str(option).strip().lower(): str(option).strip() for option in (allowed_options or []) if str(option).strip()}
+    alias_map = {str(k).strip().lower(): str(v).strip().lower() for k, v in (aliases or {}).items() if str(k).strip() and str(v).strip()}
+    if isinstance(values, str):
+        raw_values = split_markets(values)
+    else:
+        raw_values = list(values or [])
+    cleaned = []
+    for value in raw_values:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        lookup = alias_map.get(raw.lower(), raw.lower())
+        canonical = option_map.get(lookup)
+        if canonical and canonical not in cleaned:
+            cleaned.append(canonical)
+    return join_markets(cleaned)
 
 
 def update_person_outreach_status_for_sms(db, person_id, event_type):
@@ -22532,10 +22581,12 @@ def buyers_page():
             notice = "First and last name are required."
         else:
             counties = join_markets(request.form.getlist("target_counties"))
+            buyer_categories = normalize_option_csv(request.form.getlist("buyer_categories"), BUYER_ROLE_OPTIONS, BUYER_ROLE_ALIASES)
+            property_types = normalize_option_csv(request.form.getlist("property_types"), BUYER_PROPERTY_TYPE_OPTIONS, BUYER_PROPERTY_TYPE_ALIASES)
             db.execute(
                 """
-                INSERT INTO buyers (first_name, last_name, business_name, email, phone, notes, target_counties)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO buyers (first_name, last_name, business_name, email, phone, notes, target_counties, buyer_categories, property_types)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     first_name,
@@ -22545,6 +22596,8 @@ def buyers_page():
                     (request.form.get("phone") or "").strip(),
                     (request.form.get("notes") or "").strip(),
                     counties,
+                    buyer_categories,
+                    property_types,
                 ),
             )
             db.commit()
@@ -22582,6 +22635,8 @@ def buyers_page():
     for row in rows:
         item = dict(row)
         item["target_counties_list"] = split_markets(item.get("target_counties"))
+        item["buyer_categories_list"] = split_markets(item.get("buyer_categories"))
+        item["property_types_list"] = split_markets(item.get("property_types"))
         buyers.append(item)
     return render_template(
         "buyers.html",
@@ -22590,6 +22645,8 @@ def buyers_page():
         county=county,
         notice=notice,
         nj_counties=NJ_COUNTIES,
+        buyer_role_options=BUYER_ROLE_OPTIONS,
+        buyer_property_type_options=BUYER_PROPERTY_TYPE_OPTIONS,
     )
 
 
@@ -22599,6 +22656,8 @@ def buyers_upload():
     db = get_db()
     file = request.files.get("buyers_file")
     default_counties = request.form.getlist("target_counties")
+    default_buyer_categories = request.form.getlist("buyer_categories")
+    default_property_types = request.form.getlist("property_types")
     if not file or not file.filename:
         return redirect(url_for("buyers_page", q="", county="", notice="No file selected."))
     try:
@@ -22624,13 +22683,39 @@ def buyers_upload():
             or row.get("target_counties")
             or ""
         ).strip()
+        row_buyer_categories = (
+            row.get("Buyer Categories")
+            or row.get("Buyer Category")
+            or row.get("Categories")
+            or row.get("Category")
+            or row.get("buyer_categories")
+            or ""
+        ).strip()
+        row_property_types = (
+            row.get("Property Types")
+            or row.get("Property Type")
+            or row.get("Asset Types")
+            or row.get("Asset Type")
+            or row.get("property_types")
+            or ""
+        ).strip()
         counties = split_markets(row_counties) if row_counties else default_counties
+        buyer_categories = normalize_option_csv(
+            split_markets(row_buyer_categories) if row_buyer_categories else default_buyer_categories,
+            BUYER_ROLE_OPTIONS,
+            BUYER_ROLE_ALIASES,
+        )
+        property_types = normalize_option_csv(
+            split_markets(row_property_types) if row_property_types else default_property_types,
+            BUYER_PROPERTY_TYPE_OPTIONS,
+            BUYER_PROPERTY_TYPE_ALIASES,
+        )
         db.execute(
             """
-            INSERT INTO buyers (first_name, last_name, business_name, email, phone, notes, target_counties)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO buyers (first_name, last_name, business_name, email, phone, notes, target_counties, buyer_categories, property_types)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (first, last, business_name, email, phone, notes, join_markets(counties)),
+            (first, last, business_name, email, phone, notes, join_markets(counties), buyer_categories, property_types),
         )
         added += 1
     db.commit()
@@ -22654,10 +22739,12 @@ def buyer_update(buyer_id):
 
     selected_counties = request.form.getlist("target_counties")
     counties = join_markets(selected_counties) if selected_counties else join_markets(split_markets(request.form.get("target_counties", "")))
+    buyer_categories = normalize_option_csv(request.form.getlist("buyer_categories"), BUYER_ROLE_OPTIONS, BUYER_ROLE_ALIASES)
+    property_types = normalize_option_csv(request.form.getlist("property_types"), BUYER_PROPERTY_TYPE_OPTIONS, BUYER_PROPERTY_TYPE_ALIASES)
     db.execute(
         """
         UPDATE buyers
-        SET first_name = ?, last_name = ?, business_name = ?, email = ?, phone = ?, notes = ?, target_counties = ?
+        SET first_name = ?, last_name = ?, business_name = ?, email = ?, phone = ?, notes = ?, target_counties = ?, buyer_categories = ?, property_types = ?
         WHERE id = ?
         """,
         (
@@ -22668,6 +22755,8 @@ def buyer_update(buyer_id):
             (request.form.get("phone") or "").strip(),
             (request.form.get("notes") or "").strip(),
             counties,
+            buyer_categories,
+            property_types,
             buyer_id,
         ),
     )
@@ -23949,9 +24038,9 @@ def referral_realtors_template():
 @app.route("/templates/buyers-template.csv")
 def buyers_template():
     template = (
-        "First Name,Last Name,Business Name,Email,Phone,Notes,Target Counties\n"
-        "Jamie,Doe,Acme Homes,jamie@acmehomes.com,(973)555-1212,Prefers off-market duplexes,\"Essex, Union\"\n"
-        "Alex,Smith,,alex@example.com,(201)555-3434,Looking for light rehab single families,Bergen\n"
+        "First Name,Last Name,Business Name,Email,Phone,Notes,Target Counties,Buyer Categories,Property Types\n"
+        "Jamie,Doe,Acme Homes,jamie@acmehomes.com,(973)555-1212,Prefers off-market duplexes,\"Essex, Union\",\"Wholesaler, Builder\",\"SFR, MF\"\n"
+        "Alex,Smith,,alex@example.com,(201)555-3434,Looking for light rehab single families,Bergen,Rehabber,SFR\n"
     )
     return app.response_class(
         template,

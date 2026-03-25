@@ -270,6 +270,8 @@ CREATE TABLE IF NOT EXISTS buyers (
     phone TEXT,
     notes TEXT,
     target_counties TEXT,
+    buyer_categories TEXT,
+    property_types TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

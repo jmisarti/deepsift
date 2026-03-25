@@ -17,6 +17,36 @@
             <label>Phone <input name="phone"></label>
             <label class="span2">Notes <textarea name="notes" rows="3"></textarea></label>
             <fieldset class="span2 county-toggle-grid">
+                <legend>Buyer Categories</legend>
+                {% for option in buyer_role_options %}
+                <label class="county-toggle-item">
+                    <span class="county-name">{{ option }}</span>
+                    <span class="county-toggle-controls">
+                        <span class="toggle-switch">
+                            <input type="checkbox" name="buyer_categories" value="{{ option }}">
+                            <span class="toggle-slider"></span>
+                        </span>
+                        <span class="county-toggle-state">Off</span>
+                    </span>
+                </label>
+                {% endfor %}
+            </fieldset>
+            <fieldset class="span2 county-toggle-grid">
+                <legend>Property Types</legend>
+                {% for option in buyer_property_type_options %}
+                <label class="county-toggle-item">
+                    <span class="county-name">{{ option }}</span>
+                    <span class="county-toggle-controls">
+                        <span class="toggle-switch">
+                            <input type="checkbox" name="property_types" value="{{ option }}">
+                            <span class="toggle-slider"></span>
+                        </span>
+                        <span class="county-toggle-state">Off</span>
+                    </span>
+                </label>
+                {% endfor %}
+            </fieldset>
+            <fieldset class="span2 county-toggle-grid">
                 <legend>Target Counties</legend>
                 {% for county_name in nj_counties %}
                 <label class="county-toggle-item">
@@ -42,6 +72,36 @@
             <label class="span2">CSV file
                 <input type="file" name="buyers_file" accept=".csv" required>
             </label>
+            <fieldset class="span2 county-toggle-grid">
+                <legend>Default Buyer Categories</legend>
+                {% for option in buyer_role_options %}
+                <label class="county-toggle-item">
+                    <span class="county-name">{{ option }}</span>
+                    <span class="county-toggle-controls">
+                        <span class="toggle-switch">
+                            <input type="checkbox" name="buyer_categories" value="{{ option }}">
+                            <span class="toggle-slider"></span>
+                        </span>
+                        <span class="county-toggle-state">Off</span>
+                    </span>
+                </label>
+                {% endfor %}
+            </fieldset>
+            <fieldset class="span2 county-toggle-grid">
+                <legend>Default Property Types</legend>
+                {% for option in buyer_property_type_options %}
+                <label class="county-toggle-item">
+                    <span class="county-name">{{ option }}</span>
+                    <span class="county-toggle-controls">
+                        <span class="toggle-switch">
+                            <input type="checkbox" name="property_types" value="{{ option }}">
+                            <span class="toggle-slider"></span>
+                        </span>
+                        <span class="county-toggle-state">Off</span>
+                    </span>
+                </label>
+                {% endfor %}
+            </fieldset>
             <fieldset class="span2 county-toggle-grid">
                 <legend>Default Target Counties</legend>
                 {% for county_name in nj_counties %}
@@ -80,7 +140,7 @@
     </form>
     <table>
         <thead>
-            <tr><th>Name</th><th>Business</th><th>Email</th><th>Phone</th><th>Counties</th><th>Notes</th><th></th></tr>
+            <tr><th>Name</th><th>Business</th><th>Email</th><th>Phone</th><th>Counties</th><th>Buyer Categories</th><th>Property Types</th><th>Notes</th><th></th></tr>
         </thead>
         <tbody>
             {% for b in buyers %}
@@ -90,6 +150,8 @@
                 <td>{{ b.email or '-' }}</td>
                 <td>{{ b.phone|fmt_phone if b.phone else '-' }}</td>
                 <td>{{ b.target_counties or '-' }}</td>
+                <td>{{ b.buyer_categories or '-' }}</td>
+                <td>{{ b.property_types or '-' }}</td>
                 <td>{{ b.notes or '-' }}</td>
                 <td>
                     <div class="inline-actions">
@@ -103,7 +165,7 @@
                 </td>
             </tr>
             <tr id="edit-buyer-{{ b.id }}">
-                <td colspan="7">
+                <td colspan="9">
                     <details>
                         <summary><strong>Edit {{ b.first_name }} {{ b.last_name }}</strong></summary>
                         <form method="post" action="{{ url_for('buyer_update', buyer_id=b.id) }}" class="grid-form compact">
@@ -115,6 +177,36 @@
                             <label>Email <input name="email" value="{{ b.email or '' }}"></label>
                             <label>Phone <input name="phone" value="{{ b.phone or '' }}"></label>
                             <label class="span2">Notes <textarea name="notes" rows="3">{{ b.notes or '' }}</textarea></label>
+                            <fieldset class="span2 county-toggle-grid">
+                                <legend>Buyer Categories</legend>
+                                {% for option in buyer_role_options %}
+                                <label class="county-toggle-item">
+                                    <span class="county-name">{{ option }}</span>
+                                    <span class="county-toggle-controls">
+                                        <span class="toggle-switch">
+                                            <input type="checkbox" name="buyer_categories" value="{{ option }}" {% if option in b.buyer_categories_list %}checked{% endif %}>
+                                            <span class="toggle-slider"></span>
+                                        </span>
+                                        <span class="county-toggle-state">{% if option in b.buyer_categories_list %}On{% else %}Off{% endif %}</span>
+                                    </span>
+                                </label>
+                                {% endfor %}
+                            </fieldset>
+                            <fieldset class="span2 county-toggle-grid">
+                                <legend>Property Types</legend>
+                                {% for option in buyer_property_type_options %}
+                                <label class="county-toggle-item">
+                                    <span class="county-name">{{ option }}</span>
+                                    <span class="county-toggle-controls">
+                                        <span class="toggle-switch">
+                                            <input type="checkbox" name="property_types" value="{{ option }}" {% if option in b.property_types_list %}checked{% endif %}>
+                                            <span class="toggle-slider"></span>
+                                        </span>
+                                        <span class="county-toggle-state">{% if option in b.property_types_list %}On{% else %}Off{% endif %}</span>
+                                    </span>
+                                </label>
+                                {% endfor %}
+                            </fieldset>
                             <fieldset class="span2 county-toggle-grid">
                                 <legend>Target Counties</legend>
                                 {% for county_name in nj_counties %}
@@ -136,14 +228,14 @@
                 </td>
             </tr>
             {% else %}
-            <tr><td colspan="7">No buyers found.</td></tr>
+            <tr><td colspan="9">No buyers found.</td></tr>
             {% endfor %}
         </tbody>
     </table>
 </section>
 <script>
 document.addEventListener("DOMContentLoaded", function () {
-    const boxes = document.querySelectorAll('.county-toggle-item input[type="checkbox"][name="target_counties"]');
+    const boxes = document.querySelectorAll('.county-toggle-item input[type="checkbox"]');
     boxes.forEach(function (box) {
         const wrapper = box.closest(".county-toggle-item");
         if (!wrapper) return;

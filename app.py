@@ -12063,6 +12063,11 @@ def _reisift_status_label(status_value, default="New Lead"):
     return aliases.get(normalized, " ".join(part.capitalize() for part in normalized.split()) or default)
 
 
+def _reisift_create_status_value(status_value, default="new_lead"):
+    raw = str(status_value or "").strip()
+    return raw or default
+
+
 def _playbook_priority_for_action(property_status, action_type, fallback_priority):
     status_key = _normalize_reisift_status(property_status)
     row = REISIFT_PLAYBOOK_PRIORITY.get(status_key, {})
@@ -15202,7 +15207,7 @@ def _reisift_build_property_create_payload(address_info_payload, input_payload):
 
     lists = parse_csv_list(input_payload.get("lists"))
     tags = parse_csv_list(input_payload.get("tags"))
-    status = _reisift_status_label(input_payload.get("status") or input_payload.get("reisift_status"), default="New Lead")
+    status = _reisift_create_status_value(input_payload.get("status") or input_payload.get("reisift_status"), default="new_lead")
     notes = (input_payload.get("notes") or "").strip()
 
     owner_payload = {
@@ -15347,7 +15352,7 @@ def _reisift_build_property_create_payload_from_input(input_payload):
     notes = (input_payload.get("notes") or "").strip()
     return {
         "address": property_address,
-        "status": _reisift_status_label(input_payload.get("status") or input_payload.get("reisift_status"), default="New Lead"),
+        "status": _reisift_create_status_value(input_payload.get("status") or input_payload.get("reisift_status"), default="new_lead"),
         "lists": lists,
         "tags": tags,
         "notes": notes,

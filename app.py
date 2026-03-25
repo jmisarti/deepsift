@@ -8355,6 +8355,51 @@ def _untitled_owner_name_parts(row):
     return {"first_name": "", "last_name": ""}
 
 
+def _untitled_has_full_property_contact_address(row):
+    row = row if isinstance(row, dict) else {}
+    address = _untitled_source_address(row)
+    return bool(
+        normalize_whitespace(row.get("first_name") or "")
+        and normalize_whitespace(row.get("last_name") or "")
+        and address.get("street")
+        and address.get("city")
+        and address.get("state")
+        and address.get("postal_code")
+    )
+
+
+def _short_duration_label(seconds_value):
+    try:
+        total_seconds = int(round(float(seconds_value or 0)))
+    except Exception:
+        total_seconds = 0
+    if total_seconds <= 0:
+        return "0s"
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def _short_url_path(url_value):
+    raw = str(url_value or "").strip()
+    if not raw:
+        return "-"
+    try:
+        parsed = urlsplit(raw)
+    except Exception:
+        return raw
+    if parsed.scheme and parsed.netloc:
+        compact = parsed.path or "/"
+        if parsed.query:
+            compact = f"{compact}?{parsed.query}"
+        return compact
+    return raw
+
+
 def _update_untitled_current_row_state(db, record_key, **fields):
     allowed = {
         "local_property_id",
@@ -8764,8 +8809,14 @@ def run_untitled_lead_skip_trace_once(db, row, actor="", source="Anon queue"):
         return {"ok": True, "already_done": True, "property_id": int(row.get("local_property_id") or 0), "summary": {}}
 
     property_id = int(row.get("local_property_id") or 0)
+    track_result = None
     if property_id <= 0:
-        raise ValueError("Push this lead into SIFT first so it has a local property record.")
+        if not _untitled_has_full_property_contact_address(row):
+            raise ValueError("This row needs first name, last name, street, city, state, and ZIP before skip trace can run.")
+        track_result = track_untitled_lead_in_sift(db, row, actor=actor, source=source)
+        property_id = int(track_result.get("property_id") or 0)
+    if property_id <= 0:
+        raise ValueError("Could not prepare a local property for anonymous lead skip trace.")
 
     result = run_property_skip_trace_lookup(db, property_id)
     now_text = format_db_time(datetime.utcnow())
@@ -8796,7 +8847,13 @@ def run_untitled_lead_skip_trace_once(db, row, actor="", source="Anon queue"):
             json.dumps({"record_key": record_key, "actor": actor, "result": result}, default=str),
         ),
     )
-    return {"ok": True, "already_done": False, "property_id": property_id, "summary": result.get("summary") or {}}
+    return {
+        "ok": True,
+        "already_done": False,
+        "property_id": property_id,
+        "summary": result.get("summary") or {},
+        "track_result": track_result,
+    }
 
 
 def run_untitled_leads_snapshot_once():
@@ -19770,6 +19827,7 @@ def anon_dashboard():
     lead_stage = (request.args.get("lead_stage") or "").strip()
     tracked = (request.args.get("tracked") or "").strip().lower()
     active_filter = (request.args.get("active") or "active").strip().lower()
+    sort = (request.args.get("sort") or "last_seen_desc").strip().lower()
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()
 
@@ -19807,6 +19865,13 @@ def anon_dashboard():
         )
         params.extend([like, like, like, like, like, like, like, like])
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    order_sql = "datetime(COALESCE(u.last_seen_at, u.last_changed_at, u.first_seen_at)) DESC, u.id DESC"
+    if sort == "category_asc":
+        order_sql = "lower(COALESCE(u.lead_category, '')) ASC, datetime(COALESCE(u.last_seen_at, u.last_changed_at, u.first_seen_at)) DESC, u.id DESC"
+    elif sort == "category_desc":
+        order_sql = "lower(COALESCE(u.lead_category, '')) DESC, datetime(COALESCE(u.last_seen_at, u.last_changed_at, u.first_seen_at)) DESC, u.id DESC"
+    elif sort == "last_seen_asc":
+        order_sql = "datetime(COALESCE(u.last_seen_at, u.last_changed_at, u.first_seen_at)) ASC, u.id ASC"
 
     rows = db.execute(
         f"""
@@ -19827,10 +19892,7 @@ def anon_dashboard():
         LEFT JOIN properties p ON p.id = u.local_property_id
         LEFT JOIN people op ON op.id = p.owner_person_id
         {where_sql}
-        ORDER BY
-            CASE WHEN lower(COALESCE(u.lead_category, '')) = 'hot' THEN 0 ELSE 1 END,
-            datetime(COALESCE(u.last_changed_at, u.last_seen_at, u.first_seen_at)) DESC,
-            u.id DESC
+        ORDER BY {order_sql}
         LIMIT 500
         """,
         tuple(params),
@@ -19888,8 +19950,8 @@ def anon_dashboard():
             address.get("postal_code"),
         ) or "-"
         item["selected"] = local_property_id > 0
+        item["can_skip"] = (local_property_id <= 0) and _untitled_has_full_property_contact_address(item)
         item["local_property_url"] = url_for("property_detail", property_id=local_property_id) if local_property_id > 0 else ""
-        item["mail_url"] = url_for("property_detail", property_id=local_property_id, mail=1) if local_property_id > 0 else ""
         item["sift_record_url"] = _sift_record_url(local_uuid) if local_uuid else ""
         item["local_owner_name"] = " ".join(
             x
@@ -19900,6 +19962,10 @@ def anon_dashboard():
             ]
             if x
         ).strip()
+        item["last_seen_display"] = item.get("last_seen_at") or item.get("last_changed_at") or item.get("first_seen_at") or "-"
+        item["time_on_page_display"] = _short_duration_label(item.get("last_session_est_duration") or 0)
+        item["entry_url_short"] = _short_url_path(item.get("last_session_entry_url") or "")
+        item["exit_url_short"] = _short_url_path(item.get("last_session_exit_url") or "")
         anon_rows.append(item)
 
     return render_template(
@@ -19911,6 +19977,7 @@ def anon_dashboard():
         lead_stage=lead_stage,
         tracked=tracked,
         active_filter=active_filter,
+        sort=sort,
         category_options=category_options,
         stage_options=stage_options,
         notice=notice,
@@ -19959,11 +20026,19 @@ def anon_skip_trace_once_route(record_key):
         if result.get("already_done"):
             return _anon_redirect_with_message(target_url, "notice", "Skip trace already completed for this anonymous lead.")
         summary = result.get("summary") or {}
-        message = (
+        message_bits = []
+        if result.get("track_result"):
+            property_id = int((result.get("track_result") or {}).get("property_id") or 0)
+            if property_id:
+                message_bits.append(f"Created local property #{property_id} and pushed to SIFT as cold lead.")
+            else:
+                message_bits.append("Created local property and pushed to SIFT as cold lead.")
+        message_bits.append(
             f"Skip trace complete. Owners {summary.get('owners_processed') or 0}, "
             f"phones synced {((summary.get('reisift_contact_sync') or {}).get('phones_attempted') or 0)}, "
             f"emails synced {((summary.get('reisift_contact_sync') or {}).get('emails_attempted') or 0)}."
         )
+        message = " ".join(message_bits)
         return _anon_redirect_with_message(target_url, "notice", message)
     except Exception as exc:
         db.rollback()

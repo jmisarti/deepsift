@@ -930,6 +930,52 @@ button:hover { filter: brightness(1.05); }
     white-space: nowrap;
 }
 
+.anon-compact-table {
+    table-layout: fixed;
+}
+
+.anon-compact-table th,
+.anon-compact-table td {
+    font-size: 0.83rem;
+    white-space: nowrap;
+    vertical-align: middle;
+}
+
+.anon-compact-table td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.anon-compact-table .table-filter-row input,
+.anon-compact-table .table-filter-row select {
+    font-size: 0.78rem;
+}
+
+.anon-action-cell {
+    overflow: visible !important;
+}
+
+.anon-name {
+    font-weight: 600;
+}
+
+.anon-category-pill {
+    margin-left: 0.3rem;
+    font-size: 0.72rem;
+}
+
+.anon-url-cell a {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.anon-muted {
+    color: var(--muted);
+}
+
 .inline-check {
     display: inline-flex !important;
     flex-direction: row !important;

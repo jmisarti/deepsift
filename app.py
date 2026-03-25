@@ -1453,7 +1453,12 @@ def normalize_state_code(value):
 def normalize_postal_code(value):
     raw = normalize_whitespace(value)
     match = re.search(r"\d{5}(?:-\d{4})?", raw)
-    return match.group(0) if match else ""
+    if match:
+        return match.group(0)
+    four_digit = re.search(r"\b(\d{4})\b", raw)
+    if four_digit:
+        return f"0{four_digit.group(1)}"
+    return ""
 
 
 def normalize_address_match_text(value):

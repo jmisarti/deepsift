@@ -55,12 +55,17 @@
                 <td></td>
                 <td>
                     <input form="anonFilterForm" name="q" value="{{ q }}" placeholder="Name, phone, address">
+                    <select form="anonFilterForm" name="has_name">
+                        <option value="">Any name</option>
+                        <option value="yes" {% if has_name == 'yes' %}selected{% endif %}>Has full name</option>
+                        <option value="no" {% if has_name == 'no' %}selected{% endif %}>Missing name</option>
+                    </select>
                 </td>
                 <td>
-                    <select form="anonFilterForm" name="active">
-                        <option value="active" {% if active_filter == 'active' %}selected{% endif %}>Active only</option>
-                        <option value="all" {% if active_filter == 'all' %}selected{% endif %}>All rows</option>
-                        <option value="inactive" {% if active_filter == 'inactive' %}selected{% endif %}>Inactive only</option>
+                    <select form="anonFilterForm" name="has_address">
+                        <option value="">Any address</option>
+                        <option value="yes" {% if has_address == 'yes' %}selected{% endif %}>Has full address</option>
+                        <option value="no" {% if has_address == 'no' %}selected{% endif %}>Missing address</option>
                     </select>
                 </td>
                 <td>
@@ -90,7 +95,6 @@
                         {% endfor %}
                     </select>
                 </td>
-                <td></td>
                 <td></td>
                 <td class="anon-filter-actions">
                     <select form="anonFilterForm" name="tracked">
@@ -128,7 +132,7 @@
                 </td>
                 <td title="{{ row.address_line }}">{{ row.address_line }}</td>
                 <td>{{ row.last_seen_display }}</td>
-                <td>{{ row.last_changed_display }}</td>
+                <td title="{{ row.last_changed_hover or '' }}">{{ row.last_changed_display }}</td>
                 <td>{{ row.time_on_page_display }}</td>
                 <td>{{ row.last_session_total_pages_visited or 0 }}</td>
                 <td class="anon-url-cell" title="{{ row.last_session_entry_url or '' }}">

@@ -8448,6 +8448,14 @@ def _untitled_name_display(row):
     return full_name or "Anonymous visitor"
 
 
+def _untitled_has_full_name(row):
+    row = row if isinstance(row, dict) else {}
+    return bool(
+        normalize_whitespace(row.get("first_name") or "")
+        and normalize_whitespace(row.get("last_name") or "")
+    )
+
+
 def _untitled_actual_last_changed_display(row):
     row = row if isinstance(row, dict) else {}
     changed_dt = parse_flexible_datetime(row.get("last_changed_at"))
@@ -8457,6 +8465,42 @@ def _untitled_actual_last_changed_display(row):
     if changed_dt <= first_seen_dt:
         return ""
     return _compact_est_datetime(row.get("last_changed_at") or "")
+
+
+def _untitled_change_hover_text(change_row):
+    change_row = change_row if isinstance(change_row, dict) else {}
+    changed_fields = parse_json_object(change_row.get("changed_fields_json") or "{}")
+    if not isinstance(changed_fields, dict) or not changed_fields:
+        return ""
+    label_map = {
+        "lead_category": "Category",
+        "lead_stage": "Stage",
+        "total_session_count": "Session count",
+        "last_session_est_duration": "Time on page",
+        "last_session_total_pages_visited": "Pages viewed",
+        "last_session_entry_url": "Entry URL",
+        "last_session_exit_url": "Exit URL",
+        "first_name": "First name",
+        "last_name": "Last name",
+        "mobile_phone": "Phone",
+        "email": "Email",
+        "business_email": "Business email",
+        "personal_email": "Personal email",
+        "personal_address": "Street",
+        "personal_city": "City",
+        "personal_state": "State",
+        "personal_zip": "ZIP",
+    }
+    lines = []
+    for key, values in changed_fields.items():
+        before = str((values or {}).get("before") or "").strip() or "-"
+        after = str((values or {}).get("after") or "").strip() or "-"
+        label = label_map.get(key, key.replace("_", " ").title())
+        lines.append(f"{label}: {before} -> {after}")
+    if len(lines) > 8:
+        hidden_count = len(lines) - 8
+        lines = lines[:8] + [f"+{hidden_count} more"]
+    return "\n".join(lines)
 
 
 def _update_untitled_current_row_state(db, record_key, **fields):
@@ -19884,25 +19928,37 @@ def anon_dashboard():
     q = (request.args.get("q") or "").strip()
     lead_category = (request.args.get("lead_category") or "").strip().lower()
     lead_stage = (request.args.get("lead_stage") or "").strip()
+    has_name = (request.args.get("has_name") or "").strip().lower()
+    has_address = (request.args.get("has_address") or "").strip().lower()
     time_on_page = (request.args.get("time_on_page") or "").strip().lower()
     tracked = (request.args.get("tracked") or "").strip().lower()
-    active_filter = (request.args.get("active") or "active").strip().lower()
     sort = (request.args.get("sort") or "last_seen_desc").strip().lower()
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()
 
     where = []
     params = []
-    if active_filter == "active":
-        where.append("COALESCE(u.is_active, 1) = 1")
-    elif active_filter == "inactive":
-        where.append("COALESCE(u.is_active, 1) = 0")
+    where.append("COALESCE(u.is_active, 1) = 1")
     if lead_category:
         where.append("lower(COALESCE(u.lead_category, '')) = ?")
         params.append(lead_category)
     if lead_stage:
         where.append("COALESCE(u.lead_stage, '') = ?")
         params.append(lead_stage)
+    if has_name == "yes":
+        where.append("trim(COALESCE(u.first_name, '')) <> '' AND trim(COALESCE(u.last_name, '')) <> ''")
+    elif has_name == "no":
+        where.append("trim(COALESCE(u.first_name, '')) = '' OR trim(COALESCE(u.last_name, '')) = ''")
+    if has_address == "yes":
+        where.append(
+            "trim(COALESCE(u.personal_address, '')) <> '' AND trim(COALESCE(u.personal_city, '')) <> '' "
+            "AND trim(COALESCE(u.personal_state, '')) <> '' AND trim(COALESCE(u.personal_zip, '')) <> ''"
+        )
+    elif has_address == "no":
+        where.append(
+            "trim(COALESCE(u.personal_address, '')) = '' OR trim(COALESCE(u.personal_city, '')) = '' "
+            "OR trim(COALESCE(u.personal_state, '')) = '' OR trim(COALESCE(u.personal_zip, '')) = ''"
+        )
     duration_thresholds = {
         "30s": 30,
         "1m": 60,
@@ -19995,9 +20051,29 @@ def anon_dashboard():
         "skiptraced": db.execute("SELECT COUNT(*) AS c FROM untitled_sheet_current WHERE trim(COALESCE(skiptrace_completed_at, '')) <> ''").fetchone()["c"],
     }
 
+    record_keys = [str(row["record_key"] or "").strip() for row in rows if str(row["record_key"] or "").strip()]
+    latest_changes = {}
+    if record_keys:
+        placeholders = ",".join("?" for _ in record_keys)
+        change_rows = db.execute(
+            f"""
+            SELECT record_key, change_type, changed_fields_json, created_at
+            FROM untitled_sheet_changes
+            WHERE record_key IN ({placeholders})
+              AND change_type IN ('updated', 'reappeared')
+            ORDER BY id DESC
+            """,
+            tuple(record_keys),
+        ).fetchall()
+        for row in change_rows:
+            key = str(row["record_key"] or "").strip()
+            if key and key not in latest_changes:
+                latest_changes[key] = dict(row)
+
     anon_rows = []
     for row in rows:
         item = dict(row)
+        record_key = str(item.get("record_key") or "").strip()
         emails = _untitled_source_emails(item)
         phones = _untitled_source_phones(item)
         address = _untitled_source_address(item)
@@ -20029,6 +20105,7 @@ def anon_dashboard():
         item["last_session_date_value"] = _untitled_last_session_date_value(item)
         item["last_seen_display"] = _compact_est_datetime(item["last_session_date_value"] or item.get("last_seen_at") or item.get("last_changed_at") or item.get("first_seen_at") or "")
         item["last_changed_display"] = _untitled_actual_last_changed_display(item)
+        item["last_changed_hover"] = _untitled_change_hover_text(latest_changes.get(record_key) or {})
         item["last_seen_sort_dt"] = _untitled_last_seen_sort_dt(item)
         item["time_on_page_display"] = _short_duration_label(item.get("last_session_est_duration") or 0)
         item["entry_url_short"] = _short_url_path(item.get("last_session_entry_url") or "")
@@ -20054,9 +20131,10 @@ def anon_dashboard():
         q=q,
         lead_category=lead_category,
         lead_stage=lead_stage,
+        has_name=has_name,
+        has_address=has_address,
         time_on_page=time_on_page,
         tracked=tracked,
-        active_filter=active_filter,
         sort=sort,
         category_options=category_options,
         stage_options=stage_options,

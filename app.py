@@ -8448,6 +8448,17 @@ def _untitled_name_display(row):
     return full_name or "Anonymous visitor"
 
 
+def _untitled_actual_last_changed_display(row):
+    row = row if isinstance(row, dict) else {}
+    changed_dt = parse_flexible_datetime(row.get("last_changed_at"))
+    first_seen_dt = parse_flexible_datetime(row.get("first_seen_at"))
+    if changed_dt is None or first_seen_dt is None:
+        return ""
+    if changed_dt <= first_seen_dt:
+        return ""
+    return _compact_est_datetime(row.get("last_changed_at") or "")
+
+
 def _update_untitled_current_row_state(db, record_key, **fields):
     allowed = {
         "local_property_id",
@@ -20017,6 +20028,7 @@ def anon_dashboard():
         ).strip()
         item["last_session_date_value"] = _untitled_last_session_date_value(item)
         item["last_seen_display"] = _compact_est_datetime(item["last_session_date_value"] or item.get("last_seen_at") or item.get("last_changed_at") or item.get("first_seen_at") or "")
+        item["last_changed_display"] = _untitled_actual_last_changed_display(item)
         item["last_seen_sort_dt"] = _untitled_last_seen_sort_dt(item)
         item["time_on_page_display"] = _short_duration_label(item.get("last_session_est_duration") or 0)
         item["entry_url_short"] = _short_url_path(item.get("last_session_entry_url") or "")

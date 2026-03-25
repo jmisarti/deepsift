@@ -15,15 +15,16 @@
     <form id="anonFilterForm" method="get"></form>
     <table class="crm-table anon-compact-table">
         <colgroup>
-            <col style="width:7%">
             <col style="width:6%">
+            <col style="width:5%">
+            <col style="width:10%">
+            <col style="width:17%">
             <col style="width:11%">
-            <col style="width:18%">
-            <col style="width:13%">
-            <col style="width:9%">
-            <col style="width:7%">
-            <col style="width:12%">
             <col style="width:11%">
+            <col style="width:8%">
+            <col style="width:6%">
+            <col style="width:10%">
+            <col style="width:10%">
             <col style="width:6%">
         </colgroup>
         <thead>
@@ -33,6 +34,7 @@
                 <th>Name</th>
                 <th>Address</th>
                 <th>Last Seen</th>
+                <th>Last Changed</th>
                 <th>Time On Page</th>
                 <th>Pages Viewed</th>
                 <th>Entry URL</th>
@@ -69,6 +71,7 @@
                         <option value="category_desc" {% if sort == 'category_desc' %}selected{% endif %}>Category Z-A</option>
                     </select>
                 </td>
+                <td></td>
                 <td>
                     <select form="anonFilterForm" name="time_on_page">
                         <option value="">Any duration</option>
@@ -125,6 +128,7 @@
                 </td>
                 <td title="{{ row.address_line }}">{{ row.address_line }}</td>
                 <td>{{ row.last_seen_display }}</td>
+                <td>{{ row.last_changed_display }}</td>
                 <td>{{ row.time_on_page_display }}</td>
                 <td>{{ row.last_session_total_pages_visited or 0 }}</td>
                 <td class="anon-url-cell" title="{{ row.last_session_entry_url or '' }}">
@@ -151,7 +155,7 @@
             </tr>
             {% endfor %}
             {% if not rows %}
-            <tr><td colspan="10">No anonymous leads matched this filter.</td></tr>
+            <tr><td colspan="11">No anonymous leads matched this filter.</td></tr>
             {% endif %}
         </tbody>
     </table>

@@ -12179,6 +12179,7 @@ def route_new_agent_signals_once(db, limit=50):
     system_numbers = _known_system_numbers(db, refresh_seconds=300)
 
     def _signal_rollup_context(signal_row, payload_obj):
+        signal_row = dict(signal_row) if isinstance(signal_row, sqlite3.Row) else (signal_row if isinstance(signal_row, dict) else {})
         payload_obj = payload_obj if isinstance(payload_obj, dict) else {}
         signal_obj = payload_obj.get("signal") if isinstance(payload_obj.get("signal"), dict) else {}
         analysis_obj = payload_obj.get("analysis") if isinstance(payload_obj.get("analysis"), dict) else {}

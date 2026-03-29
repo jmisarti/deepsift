@@ -6294,11 +6294,13 @@ def get_automation_settings(db):
     reisift_placeholder_raw = get_setting(db, "automation_reisift_placeholder_enabled", "1")
     auto_send_realtors_raw = get_setting(db, "automation_auto_send_realtors_enabled", "1")
     untitled_leads_raw = get_setting(db, "automation_untitled_leads_enabled", "1")
+    smrtagent_slack_raw = get_setting(db, "automation_smrtagent_slack_enabled", "1")
     return {
         "clever_leads_enabled": (clever_enabled_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
         "reisift_placeholder_enabled": (reisift_placeholder_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
         "auto_send_realtors_enabled": (auto_send_realtors_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
         "untitled_leads_enabled": (untitled_leads_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
+        "smrtagent_slack_enabled": (smrtagent_slack_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
     }
 
 
@@ -23480,6 +23482,9 @@ def settings_page():
             elif automation_key == "auto_send_realtors":
                 auto_send_enabled = (request.form.get("automation_auto_send_realtors_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
                 set_setting(db, "automation_auto_send_realtors_enabled", "1" if auto_send_enabled else "0")
+            elif automation_key == "smrtagent_slack":
+                smrtagent_slack_enabled = (request.form.get("automation_smrtagent_slack_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
+                set_setting(db, "automation_smrtagent_slack_enabled", "1" if smrtagent_slack_enabled else "0")
             notice = "Automation settings saved."
         elif active_tab == "helpers":
             market_helper_address = (request.form.get("market_helper_address") or "").strip()
@@ -27218,13 +27223,18 @@ def smrtphone_agent_call_ended_webhook():
     if detail_lines:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(detail_lines)[:2900]}})
 
-    try:
-        send_agent_ops_notification(db, "\n".join(text_lines), blocks=blocks)
-        processing_status = "slack_sent"
+    automation_settings = get_automation_settings(db)
+    if not automation_settings.get("smrtagent_slack_enabled"):
+        processing_status = "slack_disabled"
         error_text = ""
-    except Exception as exc:
-        processing_status = "slack_error"
-        error_text = str(exc)
+    else:
+        try:
+            send_agent_ops_notification(db, "\n".join(text_lines), blocks=blocks)
+            processing_status = "slack_sent"
+            error_text = ""
+        except Exception as exc:
+            processing_status = "slack_error"
+            error_text = str(exc)
 
     log_smrtphone_webhook_event(
         db,

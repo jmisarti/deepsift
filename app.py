@@ -27202,53 +27202,21 @@ def smrtphone_agent_call_ended_webhook():
         or extract_first_string_by_keys(webhook, ["timestamp", "completed_at", "endedAt", "ended_at", "date"])
     ).strip()
 
-    text_lines = ["AI Agent just completed a call"]
-    if contact_name:
-        text_lines.append(f"Contact: {contact_name}")
-    if from_number or to_number:
-        text_lines.append(f"Numbers: {from_number or '(unknown)'} -> {to_number or '(unknown)'}")
-    if outcome:
-        text_lines.append(f"Outcome: {outcome}")
-    if duration:
-        text_lines.append(f"Duration: {duration}")
+    slack_title = "SmartAgent just completed a call"
+    text_lines = [slack_title]
+    if call_sid:
+        text_lines.append(f"callid: {call_sid}")
     if summary:
         text_lines.append(f"Summary: {summary}")
 
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "*AI Agent just completed a call*",
-            },
-        }
-    ]
-    field_pairs = []
-    if agent_name:
-        field_pairs.append({"type": "mrkdwn", "text": f"*Agent*\n{agent_name}"})
-    if contact_name:
-        field_pairs.append({"type": "mrkdwn", "text": f"*Contact*\n{contact_name}"})
-    if from_number:
-        field_pairs.append({"type": "mrkdwn", "text": f"*From*\n{from_number}"})
-    if to_number:
-        field_pairs.append({"type": "mrkdwn", "text": f"*To*\n{to_number}"})
-    if outcome:
-        field_pairs.append({"type": "mrkdwn", "text": f"*Outcome*\n{outcome}"})
-    if duration:
-        field_pairs.append({"type": "mrkdwn", "text": f"*Duration*\n{duration}"})
-    if timestamp_text:
-        field_pairs.append({"type": "mrkdwn", "text": f"*Completed*\n{timestamp_text}"})
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f"*{slack_title}*"}}]
+    detail_lines = []
     if call_sid:
-        field_pairs.append({"type": "mrkdwn", "text": f"*Call SID*\n{call_sid}"})
-    if field_pairs:
-        blocks.append({"type": "section", "fields": field_pairs[:10]})
+        detail_lines.append(f"*callid:* {call_sid}")
     if summary:
-        blocks.append(
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Summary*\n{summary[:2900]}"},
-            }
-        )
+        detail_lines.append(f"*Summary:* {summary}")
+    if detail_lines:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(detail_lines)[:2900]}})
 
     try:
         send_agent_ops_notification(db, "\n".join(text_lines), blocks=blocks)

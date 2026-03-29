@@ -27152,6 +27152,133 @@ def smrtphone_call_completed_webhook():
     return jsonify({"ok": True, "job_id": cur.lastrowid, "call_sid": call_sid, "recording_url": recording_url, "fetch_status": fetch_status})
 
 
+@app.route("/webhooks/smrtphone/agent-call-ended", methods=["POST"])
+def smrtphone_agent_call_ended_webhook():
+    ensure_db()
+    db = get_db()
+
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    webhook = payload.get("webhook") if isinstance(payload.get("webhook"), dict) else {}
+    event_name = (
+        extract_first_string_by_keys(payload, ["event", "eventType", "type", "name"])
+        or extract_first_string_by_keys(webhook, ["event", "eventType", "type", "name"])
+        or "smrtAgent Call Ended"
+    ).strip()
+    call_sid = (
+        extract_first_string_by_keys(payload, ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "callID", "id"])
+        or extract_first_string_by_keys(webhook, ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "callID", "id"])
+    )
+    from_number = normalize_phone(
+        extract_first_string_by_keys(payload, ["from", "from_number", "fromNumber", "caller", "source", "ani"])
+        or extract_first_string_by_keys(webhook, ["from", "from_number", "fromNumber", "caller", "source", "ani"])
+    )
+    to_number = normalize_phone(
+        extract_first_string_by_keys(payload, ["to", "to_number", "toNumber", "callee", "destination", "dnis"])
+        or extract_first_string_by_keys(webhook, ["to", "to_number", "toNumber", "callee", "destination", "dnis"])
+    )
+    agent_name = (
+        extract_first_string_by_keys(payload, ["agentName", "agent_name", "userName", "user_name", "aiAgent", "agent"])
+        or extract_first_string_by_keys(webhook, ["agentName", "agent_name", "userName", "user_name", "aiAgent", "agent"])
+        or "AI Agent"
+    ).strip()
+    contact_name = (
+        extract_first_string_by_keys(payload, ["contactName", "contact_name", "leadName", "lead_name", "callerName", "caller_name"])
+        or extract_first_string_by_keys(webhook, ["contactName", "contact_name", "leadName", "lead_name", "callerName", "caller_name"])
+    ).strip()
+    outcome = (
+        extract_first_string_by_keys(payload, ["callOutcome", "call_outcome", "outcome", "status", "disposition"])
+        or extract_first_string_by_keys(webhook, ["callOutcome", "call_outcome", "outcome", "status", "disposition"])
+    ).strip()
+    duration = (
+        extract_first_string_by_keys(payload, ["duration", "callDuration", "call_duration", "durationSeconds", "duration_seconds"])
+        or extract_first_string_by_keys(webhook, ["duration", "callDuration", "call_duration", "durationSeconds", "duration_seconds"])
+    ).strip()
+    summary = (
+        extract_first_string_by_keys(payload, ["summary", "notes", "callSummary", "call_summary", "dispositionNotes", "disposition_notes"])
+        or extract_first_string_by_keys(webhook, ["summary", "notes", "callSummary", "call_summary", "dispositionNotes", "disposition_notes"])
+    ).strip()
+    timestamp_text = (
+        extract_first_string_by_keys(payload, ["timestamp", "completed_at", "endedAt", "ended_at", "date"])
+        or extract_first_string_by_keys(webhook, ["timestamp", "completed_at", "endedAt", "ended_at", "date"])
+    ).strip()
+
+    text_lines = ["AI Agent just completed a call"]
+    if contact_name:
+        text_lines.append(f"Contact: {contact_name}")
+    if from_number or to_number:
+        text_lines.append(f"Numbers: {from_number or '(unknown)'} -> {to_number or '(unknown)'}")
+    if outcome:
+        text_lines.append(f"Outcome: {outcome}")
+    if duration:
+        text_lines.append(f"Duration: {duration}")
+    if summary:
+        text_lines.append(f"Summary: {summary}")
+
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*AI Agent just completed a call*",
+            },
+        }
+    ]
+    field_pairs = []
+    if agent_name:
+        field_pairs.append({"type": "mrkdwn", "text": f"*Agent*\n{agent_name}"})
+    if contact_name:
+        field_pairs.append({"type": "mrkdwn", "text": f"*Contact*\n{contact_name}"})
+    if from_number:
+        field_pairs.append({"type": "mrkdwn", "text": f"*From*\n{from_number}"})
+    if to_number:
+        field_pairs.append({"type": "mrkdwn", "text": f"*To*\n{to_number}"})
+    if outcome:
+        field_pairs.append({"type": "mrkdwn", "text": f"*Outcome*\n{outcome}"})
+    if duration:
+        field_pairs.append({"type": "mrkdwn", "text": f"*Duration*\n{duration}"})
+    if timestamp_text:
+        field_pairs.append({"type": "mrkdwn", "text": f"*Completed*\n{timestamp_text}"})
+    if call_sid:
+        field_pairs.append({"type": "mrkdwn", "text": f"*Call SID*\n{call_sid}"})
+    if field_pairs:
+        blocks.append({"type": "section", "fields": field_pairs[:10]})
+    if summary:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Summary*\n{summary[:2900]}"},
+            }
+        )
+
+    try:
+        send_agent_ops_notification(db, "\n".join(text_lines), blocks=blocks)
+        processing_status = "slack_sent"
+        error_text = ""
+    except Exception as exc:
+        processing_status = "slack_error"
+        error_text = str(exc)
+
+    log_smrtphone_webhook_event(
+        db,
+        "agent_call_ended",
+        payload,
+        processing_status=processing_status,
+        sms_id=call_sid,
+        from_number=from_number,
+        to_number=to_number,
+        error_text=error_text,
+    )
+    db.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "event": event_name or "smrtAgent Call Ended",
+            "call_sid": call_sid,
+            "slack_status": processing_status,
+        }
+    ), 200
+
+
 @app.route("/api/notifications/sms-unread", methods=["GET"])
 def unread_sms_notifications():
     return unread_notifications()

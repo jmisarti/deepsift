@@ -27301,7 +27301,7 @@ def smrtphone_agent_call_ended_webhook():
         error_text = ""
     else:
         try:
-            send_agent_ops_notification(db, "\n".join(text_lines), blocks=blocks)
+            send_slack_notification(db, "\n".join(text_lines), blocks=blocks, channel="#acquisitions")
             processing_status = "slack_sent"
             error_text = ""
         except Exception as exc:

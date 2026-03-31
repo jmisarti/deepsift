@@ -15480,20 +15480,50 @@ def reisift_update_property_status(token, property_uuid, status_slug):
         raise ValueError("property_uuid is required for status update.")
     if not status_slug:
         raise ValueError("status_slug is required for status update.")
-    status_label = _reisift_status_label(status_slug, default="New Lead")
-    response = requests.post(
-        f"{REISIFT_BASE_URL}/api/internal/property/{property_uuid}/status/",
-        headers=reisift_auth_headers(token),
-        json={"status": status_label},
-        timeout=30,
+    attempted_statuses = []
+    candidates = []
+    for candidate in [
+        status_slug,
+        _normalize_reisift_status(status_slug),
+        _reisift_status_slug(status_slug, default=status_slug),
+        _reisift_status_label(status_slug, default="New Lead"),
+    ]:
+        value = str(candidate or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    last_error = None
+    for candidate in candidates:
+        response = requests.post(
+            f"{REISIFT_BASE_URL}/api/internal/property/{property_uuid}/status/",
+            headers=reisift_auth_headers(token),
+            json={"status": candidate},
+            timeout=30,
+        )
+        try:
+            body = response.json()
+        except ValueError:
+            body = {"raw_text": response.text}
+        attempted_statuses.append({"status": candidate, "status_code": response.status_code})
+        if response.ok:
+            return {
+                "request": {"status": candidate},
+                "response": body,
+                "attempted_statuses": attempted_statuses,
+            }
+        last_error = (response.status_code, body)
+        status_errors = body.get("status") if isinstance(body, dict) else None
+        invalid_choice = isinstance(status_errors, list) and any(
+            "not a valid status choice" in str(item or "").lower() for item in status_errors
+        )
+        if not invalid_choice:
+            raise ValueError(f"ReiSift status update failed ({response.status_code}): {body}")
+
+    if last_error is None:
+        raise ValueError("ReiSift status update failed: no status candidates were attempted.")
+    raise ValueError(
+        f"ReiSift status update failed after trying {candidates} ({last_error[0]}): {last_error[1]}"
     )
-    try:
-        body = response.json()
-    except ValueError:
-        body = {"raw_text": response.text}
-    if not response.ok:
-        raise ValueError(f"ReiSift status update failed ({response.status_code}): {body}")
-    return {"request": {"status": status_label}, "response": body}
 
 
 def reisift_upsert_owner_contacts(token, owner_uuid, phones, emails):

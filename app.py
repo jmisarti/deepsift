@@ -17830,6 +17830,259 @@ def launch_d4d_slack_intake(response_url, address_text, raw_text="", added_by=""
     return worker
 
 
+def _normalize_counties_csv(values):
+    county_map = {str(option).strip().lower(): str(option).strip() for option in (NJ_COUNTIES or []) if str(option).strip()}
+    cleaned = []
+    raw_values = split_markets(values) if isinstance(values, str) else list(values or [])
+    for value in raw_values:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        lookup = re.sub(r"\s+county$", "", raw, flags=re.IGNORECASE).strip().lower()
+        canonical = county_map.get(lookup)
+        if canonical and canonical not in cleaned:
+            cleaned.append(canonical)
+    return join_markets(cleaned)
+
+
+def _extract_wrapped_slack_arg(text, label):
+    pattern = re.compile(rf"(?i)\b{re.escape(label)}\s*\((.*?)\)")
+    match = pattern.search(text or "")
+    if not match:
+        return "", (text or "")
+    value = (match.group(1) or "").strip()
+    remaining = ((text or "")[: match.start()] + " " + (text or "")[match.end() :]).strip()
+    remaining = re.sub(r"\s{2,}", " ", remaining).strip()
+    return value, remaining
+
+
+def _extract_first_phone_like(text):
+    candidates = re.findall(r"(?:\+?1[\s\-.()]*)?(?:\(?\d{3}\)?[\s\-.()]*)\d{3}[\s\-.()]*\d{4}", text or "")
+    for candidate in candidates:
+        norm = normalize_phone(candidate)
+        if len(norm) == 10:
+            return candidate.strip(), norm
+    return "", ""
+
+
+def _extract_first_email_like(text):
+    match = EMAIL_RE.search(text or "")
+    if not match:
+        return "", ""
+    raw = match.group(0).strip()
+    return raw, normalize_email(raw)
+
+
+def _slack_command_remaining_text_without_value(text, value):
+    if not text or not value:
+        return text or ""
+    pattern = re.compile(re.escape(value), re.IGNORECASE)
+    remaining = pattern.sub(" ", text, count=1)
+    remaining = re.sub(r"\s{2,}", " ", remaining).strip()
+    return remaining
+
+
+def _parse_slack_buyer_name(remaining_text):
+    text = normalize_whitespace(remaining_text or "")
+    if not text:
+        return "", "", ""
+    tokens = [re.sub(r"^[^\w]+|[^\w'.-]+$", "", token) for token in text.split()]
+    tokens = [token for token in tokens if token]
+    if len(tokens) >= 2:
+        return tokens[0], tokens[1], " ".join(tokens[2:]).strip()
+    if len(tokens) == 1:
+        return tokens[0], "Buyer", ""
+    return "", "", ""
+
+
+def parse_slack_buyer_command(raw_text):
+    original = normalize_whitespace(raw_text or "")
+    text = original
+    if text.lower().startswith("buyer "):
+        text = text[6:].strip()
+    elif text.lower() == "buyer":
+        text = ""
+
+    extracted = {}
+    for label in ["county", "category", "type", "email", "business", "notes", "name"]:
+        value, text = _extract_wrapped_slack_arg(text, label)
+        extracted[label] = value
+
+    phone_raw, phone_norm = _extract_first_phone_like(text)
+    text = _slack_command_remaining_text_without_value(text, phone_raw)
+
+    inferred_email_raw, inferred_email = _extract_first_email_like(text)
+    if not extracted.get("email"):
+        extracted["email"] = inferred_email_raw
+    text = _slack_command_remaining_text_without_value(text, inferred_email_raw)
+
+    explicit_name = normalize_whitespace(extracted.get("name") or "")
+    if explicit_name:
+        first_name, last_name, leftover_name = _parse_slack_buyer_name(explicit_name)
+    else:
+        first_name, last_name, leftover_name = _parse_slack_buyer_name(text)
+        text = leftover_name
+
+    normalized_email = normalize_email(extracted.get("email") or inferred_email or "")
+    business_name = normalize_whitespace(extracted.get("business") or "")
+    notes_value = normalize_whitespace(extracted.get("notes") or "")
+    leftover_notes = normalize_whitespace(text or "")
+    notes_parts = []
+    if notes_value:
+        notes_parts.append(notes_value)
+    if leftover_notes:
+        notes_parts.append(f"Unparsed Slack text: {leftover_notes}")
+    notes_parts.append(f"Slack intake: {original}")
+    counties = _normalize_counties_csv(extracted.get("county") or "")
+    buyer_categories = normalize_option_csv(
+        split_markets(extracted.get("category") or ""),
+        BUYER_ROLE_OPTIONS,
+        BUYER_ROLE_ALIASES,
+    )
+    property_types = normalize_option_csv(
+        split_markets(extracted.get("type") or ""),
+        BUYER_PROPERTY_TYPE_OPTIONS,
+        BUYER_PROPERTY_TYPE_ALIASES,
+    )
+
+    if not first_name and business_name:
+        first_name = business_name
+        last_name = "Buyer"
+    elif not first_name:
+        first_name = "Unknown"
+        last_name = "Buyer"
+    elif not last_name:
+        last_name = "Buyer"
+
+    return {
+        "ok": bool(phone_norm),
+        "phone_raw": phone_raw.strip(),
+        "phone_norm": phone_norm,
+        "phone_display": phone_raw.strip() or phone_norm,
+        "email": normalized_email,
+        "first_name": first_name,
+        "last_name": last_name,
+        "business_name": business_name,
+        "target_counties": counties,
+        "buyer_categories": buyer_categories,
+        "property_types": property_types,
+        "notes": "\n".join([part for part in notes_parts if part]).strip(),
+        "raw_text": original,
+        "error": "" if phone_norm else "A phone number is required. Example: buyer 9735551212 John Smith county(Essex) category(Wholesaler) type(SFR)",
+    }
+
+
+def _find_existing_buyer_row(db, phone_norm="", email=""):
+    phone_norm = normalize_phone(phone_norm or "")
+    email_norm = normalize_email(email or "")
+    rows = db.execute(
+        """
+        SELECT *
+        FROM buyers
+        ORDER BY id DESC
+        """
+    ).fetchall()
+    email_match = None
+    for row in rows or []:
+        row_phone = normalize_phone(row["phone"] or "")
+        row_email = normalize_email(row["email"] or "")
+        if phone_norm and row_phone == phone_norm:
+            return row
+        if email_norm and row_email == email_norm and email_match is None:
+            email_match = row
+    return email_match
+
+
+def upsert_buyer_from_slack_command(db, parsed, added_by=""):
+    phone_norm = normalize_phone(parsed.get("phone_norm") or parsed.get("phone_raw") or "")
+    if not phone_norm:
+        raise ValueError("A phone number is required for buyer intake.")
+
+    existing = _find_existing_buyer_row(db, phone_norm=phone_norm, email=parsed.get("email") or "")
+    now_text = format_est_datetime(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    actor = normalize_whitespace(added_by or "") or "Slack"
+    intake_note = f"Slack buyer intake on {now_text} by {actor}."
+    combined_notes = "\n".join([x for x in [parsed.get("notes") or "", intake_note] if x]).strip()
+
+    if existing:
+        first_name = (parsed.get("first_name") or existing["first_name"] or "").strip() or "Unknown"
+        last_name = (parsed.get("last_name") or existing["last_name"] or "").strip() or "Buyer"
+        business_name = (parsed.get("business_name") or existing["business_name"] or "").strip()
+        email_value = normalize_email(parsed.get("email") or existing["email"] or "")
+        phone_value = (parsed.get("phone_display") or existing["phone"] or phone_norm).strip()
+        target_counties = _normalize_counties_csv(
+            split_markets(existing["target_counties"] or "") + split_markets(parsed.get("target_counties") or "")
+        )
+        buyer_categories = normalize_option_csv(
+            split_markets(existing["buyer_categories"] or "") + split_markets(parsed.get("buyer_categories") or ""),
+            BUYER_ROLE_OPTIONS,
+            BUYER_ROLE_ALIASES,
+        )
+        property_types = normalize_option_csv(
+            split_markets(existing["property_types"] or "") + split_markets(parsed.get("property_types") or ""),
+            BUYER_PROPERTY_TYPE_OPTIONS,
+            BUYER_PROPERTY_TYPE_ALIASES,
+        )
+        existing_notes = (existing["notes"] or "").strip()
+        notes = "\n\n".join([x for x in [existing_notes, combined_notes] if x]).strip()
+        db.execute(
+            """
+            UPDATE buyers
+            SET first_name = ?, last_name = ?, business_name = ?, email = ?, phone = ?, notes = ?,
+                target_counties = ?, buyer_categories = ?, property_types = ?
+            WHERE id = ?
+            """,
+            (
+                first_name,
+                last_name,
+                business_name,
+                email_value,
+                phone_value,
+                notes,
+                target_counties,
+                buyer_categories,
+                property_types,
+                int(existing["id"]),
+            ),
+        )
+        buyer_id = int(existing["id"])
+        action = "updated"
+    else:
+        cur = db.execute(
+            """
+            INSERT INTO buyers
+            (first_name, last_name, business_name, email, phone, notes, target_counties, buyer_categories, property_types)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (parsed.get("first_name") or "Unknown").strip(),
+                (parsed.get("last_name") or "Buyer").strip(),
+                (parsed.get("business_name") or "").strip(),
+                normalize_email(parsed.get("email") or ""),
+                (parsed.get("phone_display") or phone_norm).strip(),
+                combined_notes,
+                parsed.get("target_counties") or "",
+                parsed.get("buyer_categories") or "",
+                parsed.get("property_types") or "",
+            ),
+        )
+        buyer_id = int(cur.lastrowid or 0)
+        action = "created"
+
+    upsert_cached_contact_context(
+        db,
+        phone_norm,
+        classification="buyer",
+        source="slack_buyer_intake",
+        confidence=0.95,
+        notes=f"Buyer {action} from Slack command (buyer_id={buyer_id}).",
+        last_reisift_lookup_at=format_db_time(datetime.utcnow()),
+    )
+
+    row = db.execute("SELECT * FROM buyers WHERE id = ?", (buyer_id,)).fetchone()
+    return {"buyer_id": buyer_id, "action": action, "buyer": dict(row) if row else {}}
+
+
 def build_market_status_helper(address_text):
     address = " ".join((address_text or "").strip().split())
     if not address:
@@ -26551,6 +26804,7 @@ def slack_command_webhook():
                     "• `queue` - pending Agent 2 actions\n"
                     "• `unresolved` - unresolved lead-watch items\n"
                     "• `d4d <address>` - add or flag a Driving For Dollars lead\n"
+                    "• `buyer <phone> [name] county(x,y) category(x,y) type(x,y)` - add or update a buyer\n"
                     "• `health` - agent endpoint health\n"
                     "• `help` - command list"
                 ),
@@ -26596,6 +26850,48 @@ def slack_command_webhook():
                 "text": "\n".join(result.get("lines") or [result.get("message") or "D4D intake finished."]),
             }
         )
+    if sub == "buyer":
+        parsed = parse_slack_buyer_command(text)
+        if not parsed.get("ok"):
+            return jsonify({"response_type": "ephemeral", "text": parsed.get("error") or "Could not parse buyer command."})
+        try:
+            result = upsert_buyer_from_slack_command(db, parsed, added_by=user_name or user_id)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            log_app_error(
+                db,
+                source="slack_buyer_intake",
+                error_message=str(exc),
+                details=json.dumps({"text": text, "user": user_name or user_id}),
+                route="/webhooks/slack/command",
+                status_code=500,
+            )
+            db.commit()
+            return jsonify(
+                {
+                    "response_type": "ephemeral",
+                    "text": f"Could not create buyer: {exc}",
+                }
+            )
+        buyer = result.get("buyer") or {}
+        buyer_name = " ".join([x for x in [buyer.get("first_name"), buyer.get("last_name")] if str(x or "").strip()]).strip() or "Unknown Buyer"
+        msg_lines = [
+            f"Buyer {result.get('action') or 'saved'}: {buyer_name}",
+            f"Phone: {buyer.get('phone') or parsed.get('phone_display') or parsed.get('phone_norm')}",
+        ]
+        if buyer.get("email"):
+            msg_lines.append(f"Email: {buyer.get('email')}")
+        if buyer.get("business_name"):
+            msg_lines.append(f"Business: {buyer.get('business_name')}")
+        if buyer.get("target_counties"):
+            msg_lines.append(f"Counties: {buyer.get('target_counties')}")
+        if buyer.get("buyer_categories"):
+            msg_lines.append(f"Buyer Categories: {buyer.get('buyer_categories')}")
+        if buyer.get("property_types"):
+            msg_lines.append(f"Property Types: {buyer.get('property_types')}")
+        msg_lines.append(f"Buyer ID: {result.get('buyer_id')}")
+        return jsonify({"response_type": "in_channel", "text": "\n".join(msg_lines)})
     if sub in {"status", "overview"}:
         snap = build_agent_advisor_snapshot(db, window_hours=72)
         signals = snap.get("signals", {})

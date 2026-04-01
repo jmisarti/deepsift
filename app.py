@@ -7897,6 +7897,18 @@ def _extract_website_lead_fields(payload):
         city = city or (parsed.get("city") or "")
         state = state or (parsed.get("state") or "")
         postal_code = postal_code or (parsed.get("postal_code") or "")
+    normalized = _normalize_address_components(
+        street=street,
+        city=city,
+        state=state,
+        postal_code=postal_code,
+        raw_address=address,
+    )
+    street = normalized.get("street") or ""
+    city = normalized.get("city") or ""
+    state = normalized.get("state") or ""
+    postal_code = normalized.get("postal_code") or ""
+    address = normalized.get("address") or address
     return {
         "address": address,
         "street": street,
@@ -7938,9 +7950,18 @@ def _website_merge_fields(step1_fields, step2_fields):
         merged["city"] = merged["city"] or (parsed.get("city") or "")
         merged["state"] = merged["state"] or (parsed.get("state") or "")
         merged["postal_code"] = merged["postal_code"] or (parsed.get("postal_code") or "")
-    if (not merged["address"]) and merged["street"]:
-        parts = [x for x in [merged["street"], merged.get("city"), merged.get("state"), merged.get("postal_code")] if x]
-        merged["address"] = ", ".join(parts)
+    normalized = _normalize_address_components(
+        street=merged.get("street") or "",
+        city=merged.get("city") or "",
+        state=merged.get("state") or "",
+        postal_code=merged.get("postal_code") or "",
+        raw_address=merged.get("address") or "",
+    )
+    merged["street"] = normalized.get("street") or merged.get("street") or ""
+    merged["city"] = normalized.get("city") or merged.get("city") or ""
+    merged["state"] = normalized.get("state") or merged.get("state") or ""
+    merged["postal_code"] = normalized.get("postal_code") or merged.get("postal_code") or ""
+    merged["address"] = normalized.get("address") or merged.get("address") or ""
     return merged
 
 
@@ -15760,6 +15781,132 @@ def _reisift_build_property_create_payload(address_info_payload, input_payload):
     }
 
 
+US_STATE_CODE_MAP = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
+    "colorado": "CO", "connecticut": "CT", "delaware": "DE", "florida": "FL", "georgia": "GA",
+    "hawaii": "HI", "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA",
+    "kansas": "KS", "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS", "missouri": "MO",
+    "montana": "MT", "nebraska": "NE", "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
+    "new mexico": "NM", "new york": "NY", "north carolina": "NC", "north dakota": "ND", "ohio": "OH",
+    "oklahoma": "OK", "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT",
+    "virginia": "VA", "washington": "WA", "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+    "district of columbia": "DC",
+}
+US_STATE_NAME_BY_CODE = {code: name.title() for name, code in US_STATE_CODE_MAP.items()}
+
+
+def _normalize_state_code(value):
+    raw = re.sub(r"[,\s]+", " ", str(value or "")).strip()
+    if not raw:
+        return ""
+    if re.fullmatch(r"[A-Za-z]{2}", raw):
+        return raw.upper()
+    lowered = raw.lower().replace(".", "").strip()
+    if lowered in US_STATE_CODE_MAP:
+        return US_STATE_CODE_MAP[lowered]
+    compact = re.sub(r"[^a-z]", "", lowered)
+    for state_name, code in US_STATE_CODE_MAP.items():
+        if compact == re.sub(r"[^a-z]", "", state_name):
+            return code
+    letters = re.sub(r"[^A-Za-z]", "", raw)
+    if len(letters) >= 2:
+        return letters[:2].upper()
+    return raw[:2].upper()
+
+
+def _normalize_postal_code(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    match = re.search(r"\b(\d{5})(?:-(\d{4}))?\b", raw)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}" if match.group(2) else match.group(1)
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 9:
+        return f"{digits[:5]}-{digits[5:]}"
+    if len(digits) >= 5:
+        return digits[:5]
+    return raw
+
+
+def _normalize_city_value(value, state_code=""):
+    city = re.sub(r"[,\s]+", " ", str(value or "")).strip(" ,")
+    if not city:
+        return ""
+    if state_code:
+        city = re.sub(rf"(?i)\b{re.escape(state_code)}\b\s*$", "", city).strip(" ,")
+        full_state = US_STATE_NAME_BY_CODE.get(state_code.upper(), "")
+        if full_state:
+            city = re.sub(rf"(?i)\b{re.escape(full_state)}\b\s*$", "", city).strip(" ,")
+    for state_name, code in US_STATE_CODE_MAP.items():
+        city = re.sub(rf"(?i)\b{re.escape(state_name.title())}\b\s*$", "", city).strip(" ,")
+        city = re.sub(rf"(?i)\b{re.escape(code)}\b\s*$", "", city).strip(" ,")
+    return re.sub(r"\s{2,}", " ", city).strip(" ,")
+
+
+def _normalize_street_value(value):
+    street = re.sub(r"[,\s]+", " ", str(value or "")).strip(" ,")
+    if not street:
+        return ""
+    street = re.sub(
+        r"(?i)^\s*(\d+[A-Za-z]?)\s+(?:to|through|thru)\s+(\d+[A-Za-z]?)(\s+)",
+        r"\1-\2\3",
+        street,
+    )
+    return street.strip(" ,")
+
+
+def _strip_city_state_suffix_from_street(street, city="", state_code=""):
+    street_text = _normalize_street_value(street)
+    if not street_text:
+        return ""
+    if city:
+        escaped_city = re.escape(city)
+        state_variants = []
+        if state_code:
+            state_variants.append(re.escape(state_code))
+            full_state = US_STATE_NAME_BY_CODE.get(state_code.upper(), "")
+            if full_state:
+                state_variants.append(re.escape(full_state))
+        state_part = rf"(?:[\s,]+(?:{'|'.join(state_variants)}))?" if state_variants else ""
+        street_text = re.sub(
+            rf"(?i)[\s,]+{escaped_city}{state_part}\s*$",
+            "",
+            street_text,
+        ).strip(" ,")
+    if state_code:
+        full_state = US_STATE_NAME_BY_CODE.get(state_code.upper(), "")
+        if full_state:
+            street_text = re.sub(rf"(?i)[\s,]+{re.escape(full_state)}\s*$", "", street_text).strip(" ,")
+        street_text = re.sub(rf"(?i)[\s,]+{re.escape(state_code)}\s*$", "", street_text).strip(" ,")
+    return street_text
+
+
+def _normalize_address_components(street="", city="", state="", postal_code="", raw_address=""):
+    state_code = _normalize_state_code(state)
+    postal = _normalize_postal_code(postal_code)
+    city_value = _normalize_city_value(city, state_code=state_code)
+    street_value = _normalize_street_value(street)
+    if raw_address and (not street_value or not city_value):
+        parsed = _parse_search_address_simple(raw_address)
+        street_value = street_value or (parsed.get("street") or "")
+        city_value = city_value or (parsed.get("city") or "")
+        state_code = state_code or (parsed.get("state") or "")
+        postal = postal or (parsed.get("postal_code") or "")
+    city_value = _normalize_city_value(city_value, state_code=state_code)
+    street_value = _strip_city_state_suffix_from_street(street_value, city=city_value, state_code=state_code)
+    full_address = ", ".join([part for part in [street_value, city_value, state_code, postal] if part]).strip(", ")
+    return {
+        "street": street_value,
+        "city": city_value,
+        "state": state_code,
+        "postal_code": postal,
+        "address": full_address,
+    }
+
+
 def _parse_search_address_simple(search):
     text = (search or "").strip()
     text = re.sub(r"\s*,\s*United States\s*$", "", text, flags=re.IGNORECASE)
@@ -15784,21 +15931,6 @@ def _parse_search_address_simple(search):
         )
         if m2:
             street, city, state, postal_code = m2.group(1).strip(), m2.group(2).strip(), m2.group(3).strip(), m2.group(4).strip()
-    if len(state) > 2:
-        state_map = {
-            "new jersey": "NJ",
-            "new york": "NY",
-            "california": "CA",
-            "connecticut": "CT",
-            "pennsylvania": "PA",
-            "massachusetts": "MA",
-            "illinois": "IL",
-            "north carolina": "NC",
-            "virginia": "VA",
-            "texas": "TX",
-            "florida": "FL",
-        }
-        state = state_map.get(state.strip().lower(), state[:2].upper())
     if (not street or not city) and text:
         # Heuristic fallback for step-1 style addresses such as:
         # "59 Mayfair Dr West Orange NJ 07052"
@@ -15843,11 +15975,12 @@ def _parse_search_address_simple(search):
                     if best:
                         street = " ".join(best[0]).strip()
                         city = " ".join(best[1]).strip()
+    normalized = _normalize_address_components(street=street, city=city, state=state, postal_code=postal_code)
     return {
-        "street": street,
-        "city": city,
-        "state": state.upper(),
-        "postal_code": postal_code,
+        "street": normalized["street"],
+        "city": normalized["city"],
+        "state": normalized["state"],
+        "postal_code": normalized["postal_code"],
     }
 
 
@@ -15855,12 +15988,13 @@ def _reisift_build_property_create_payload_from_input(input_payload):
     input_payload = input_payload or {}
     search = (input_payload.get("search") or input_payload.get("address_search") or "").strip()
     parsed = _parse_search_address_simple(search)
-    property_address = {
-        "street": (input_payload.get("street") or parsed["street"] or "").strip(),
-        "city": (input_payload.get("city") or parsed["city"] or "").strip(),
-        "state": (input_payload.get("state") or parsed["state"] or "").strip(),
-        "postal_code": (input_payload.get("postal_code") or parsed["postal_code"] or "").strip(),
-    }
+    property_address = _normalize_address_components(
+        street=(input_payload.get("street") or parsed["street"] or "").strip(),
+        city=(input_payload.get("city") or parsed["city"] or "").strip(),
+        state=(input_payload.get("state") or parsed["state"] or "").strip(),
+        postal_code=(input_payload.get("postal_code") or parsed["postal_code"] or "").strip(),
+        raw_address=search,
+    )
     if not property_address["street"] or not property_address["city"]:
         raise ValueError("Could not parse property address without map lookup.")
 
@@ -15870,17 +16004,22 @@ def _reisift_build_property_create_payload_from_input(input_payload):
     last_name = (override_owner.get("last_name") or owner_name["last_name"] or "").strip() or "Owner"
     emails = _reisift_parse_owner_emails(override_owner)
     phones = _reisift_parse_owner_phones(override_owner)
-    owner_address = {
-        "street": (override_owner.get("address_street") or property_address["street"]).strip(),
-        "city": (override_owner.get("address_city") or property_address["city"]).strip(),
-        "state": (override_owner.get("address_state") or property_address["state"]).strip(),
-        "postal_code": (override_owner.get("address_postal_code") or property_address["postal_code"]).strip(),
-    }
+    owner_address = _normalize_address_components(
+        street=(override_owner.get("address_street") or property_address["street"]).strip(),
+        city=(override_owner.get("address_city") or property_address["city"]).strip(),
+        state=(override_owner.get("address_state") or property_address["state"]).strip(),
+        postal_code=(override_owner.get("address_postal_code") or property_address["postal_code"]).strip(),
+    )
     lists = parse_csv_list(input_payload.get("lists"))
     tags = parse_csv_list(input_payload.get("tags"))
     notes = (input_payload.get("notes") or "").strip()
     return {
-        "address": property_address,
+        "address": {
+            "street": property_address["street"],
+            "city": property_address["city"],
+            "state": property_address["state"],
+            "postal_code": property_address["postal_code"],
+        },
         "status": _reisift_create_status_value(input_payload.get("status") or input_payload.get("reisift_status"), default="new_lead"),
         "lists": lists,
         "tags": tags,
@@ -15889,7 +16028,12 @@ def _reisift_build_property_create_payload_from_input(input_payload):
             "first_name": first_name,
             "last_name": last_name,
             "company": override_owner.get("company"),
-            "address": owner_address,
+            "address": {
+                "street": owner_address["street"],
+                "city": owner_address["city"],
+                "state": owner_address["state"],
+                "postal_code": owner_address["postal_code"],
+            },
             "emails": emails,
             "emails_info": {e: {"verified": False} for e in emails},
             "primary_email": None,

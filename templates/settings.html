@@ -162,6 +162,38 @@
         <p><code>POST /webhooks/slack/command</code> and <code>POST /webhooks/slack/events</code></p>
         <p><strong>ReiSift placeholder webhook:</strong></p>
         <p><code>POST /webhooks/reisift/automation</code></p>
+        <details class="collapsed-section" style="margin-top: 1rem;" open>
+            <summary>PropertyLeads.com Webhook Log</summary>
+            {% if propertyleads_webhook_events and propertyleads_webhook_events|length > 0 %}
+            <div class="table-wrap" style="margin-top: 0.75rem;">
+                <table class="compact-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Event Key</th>
+                            <th>Payload</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in propertyleads_webhook_events %}
+                        <tr>
+                            <td>{{ row.created_at|fmt_est_datetime }}</td>
+                            <td>{{ row.event_key or '-' }}</td>
+                            <td style="white-space: pre-wrap;">
+                                <details>
+                                    <summary>View payload</summary>
+                                    <pre style="margin-top:0.5rem; white-space: pre-wrap;">{{ row.payload_json }}</pre>
+                                </details>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p style="margin-top:0.75rem;">No PropertyLeads.com webhook events yet.</p>
+            {% endif %}
+        </details>
     {% elif active_tab == 'automations' %}
         <p>These switches control entire automations. If off, the automation does not run at all.</p>
         <div class="table-wrap">
@@ -392,40 +424,6 @@
         </div>
         {% else %}
         <p style="margin-top:0.75rem;">No Clever webhook notes yet.</p>
-        {% endif %}
-    </details>
-
-    <details class="collapsed-section" style="margin-top: 1rem;" open>
-        <summary>PropertyLeads.com Webhook Log</summary>
-        <p style="margin-top:0.75rem;"><code>POST /webhooks/propertyleads/ppl</code></p>
-        {% if propertyleads_webhook_events and propertyleads_webhook_events|length > 0 %}
-        <div class="table-wrap" style="margin-top: 0.75rem;">
-            <table class="compact-table">
-                <thead>
-                    <tr>
-                        <th>Time</th>
-                        <th>Event Key</th>
-                        <th>Payload</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for row in propertyleads_webhook_events %}
-                    <tr>
-                        <td>{{ row.created_at|fmt_est_datetime }}</td>
-                        <td>{{ row.event_key or '-' }}</td>
-                        <td style="white-space: pre-wrap;">
-                            <details>
-                                <summary>View payload</summary>
-                                <pre style="margin-top:0.5rem; white-space: pre-wrap;">{{ row.payload_json }}</pre>
-                            </details>
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
-        {% else %}
-        <p style="margin-top:0.75rem;">No PropertyLeads.com webhook events yet.</p>
         {% endif %}
     </details>
 

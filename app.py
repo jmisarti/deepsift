@@ -152,6 +152,7 @@ GOOGLE_SHEETS_POLL_SECONDS = max(int((os.getenv("GOOGLE_SHEETS_POLL_SECONDS") or
 GOOGLE_SHEETS_POLL_MODE = (os.getenv("GOOGLE_SHEETS_POLL_MODE") or "latest_only").strip().lower()
 CLEVER_LEADS_EVENT_SOURCE = "clever_leads_ingest"
 WEBSITE_LEADS_EVENT_SOURCE = "website_leads_ingest"
+PROPERTYLEADS_PPL_EVENT_SOURCE = "propertyleads_ppl_ingest"
 UNTITLED_LEADS_SPREADSHEET_ID = (
     os.getenv("UNTITLED_LEADS_SPREADSHEET_ID", "1HG9ZqmJPGWtccN1yA9ItZlaleFXUVjLkS46jDnutVoo").strip()
 )
@@ -2298,6 +2299,83 @@ def extract_first_string_by_keys(payload, keys):
                 if isinstance(item, (dict, list)):
                     queue.append(item)
     return ""
+
+
+def _multidict_with_lists(multidict):
+    data = {}
+    for key in multidict.keys():
+        values = [str(v) if v is not None else "" for v in multidict.getlist(key)]
+        data[key] = values[0] if len(values) == 1 else values
+    return data
+
+
+def _capture_propertyleads_webhook_payload(req):
+    payload = {}
+    parsed_json = req.get_json(silent=True)
+    if parsed_json is not None:
+        payload["json"] = parsed_json
+    form_data = _multidict_with_lists(req.form)
+    if form_data:
+        payload["form"] = form_data
+    query_data = _multidict_with_lists(req.args)
+    if query_data:
+        payload["query"] = query_data
+    raw_body = req.get_data(as_text=True) or ""
+    if raw_body:
+        payload["raw_body"] = raw_body
+    summary = {
+        "lead_id": (
+            extract_first_string_by_keys(payload, ["lead_id", "leadId", "leadID", "record_id", "recordId", "id", "uuid"])
+            or ""
+        ),
+        "name": (
+            extract_first_string_by_keys(payload, ["name", "full_name", "fullName", "seller_name", "sellerName", "owner_name", "ownerName"])
+            or ""
+        ),
+        "phone": normalize_phone(
+            extract_first_string_by_keys(payload, ["phone", "phone_number", "phoneNumber", "mobile", "mobile_phone", "mobilePhone"])
+            or ""
+        ),
+        "email": normalize_email(
+            extract_first_string_by_keys(payload, ["email", "email_address", "emailAddress"])
+            or ""
+        ),
+        "address": (
+            extract_first_string_by_keys(payload, ["address", "property_address", "propertyAddress", "street_address", "streetAddress"])
+            or ""
+        ),
+    }
+    payload["_meta"] = {
+        "received_at": format_db_time(datetime.utcnow()),
+        "method": req.method,
+        "content_type": (req.content_type or "").strip(),
+        "user_agent": (req.headers.get("User-Agent") or "").strip(),
+        "remote_addr": (
+            (req.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+            or (req.remote_addr or "")
+        ),
+        "summary": summary,
+    }
+    return payload
+
+
+def _derive_propertyleads_event_key(payload):
+    return (
+        extract_first_string_by_keys(
+            payload,
+            [
+                "event_key",
+                "eventKey",
+                "delivery_id",
+                "deliveryId",
+                "request_id",
+                "requestId",
+                "webhook_id",
+                "webhookId",
+            ],
+        )
+        or ""
+    ).strip()
 
 
 def send_smrtphone_sms(to_number, message_body, from_number=None):
@@ -23954,6 +24032,16 @@ def settings_page():
         LIMIT 50
         """
     ).fetchall()
+    propertyleads_webhook_events = db.execute(
+        """
+        SELECT id, event_key, payload_json, created_at
+        FROM integration_events
+        WHERE source = ?
+        ORDER BY id DESC
+        LIMIT 50
+        """,
+        (PROPERTYLEADS_PPL_EVENT_SOURCE,),
+    ).fetchall()
     untitled_snapshot_runs = db.execute(
         """
         SELECT id, worksheet_name, row_count, new_rows, updated_rows, removed_rows, reappeared_rows,
@@ -24004,6 +24092,7 @@ def settings_page():
         error_notice=error_notice,
         recent_errors=recent_errors,
         clever_webhook_notes=clever_webhook_notes,
+        propertyleads_webhook_events=propertyleads_webhook_events,
         clever_poll_minutes=max(int(GOOGLE_SHEETS_POLL_SECONDS / 60), 1),
         untitled_snapshot_runs=untitled_snapshot_runs,
         untitled_change_log=untitled_change_log,
@@ -28709,6 +28798,80 @@ def reisift_automation_placeholder_webhook():
     upsert_integration_event(db, "reisift_automation_placeholder", event_key, payload)
     db.commit()
     return jsonify({"ok": True, "placeholder": True, "event_key": event_key}), 200
+
+
+@app.route("/webhooks/propertyleads/ppl", methods=["POST", "GET", "OPTIONS"])
+def propertyleads_ppl_webhook():
+    ensure_db()
+    db = get_db()
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True, "method": "OPTIONS"}), 200
+    if request.method == "GET":
+        return jsonify(
+            {
+                "ok": True,
+                "endpoint": "/webhooks/propertyleads/ppl",
+                "method": "POST",
+                "status": "ready",
+                "note": "Inbound PropertyLeads.com webhook payloads are stored raw for review.",
+            }
+        ), 200
+    try:
+        payload = _capture_propertyleads_webhook_payload(request)
+        event_key = _derive_propertyleads_event_key(payload)
+        stored = upsert_integration_event(db, PROPERTYLEADS_PPL_EVENT_SOURCE, event_key, payload)
+        db.commit()
+        return jsonify(
+            {
+                "ok": True,
+                "source": PROPERTYLEADS_PPL_EVENT_SOURCE,
+                "stored": bool(stored),
+                "duplicate": not bool(stored) if event_key else False,
+                "event_key": event_key or "",
+            }
+        ), 200
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="propertyleads_ppl_webhook",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/webhooks/propertyleads/ppl",
+            status_code=500,
+        )
+        db.commit()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/webhooks/propertyleads/events", methods=["GET"])
+def propertyleads_webhook_events_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    try:
+        limit = max(1, min(int(request.args.get("limit") or "50"), 200))
+    except Exception:
+        limit = 50
+    rows = db.execute(
+        """
+        SELECT id, event_key, payload_json, created_at
+        FROM integration_events
+        WHERE source = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (PROPERTYLEADS_PPL_EVENT_SOURCE, limit),
+    ).fetchall()
+    return jsonify(
+        {
+            "ok": True,
+            "source": PROPERTYLEADS_PPL_EVENT_SOURCE,
+            "count": len(rows),
+            "events": [dict(row) for row in rows],
+        }
+    ), 200
 
 
 @app.route("/api/email/poll-now", methods=["POST"])

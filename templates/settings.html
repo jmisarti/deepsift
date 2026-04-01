@@ -396,6 +396,40 @@
     </details>
 
     <details class="collapsed-section" style="margin-top: 1rem;" open>
+        <summary>PropertyLeads.com Webhook Log</summary>
+        <p style="margin-top:0.75rem;"><code>POST /webhooks/propertyleads/ppl</code></p>
+        {% if propertyleads_webhook_events and propertyleads_webhook_events|length > 0 %}
+        <div class="table-wrap" style="margin-top: 0.75rem;">
+            <table class="compact-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Event Key</th>
+                        <th>Payload</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in propertyleads_webhook_events %}
+                    <tr>
+                        <td>{{ row.created_at|fmt_est_datetime }}</td>
+                        <td>{{ row.event_key or '-' }}</td>
+                        <td style="white-space: pre-wrap;">
+                            <details>
+                                <summary>View payload</summary>
+                                <pre style="margin-top:0.5rem; white-space: pre-wrap;">{{ row.payload_json }}</pre>
+                            </details>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p style="margin-top:0.75rem;">No PropertyLeads.com webhook events yet.</p>
+        {% endif %}
+    </details>
+
+    <details class="collapsed-section" style="margin-top: 1rem;" open>
         <summary>Anonymous Lead Snapshot Runs</summary>
         {% if untitled_snapshot_runs and untitled_snapshot_runs|length > 0 %}
         <div class="table-wrap" style="margin-top: 0.75rem;">

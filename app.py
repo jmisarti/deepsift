@@ -2434,6 +2434,327 @@ def _derive_propertyleads_event_key(payload):
     ).strip()
 
 
+def _extract_propertyleads_fields(payload):
+    first_name = (
+        extract_first_string_by_keys(payload, ["first_name", "firstName", "firstname", "First_Name"])
+        or ""
+    ).strip()
+    last_name = (
+        extract_first_string_by_keys(payload, ["last_name", "lastName", "lastname", "Last_Name"])
+        or ""
+    ).strip()
+    seller_name = " ".join([part for part in [first_name, last_name] if part]).strip()
+    street = (
+        extract_first_string_by_keys(
+            payload,
+            ["address", "property_address", "propertyAddress", "street_address", "streetAddress", "Property_Address"],
+        )
+        or ""
+    ).strip()
+    city = (
+        extract_first_string_by_keys(payload, ["city", "City"])
+        or ""
+    ).strip()
+    state = (
+        extract_first_string_by_keys(payload, ["state", "State"])
+        or ""
+    ).strip().upper()
+    postal_code = (
+        extract_first_string_by_keys(payload, ["zip", "Zip", "zipcode", "postal_code", "postalCode"])
+        or ""
+    ).strip()
+    address = ", ".join(
+        [part for part in [street, ", ".join([p for p in [city, state] if p]).strip(), postal_code] if part]
+    ).strip(", ")
+    phone = normalize_phone(
+        extract_first_string_by_keys(
+            payload,
+            [
+                "phone",
+                "phone_number",
+                "phoneNumber",
+                "mobile",
+                "mobile_phone",
+                "mobilePhone",
+                "primary_phone",
+                "Primary_Phone",
+            ],
+        )
+        or ""
+    )
+    email = normalize_email(
+        extract_first_string_by_keys(payload, ["email", "email_address", "emailAddress", "Email"])
+        or ""
+    )
+    lead_id = (
+        extract_first_string_by_keys(
+            payload,
+            ["lead_id", "leadId", "leadID", "Lead ID", "record_id", "recordId", "id", "uuid"],
+        )
+        or ""
+    ).strip()
+    return {
+        "lead_id": lead_id,
+        "county": (extract_first_string_by_keys(payload, ["county", "County"]) or "").strip(),
+        "first_name": first_name,
+        "last_name": last_name,
+        "seller_name": seller_name,
+        "street": street,
+        "city": city,
+        "state": state,
+        "postal_code": postal_code,
+        "address": address,
+        "phone": phone,
+        "email": email,
+        "asking_price": (extract_first_string_by_keys(payload, ["asking_price", "Asking_Price", "askingPrice"]) or "").strip(),
+        "how_long_owned_property": (
+            extract_first_string_by_keys(payload, ["how_long_owned_property", "How_Long_Owned_Property"])
+            or ""
+        ).strip(),
+        "repairs_maintenance_needed": (
+            extract_first_string_by_keys(payload, ["repairs_maintenance_needed", "Repairs_Maintenance_Needed"])
+            or ""
+        ).strip(),
+        "anyone_living_in_house": (
+            extract_first_string_by_keys(payload, ["anyone_living_in_house", "Anyone_Living_In_House"])
+            or ""
+        ).strip(),
+        "reason_for_selling": (
+            extract_first_string_by_keys(payload, ["reason_for_selling", "Reason_for_Selling"])
+            or ""
+        ).strip(),
+        "time_frame_to_sell": (
+            extract_first_string_by_keys(payload, ["time_frame_to_sell", "Time_Frame_To_Sell"])
+            or ""
+        ).strip(),
+        "comments": (extract_first_string_by_keys(payload, ["comments", "Comments"]) or "").strip(),
+        "feedback": (extract_first_string_by_keys(payload, ["feedback", "Feedback"]) or "").strip(),
+        "date_created": (extract_first_string_by_keys(payload, ["date_created", "Date Created"]) or "").strip(),
+        "lead_cost": (extract_first_string_by_keys(payload, ["lead_cost", "Lead_Cost"]) or "").strip(),
+    }
+
+
+def _build_propertyleads_notes(payload, fields, source_label="webhook"):
+    lines = [
+        "Source: PropertyLeads.com PPL",
+        f"Ingest Source: {source_label}",
+    ]
+    ordered_pairs = [
+        ("Lead ID", fields.get("lead_id")),
+        ("Date Created", fields.get("date_created")),
+        ("County", fields.get("county")),
+        ("Name", fields.get("seller_name")),
+        ("Address", fields.get("address")),
+        ("Phone", fields.get("phone")),
+        ("Email", fields.get("email")),
+        ("Asking Price", fields.get("asking_price")),
+        ("How Long Owned Property", fields.get("how_long_owned_property")),
+        ("Repairs / Maintenance Needed", fields.get("repairs_maintenance_needed")),
+        ("Anyone Living In House", fields.get("anyone_living_in_house")),
+        ("Reason For Selling", fields.get("reason_for_selling")),
+        ("Time Frame To Sell", fields.get("time_frame_to_sell")),
+        ("Comments", fields.get("comments")),
+        ("Feedback", fields.get("feedback")),
+        ("Lead Cost", fields.get("lead_cost")),
+    ]
+    for label, value in ordered_pairs:
+        if value:
+            lines.append(f"{label}: {value}")
+    form_payload = payload.get("form") if isinstance(payload.get("form"), dict) else {}
+    used_labels = {label for label, _ in ordered_pairs}
+    for key in sorted(form_payload.keys(), key=lambda item: str(item).lower()):
+        label = str(key or "").strip()
+        value = str(form_payload.get(key) or "").strip()
+        if not label or not value or label in used_labels:
+            continue
+        lines.append(f"{label}: {value}")
+    return "\n".join(lines)
+
+
+def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "Invalid payload object.", "error_type": "validation", "slack_sent": False}
+    fields = _extract_propertyleads_fields(payload)
+    event_key = _derive_propertyleads_event_key(payload)
+    if not event_key:
+        payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
+        event_key = f"propertyleads:{payload_hash}"
+    is_new = upsert_integration_event(db, PROPERTYLEADS_PPL_EVENT_SOURCE, event_key, payload)
+    db.commit()
+    if not is_new:
+        return {"ok": True, "duplicate": True, "event_key": event_key, "slack_sent": False}
+
+    if not fields.get("address"):
+        err = "PropertyLeads payload missing property address."
+        log_app_error(
+            db,
+            source="propertyleads_ppl_ingest",
+            error_message=err,
+            details=json.dumps({"event_key": event_key, "payload": payload}),
+            route="/webhooks/propertyleads/ppl",
+            status_code=400,
+        )
+        try:
+            send_slack_notification(
+                db,
+                "\n".join(
+                    [
+                        "New PropertyLeads submission received",
+                        "Mode: failed",
+                        f"Lead ID: {fields.get('lead_id') or '-'}",
+                        f"Address: {fields.get('address') or '-'}",
+                        f"Name: {fields.get('seller_name') or '-'}",
+                        f"Phone: {fields.get('phone') or '-'}",
+                        f"Email: {fields.get('email') or '-'}",
+                        f"Error: {err}",
+                    ]
+                ),
+                channel="#acquisitions",
+            )
+        except Exception:
+            pass
+        db.commit()
+        return {
+            "ok": False,
+            "event_key": event_key,
+            "error": err,
+            "error_type": "validation",
+            "slack_sent": True,
+        }
+
+    notes = _build_propertyleads_notes(payload, fields, source_label=source_label)
+    owner_payload = {}
+    if fields.get("first_name") or fields.get("last_name"):
+        owner_payload["first_name"] = fields.get("first_name") or "Unknown"
+        owner_payload["last_name"] = fields.get("last_name") or "Owner"
+    if fields.get("email"):
+        owner_payload["emails"] = [fields.get("email")]
+    if fields.get("phone"):
+        owner_payload["phones"] = [{"number": fields.get("phone"), "type": "UNKNOWN", "status": "UNKNOWN"}]
+    create_payload = {
+        "search": fields.get("address") or "",
+        "street": fields.get("street") or "",
+        "city": fields.get("city") or "",
+        "state": fields.get("state") or "",
+        "postal_code": fields.get("postal_code") or "",
+        "status": "new_lead",
+        "lists": "PropertyLeadsPPL",
+        "tags": "PropertyLeadsPPL",
+        "notes": notes,
+        "owner": owner_payload,
+        "skip_map_lookup": True,
+    }
+
+    created_uuid = ""
+    owner_uuid = ""
+    duplicate_existing = False
+    duplicate_reason = ""
+    contact_sync = None
+    note_sync = None
+    enrich_result = None
+    create_result = None
+    mode = "processed"
+
+    try:
+        create_result = create_reisift_property_from_search(create_payload)
+        created_uuid = str(create_result.get("created_uuid") or "").strip()
+        owner_uuid = str(create_result.get("owner_uuid") or "").strip()
+        duplicate_existing = bool(create_result.get("duplicate_existing"))
+        duplicate_reason = str(create_result.get("duplicate_reason") or "").strip()
+        contact_sync = create_result.get("owner_contact_sync")
+        if duplicate_existing:
+            mode = "sift_duplicate_existing"
+
+        token = reisift_get_access_token() if created_uuid else None
+        if token and not owner_uuid and created_uuid:
+            try:
+                owner_uuid = _reisift_find_owner_uuid(fetch_reisift_property_payload(token, created_uuid)) or owner_uuid
+            except Exception:
+                pass
+        if token and owner_uuid and not contact_sync and (fields.get("phone") or fields.get("email")):
+            contact_sync = reisift_upsert_owner_contacts(
+                token,
+                owner_uuid,
+                [{"number": fields.get("phone"), "type": "UNKNOWN"}] if fields.get("phone") else [],
+                [fields.get("email")] if fields.get("email") else [],
+            )
+        if token and created_uuid and duplicate_existing:
+            note_sync = reisift_append_property_note(token, created_uuid, notes)
+        if token and created_uuid and not duplicate_existing:
+            enrich_result = create_result.get("enrich")
+
+        sift_link = _sift_record_url(created_uuid)
+        slack_lines = [
+            "New PropertyLeads submission received",
+            f"Mode: {mode}",
+            f"Lead ID: {fields.get('lead_id') or '-'}",
+            f"County: {fields.get('county') or '-'}",
+            f"Address: {fields.get('address') or '-'}",
+            f"Name: {fields.get('seller_name') or '-'}",
+            f"Phone: {fields.get('phone') or '-'}",
+            f"Email: {fields.get('email') or '-'}",
+            f"ReiSift Record: {sift_link or '-'}",
+        ]
+        if duplicate_reason:
+            slack_lines.append(f"Reason: {duplicate_reason}")
+        send_slack_notification(db, "\n".join(slack_lines), channel="#acquisitions")
+        db.commit()
+        return {
+            "ok": True,
+            "event_key": event_key,
+            "created_uuid": created_uuid,
+            "owner_uuid": owner_uuid,
+            "duplicate_existing": duplicate_existing,
+            "duplicate_reason": duplicate_reason,
+            "contact_sync": contact_sync,
+            "note_sync": note_sync,
+            "enrich": enrich_result,
+            "create_result": create_result,
+            "slack_sent": True,
+        }
+    except Exception as exc:
+        err = str(exc)
+        log_app_error(
+            db,
+            source="propertyleads_ppl_ingest",
+            error_message=err,
+            details=traceback.format_exc(),
+            route="/webhooks/propertyleads/ppl",
+            status_code=500,
+        )
+        sift_link = _sift_record_url(created_uuid)
+        try:
+            send_slack_notification(
+                db,
+                "\n".join(
+                    [
+                        "New PropertyLeads submission received",
+                        "Mode: failed",
+                        f"Lead ID: {fields.get('lead_id') or '-'}",
+                        f"County: {fields.get('county') or '-'}",
+                        f"Address: {fields.get('address') or '-'}",
+                        f"Name: {fields.get('seller_name') or '-'}",
+                        f"Phone: {fields.get('phone') or '-'}",
+                        f"Email: {fields.get('email') or '-'}",
+                        f"ReiSift Record: {sift_link or '-'}",
+                        f"Error: {err}",
+                    ]
+                ),
+                channel="#acquisitions",
+            )
+        except Exception:
+            pass
+        db.commit()
+        return {
+            "ok": False,
+            "event_key": event_key,
+            "created_uuid": created_uuid,
+            "error": err,
+            "error_type": "server",
+            "slack_sent": True,
+        }
+
+
 def send_smrtphone_sms(to_number, message_body, from_number=None):
     api_key = os.getenv("SMRTPHONE_API_KEY", "").strip()
     if not api_key:
@@ -28872,32 +29193,10 @@ def propertyleads_ppl_webhook():
                 "note": "Inbound PropertyLeads.com webhook payloads are stored raw for review.",
             }
         ), 200
-    try:
-        payload = _capture_propertyleads_webhook_payload(request)
-        event_key = _derive_propertyleads_event_key(payload)
-        stored = upsert_integration_event(db, PROPERTYLEADS_PPL_EVENT_SOURCE, event_key, payload)
-        db.commit()
-        return jsonify(
-            {
-                "ok": True,
-                "source": PROPERTYLEADS_PPL_EVENT_SOURCE,
-                "stored": bool(stored),
-                "duplicate": not bool(stored) if event_key else False,
-                "event_key": event_key or "",
-            }
-        ), 200
-    except Exception as exc:
-        db.rollback()
-        log_app_error(
-            db,
-            source="propertyleads_ppl_webhook",
-            error_message=str(exc),
-            details=traceback.format_exc(),
-            route="/webhooks/propertyleads/ppl",
-            status_code=500,
-        )
-        db.commit()
-        return jsonify({"ok": False, "error": str(exc)}), 500
+    payload = _capture_propertyleads_webhook_payload(request)
+    result = process_propertyleads_ppl_payload(db, payload, source_label="webhook")
+    status_code = 500 if not result.get("ok") else 200
+    return jsonify(result), status_code
 
 
 @app.route("/api/webhooks/propertyleads/events", methods=["GET"])

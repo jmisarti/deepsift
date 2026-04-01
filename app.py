@@ -2323,27 +2323,79 @@ def _capture_propertyleads_webhook_payload(req):
     raw_body = req.get_data(as_text=True) or ""
     if raw_body:
         payload["raw_body"] = raw_body
+    first_name = (
+        extract_first_string_by_keys(payload, ["first_name", "firstName", "firstname", "First_Name"])
+        or ""
+    ).strip()
+    last_name = (
+        extract_first_string_by_keys(payload, ["last_name", "lastName", "lastname", "Last_Name"])
+        or ""
+    ).strip()
+    full_name = (
+        extract_first_string_by_keys(
+            payload,
+            [
+                "name",
+                "full_name",
+                "fullName",
+                "seller_name",
+                "sellerName",
+                "owner_name",
+                "ownerName",
+            ],
+        )
+        or " ".join([part for part in [first_name, last_name] if part]).strip()
+    )
+    street = (
+        extract_first_string_by_keys(
+            payload,
+            ["address", "property_address", "propertyAddress", "street_address", "streetAddress", "Property_Address"],
+        )
+        or ""
+    ).strip()
+    city = (
+        extract_first_string_by_keys(payload, ["city", "City"])
+        or ""
+    ).strip()
+    state = (
+        extract_first_string_by_keys(payload, ["state", "State"])
+        or ""
+    ).strip()
+    postal_code = (
+        extract_first_string_by_keys(payload, ["zip", "Zip", "zipcode", "postal_code", "postalCode"])
+        or ""
+    ).strip()
+    full_address = ", ".join([part for part in [street, ", ".join([p for p in [city, state] if p]).strip(), postal_code] if part]).strip(", ")
     summary = {
         "lead_id": (
-            extract_first_string_by_keys(payload, ["lead_id", "leadId", "leadID", "record_id", "recordId", "id", "uuid"])
+            extract_first_string_by_keys(
+                payload,
+                ["lead_id", "leadId", "leadID", "Lead ID", "record_id", "recordId", "id", "uuid"],
+            )
             or ""
         ),
-        "name": (
-            extract_first_string_by_keys(payload, ["name", "full_name", "fullName", "seller_name", "sellerName", "owner_name", "ownerName"])
-            or ""
-        ),
+        "name": full_name,
         "phone": normalize_phone(
-            extract_first_string_by_keys(payload, ["phone", "phone_number", "phoneNumber", "mobile", "mobile_phone", "mobilePhone"])
+            extract_first_string_by_keys(
+                payload,
+                [
+                    "phone",
+                    "phone_number",
+                    "phoneNumber",
+                    "mobile",
+                    "mobile_phone",
+                    "mobilePhone",
+                    "primary_phone",
+                    "Primary_Phone",
+                ],
+            )
             or ""
         ),
         "email": normalize_email(
-            extract_first_string_by_keys(payload, ["email", "email_address", "emailAddress"])
+            extract_first_string_by_keys(payload, ["email", "email_address", "emailAddress", "Email"])
             or ""
         ),
-        "address": (
-            extract_first_string_by_keys(payload, ["address", "property_address", "propertyAddress", "street_address", "streetAddress"])
-            or ""
-        ),
+        "address": full_address or street,
     }
     payload["_meta"] = {
         "received_at": format_db_time(datetime.utcnow()),
@@ -2372,6 +2424,10 @@ def _derive_propertyleads_event_key(payload):
                 "requestId",
                 "webhook_id",
                 "webhookId",
+                "lead_id",
+                "Lead ID",
+                "leadId",
+                "leadID",
             ],
         )
         or ""

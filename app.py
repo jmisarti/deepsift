@@ -126,6 +126,7 @@ REISIFT_FOLLOWUPS_EXCLUDE_TAG = os.getenv("REISIFT_FOLLOWUPS_EXCLUDE_TAG", "3cf5
 REISIFT_DISABLE_MAP_LOOKUP = env_flag("REISIFT_DISABLE_MAP_LOOKUP", True)
 OPENLETTERCONNECT_BASE_URL = os.getenv("OPENLETTERCONNECT_BASE_URL", "https://api.openletterconnect.com/api/v1")
 OPENLETTERCONNECT_TEMPLATE_ID = int(os.getenv("OPENLETTERCONNECT_TEMPLATE_ID", "9256"))
+OPENLETTERCONNECT_API_KEY = os.getenv("OPENLETTERCONNECT_API_KEY", "").strip()
 CALL_RECORDING_WORKER_ENABLED = env_flag("CALL_RECORDING_WORKER_ENABLED", True)
 CALL_RECORDING_POLL_SECONDS = max(int((os.getenv("CALL_RECORDING_POLL_SECONDS") or "60").strip() or "60"), 15)
 SMS_ANALYSIS_WORKER_ENABLED = env_flag("SMS_ANALYSIS_WORKER_ENABLED", True)
@@ -139,6 +140,8 @@ WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
 MARKET_STATUS_REMOTE_URL = (os.getenv("MARKET_STATUS_REMOTE_URL") or "").strip()
 MARKET_STATUS_REMOTE_TOKEN = (os.getenv("MARKET_STATUS_REMOTE_TOKEN") or "").strip()
+SLYBROADCAST_BASE_URL = os.getenv("SLYBROADCAST_BASE_URL", "https://www.mobile-sphere.com/gateway/vmb.php").strip()
+PUBLIC_APP_BASE_URL = (os.getenv("PUBLIC_APP_BASE_URL") or os.getenv("APP_BASE_URL") or "").strip()
 RENTCAST_BASE_URL = (os.getenv("RENTCAST_BASE_URL") or "https://api.rentcast.io/v1").strip().rstrip("/") or "https://api.rentcast.io/v1"
 RENTCAST_API_KEY = os.getenv("RENTCAST_API_KEY", "").strip()
 RENTCAST_MARKET_STATUS_CACHE_HOURS = max(int((os.getenv("RENTCAST_MARKET_STATUS_CACHE_HOURS") or "24").strip() or "24"), 1)
@@ -169,6 +172,7 @@ try:
     EST_TZ = ZoneInfo("America/New_York")
 except ZoneInfoNotFoundError:
     EST_TZ = timezone(timedelta(hours=-5))
+SEQUENCE_SUPPORTED_CHANNELS = {"SMS", "EMAIL", "MAIL", "VM_DROP"}
 BULK_SMS_WORKER_STARTED = False
 EMAIL_POLL_WORKER_STARTED = False
 CLEVER_LEADS_WORKER_STARTED = False
@@ -3582,10 +3586,10 @@ def call_skipsherpa_property_lookup(street, city="", state="", zipcode=""):
     return {"request": payload, "response": data}
 
 
-def openletterconnect_headers():
-    api_key = os.getenv("OPENLETTERCONNECT_API_KEY", "").strip()
+def openletterconnect_headers(db=None):
+    api_key = get_openletterconnect_api_key(db)
     if not api_key:
-        raise ValueError("OPENLETTERCONNECT_API_KEY is not set")
+        raise ValueError("OpenLetterConnect API key is not set")
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -3601,10 +3605,10 @@ def format_phone_pretty(value):
     return (value or "").strip()
 
 
-def fetch_openletterconnect_template(template_id):
+def fetch_openletterconnect_template(template_id, db=None):
     response = requests.get(
         f"{OPENLETTERCONNECT_BASE_URL}/templates/{template_id}",
-        headers=openletterconnect_headers(),
+        headers=openletterconnect_headers(db),
         timeout=30,
     )
     try:
@@ -3616,10 +3620,10 @@ def fetch_openletterconnect_template(template_id):
     return payload
 
 
-def fetch_openletterconnect_templates():
+def fetch_openletterconnect_templates(db=None):
     response = requests.get(
         f"{OPENLETTERCONNECT_BASE_URL}/templates",
-        headers=openletterconnect_headers(),
+        headers=openletterconnect_headers(db),
         timeout=30,
     )
     try:
@@ -3637,10 +3641,10 @@ def fetch_openletterconnect_templates():
     return []
 
 
-def fetch_openletterconnect_products():
+def fetch_openletterconnect_products(db=None):
     response = requests.get(
         f"{OPENLETTERCONNECT_BASE_URL}/products",
-        headers=openletterconnect_headers(),
+        headers=openletterconnect_headers(db),
         timeout=30,
     )
     try:
@@ -3658,7 +3662,7 @@ def fetch_openletterconnect_products():
     return []
 
 
-def resolve_openletterconnect_product_id(template_data, preferred_postage_type="", preferred_envelope_type=""):
+def resolve_openletterconnect_product_id(template_data, preferred_postage_type="", preferred_envelope_type="", db=None):
     base_product = template_data.get("product") if isinstance(template_data, dict) else None
     if not isinstance(base_product, dict):
         return None
@@ -3673,8 +3677,7 @@ def resolve_openletterconnect_product_id(template_data, preferred_postage_type="
     base_paper_type = (base_product.get("paperType") or "").strip().lower()
     base_paper_size = (base_product.get("paperSize") or "").strip().lower()
     base_delivery_type = (base_product.get("deliveryType") or "").strip().lower()
-
-    products = fetch_openletterconnect_products()
+    products = fetch_openletterconnect_products(db=db)
     scoped = []
     for p in products:
         if (p.get("productType") or "").strip().lower() != base_product_type:
@@ -3717,8 +3720,8 @@ def resolve_openletterconnect_product_id(template_data, preferred_postage_type="
     return default_id
 
 
-def get_template_product_options(template_id):
-    template = fetch_openletterconnect_template(template_id)
+def get_template_product_options(template_id, db=None):
+    template = fetch_openletterconnect_template(template_id, db=db)
     template_data = template.get("data") if isinstance(template, dict) and isinstance(template.get("data"), dict) else template
     if not isinstance(template_data, dict):
         return {"postage_options": [], "envelope_options": []}
@@ -3727,7 +3730,7 @@ def get_template_product_options(template_id):
     base_paper_type = (base_product.get("paperType") or "").strip().lower()
     base_paper_size = (base_product.get("paperSize") or "").strip().lower()
 
-    products = fetch_openletterconnect_products()
+    products = fetch_openletterconnect_products(db=db)
     postage_options = set()
     envelope_options = set()
     for p in products:
@@ -3751,7 +3754,7 @@ def get_template_product_options(template_id):
 
 def build_openletterconnect_order_payload(db, contacts, property_row, template_id=None, mode="property-relative-mail"):
     template_id = int(template_id or OPENLETTERCONNECT_TEMPLATE_ID)
-    template = fetch_openletterconnect_template(template_id)
+    template = fetch_openletterconnect_template(template_id, db=db)
     template_data = template.get("data") if isinstance(template, dict) and isinstance(template.get("data"), dict) else template
     if not isinstance(template_data, dict):
         raise ValueError(f"Template payload for {template_id} is invalid")
@@ -3774,6 +3777,7 @@ def build_openletterconnect_order_payload(db, contacts, property_row, template_i
         template_data,
         preferred_postage_type=postage_type,
         preferred_envelope_type=envelope_type,
+        db=db,
     )
     if not product_id:
         raise ValueError(f"Could not resolve product id for template {template_id}")
@@ -3910,7 +3914,7 @@ def _normalize_proof_url(raw):
     return ""
 
 
-def view_openletterconnect_proofs(order_payload):
+def view_openletterconnect_proofs(order_payload, db=None):
     contacts = order_payload.get("contacts") if isinstance(order_payload, dict) else []
     if not isinstance(contacts, list) or not contacts:
         return []
@@ -3952,7 +3956,7 @@ def view_openletterconnect_proofs(order_payload):
             proof_payload["returnContact"] = return_contact
         response = requests.post(
             f"{OPENLETTERCONNECT_BASE_URL}/orders/view-proof",
-            headers=openletterconnect_headers(),
+            headers=openletterconnect_headers(db),
             json=proof_payload,
             timeout=60,
         )
@@ -4035,7 +4039,7 @@ def place_openletterconnect_order(db, contacts, property_row, template_id=None, 
     payload = built["payload"]
     response = requests.post(
         f"{OPENLETTERCONNECT_BASE_URL}/orders",
-        headers=openletterconnect_headers(),
+        headers=openletterconnect_headers(db),
         json=payload,
         timeout=45,
     )
@@ -4143,6 +4147,124 @@ def _format_person_contact_for_mail(db, property_row, person_id):
             },
         },
     }
+
+
+def _parse_slybroadcast_send_response(raw_text):
+    text = (raw_text or "").strip()
+    parsed = {"ok": False, "status": "", "message": "", "session_id": "", "campaign": "", "raw_text": text}
+    if not text:
+        return parsed
+    if "&" in text and "=" in text:
+        try:
+            pairs = dict((k.strip().lower(), v.strip()) for k, v in [part.split("=", 1) for part in text.split("&") if "=" in part])
+        except Exception:
+            pairs = {}
+        parsed["status"] = pairs.get("status", "")
+        parsed["message"] = pairs.get("message", "")
+        parsed["session_id"] = pairs.get("session_id", "")
+        parsed["campaign"] = pairs.get("campaign", "")
+        parsed["ok"] = parsed["status"].upper() == "OK"
+        return parsed
+    parsed["ok"] = text.upper().startswith("OK")
+    session_match = re.search(r"session_id=([A-Za-z0-9_-]+)", text, flags=re.IGNORECASE)
+    campaign_match = re.search(r"campaign=([A-Za-z0-9_-]+)", text, flags=re.IGNORECASE)
+    message_match = re.search(r"message=<([^>]+)>", text, flags=re.IGNORECASE)
+    parsed["status"] = "OK" if parsed["ok"] else "ERROR"
+    parsed["session_id"] = session_match.group(1) if session_match else ""
+    parsed["campaign"] = campaign_match.group(1) if campaign_match else ""
+    parsed["message"] = message_match.group(1) if message_match else text
+    return parsed
+
+
+def _extract_slybroadcast_callback_line(req):
+    candidates = []
+    raw_body = (req.get_data(as_text=True) or "").strip()
+    if raw_body:
+        candidates.append(raw_body)
+    if req.form:
+        candidates.extend(str(v or "").strip() for v in req.form.values())
+        candidates.extend(str(k or "").strip() for k in req.form.keys())
+    for candidate in candidates:
+        if candidate and "|" in candidate:
+            return candidate
+    return raw_body
+
+
+def _parse_slybroadcast_callback_line(raw_line):
+    line = (raw_line or "").strip()
+    if not line:
+        return {}
+    parts = [part.strip().strip('"').strip("'") for part in line.split("|")]
+    if len(parts) >= 9:
+        return {
+            "campaign_id": parts[0],
+            "recipient": parts[1],
+            "delivered_date": parts[2],
+            "delivered_time": parts[3],
+            "caller_id": parts[4],
+            "audio": parts[5],
+            "duration": parts[6],
+            "status": parts[7],
+            "session_id": parts[8],
+            "failure_reason": "",
+            "carrier": "",
+        }
+    while len(parts) < 6:
+        parts.append("")
+    return {
+        "session_id": parts[0],
+        "recipient": parts[1],
+        "status": parts[2],
+        "failure_reason": parts[3],
+        "delivered_time": parts[4],
+        "carrier": parts[5],
+        "campaign_id": "",
+        "caller_id": "",
+        "audio": "",
+        "duration": "",
+    }
+
+
+def send_slybroadcast_vm_drop(db, to_number, recording_name="", title=""):
+    settings = get_slybroadcast_settings(db)
+    uid = (settings.get("uid") or "").strip()
+    password = (settings.get("password") or "").strip()
+    caller_id = normalize_phone(settings.get("caller_id") or "")
+    target_number = normalize_phone(to_number or "")
+    resolved_recording = (recording_name or "").strip() or (settings.get("default_recording_name") or "").strip()
+    if not uid or not password:
+        raise ValueError("Slybroadcast credentials are not configured")
+    if not caller_id:
+        raise ValueError("Slybroadcast caller ID is not configured")
+    if not target_number:
+        raise ValueError("No valid phone number available for voicemail drop")
+    if not resolved_recording:
+        raise ValueError("No Slybroadcast recording name is configured for this voicemail drop")
+
+    payload = {
+        "c_uid": uid,
+        "c_password": password,
+        "c_phone": target_number,
+        "c_callerID": caller_id,
+        "c_date": "now",
+        "c_title": (title or f"DeepSift VM Drop {target_number}").strip(),
+        "c_record_audio": resolved_recording,
+        "mobile_only": "1",
+    }
+    callback_url = (settings.get("callback_url") or "").strip()
+    if callback_url:
+        payload["c_dispo_url"] = callback_url
+
+    response = requests.post(SLYBROADCAST_BASE_URL, data=payload, timeout=30)
+    raw_text = (response.text or "").strip()
+    if not response.ok:
+        raise ValueError(f"Slybroadcast request failed ({response.status_code}): {raw_text[:400]}")
+    parsed = _parse_slybroadcast_send_response(raw_text)
+    if not parsed.get("ok"):
+        raise ValueError(parsed.get("message") or raw_text or "Slybroadcast rejected the voicemail drop")
+    safe_request = dict(payload)
+    safe_request["c_password"] = "***"
+    return {"request": safe_request, "response_text": raw_text, "parsed": parsed}
 
 
 def _person_full_name_from_payload(person_payload):
@@ -5997,6 +6119,33 @@ def get_sequence_sms_targets(db, person_id):
     return keep, skipped
 
 
+def get_sequence_vm_drop_targets(db, person_id):
+    return get_sequence_sms_targets(db, person_id)
+
+
+def format_sequence_mail_target(contact):
+    if not isinstance(contact, dict):
+        return ""
+    name = " ".join([str(contact.get("firstName") or "").strip(), str(contact.get("lastName") or "").strip()]).strip()
+    address_bits = [
+        (contact.get("address1") or "").strip(),
+        (contact.get("city") or "").strip(),
+        (contact.get("state") or "").strip(),
+        (contact.get("zip") or "").strip(),
+    ]
+    address = ", ".join([bit for bit in address_bits if bit])
+    if name and address:
+        return f"{name} — {address}"
+    return name or address
+
+
+def get_sequence_mail_target(db, property_row, person_id):
+    contact = _format_person_contact_for_mail(db, property_row, person_id)
+    if contact:
+        return contact, []
+    return None, [{"value": "", "reason": "no mailing address available"}]
+
+
 def get_manual_sms_targets_for_person(db, person_id):
     rows = db.execute(
         """
@@ -6194,7 +6343,7 @@ def extract_steps_from_form(form, prefix):
             delay_hours = 0.0
         delay_int = int(round(delay_hours * 60))
         channel = (channel_val or "SMS").strip().upper()
-        if channel not in {"SMS", "EMAIL"}:
+        if channel not in SEQUENCE_SUPPORTED_CHANNELS:
             channel = "SMS"
         steps.append(
             {
@@ -6240,17 +6389,38 @@ def enroll_person_in_sequence(db, campaign_id, property_id, person_id):
     steps = get_sequence_steps(db, campaign_id)
     if not steps:
         raise ValueError("Campaign has no active steps")
+    prop = db.execute(
+        """
+        SELECT p.id, p.owner_person_id, a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        """,
+        (property_id,),
+    ).fetchone()
+    if not prop:
+        raise ValueError("Property not found")
     phone_targets, _ = get_sequence_sms_targets(db, person_id)
+    vm_drop_targets, _ = get_sequence_vm_drop_targets(db, person_id)
     email_targets, _ = get_sequence_email_targets(db, person_id)
-    has_phone = bool(phone_targets)
-    has_email = bool(email_targets)
-    if not has_phone and not has_email:
-        raise ValueError("No usable contact info for this person")
+    mail_target, _ = get_sequence_mail_target(db, prop, person_id)
+    availability = {
+        "SMS": bool(phone_targets),
+        "VM_DROP": bool(vm_drop_targets),
+        "EMAIL": bool(email_targets),
+        "MAIL": bool(mail_target),
+    }
     needed_channels = {str(s["channel"] or "SMS").upper() for s in steps}
-    if "SMS" in needed_channels and not has_phone and "EMAIL" not in needed_channels:
-        raise ValueError("Campaign requires SMS but no phone is available")
-    if "EMAIL" in needed_channels and not has_email and "SMS" not in needed_channels:
+    if not any(availability.get(channel, False) for channel in needed_channels):
+        raise ValueError("No usable contact info is available for the channels in this campaign")
+    if "SMS" in needed_channels and not availability["SMS"]:
+        raise ValueError("Campaign requires SMS but no mobile number is available")
+    if "VM_DROP" in needed_channels and not availability["VM_DROP"]:
+        raise ValueError("Campaign requires VM Drop but no mobile number is available")
+    if "EMAIL" in needed_channels and not availability["EMAIL"]:
         raise ValueError("Campaign requires Email but no valid email is available")
+    if "MAIL" in needed_channels and not availability["MAIL"]:
+        raise ValueError("Campaign requires Mail but no mailing address is available")
     exists = db.execute(
         """
         SELECT id
@@ -6419,7 +6589,7 @@ def run_sequence_tick():
                             error_text += f" | {skip_txt}"
                         if fail_txt:
                             error_text += f" | {fail_txt}"
-                else:
+                elif channel == "SMS":
                     sms_targets, sms_skipped = get_sequence_sms_targets(db, enr["person_id"])
                     if not sms_targets:
                         raise ValueError("No eligible mobile targets for sequence step")
@@ -6469,6 +6639,119 @@ def run_sequence_tick():
                             error_text += f" | {skip_txt}"
                         if fail_txt:
                             error_text += f" | {fail_txt}"
+                elif channel == "VM_DROP":
+                    vm_targets, vm_skipped = get_sequence_vm_drop_targets(db, enr["person_id"])
+                    if not vm_targets:
+                        raise ValueError("No eligible mobile targets for voicemail drop")
+                    recording_name = render_sequence_template(next_step["body_template"], person, prop, owner).strip()
+                    sent_count = 0
+                    failures = []
+                    caller_id = get_slybroadcast_settings(db).get("caller_id") or ""
+                    title = f"DeepSift VM Drop - Property {enr['property_id']} - Person {enr['person_id']}"
+                    for to_number in vm_targets:
+                        try:
+                            sent = send_slybroadcast_vm_drop(
+                                db,
+                                to_number,
+                                recording_name=recording_name,
+                                title=title,
+                            )
+                            parsed = sent.get("parsed") or {}
+                            status_text = "Queued" if parsed.get("session_id") else (parsed.get("message") or "Queued")
+                            ext_id = parsed.get("session_id") or parsed.get("campaign") or ""
+                            cur = db.execute(
+                                """
+                                INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id)
+                                VALUES (?, ?, 'VM_DROP', 'Outbound', ?, ?, ?, ?, 1, ?, ?)
+                                """,
+                                (
+                                    enr["property_id"],
+                                    enr["person_id"],
+                                    caller_id,
+                                    to_number,
+                                    f"Slybroadcast recording: {recording_name}",
+                                    status_text,
+                                    format_db_time(now),
+                                    ext_id,
+                                ),
+                            )
+                            if comm_id is None:
+                                comm_id = cur.lastrowid
+                            update_person_outreach_status_for_sms(db, enr["person_id"], "outbound_success")
+                            sent_count += 1
+                        except Exception as send_exc:
+                            failures.append(f"{to_number}: {send_exc}")
+                    if sent_count == 0:
+                        raise ValueError("; ".join(failures) if failures else "No voicemail drops were queued")
+                    skip_txt = ", ".join([f"{s['value']} ({s['reason']})" for s in vm_skipped[:5]])
+                    fail_txt = "; ".join(failures[:3])
+                    bits = []
+                    if vm_skipped:
+                        bits.append(f"Skipped {len(vm_skipped)}")
+                    if failures:
+                        bits.append(f"Failed {len(failures)}")
+                    if bits:
+                        error_text = " | ".join(bits)
+                        if skip_txt:
+                            error_text += f" | {skip_txt}"
+                        if fail_txt:
+                            error_text += f" | {fail_txt}"
+                elif channel == "MAIL":
+                    mail_target, mail_skipped = get_sequence_mail_target(db, prop, enr["person_id"])
+                    if not mail_target:
+                        raise ValueError("No mailing address available for sequence step")
+                    template_id = get_direct_mail_template_id(db)
+                    result = place_openletterconnect_order(
+                        db,
+                        [mail_target],
+                        prop,
+                        template_id=template_id,
+                        mode="sequence-mail",
+                    )
+                    response_payload = result.get("response") if isinstance(result, dict) and isinstance(result.get("response"), dict) else {}
+                    external_order_id = str(
+                        response_payload.get("id") or response_payload.get("orderId") or response_payload.get("order_id") or ""
+                    )
+                    order_status = str(response_payload.get("status") or "Submitted").strip() or "Submitted"
+                    cost = response_payload.get("totalCost") or response_payload.get("cost")
+                    db.execute(
+                        """
+                        INSERT INTO mail_orders (property_id, person_id, mode, template_id, external_order_id, status, cost, recipient_count, request_json, response_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            enr["property_id"],
+                            enr["person_id"],
+                            "sequence_mail",
+                            template_id,
+                            external_order_id,
+                            order_status,
+                            cost,
+                            1,
+                            json.dumps(result.get("request")),
+                            json.dumps(response_payload),
+                        ),
+                    )
+                    cur = db.execute(
+                        """
+                        INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id)
+                        VALUES (?, ?, 'MAIL', 'Outbound', '', ?, ?, ?, 1, ?, ?)
+                        """,
+                        (
+                            enr["property_id"],
+                            enr["person_id"],
+                            format_sequence_mail_target(mail_target),
+                            render_sequence_template(next_step["body_template"], person, prop, owner),
+                            order_status,
+                            format_db_time(now),
+                            external_order_id,
+                        ),
+                    )
+                    comm_id = cur.lastrowid
+                    if mail_skipped:
+                        error_text = ", ".join([f"{s['reason']}" for s in mail_skipped[:3]])
+                else:
+                    raise ValueError(f"Unsupported sequence channel: {channel}")
             except Exception as exc:
                 status = "Failed"
                 error_text = str(exc)
@@ -9317,6 +9600,37 @@ def get_integration_api_key(db):
     return (get_setting(db, "integration_api_key", "") or os.getenv("INTEGRATION_API_KEY", "")).strip()
 
 
+def get_public_app_base_url(db=None):
+    if db is None:
+        try:
+            db = get_db()
+        except Exception:
+            db = None
+    if db is not None:
+        configured = (get_setting(db, "public_app_base_url", "") or "").strip()
+        if configured:
+            return configured.rstrip("/")
+    if PUBLIC_APP_BASE_URL:
+        return PUBLIC_APP_BASE_URL.rstrip("/")
+    railway_domain = (os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_STATIC_URL") or "").strip()
+    if railway_domain:
+        if railway_domain.startswith("http://") or railway_domain.startswith("https://"):
+            return railway_domain.rstrip("/")
+        return f"https://{railway_domain}".rstrip("/")
+    return ""
+
+
+def get_openletterconnect_api_key(db=None):
+    if db is None:
+        try:
+            db = get_db()
+        except Exception:
+            db = None
+    if db is not None:
+        return (get_setting(db, "openletterconnect_api_key", "") or OPENLETTERCONNECT_API_KEY).strip()
+    return OPENLETTERCONNECT_API_KEY
+
+
 def get_skipsherpa_api_key(db=None):
     if db is None:
         try:
@@ -9337,6 +9651,28 @@ def get_rentcast_api_key(db=None):
     if db is not None:
         return (get_setting(db, "rentcast_api_key", "") or RENTCAST_API_KEY).strip()
     return RENTCAST_API_KEY
+
+
+def get_slybroadcast_settings(db):
+    return {
+        "uid": get_setting(db, "slybroadcast_uid", ""),
+        "password": get_setting(db, "slybroadcast_password", ""),
+        "caller_id": get_setting(db, "slybroadcast_caller_id", ""),
+        "default_recording_name": get_setting(db, "slybroadcast_default_recording_name", ""),
+        "callback_url": get_slybroadcast_callback_url(db),
+    }
+
+
+def get_slybroadcast_callback_url(db=None):
+    base_url = get_public_app_base_url(db)
+    if not base_url:
+        return ""
+    query = ""
+    if db is not None:
+        integration_key = get_integration_api_key(db)
+        if integration_key:
+            query = f"?{urlencode({'integration_key': integration_key})}"
+    return f"{base_url}/webhooks/slybroadcast/status{query}"
 
 
 def integration_auth_ok(db, req):
@@ -27297,14 +27633,20 @@ def settings_page():
                     )
             else:
                 fields = {
+                    "public_app_base_url": request.form.get("public_app_base_url", ""),
                     "integration_api_key": request.form.get("integration_api_key", ""),
                     "slack_webhook_url": request.form.get("slack_webhook_url", ""),
                     "slack_signing_secret": request.form.get("slack_signing_secret", ""),
                     "slack_default_channel": request.form.get("slack_default_channel", ""),
                     "slack_agent_ops_webhook_url": request.form.get("slack_agent_ops_webhook_url", ""),
                     "slack_agent_ops_channel": request.form.get("slack_agent_ops_channel", ""),
+                    "openletterconnect_api_key": request.form.get("openletterconnect_api_key", ""),
                     "skipsherpa_api_key": request.form.get("skipsherpa_api_key", ""),
                     "rentcast_api_key": request.form.get("rentcast_api_key", ""),
+                    "slybroadcast_uid": request.form.get("slybroadcast_uid", ""),
+                    "slybroadcast_password": request.form.get("slybroadcast_password", ""),
+                    "slybroadcast_caller_id": request.form.get("slybroadcast_caller_id", ""),
+                    "slybroadcast_default_recording_name": request.form.get("slybroadcast_default_recording_name", ""),
                     "emaillistverify_api_key": request.form.get("emaillistverify_api_key", ""),
                     "emailoctopus_api_key": request.form.get("emailoctopus_api_key", ""),
                     "emailoctopus_list_id": request.form.get("emailoctopus_list_id", ""),
@@ -27438,8 +27780,11 @@ def settings_page():
     automation_settings = get_automation_settings(db)
     ad_platform_settings = get_ads_dashboard_settings(db)
     integration_api_key = get_integration_api_key(db)
+    public_app_base_url = get_public_app_base_url(db)
+    openletterconnect_api_key = get_openletterconnect_api_key(db)
     skipsherpa_api_key = get_skipsherpa_api_key(db)
     rentcast_api_key = get_rentcast_api_key(db)
+    slybroadcast_settings = get_slybroadcast_settings(db)
     deep_dive_smrtphone_from = get_setting(db, "deep_dive_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     referral_smrtphone_from = get_setting(db, "referral_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     postage_options = []
@@ -27447,7 +27792,7 @@ def settings_page():
     options_error = ""
     if active_tab == "direct_mail":
         try:
-            options = get_template_product_options(get_direct_mail_template_id(db))
+            options = get_template_product_options(get_direct_mail_template_id(db), db=db)
             postage_options = options.get("postage_options") or []
             envelope_options = options.get("envelope_options") or []
         except Exception as exc:
@@ -27527,9 +27872,12 @@ def settings_page():
         slack_settings=slack_settings,
         automation_settings=automation_settings,
         ad_platform_settings=ad_platform_settings,
+        public_app_base_url=public_app_base_url,
         integration_api_key=integration_api_key,
+        openletterconnect_api_key=openletterconnect_api_key,
         skipsherpa_api_key=skipsherpa_api_key,
         rentcast_api_key=rentcast_api_key,
+        slybroadcast_settings=slybroadcast_settings,
         active_tab=active_tab,
         deep_dive_smrtphone_from=deep_dive_smrtphone_from,
         referral_smrtphone_from=referral_smrtphone_from,
@@ -27731,7 +28079,9 @@ def preview_sequence_campaign(campaign_id):
     owner = db.execute("SELECT * FROM people WHERE id = ?", (prop["owner_person_id"],)).fetchone() if prop["owner_person_id"] else None
     steps = get_sequence_steps(db, campaign_id)
     sms_targets, sms_skipped = get_sequence_sms_targets(db, person_id)
+    vm_drop_targets, vm_drop_skipped = get_sequence_vm_drop_targets(db, person_id)
     email_targets, email_skipped = get_sequence_email_targets(db, person_id)
+    mail_target, mail_skipped = get_sequence_mail_target(db, prop, person_id)
     rendered = []
     for s in steps:
         rendered.append(
@@ -27754,8 +28104,12 @@ def preview_sequence_campaign(campaign_id):
             "targets": {
                 "sms_mobile": sms_targets,
                 "sms_skipped": sms_skipped,
+                "vm_drop": vm_drop_targets,
+                "vm_drop_skipped": vm_drop_skipped,
                 "email": email_targets,
                 "email_skipped": email_skipped,
+                "mail": [format_sequence_mail_target(mail_target)] if mail_target else [],
+                "mail_skipped": mail_skipped,
             },
             "steps": rendered,
         }
@@ -31938,6 +32292,15 @@ def openletterconnect_order_status_webhook():
             "UPDATE mail_orders SET status = COALESCE(NULLIF(?, ''), status), response_json = ? WHERE id = ?",
             (status, json.dumps(payload), row["id"]),
         )
+        if external_order_id:
+            db.execute(
+                """
+                UPDATE communications
+                SET status = COALESCE(NULLIF(?, ''), status)
+                WHERE external_id = ? AND upper(COALESCE(channel, '')) = 'MAIL'
+                """,
+                (status, external_order_id),
+            )
         person_ids = _mail_order_person_ids(row)
         for pid in person_ids:
             add_person_note(
@@ -31961,6 +32324,55 @@ def openletterconnect_order_status_webhook():
         )
     db.commit()
     return jsonify({"ok": True, "updated_orders": len(rows)}), 200
+
+
+@app.route("/webhooks/slybroadcast/status", methods=["POST"])
+def slybroadcast_status_webhook():
+    ensure_db()
+    db = get_db()
+    expected_key = get_integration_api_key(db)
+    provided_key = (request.args.get("integration_key") or "").strip()
+    if expected_key and provided_key and not hmac.compare_digest(provided_key, expected_key):
+        return "OK", 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+    raw_line = _extract_slybroadcast_callback_line(request)
+    parsed = _parse_slybroadcast_callback_line(raw_line)
+    session_id = (parsed.get("session_id") or "").strip()
+    if not session_id:
+        return "OK", 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+    rows = db.execute(
+        """
+        SELECT *
+        FROM communications
+        WHERE external_id = ? AND upper(COALESCE(channel, '')) = 'VM_DROP'
+        ORDER BY id DESC
+        """,
+        (session_id,),
+    ).fetchall()
+    if not rows:
+        return "OK", 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+    status_value = (parsed.get("status") or "").strip()
+    failure_reason = (parsed.get("failure_reason") or "").strip()
+    normalized_status = "Delivered" if status_value.upper() in {"OK", "SENT", "DELIVERED"} else (f"Failed: {failure_reason}" if failure_reason else (status_value or "Failed"))
+    payload_json = json.dumps({"raw": raw_line, "parsed": parsed})
+    for row in rows:
+        db.execute("UPDATE communications SET status = ? WHERE id = ?", (normalized_status, row["id"]))
+        db.execute(
+            """
+            INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+            VALUES (?, ?, 'Voicemail Drop Webhook', ?, ?)
+            """,
+            (
+                row["property_id"],
+                row["person_id"],
+                normalized_status,
+                payload_json,
+            ),
+        )
+    db.commit()
+    return "OK", 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/api/notifications/sms-unread/<int:communication_id>/read", methods=["POST"])

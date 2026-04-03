@@ -209,6 +209,9 @@
         <p>Configure external system ingress and Slack notifications.</p>
         <form method="post" class="grid-form">
             <input type="hidden" name="settings_tab" value="integrations">
+            <label class="span2">Public App Base URL
+                <input name="public_app_base_url" value="{{ public_app_base_url }}" placeholder="https://deepsift-production.up.railway.app">
+            </label>
             <label class="span2">Integration API Key (for external POST endpoints)
                 <input name="integration_api_key" value="{{ integration_api_key }}">
             </label>
@@ -227,11 +230,26 @@
             <label>Slack Agent Ops Channel (optional)
                 <input name="slack_agent_ops_channel" value="{{ slack_settings.agent_ops_channel }}" placeholder="#agent-ops">
             </label>
+            <label class="span2">OpenLetterConnect API Key
+                <input name="openletterconnect_api_key" value="{{ openletterconnect_api_key }}">
+            </label>
             <label class="span2">SkipSherpa API Key
                 <input name="skipsherpa_api_key" value="{{ skipsherpa_api_key }}">
             </label>
             <label class="span2">RentCast API Key
                 <input name="rentcast_api_key" value="{{ rentcast_api_key }}">
+            </label>
+            <label class="span2">Slybroadcast Login / UID
+                <input name="slybroadcast_uid" value="{{ slybroadcast_settings.uid }}">
+            </label>
+            <label class="span2">Slybroadcast Password
+                <input name="slybroadcast_password" value="{{ slybroadcast_settings.password }}">
+            </label>
+            <label>Slybroadcast Caller ID
+                <input name="slybroadcast_caller_id" value="{{ slybroadcast_settings.caller_id }}" placeholder="19085551212">
+            </label>
+            <label>Slybroadcast Default Recording Name
+                <input name="slybroadcast_default_recording_name" value="{{ slybroadcast_settings.default_recording_name }}" placeholder="my_saved_recording">
             </label>
             <label class="span2">EmailListVerify API Key
                 <input name="emaillistverify_api_key" value="{{ anonymous_email_settings.emaillistverify_api_key }}">
@@ -255,6 +273,8 @@
                 <button type="submit" name="integration_action" value="test_slack_agent_ops">Save + Test Agent Ops Slack</button>
             </div>
         </form>
+        <p class="muted-text">Sequence <code>MAIL</code> steps use the OpenLetterConnect API key above plus the sender/template values from Direct Mail Settings.</p>
+        <p class="muted-text">Sequence <code>VM_DROP</code> steps use the Slybroadcast credentials above. The step body should be the recording name for that drop. Callback URL: <code>{{ slybroadcast_settings.callback_url or 'Set Public App Base URL to generate the Slybroadcast callback URL.' }}</code></p>
         <p class="muted-text">RentCast is used for systematic sale-listing checks via <code>/v1/listings/sale</code>. If a matching listing returns <code>status=Active</code>, the referral is treated as on-market, and listing agent details are cached with the referral payload.</p>
         <p class="muted-text">Anonymous browse-stage leads are only validated/pushed when they remain outside <code>/step-2/</code> and <code>/thank-you/</code>. Imported EmailOctopus sent-email registry size: {{ anonymous_email_registry_count }}.</p>
         <form method="post" enctype="multipart/form-data" class="grid-form" style="margin-top:0.75rem;">

@@ -3,6 +3,7 @@
 <section class="panel">
     <h2>Sequence Campaigns</h2>
     <p>Create reusable campaigns, then enroll people from property/person pages.</p>
+    <p class="muted-text">Step behavior: <code>EMAIL</code> uses subject + body, <code>SMS</code> uses body, <code>VM_DROP</code> uses the body field as the Slybroadcast recording name, and <code>MAIL</code> uses the global direct mail template while keeping the body as an internal note.</p>
     {% if notice %}<div class="notice-banner">{{ notice }}</div>{% endif %}
     {% if error_notice %}<div class="error-banner">{{ error_notice }}</div>{% endif %}
 </section>
@@ -18,12 +19,12 @@
         <label class="inline-check"><input type="checkbox" name="stop_on_reply" value="1" checked><span>Stop on reply</span></label>
         <div class="span2">
             <table class="crm-table" id="newCampaignSteps">
-                <thead><tr><th>Order</th><th>Delay Hours</th><th>Channel</th><th>Subject (Email)</th><th>Body</th><th></th></tr></thead>
+                <thead><tr><th>Order</th><th>Delay Hours</th><th>Channel</th><th>Subject (Email Only)</th><th>Body / Recording / Note</th><th></th></tr></thead>
                 <tbody>
                     <tr>
                         <td><input name="new_step_order[]" type="number" min="1" value="1"></td>
                         <td><input name="new_step_delay[]" type="number" min="0" step="0.25" value="0"></td>
-                        <td><select name="new_step_channel[]"><option>SMS</option><option>EMAIL</option></select></td>
+                        <td><select name="new_step_channel[]"><option>SMS</option><option>EMAIL</option><option>VM_DROP</option><option>MAIL</option></select></td>
                         <td><input name="new_step_subject[]" placeholder="Question re: {property_address}"></td>
                         <td><textarea name="new_step_body[]" rows="2" required>Hi {first_name}, quick question re: {property_address}.</textarea></td>
                         <td><button type="button" class="icon-btn step-remove">x</button></td>
@@ -31,7 +32,7 @@
                     <tr>
                         <td><input name="new_step_order[]" type="number" min="1" value="2"></td>
                         <td><input name="new_step_delay[]" type="number" min="0" step="0.25" value="48"></td>
-                        <td><select name="new_step_channel[]"><option>SMS</option><option selected>EMAIL</option></select></td>
+                        <td><select name="new_step_channel[]"><option>SMS</option><option selected>EMAIL</option><option>VM_DROP</option><option>MAIL</option></select></td>
                         <td><input name="new_step_subject[]" value="Question re: {property_address}"></td>
                         <td><textarea name="new_step_body[]" rows="2" required>Hi {first_name}, can you help me with a quick question on {property_address}?</textarea></td>
                         <td><button type="button" class="icon-btn step-remove">x</button></td>
@@ -39,7 +40,7 @@
                     <tr>
                         <td><input name="new_step_order[]" type="number" min="1" value="3"></td>
                         <td><input name="new_step_delay[]" type="number" min="0" step="0.25" value="72"></td>
-                        <td><select name="new_step_channel[]"><option selected>SMS</option><option>EMAIL</option></select></td>
+                        <td><select name="new_step_channel[]"><option selected>SMS</option><option>EMAIL</option><option>VM_DROP</option><option>MAIL</option></select></td>
                         <td><input name="new_step_subject[]" placeholder="Question re: {property_address}"></td>
                         <td><textarea name="new_step_body[]" rows="2" required>Following up on {property_address}. If this is not a good number, please let me know.</textarea></td>
                         <td><button type="button" class="icon-btn step-remove">x</button></td>
@@ -67,13 +68,13 @@
                 <label class="inline-check"><input type="checkbox" name="stop_on_reply" value="1" {% if row.campaign.stop_on_reply %}checked{% endif %}><span>Stop on reply</span></label>
                 <div class="span2">
                     <table class="crm-table campaign-steps-table" id="campaignSteps{{ row.campaign.id }}">
-                        <thead><tr><th>Order</th><th>Delay Hours</th><th>Channel</th><th>Subject (Email)</th><th>Body</th><th></th></tr></thead>
+                        <thead><tr><th>Order</th><th>Delay Hours</th><th>Channel</th><th>Subject (Email Only)</th><th>Body / Recording / Note</th><th></th></tr></thead>
                         <tbody>
                             {% for s in row.steps %}
                             <tr>
                                 <td><input name="edit_step_order[]" type="number" min="1" value="{{ s.step_order }}"></td>
                                 <td><input name="edit_step_delay[]" type="number" min="0" step="0.25" value="{{ s.delay_hours }}"></td>
-                                <td><select name="edit_step_channel[]"><option value="SMS" {% if s.channel == 'SMS' %}selected{% endif %}>SMS</option><option value="EMAIL" {% if s.channel == 'EMAIL' %}selected{% endif %}>EMAIL</option></select></td>
+                                <td><select name="edit_step_channel[]"><option value="SMS" {% if s.channel == 'SMS' %}selected{% endif %}>SMS</option><option value="EMAIL" {% if s.channel == 'EMAIL' %}selected{% endif %}>EMAIL</option><option value="VM_DROP" {% if s.channel == 'VM_DROP' %}selected{% endif %}>VM_DROP</option><option value="MAIL" {% if s.channel == 'MAIL' %}selected{% endif %}>MAIL</option></select></td>
                                 <td><input name="edit_step_subject[]" value="{{ s.subject_template or '' }}"></td>
                                 <td><textarea name="edit_step_body[]" rows="2" required>{{ s.body_template }}</textarea></td>
                                 <td><button type="button" class="icon-btn step-remove">x</button></td>
@@ -132,7 +133,7 @@ function makeStepRow(orderValue){
   tr.innerHTML = `
     <td><input name="__ORDER__[]" type="number" min="1" value="${orderValue}"></td>
     <td><input name="__DELAY__[]" type="number" min="0" step="0.25" value="0"></td>
-    <td><select name="__CHANNEL__[]"><option value="SMS">SMS</option><option value="EMAIL">EMAIL</option></select></td>
+    <td><select name="__CHANNEL__[]"><option value="SMS">SMS</option><option value="EMAIL">EMAIL</option><option value="VM_DROP">VM_DROP</option><option value="MAIL">MAIL</option></select></td>
     <td><input name="__SUBJECT__[]" placeholder="Question re: {property_address}"></td>
     <td><textarea name="__BODY__[]" rows="2" required></textarea></td>
     <td><button type="button" class="icon-btn step-remove">x</button></td>
@@ -196,9 +197,13 @@ document.getElementById('previewRenderBtn')?.addEventListener('click', async () 
       </tr>
     `).join('');
     const sms = data.targets?.sms_mobile || [];
+    const vmDrop = data.targets?.vm_drop || [];
     const em = data.targets?.email || [];
+    const mail = data.targets?.mail || [];
     const smsSkip = data.targets?.sms_skipped || [];
+    const vmDropSkip = data.targets?.vm_drop_skipped || [];
     const emSkip = data.targets?.email_skipped || [];
+    const mailSkip = data.targets?.mail_skipped || [];
     out.innerHTML = `
       <p><strong>Person:</strong> ${esc(data.person?.name || '')} | <strong>Property:</strong> ${esc(data.property?.address || '')}</p>
       <div class="split">
@@ -208,13 +213,25 @@ document.getElementById('previewRenderBtn')?.addEventListener('click', async () 
           ${smsSkip.length ? `<details><summary>Skipped SMS (${smsSkip.length})</summary><pre class="json-block">${esc(JSON.stringify(smsSkip, null, 2))}</pre></details>` : ''}
         </div>
         <div>
+          <h4>VM Drop Targets</h4>
+          <p>${vmDrop.length ? vmDrop.map(esc).join('<br>') : 'None'}</p>
+          ${vmDropSkip.length ? `<details><summary>Skipped VM Drop (${vmDropSkip.length})</summary><pre class="json-block">${esc(JSON.stringify(vmDropSkip, null, 2))}</pre></details>` : ''}
+        </div>
+      </div>
+      <div class="split">
+        <div>
           <h4>Email Targets</h4>
           <p>${em.length ? em.map(esc).join('<br>') : 'None'}</p>
           ${emSkip.length ? `<details><summary>Skipped Email (${emSkip.length})</summary><pre class="json-block">${esc(JSON.stringify(emSkip, null, 2))}</pre></details>` : ''}
         </div>
+        <div>
+          <h4>Mail Targets</h4>
+          <p>${mail.length ? mail.map(esc).join('<br>') : 'None'}</p>
+          ${mailSkip.length ? `<details><summary>Skipped Mail (${mailSkip.length})</summary><pre class="json-block">${esc(JSON.stringify(mailSkip, null, 2))}</pre></details>` : ''}
+        </div>
       </div>
       <table class="crm-table">
-        <thead><tr><th>Step</th><th>Delay Hours</th><th>Channel</th><th>Subject</th><th>Rendered Body</th></tr></thead>
+        <thead><tr><th>Step</th><th>Delay Hours</th><th>Channel</th><th>Subject</th><th>Rendered Body / Recording / Note</th></tr></thead>
         <tbody>${stepsHtml || '<tr><td colspan="5">No steps</td></tr>'}</tbody>
       </table>
     `;

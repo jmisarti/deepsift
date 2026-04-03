@@ -8620,9 +8620,8 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
             "Configured Amazon profile scopes are not accessible with the current token."
         )
     rows = []
-    pending_profile_days = []
-    empty_metric_profile_days = []
-    legacy_endpoint_unsupported = False
+    pending_profile_ids = []
+    empty_metric_profile_ids = []
     for profile_id in matched_profile_ids:
         snapshots = _fetch_amazon_campaign_snapshots(settings, access_token, profile_id)
         rows.extend(snapshots)
@@ -8631,95 +8630,77 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
             for snapshot in snapshots
             if normalize_whitespace(snapshot.get("campaign_id"))
         }
-        for metric_date in _amazon_iter_dates(start_date, end_date):
-            report_rows = []
-            pending = _get_pending_ad_report(db, "amazon_legacy", profile_id, metric_date, metric_date)
-            if pending:
-                report_meta = _amazon_legacy_report_status_once(
-                    settings,
-                    access_token,
-                    profile_id,
-                    normalize_whitespace(pending.get("report_id")),
-                )
-                report_status = normalize_whitespace(
-                    report_meta.get("status")
-                    or report_meta.get("statusDetails")
-                    or report_meta.get("reportStatus")
-                ).upper()
-                download_url = _amazon_report_download_url(report_meta)
-                if report_status in {"COMPLETED", "SUCCESS", "DONE"} and download_url:
-                    _delete_pending_ad_report(db, "amazon_legacy", profile_id, metric_date, metric_date)
-                    report_rows = _download_amazon_report_rows(download_url)
-                    if not report_rows:
-                        empty_metric_profile_days.append(f"{profile_id}:{metric_date}")
-                elif report_status in {"FAILURE", "FAILED", "ERROR", "CANCELLED"}:
-                    _delete_pending_ad_report(db, "amazon_legacy", profile_id, metric_date, metric_date)
-                    raise RuntimeError(f"Amazon legacy campaign report failed for {profile_id} on {metric_date}: {report_meta}")
-                else:
-                    _upsert_pending_ad_report(
-                        db,
-                        "amazon_legacy",
-                        profile_id,
-                        metric_date,
-                        metric_date,
-                        pending.get("report_id"),
-                        report_status or "PENDING",
-                        report_meta,
-                    )
-                    pending_profile_days.append(f"{profile_id}:{metric_date}")
+        report_rows = []
+        pending = _get_pending_ad_report(db, "amazon", profile_id, start_date, end_date)
+        if pending:
+            report_meta = _amazon_report_status_once(
+                settings,
+                access_token,
+                profile_id,
+                normalize_whitespace(pending.get("report_id")),
+            )
+            report_status = normalize_whitespace(
+                report_meta.get("status")
+                or report_meta.get("reportStatus")
+                or report_meta.get("statusDetails")
+            ).upper()
+            download_url = _amazon_report_download_url(report_meta)
+            if report_status in {"COMPLETED", "SUCCESS", "DONE"} and download_url:
+                _delete_pending_ad_report(db, "amazon", profile_id, start_date, end_date)
+                report_rows = _download_amazon_report_rows(download_url)
+                if not report_rows:
+                    empty_metric_profile_ids.append(profile_id)
+            elif report_status in {"FAILURE", "FAILED", "ERROR", "CANCELLED"}:
+                _delete_pending_ad_report(db, "amazon", profile_id, start_date, end_date)
+                raise RuntimeError(f"Amazon Sponsored TV report failed for profile {profile_id}: {report_meta}")
             else:
-                try:
-                    created = _amazon_create_legacy_campaign_day_report(settings, access_token, profile_id, metric_date)
-                except RuntimeError as exc:
-                    if _amazon_legacy_auth_contract_error(str(exc)):
-                        legacy_endpoint_unsupported = True
-                        break
-                    raise
                 _upsert_pending_ad_report(
                     db,
-                    "amazon_legacy",
+                    "amazon",
                     profile_id,
-                    metric_date,
-                    metric_date,
-                    created.get("report_id"),
-                    "PENDING",
-                    created,
+                    start_date,
+                    end_date,
+                    pending.get("report_id"),
+                    report_status or "PENDING",
+                    report_meta,
                 )
-                pending_profile_days.append(f"{profile_id}:{metric_date}")
-            rows.extend(_amazon_legacy_report_rows_to_dashboard_rows(profile_id, metric_date, report_rows, snapshots_by_campaign))
-        if legacy_endpoint_unsupported:
-            break
+                pending_profile_ids.append(profile_id)
+        else:
+            created = _amazon_create_sponsored_tv_report(settings, access_token, profile_id, start_date, end_date)
+            _upsert_pending_ad_report(
+                db,
+                "amazon",
+                profile_id,
+                start_date,
+                end_date,
+                created.get("report_id"),
+                "PENDING",
+                created,
+            )
+            pending_profile_ids.append(profile_id)
+        rows.extend(_amazon_report_rows_to_dashboard_rows(profile_id, report_rows, snapshots_by_campaign))
     message = f"Fetched {len(rows)} Amazon campaign rows across {len(matched_profile_ids)} profile(s)."
     if account_id:
         message += f" Target account: {account_id}."
     if skipped_profile_ids:
         message += " Skipped inaccessible profile IDs: " + ", ".join(skipped_profile_ids) + "."
-    if legacy_endpoint_unsupported:
-        message += " Amazon legacy /campaigns/report rejected Bearer auth for this account, so Amazon historical metrics remain unavailable on that endpoint."
-        return {
-            "status": "ok",
-            "rows": rows,
-            "message": message,
-        }
-    if pending_profile_days and not [row for row in rows if str(row.get("metric_date") or "").strip()]:
+    if pending_profile_ids and not [row for row in rows if str(row.get("metric_date") or "").strip()]:
         return {
             "status": "pending",
             "rows": rows,
             "message": message
-            + " Legacy Amazon daily campaign reports are still processing for profile/day: "
-            + ", ".join(pending_profile_days[:8])
-            + ("..." if len(pending_profile_days) > 8 else "")
+            + " Sponsored TV performance metrics are still processing for profile(s): "
+            + ", ".join(pending_profile_ids)
             + ". Refresh again in about a minute.",
         }
-    if empty_metric_profile_days:
+    if empty_metric_profile_ids:
         message += (
-            " Amazon daily campaign reports completed but returned no dated metric rows for: "
-            + ", ".join(empty_metric_profile_days[:8])
-            + ("..." if len(empty_metric_profile_days) > 8 else "")
-            + ". Campaign metadata is connected, but this report contract still needs adjustment."
+            " Sponsored TV report completed but returned no dated metric rows for profile(s): "
+            + ", ".join(empty_metric_profile_ids)
+            + ". Campaign metadata is connected, but the current Reporting v3 contract still needs adjustment."
         )
-    if pending_profile_days:
-        message += " Legacy Amazon daily campaign reports are still processing for " + ", ".join(pending_profile_days[:8]) + ("..." if len(pending_profile_days) > 8 else "") + "."
+    if pending_profile_ids:
+        message += " Sponsored TV performance metrics are still processing for profile(s): " + ", ".join(pending_profile_ids) + "."
     elif not rows:
         message += " Amazon returned no campaigns from the direct campaign endpoint for the matched profile scope."
     return {

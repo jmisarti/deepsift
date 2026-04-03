@@ -56,6 +56,7 @@
                         <tr>
                             <th>Profile ID</th>
                             <th>Account ID</th>
+                            <th>Entity ID</th>
                             <th>Account Type</th>
                             <th>Country</th>
                             <th>Currency</th>
@@ -68,6 +69,7 @@
                         <tr>
                             <td>{{ profile.profileId or profile.id or '-' }}</td>
                             <td>{{ ((profile.accountInfo.accountId if profile.accountInfo and profile.accountInfo.accountId else '') or profile.accountId or '-') }}</td>
+                            <td>{{ ((profile.accountInfo.entityId if profile.accountInfo and profile.accountInfo.entityId else '') or profile.entityId or '-') }}</td>
                             <td>{{ profile.accountInfo.type if profile.accountInfo else '-' }}</td>
                             <td>{{ profile.countryCode or '-' }}</td>
                             <td>{{ profile.currencyCode or '-' }}</td>

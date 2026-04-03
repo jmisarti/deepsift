@@ -144,8 +144,8 @@
             <label class="span2">Amazon Ads Refresh Token
                 <input name="ads_amazon_refresh_token" value="{{ ad_platform_settings.amazon_refresh_token }}">
             </label>
-            <label class="span2">Amazon Ads Account ID (preferred)
-                <input name="ads_amazon_account_id" value="{{ ad_platform_settings.amazon_account_id }}" placeholder="amzn1.ads-account...">
+            <label class="span2">Amazon Ads Account / Entity ID (preferred)
+                <input name="ads_amazon_account_id" value="{{ ad_platform_settings.amazon_account_id }}" placeholder="amzn1.ads-account... or ENTITY...">
             </label>
             <label class="span2">Amazon Ads Profile IDs
                 <input name="ads_amazon_profile_ids" value="{{ ad_platform_settings.amazon_profile_ids_raw }}" placeholder="123456789012345, 998877665544332">
@@ -157,7 +157,7 @@
                     <option value="fe" {% if ad_platform_settings.amazon_region == 'fe' %}selected{% endif %}>Far East</option>
                 </select>
             </label>
-            <p class="muted-text span2">If you save an Amazon account ID, the dashboard will resolve matching profile IDs automatically on refresh and keep targeting that account.</p>
+            <p class="muted-text span2">If you save an Amazon account ID or entity ID, the dashboard will resolve matching profile IDs automatically on refresh and keep targeting that account.</p>
             <p class="muted-text span2">Amazon redirect URI: <a href="{{ url_for('amazon_oauth_callback', _external=True) }}" target="_blank" rel="noopener">{{ url_for('amazon_oauth_callback', _external=True) }}</a></p>
             <div class="span2 inline-actions">
                 <a class="button-link" href="{{ url_for('amazon_oauth_start') }}">Connect Amazon And Get Refresh Token</a>

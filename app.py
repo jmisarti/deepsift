@@ -7461,7 +7461,7 @@ def _amazon_account_ids_from_profile(profile):
     collect(profile)
     explicit_ids = []
     for text in values:
-        if re.match(r"^amzn1\.ads-account\.", text, re.IGNORECASE):
+        if re.match(r"^amzn1\.ads-account\.", text, re.IGNORECASE) or re.match(r"^entity[a-z0-9]+$", text, re.IGNORECASE):
             explicit_ids.append(text)
     if explicit_ids:
         return list(dict.fromkeys(explicit_ids))
@@ -7469,10 +7469,12 @@ def _amazon_account_ids_from_profile(profile):
     account_info = profile.get("accountInfo") if isinstance(profile.get("accountInfo"), dict) else {}
     fallback_values = [
         profile.get("accountId"),
+        profile.get("entityId"),
         profile.get("advertiserId"),
         profile.get("sellerId"),
         profile.get("vendorCode"),
         account_info.get("accountId"),
+        account_info.get("entityId"),
         account_info.get("id"),
         account_info.get("advertiserId"),
         account_info.get("sellerId"),

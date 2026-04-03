@@ -181,6 +181,8 @@ ADS_DEFAULT_LOOKBACK_DAYS = max(int((os.getenv("ADS_DEFAULT_LOOKBACK_DAYS") or "
 ADS_REFRESH_LOOKBACK_DAYS = max(int((os.getenv("ADS_REFRESH_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
 GOOGLE_ADS_API_VERSION = (os.getenv("GOOGLE_ADS_API_VERSION") or "v22").strip() or "v22"
 META_GRAPH_API_VERSION = (os.getenv("META_GRAPH_API_VERSION") or "v23.0").strip() or "v23.0"
+AMAZON_LWA_AUTHORIZE_URL = (os.getenv("AMAZON_LWA_AUTHORIZE_URL") or "https://www.amazon.com/ap/oa").strip() or "https://www.amazon.com/ap/oa"
+AMAZON_LWA_TOKEN_URL = (os.getenv("AMAZON_LWA_TOKEN_URL") or "https://api.amazon.com/auth/o2/token").strip() or "https://api.amazon.com/auth/o2/token"
 ADS_REFRESH_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
@@ -719,6 +721,8 @@ def require_login_if_enabled():
         return None
     # Third-party callbacks must stay unauthenticated.
     if request.path.startswith("/webhooks/"):
+        return None
+    if request.path.startswith("/oauth/amazon/"):
         return None
     # External integrations authenticate via API key header.
     if request.path.startswith("/api/integrations/"):
@@ -7045,6 +7049,16 @@ def _normalize_meta_account_id(value):
     return re.sub(r"\D", "", cleaned)
 
 
+def _amazon_ads_base_url(region):
+    region_key = normalize_whitespace(region or "na").lower()
+    mapping = {
+        "na": "https://advertising-api.amazon.com",
+        "eu": "https://advertising-api-eu.amazon.com",
+        "fe": "https://advertising-api-fe.amazon.com",
+    }
+    return mapping.get(region_key, mapping["na"])
+
+
 def _google_ads_headers(settings, access_token):
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -7248,6 +7262,47 @@ def _meta_conversion_value(actions):
             continue
         total += _normalize_metric_float(action.get("value"))
     return round(total, 4)
+
+
+def _exchange_amazon_authorization_code(client_id, client_secret, code, redirect_uri):
+    response = requests.post(
+        AMAZON_LWA_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+        },
+        timeout=60,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text}
+    if not response.ok:
+        raise RuntimeError(f"Amazon token exchange failed ({response.status_code}): {payload}")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _fetch_amazon_ads_profiles(client_id, access_token, region):
+    response = requests.get(
+        f"{_amazon_ads_base_url(region)}/v2/profiles",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Amazon-Advertising-API-ClientId": client_id,
+            "Accept": "application/json",
+        },
+        timeout=60,
+    )
+    if not response.ok:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = response.text
+        raise RuntimeError(f"Amazon profile lookup failed ({response.status_code}): {payload}")
+    payload = response.json()
+    return payload if isinstance(payload, list) else []
 
 
 def _fetch_meta_campaign_snapshots(settings, account_id):
@@ -26395,6 +26450,80 @@ def buyers_template():
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=buyers-template.csv"},
     )
+
+
+@app.route("/oauth/amazon/callback", methods=["GET"])
+def amazon_oauth_callback():
+    ensure_db()
+    db = get_db()
+    settings = get_ads_dashboard_settings(db)
+    callback_url = request.base_url
+    error_value = normalize_whitespace(request.args.get("error"))
+    error_description = normalize_whitespace(request.args.get("error_description"))
+    code = normalize_whitespace(request.args.get("code"))
+    state = normalize_whitespace(request.args.get("state"))
+    result = {
+        "ok": False,
+        "notice": "",
+        "error": "",
+        "callback_url": callback_url,
+        "state": state,
+        "refresh_token": "",
+        "access_token_preview": "",
+        "expires_in": "",
+        "profiles": [],
+        "saved_to_settings": False,
+    }
+    if error_value:
+        result["error"] = error_description or error_value
+        return render_template("amazon_oauth_callback.html", result=result)
+    if not code:
+        result["notice"] = "Amazon callback is ready. Register this exact URL as the redirect URI, then start the OAuth flow from Amazon."
+        return render_template("amazon_oauth_callback.html", result=result)
+    client_id = settings.get("amazon_client_id", "")
+    client_secret = settings.get("amazon_client_secret", "")
+    if not client_id or not client_secret:
+        result["error"] = "Amazon Ads client ID and client secret must be saved in Ad Platforms before exchanging the authorization code."
+        return render_template("amazon_oauth_callback.html", result=result)
+    try:
+        token_payload = _exchange_amazon_authorization_code(client_id, client_secret, code, callback_url)
+        refresh_token = normalize_whitespace(token_payload.get("refresh_token"))
+        access_token = normalize_whitespace(token_payload.get("access_token"))
+        expires_in = token_payload.get("expires_in")
+        profiles = []
+        profile_error = ""
+        if access_token:
+            try:
+                profiles = _fetch_amazon_ads_profiles(client_id, access_token, settings.get("amazon_region") or "na")
+            except Exception as exc:
+                profile_error = str(exc)
+        if refresh_token and session.get("auth_ok"):
+            set_setting(db, "ads_amazon_refresh_token", refresh_token)
+            db.commit()
+            result["saved_to_settings"] = True
+        result["ok"] = bool(refresh_token)
+        result["refresh_token"] = refresh_token
+        result["access_token_preview"] = f"{access_token[:18]}..." if access_token else ""
+        result["expires_in"] = str(expires_in or "")
+        result["profiles"] = profiles if isinstance(profiles, list) else []
+        if profile_error:
+            result["notice"] = f"Amazon authorization succeeded, but profile lookup did not complete: {profile_error}"
+        elif refresh_token and result["profiles"]:
+            result["notice"] = "Amazon authorization succeeded. Use the profile IDs below in Ad Platforms."
+        elif refresh_token:
+            result["notice"] = "Amazon authorization succeeded."
+    except Exception as exc:
+        result["error"] = str(exc)
+        log_app_error(
+            db,
+            source="amazon_oauth_callback",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/oauth/amazon/callback",
+            status_code=500,
+        )
+        db.commit()
+    return render_template("amazon_oauth_callback.html", result=result)
 
 
 @app.route("/property/<int:property_id>/upload-contacts", methods=["POST"])

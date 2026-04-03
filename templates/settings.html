@@ -147,6 +147,7 @@
                     <option value="fe" {% if ad_platform_settings.amazon_region == 'fe' %}selected{% endif %}>Far East</option>
                 </select>
             </label>
+            <p class="muted-text span2">Amazon redirect URI: <a href="{{ url_for('amazon_oauth_callback', _external=True) }}" target="_blank" rel="noopener">{{ url_for('amazon_oauth_callback', _external=True) }}</a></p>
 
             <label class="span2">Roku Ads API Token / Key
                 <input name="ads_roku_api_token" value="{{ ad_platform_settings.roku_api_token }}">

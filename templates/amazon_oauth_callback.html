@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Amazon Ads OAuth Callback</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="container">
+        <section class="panel">
+            <h2>Amazon Ads OAuth Callback</h2>
+            <p class="muted-text">Register this exact redirect URI in your Amazon app and use it for the authorization flow.</p>
+            <p><strong>Redirect URI:</strong> <a href="{{ result.callback_url }}">{{ result.callback_url }}</a></p>
+
+            {% if result.notice %}
+            <div class="notice-banner">{{ result.notice }}</div>
+            {% endif %}
+            {% if result.error %}
+            <div class="notice-banner error">{{ result.error }}</div>
+            {% endif %}
+
+            {% if result.refresh_token %}
+            <div class="grid-form">
+                <label class="span2">Refresh Token
+                    <input value="{{ result.refresh_token }}" readonly>
+                </label>
+                {% if result.access_token_preview %}
+                <label>Access Token Preview
+                    <input value="{{ result.access_token_preview }}" readonly>
+                </label>
+                {% endif %}
+                {% if result.expires_in %}
+                <label>Access Token TTL (seconds)
+                    <input value="{{ result.expires_in }}" readonly>
+                </label>
+                {% endif %}
+                {% if result.state %}
+                <label class="span2">OAuth State
+                    <input value="{{ result.state }}" readonly>
+                </label>
+                {% endif %}
+            </div>
+            {% endif %}
+
+            {% if result.saved_to_settings %}
+            <p class="muted-text">The refresh token was also saved into <strong>Settings -> Ad Platforms</strong> because you were logged into DeepSift during the callback.</p>
+            {% endif %}
+
+            {% if result.profiles %}
+            <h3>Detected Amazon Profiles</h3>
+            <div class="table-wrap">
+                <table class="compact-table">
+                    <thead>
+                        <tr>
+                            <th>Profile ID</th>
+                            <th>Account Type</th>
+                            <th>Country</th>
+                            <th>Currency</th>
+                            <th>Daily Budget</th>
+                            <th>Name</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for profile in result.profiles %}
+                        <tr>
+                            <td>{{ profile.profileId or profile.id or '-' }}</td>
+                            <td>{{ profile.accountInfo.type if profile.accountInfo else '-' }}</td>
+                            <td>{{ profile.countryCode or '-' }}</td>
+                            <td>{{ profile.currencyCode or '-' }}</td>
+                            <td>{{ profile.dailyBudget if profile.dailyBudget is not none else '-' }}</td>
+                            <td>{{ profile.accountInfo.name if profile.accountInfo else '-' }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            <p class="muted-text">Use the Profile ID values in <strong>Settings -> Ad Platforms</strong>.</p>
+            {% endif %}
+        </section>
+    </main>
+</body>
+</html>

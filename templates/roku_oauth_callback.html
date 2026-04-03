@@ -10,31 +10,74 @@
     <main class="container">
         <section class="panel">
             <h2>Roku OAuth Callback</h2>
-            <p class="muted-text">Use this exact URL as the Roku redirect URI if Roku asks for one.</p>
+            <p class="muted-text">Register this exact redirect URI in your Roku developer app and use it for the authorization flow.</p>
             <p><strong>Redirect URI:</strong> <a href="{{ result.callback_url }}">{{ result.callback_url }}</a></p>
+            <p><a class="button-link" href="{{ url_for('roku_oauth_start') }}">Start Roku OAuth</a></p>
 
+            {% if result.notice %}
+            <div class="notice-banner">{{ result.notice }}</div>
+            {% endif %}
             {% if result.error %}
-            <div class="notice-banner error">{{ result.error_description or result.error }}</div>
-            {% elif result.code %}
-            <div class="notice-banner">Authorization code received.</div>
-            {% else %}
-            <div class="notice-banner">Callback is ready.</div>
+            <div class="notice-banner error">{{ result.error }}</div>
             {% endif %}
 
+            {% if result.refresh_token %}
             <div class="grid-form">
-                <label class="span2">Authorization Code
-                    <input value="{{ result.code }}" readonly>
+                <label class="span2">Refresh Token
+                    <input value="{{ result.refresh_token }}" readonly>
                 </label>
-                <label class="span2">State
+                {% if result.access_token_preview %}
+                <label>Access Token Preview
+                    <input value="{{ result.access_token_preview }}" readonly>
+                </label>
+                {% endif %}
+                {% if result.expires_in %}
+                <label>Access Token TTL (seconds)
+                    <input value="{{ result.expires_in }}" readonly>
+                </label>
+                {% endif %}
+                {% if result.state %}
+                <label class="span2">OAuth State
                     <input value="{{ result.state }}" readonly>
                 </label>
-                <label class="span2">Error
-                    <input value="{{ result.error }}" readonly>
-                </label>
-                <label class="span2">Error Description
-                    <input value="{{ result.error_description }}" readonly>
-                </label>
+                {% endif %}
             </div>
+            {% endif %}
+
+            {% if result.saved_to_settings %}
+            <p class="muted-text">The refresh token was also saved into <strong>Settings -> Ad Platforms</strong> because you were logged into DeepSift during the callback.</p>
+            {% endif %}
+
+            {% if result.accounts %}
+            <h3>Detected Roku Ad Accounts</h3>
+            <div class="table-wrap">
+                <table class="compact-table">
+                    <thead>
+                        <tr>
+                            <th>Account ID</th>
+                            <th>Name</th>
+                            <th>Timezone</th>
+                            <th>Country</th>
+                            <th>Currency</th>
+                            <th>Website</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for account in result.accounts %}
+                        <tr>
+                            <td>{{ account.uid or '-' }}</td>
+                            <td>{{ account.attributes.name if account.attributes else '-' }}</td>
+                            <td>{{ account.attributes.timezone if account.attributes else '-' }}</td>
+                            <td>{{ account.attributes.country if account.attributes else '-' }}</td>
+                            <td>{{ account.attributes.currency if account.attributes else '-' }}</td>
+                            <td>{{ account.attributes.website_url if account.attributes else '-' }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            <p class="muted-text">Use the Account ID values in <strong>Settings -> Ad Platforms</strong>.</p>
+            {% endif %}
 
             {% if result.params %}
             <h3>Additional Parameters</h3>

@@ -152,12 +152,25 @@
                 <a class="button-link" href="{{ url_for('amazon_oauth_start') }}">Connect Amazon And Get Refresh Token</a>
             </div>
 
-            <label class="span2">Roku Ads API Token / Key
-                <input name="ads_roku_api_token" value="{{ ad_platform_settings.roku_api_token }}">
+            <label>Roku Developer App UID
+                <input name="ads_roku_developer_app_uid" value="{{ ad_platform_settings.roku_developer_app_uid }}">
+            </label>
+            <label>Roku Client ID
+                <input name="ads_roku_client_id" value="{{ ad_platform_settings.roku_client_id }}">
+            </label>
+            <label class="span2">Roku Client Secret
+                <input name="ads_roku_client_secret" value="{{ ad_platform_settings.roku_client_secret }}">
+            </label>
+            <label class="span2">Roku Refresh Token
+                <input name="ads_roku_refresh_token" value="{{ ad_platform_settings.roku_refresh_token }}">
             </label>
             <label class="span2">Roku Ad Account IDs
                 <input name="ads_roku_account_ids" value="{{ ad_platform_settings.roku_account_ids_raw }}" placeholder="account-1, account-2">
             </label>
+            <p class="muted-text span2">Roku redirect URI: <a href="{{ url_for('roku_oauth_callback', _external=True) }}" target="_blank" rel="noopener">{{ url_for('roku_oauth_callback', _external=True) }}</a></p>
+            <div class="span2 inline-actions">
+                <a class="button-link" href="{{ url_for('roku_oauth_start') }}">Connect Roku And Get Refresh Token</a>
+            </div>
             <button type="submit">Save Ad Platform Settings</button>
         </form>
         <p class="muted-text">Current ready state: Google {% if ad_platform_settings.google_ready %}ready{% else %}pending{% endif %}, Meta {% if ad_platform_settings.meta_ready %}ready{% else %}pending{% endif %}, Amazon {% if ad_platform_settings.amazon_ready %}ready{% else %}pending{% endif %}, Roku {% if ad_platform_settings.roku_ready %}ready{% else %}pending{% endif %}.</p>

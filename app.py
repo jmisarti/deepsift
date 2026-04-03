@@ -186,6 +186,9 @@ AMAZON_LWA_AUTHORIZE_URL = (os.getenv("AMAZON_LWA_AUTHORIZE_URL") or "https://ww
 AMAZON_LWA_TOKEN_URL = (os.getenv("AMAZON_LWA_TOKEN_URL") or "https://api.amazon.com/auth/o2/token").strip() or "https://api.amazon.com/auth/o2/token"
 AMAZON_ADS_DEFAULT_SCOPE = (os.getenv("AMAZON_ADS_DEFAULT_SCOPE") or "advertising::campaign_management").strip() or "advertising::campaign_management"
 AMAZON_REPORT_POLL_SECONDS = max(int((os.getenv("AMAZON_REPORT_POLL_SECONDS") or "24").strip() or "24"), 10)
+ROKU_ADS_AUTHORIZE_URL = (os.getenv("ROKU_ADS_AUTHORIZE_URL") or "https://ads.roku.com/integrations/developer").strip() or "https://ads.roku.com/integrations/developer"
+ROKU_ADS_TOKEN_URL = (os.getenv("ROKU_ADS_TOKEN_URL") or "https://api.ads.roku.com/v1/developer/token").strip() or "https://api.ads.roku.com/v1/developer/token"
+ROKU_ADS_API_BASE_URL = (os.getenv("ROKU_ADS_API_BASE_URL") or "https://api.ads.roku.com/v1/developer").strip().rstrip("/") or "https://api.ads.roku.com/v1/developer"
 ADS_REFRESH_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
@@ -7070,6 +7073,10 @@ def _normalize_meta_account_id(value):
     return re.sub(r"\D", "", cleaned)
 
 
+def _normalize_roku_account_id(value):
+    return normalize_whitespace(value)
+
+
 def _amazon_ads_base_url(region):
     region_key = normalize_whitespace(region or "na").lower()
     mapping = {
@@ -7089,6 +7096,15 @@ def _build_amazon_authorize_url(client_id, redirect_uri, state, scope=AMAZON_ADS
         "state": state,
     }
     return f"{AMAZON_LWA_AUTHORIZE_URL}?{urlencode(params)}"
+
+
+def _build_roku_authorize_url(developer_app_uid, client_id, redirect_uri):
+    params = {
+        "developer_app_uid": developer_app_uid,
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+    }
+    return f"{ROKU_ADS_AUTHORIZE_URL}?{urlencode(params)}"
 
 
 def _google_ads_headers(settings, access_token):
@@ -7358,6 +7374,204 @@ def _exchange_amazon_refresh_token(client_id, client_secret, refresh_token):
     if not access_token:
         raise RuntimeError("Amazon refresh-token exchange did not return an access token.")
     return access_token
+
+
+def _roku_api_headers(access_token, content_type="application/json"):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def _exchange_roku_authorization_code(client_id, client_secret, code, redirect_uri):
+    response = requests.post(
+        ROKU_ADS_TOKEN_URL,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        json={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+        },
+        timeout=60,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text}
+    if not response.ok:
+        raise RuntimeError(f"Roku token exchange failed ({response.status_code}): {payload}")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _exchange_roku_refresh_token(client_id, client_secret, refresh_token):
+    response = requests.post(
+        ROKU_ADS_TOKEN_URL,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        json={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+        timeout=60,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text}
+    if not response.ok:
+        raise RuntimeError(f"Roku refresh-token exchange failed ({response.status_code}): {payload}")
+    access_token = normalize_whitespace(payload.get("access_token"))
+    if not access_token:
+        raise RuntimeError("Roku refresh-token exchange did not return an access token.")
+    return access_token
+
+
+def _fetch_roku_accounts(access_token):
+    response = requests.get(
+        f"{ROKU_ADS_API_BASE_URL}/accounts",
+        headers=_roku_api_headers(access_token, content_type=""),
+        timeout=60,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text}
+    if not response.ok:
+        raise RuntimeError(f"Roku account lookup failed ({response.status_code}): {payload}")
+    data = payload.get("data") if isinstance(payload, dict) else []
+    return data if isinstance(data, list) else []
+
+
+def _fetch_roku_campaign_snapshots(access_token):
+    response = requests.get(
+        f"{ROKU_ADS_API_BASE_URL}/campaigns",
+        headers=_roku_api_headers(access_token, content_type=""),
+        params={"limit": 500, "offset": 0},
+        timeout=90,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text}
+    if not response.ok:
+        raise RuntimeError(f"Roku campaign lookup failed ({response.status_code}): {payload}")
+    data = payload.get("data") if isinstance(payload, dict) else []
+    snapshots = []
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        attrs = item.get("attributes") or {}
+        campaign_id = normalize_whitespace(item.get("uid"))
+        account_id = _normalize_roku_account_id(attrs.get("account_uid"))
+        if not campaign_id or not account_id:
+            continue
+        snapshots.append(
+            {
+                "platform": "roku",
+                "account_id": account_id,
+                "campaign_id": campaign_id,
+                "campaign_name": normalize_whitespace(attrs.get("name")) or campaign_id,
+                "campaign_status": _normalize_ad_campaign_status(attrs.get("status")),
+                "campaign_site": _ad_campaign_site("roku", account_id),
+                "metric_date": "",
+                "spend": 0.0,
+                "impressions": 0,
+                "clicks": 0,
+                "reach": 0,
+                "conversions": 0.0,
+                "_current_snapshot": True,
+                "raw": item,
+            }
+        )
+    return snapshots
+
+
+def _create_roku_report(access_token, account_id, start_date, end_date):
+    payload = {
+        "data": [
+            {
+                "type": "report",
+                "attributes": {
+                    "name": f"DeepSift Roku {account_id} {start_date} {end_date}",
+                    "metrics": [
+                        "spend",
+                        "impressions",
+                        "household_reach",
+                        "total_unique_actions",
+                    ],
+                    "dimensions": [
+                        "campaign_id",
+                        "campaign_name",
+                        "date",
+                    ],
+                    "filters": [
+                        {
+                            "metric": "account_uid",
+                            "value": account_id,
+                        }
+                    ],
+                    "start_at": f"{start_date}T00:00:00Z",
+                    "end_at": f"{end_date}T23:59:59Z",
+                },
+            }
+        ]
+    }
+    response = requests.post(
+        f"{ROKU_ADS_API_BASE_URL}/reports",
+        headers=_roku_api_headers(access_token),
+        json=payload,
+        timeout=60,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text}
+    if not response.ok:
+        raise RuntimeError(f"Roku report create failed ({response.status_code}): {body}")
+    data = body.get("data") if isinstance(body, dict) else []
+    first = data[0] if isinstance(data, list) and data else {}
+    report_id = normalize_whitespace(first.get("uid"))
+    if not report_id:
+        raise RuntimeError(f"Roku report create returned no report ID: {body}")
+    return report_id
+
+
+def _roku_report_status_once(access_token, report_id):
+    response = requests.get(
+        f"{ROKU_ADS_API_BASE_URL}/reports/{report_id}/status",
+        headers=_roku_api_headers(access_token, content_type=""),
+        timeout=60,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text}
+    if not response.ok:
+        raise RuntimeError(f"Roku report status failed ({response.status_code}): {body}")
+    data = body.get("data") if isinstance(body, dict) else {}
+    attrs = data.get("attributes") if isinstance(data, dict) else {}
+    return attrs if isinstance(attrs, dict) else {}
+
+
+def _download_roku_report_rows(report_url):
+    response = requests.get(report_url, timeout=120)
+    if not response.ok:
+        raise RuntimeError(f"Roku report download failed ({response.status_code}).")
+    raw_bytes = response.content or b""
+    if not raw_bytes:
+        return []
+    try:
+        text = gzip.decompress(raw_bytes).decode("utf-8")
+    except Exception:
+        text = raw_bytes.decode("utf-8", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    return [dict(row) for row in reader]
 
 
 def _amazon_duplicate_report_id(payload):
@@ -7639,14 +7853,17 @@ def get_ads_dashboard_settings(db):
         "amazon_refresh_token": (get_setting(db, "ads_amazon_refresh_token", "") or os.getenv("ADS_AMAZON_REFRESH_TOKEN", "")).strip(),
         "amazon_profile_ids_raw": (get_setting(db, "ads_amazon_profile_ids", "") or os.getenv("ADS_AMAZON_PROFILE_IDS", "")).strip(),
         "amazon_region": (get_setting(db, "ads_amazon_region", "") or os.getenv("ADS_AMAZON_REGION", "na")).strip().lower() or "na",
-        "roku_api_token": (get_setting(db, "ads_roku_api_token", "") or os.getenv("ADS_ROKU_API_TOKEN", "")).strip(),
+        "roku_developer_app_uid": (get_setting(db, "ads_roku_developer_app_uid", "") or os.getenv("ADS_ROKU_DEVELOPER_APP_UID", "")).strip(),
+        "roku_client_id": (get_setting(db, "ads_roku_client_id", "") or os.getenv("ADS_ROKU_CLIENT_ID", "")).strip(),
+        "roku_client_secret": (get_setting(db, "ads_roku_client_secret", "") or os.getenv("ADS_ROKU_CLIENT_SECRET", "")).strip(),
+        "roku_refresh_token": (get_setting(db, "ads_roku_refresh_token", "") or os.getenv("ADS_ROKU_REFRESH_TOKEN", "")).strip(),
         "roku_account_ids_raw": (get_setting(db, "ads_roku_account_ids", "") or os.getenv("ADS_ROKU_ACCOUNT_IDS", "")).strip(),
     }
     settings["google_customer_ids"] = [value for value in (_normalize_google_ads_customer_id(item) for item in _split_csv_values(settings["google_customer_ids_raw"])) if value]
     settings["google_login_customer_id"] = _normalize_google_ads_customer_id(settings.get("google_login_customer_id"))
     settings["meta_account_ids"] = [value for value in (_normalize_meta_account_id(item) for item in _split_csv_values(settings["meta_account_ids_raw"])) if value]
     settings["amazon_profile_ids"] = _split_csv_values(settings["amazon_profile_ids_raw"])
-    settings["roku_account_ids"] = _split_csv_values(settings["roku_account_ids_raw"])
+    settings["roku_account_ids"] = [value for value in (_normalize_roku_account_id(item) for item in _split_csv_values(settings["roku_account_ids_raw"])) if value]
     settings["google_ready"] = bool(
         settings["google_developer_token"]
         and settings["google_client_id"]
@@ -7661,7 +7878,13 @@ def get_ads_dashboard_settings(db):
         and settings["amazon_refresh_token"]
         and settings["amazon_profile_ids"]
     )
-    settings["roku_ready"] = bool(settings["roku_api_token"] and settings["roku_account_ids"])
+    settings["roku_ready"] = bool(
+        settings["roku_developer_app_uid"]
+        and settings["roku_client_id"]
+        and settings["roku_client_secret"]
+        and settings["roku_refresh_token"]
+        and settings["roku_account_ids"]
+    )
     return settings
 
 
@@ -7700,8 +7923,14 @@ def _ad_platform_config_state(settings, platform):
         return {"ready": not missing, "missing": missing}
     if key == "roku":
         missing = []
-        if not settings.get("roku_api_token"):
-            missing.append("API token")
+        if not settings.get("roku_developer_app_uid"):
+            missing.append("developer app UID")
+        if not settings.get("roku_client_id"):
+            missing.append("client ID")
+        if not settings.get("roku_client_secret"):
+            missing.append("client secret")
+        if not settings.get("roku_refresh_token"):
+            missing.append("refresh token")
         if not settings.get("roku_account_ids"):
             missing.append("account IDs")
         return {"ready": not missing, "missing": missing}
@@ -7905,7 +8134,87 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
 
 
 def _fetch_roku_ads_campaign_rows(settings, start_date, end_date, db=None):
-    return _pending_ads_fetch_result("roku")
+    account_ids = settings.get("roku_account_ids") or []
+    if not account_ids:
+        return {"status": "missing_config", "rows": [], "message": "No Roku ad account IDs configured."}
+    access_token = _exchange_roku_refresh_token(
+        settings.get("roku_client_id", ""),
+        settings.get("roku_client_secret", ""),
+        settings.get("roku_refresh_token", ""),
+    )
+    snapshots = _fetch_roku_campaign_snapshots(access_token)
+    rows = []
+    pending_accounts = []
+    for account_id in account_ids:
+        account_id = _normalize_roku_account_id(account_id)
+        account_snapshots = [row for row in snapshots if row.get("account_id") == account_id]
+        report_rows = []
+        pending = _get_pending_ad_report(db, "roku", account_id, start_date, end_date)
+        if pending:
+            report_meta = _roku_report_status_once(access_token, normalize_whitespace(pending.get("report_id")))
+            report_status = normalize_whitespace(report_meta.get("status")).upper()
+            download_url = normalize_whitespace(report_meta.get("download_url"))
+            if report_status in {"DONE", "COMPLETED", "SUCCESS"} and download_url:
+                _delete_pending_ad_report(db, "roku", account_id, start_date, end_date)
+                report_rows = _download_roku_report_rows(download_url)
+            elif report_status in {"ERROR", "FAILED", "FAILURE", "CANCELLED"}:
+                _delete_pending_ad_report(db, "roku", account_id, start_date, end_date)
+                raise RuntimeError(f"Roku report generation failed for account {account_id}: {report_meta}")
+            else:
+                _upsert_pending_ad_report(db, "roku", account_id, start_date, end_date, pending.get("report_id"), report_status or "Pending", report_meta)
+                pending_accounts.append(account_id)
+        else:
+            report_id = _create_roku_report(access_token, account_id, start_date, end_date)
+            _upsert_pending_ad_report(db, "roku", account_id, start_date, end_date, report_id, "Pending", {"report_id": report_id})
+            pending_accounts.append(account_id)
+        seen_campaign_ids = set()
+        for item in report_rows:
+            if not isinstance(item, dict):
+                continue
+            campaign_id = normalize_whitespace(item.get("campaign_id") or item.get("campaignId"))
+            if not campaign_id:
+                continue
+            seen_campaign_ids.add(campaign_id)
+            rows.append(
+                {
+                    "platform": "roku",
+                    "account_id": account_id,
+                    "campaign_id": campaign_id,
+                    "campaign_name": normalize_whitespace(item.get("campaign_name") or item.get("campaignName")) or campaign_id,
+                    "campaign_status": next((snap.get("campaign_status") for snap in account_snapshots if snap.get("campaign_id") == campaign_id), "Unknown"),
+                    "campaign_site": _ad_campaign_site("roku", account_id),
+                    "metric_date": normalize_whitespace(item.get("date")),
+                    "spend": _normalize_metric_float(item.get("spend")),
+                    "impressions": _normalize_metric_int(item.get("impressions")),
+                    "clicks": 0,
+                    "reach": _normalize_metric_int(item.get("household_reach")),
+                    "conversions": _normalize_metric_float(item.get("total_unique_actions") or item.get("actions")),
+                    "raw": item,
+                }
+            )
+        for snapshot in account_snapshots:
+            if snapshot.get("campaign_id") in seen_campaign_ids:
+                continue
+            rows.append(dict(snapshot))
+    if pending_accounts and not rows:
+        return {
+            "status": "pending",
+            "rows": [],
+            "message": "Roku report is still processing for account(s): "
+            + ", ".join(pending_accounts)
+            + ". Try Refresh again in about a minute.",
+        }
+    if pending_accounts:
+        return {
+            "status": "ok",
+            "rows": rows,
+            "message": "Roku data refreshed for ready accounts. Still processing: " + ", ".join(pending_accounts),
+        }
+    return {
+        "status": "ok",
+        "rows": rows,
+        "message": f"Fetched {len(rows)} Roku campaign rows across {len(account_ids)} account(s).",
+    }
 
 
 def _ad_campaign_site(platform, account_id=""):
@@ -26078,7 +26387,10 @@ def settings_page():
                 "ads_amazon_refresh_token": request.form.get("ads_amazon_refresh_token", ""),
                 "ads_amazon_profile_ids": request.form.get("ads_amazon_profile_ids", ""),
                 "ads_amazon_region": request.form.get("ads_amazon_region", "na"),
-                "ads_roku_api_token": request.form.get("ads_roku_api_token", ""),
+                "ads_roku_developer_app_uid": request.form.get("ads_roku_developer_app_uid", ""),
+                "ads_roku_client_id": request.form.get("ads_roku_client_id", ""),
+                "ads_roku_client_secret": request.form.get("ads_roku_client_secret", ""),
+                "ads_roku_refresh_token": request.form.get("ads_roku_refresh_token", ""),
                 "ads_roku_account_ids": request.form.get("ads_roku_account_ids", ""),
             }
             for key, value in fields.items():
@@ -26868,19 +27180,113 @@ def amazon_oauth_start():
 
 @app.route("/oauth/roku/callback", methods=["GET"])
 def roku_oauth_callback():
+    ensure_db()
+    db = get_db()
+    settings = get_ads_dashboard_settings(db)
+    callback_url = request.base_url
+    error_value = normalize_whitespace(request.args.get("error"))
+    error_description = normalize_whitespace(request.args.get("error_description"))
+    code = normalize_whitespace(request.args.get("code"))
+    state = normalize_whitespace(request.args.get("state"))
     result = {
-        "callback_url": request.base_url,
-        "state": normalize_whitespace(request.args.get("state")),
-        "code": normalize_whitespace(request.args.get("code")),
-        "error": normalize_whitespace(request.args.get("error")),
-        "error_description": normalize_whitespace(request.args.get("error_description")),
+        "ok": False,
+        "notice": "",
+        "error": "",
+        "callback_url": callback_url,
+        "state": state,
+        "code": code,
+        "refresh_token": "",
+        "access_token_preview": "",
+        "expires_in": "",
+        "accounts": [],
+        "saved_to_settings": False,
         "params": [],
     }
     for key in sorted(request.args.keys()):
         if key in {"code", "state", "error", "error_description"}:
             continue
         result["params"].append({"key": key, "value": normalize_whitespace(request.args.get(key))})
+    if error_value:
+        result["error"] = error_description or error_value
+        return render_template("roku_oauth_callback.html", result=result)
+    if not code:
+        result["notice"] = "Roku callback is ready. Register this exact URL as the redirect URI, then start the OAuth flow from Roku."
+        return render_template("roku_oauth_callback.html", result=result)
+    client_id = settings.get("roku_client_id", "")
+    client_secret = settings.get("roku_client_secret", "")
+    if not client_id or not client_secret:
+        result["error"] = "Roku client ID and client secret must be saved in Ad Platforms before exchanging the authorization code."
+        return render_template("roku_oauth_callback.html", result=result)
+    try:
+        token_payload = _exchange_roku_authorization_code(client_id, client_secret, code, callback_url)
+        refresh_token = normalize_whitespace(token_payload.get("refresh_token"))
+        access_token = normalize_whitespace(token_payload.get("access_token"))
+        expires_in = token_payload.get("expires_in")
+        accounts = []
+        account_error = ""
+        if access_token:
+            try:
+                accounts = _fetch_roku_accounts(access_token)
+            except Exception as exc:
+                account_error = str(exc)
+        if refresh_token and session.get("auth_ok"):
+            set_setting(db, "ads_roku_refresh_token", refresh_token)
+            if accounts:
+                set_setting(
+                    db,
+                    "ads_roku_account_ids",
+                    ", ".join(
+                        account_id
+                        for account_id in (
+                            _normalize_roku_account_id((account.get("uid") if isinstance(account, dict) else ""))
+                            for account in accounts
+                        )
+                        if account_id
+                    ),
+                )
+            db.commit()
+            result["saved_to_settings"] = True
+        result["ok"] = bool(refresh_token)
+        result["refresh_token"] = refresh_token
+        result["access_token_preview"] = f"{access_token[:18]}..." if access_token else ""
+        result["expires_in"] = str(expires_in or "")
+        result["accounts"] = accounts if isinstance(accounts, list) else []
+        if account_error:
+            result["notice"] = f"Roku authorization succeeded, but account lookup did not complete: {account_error}"
+        elif refresh_token and result["accounts"]:
+            result["notice"] = "Roku authorization succeeded. Use the account IDs below in Ad Platforms."
+        elif refresh_token:
+            result["notice"] = "Roku authorization succeeded."
+    except Exception as exc:
+        result["error"] = str(exc)
+        log_app_error(
+            db,
+            source="roku_oauth_callback",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/oauth/roku/callback",
+            status_code=500,
+        )
+        db.commit()
     return render_template("roku_oauth_callback.html", result=result)
+
+
+@app.route("/oauth/roku/start", methods=["GET"])
+def roku_oauth_start():
+    ensure_db()
+    db = get_db()
+    settings = get_ads_dashboard_settings(db)
+    developer_app_uid = settings.get("roku_developer_app_uid", "")
+    client_id = settings.get("roku_client_id", "")
+    client_secret = settings.get("roku_client_secret", "")
+    if not developer_app_uid or not client_id or not client_secret:
+        return redirect(url_for("settings_page", tab="ads", notice="Save Roku developer app UID, client ID, and client secret first."))
+    authorize_url = _build_roku_authorize_url(
+        developer_app_uid=developer_app_uid,
+        client_id=client_id,
+        redirect_uri=url_for("roku_oauth_callback", _external=True),
+    )
+    return redirect(authorize_url)
 
 
 @app.route("/property/<int:property_id>/upload-contacts", methods=["POST"])

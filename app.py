@@ -7441,6 +7441,61 @@ def _fetch_amazon_ads_profiles(client_id, access_token, region):
     return payload if isinstance(payload, list) else []
 
 
+def _amazon_account_ids_from_profile(profile):
+    if not isinstance(profile, dict):
+        return []
+    values = []
+
+    def collect(obj):
+        if isinstance(obj, dict):
+            for value in obj.values():
+                collect(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                collect(value)
+        elif isinstance(obj, str):
+            text = normalize_whitespace(obj)
+            if text:
+                values.append(text)
+
+    collect(profile)
+    explicit_ids = []
+    for text in values:
+        if re.match(r"^amzn1\.ads-account\.", text, re.IGNORECASE):
+            explicit_ids.append(text)
+    if explicit_ids:
+        return list(dict.fromkeys(explicit_ids))
+
+    account_info = profile.get("accountInfo") if isinstance(profile.get("accountInfo"), dict) else {}
+    fallback_values = [
+        profile.get("accountId"),
+        profile.get("advertiserId"),
+        profile.get("sellerId"),
+        profile.get("vendorCode"),
+        account_info.get("accountId"),
+        account_info.get("id"),
+        account_info.get("advertiserId"),
+        account_info.get("sellerId"),
+        account_info.get("vendorCode"),
+    ]
+    normalized = [normalize_whitespace(value) for value in fallback_values if normalize_whitespace(value)]
+    return list(dict.fromkeys(normalized))
+
+
+def _amazon_account_ids_from_profiles(profiles):
+    ids = []
+    for profile in profiles if isinstance(profiles, list) else []:
+        ids.extend(_amazon_account_ids_from_profile(profile))
+    return list(dict.fromkeys(ids))
+
+
+def _amazon_profile_matches_account(profile, account_id):
+    target = normalize_whitespace(account_id).lower()
+    if not target:
+        return False
+    return any(value.lower() == target for value in _amazon_account_ids_from_profile(profile))
+
+
 def _amazon_profile_ids_from_profiles(profiles):
     ids = []
     for profile in profiles if isinstance(profiles, list) else []:
@@ -7955,6 +8010,7 @@ def get_ads_dashboard_settings(db):
         "amazon_client_id": (get_setting(db, "ads_amazon_client_id", "") or os.getenv("ADS_AMAZON_CLIENT_ID", "")).strip(),
         "amazon_client_secret": (get_setting(db, "ads_amazon_client_secret", "") or os.getenv("ADS_AMAZON_CLIENT_SECRET", "")).strip(),
         "amazon_refresh_token": (get_setting(db, "ads_amazon_refresh_token", "") or os.getenv("ADS_AMAZON_REFRESH_TOKEN", "")).strip(),
+        "amazon_account_id": (get_setting(db, "ads_amazon_account_id", "") or os.getenv("ADS_AMAZON_ACCOUNT_ID", "")).strip(),
         "amazon_profile_ids_raw": (get_setting(db, "ads_amazon_profile_ids", "") or os.getenv("ADS_AMAZON_PROFILE_IDS", "")).strip(),
         "amazon_region": (get_setting(db, "ads_amazon_region", "") or os.getenv("ADS_AMAZON_REGION", "na")).strip().lower() or "na",
         "roku_developer_app_uid": (get_setting(db, "ads_roku_developer_app_uid", "") or os.getenv("ADS_ROKU_DEVELOPER_APP_UID", "")).strip(),
@@ -7966,6 +8022,7 @@ def get_ads_dashboard_settings(db):
     settings["google_customer_ids"] = [value for value in (_normalize_google_ads_customer_id(item) for item in _split_csv_values(settings["google_customer_ids_raw"])) if value]
     settings["google_login_customer_id"] = _normalize_google_ads_customer_id(settings.get("google_login_customer_id"))
     settings["meta_account_ids"] = [value for value in (_normalize_meta_account_id(item) for item in _split_csv_values(settings["meta_account_ids_raw"])) if value]
+    settings["amazon_account_id"] = normalize_whitespace(settings.get("amazon_account_id"))
     settings["amazon_profile_ids"] = _split_csv_values(settings["amazon_profile_ids_raw"])
     settings["roku_account_ids"] = [value for value in (_normalize_roku_account_id(item) for item in _split_csv_values(settings["roku_account_ids_raw"])) if value]
     settings["google_ready"] = bool(
@@ -7980,7 +8037,7 @@ def get_ads_dashboard_settings(db):
         settings["amazon_client_id"]
         and settings["amazon_client_secret"]
         and settings["amazon_refresh_token"]
-        and settings["amazon_profile_ids"]
+        and (settings["amazon_account_id"] or settings["amazon_profile_ids"])
     )
     settings["roku_ready"] = bool(
         settings["roku_developer_app_uid"]
@@ -8022,8 +8079,8 @@ def _ad_platform_config_state(settings, platform):
             missing.append("client secret")
         if not settings.get("amazon_refresh_token"):
             missing.append("refresh token")
-        if not settings.get("amazon_profile_ids"):
-            missing.append("profile IDs")
+        if not settings.get("amazon_account_id") and not settings.get("amazon_profile_ids"):
+            missing.append("account ID or profile IDs")
         return {"ready": not missing, "missing": missing}
     if key == "roku":
         missing = []
@@ -8160,11 +8217,12 @@ def _fetch_meta_ads_campaign_rows(settings, start_date, end_date, db=None):
 
 
 def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
+    account_id = normalize_whitespace(settings.get("amazon_account_id"))
     profile_ids = settings.get("amazon_profile_ids")
     if not isinstance(profile_ids, list):
         profile_ids = _split_csv_values(settings.get("amazon_profile_ids_raw"))
-    if not profile_ids:
-        return {"status": "missing_config", "rows": [], "message": "No Amazon profile IDs configured."}
+    if not account_id and not profile_ids:
+        return {"status": "missing_config", "rows": [], "message": "No Amazon account ID or profile IDs configured."}
     access_token = _exchange_amazon_refresh_token(
         settings.get("amazon_client_id", ""),
         settings.get("amazon_client_secret", ""),
@@ -8175,13 +8233,28 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
         access_token,
         settings.get("amazon_region") or "na",
     )
-    accessible_profile_ids = set(_amazon_profile_ids_from_profiles(accessible_profiles))
-    matched_profile_ids = [profile_id for profile_id in profile_ids if profile_id in accessible_profile_ids] if accessible_profile_ids else list(profile_ids)
-    skipped_profile_ids = [profile_id for profile_id in profile_ids if accessible_profile_ids and profile_id not in accessible_profile_ids]
-    if accessible_profile_ids and not matched_profile_ids:
+    if account_id:
+        filtered_profiles = [profile for profile in accessible_profiles if _amazon_profile_matches_account(profile, account_id)]
+        matched_profile_ids = _amazon_profile_ids_from_profiles(filtered_profiles)
+        if not matched_profile_ids:
+            available_accounts = _amazon_account_ids_from_profiles(accessible_profiles)
+            raise RuntimeError(
+                "Configured Amazon account ID is not accessible with the current token. "
+                f"Configured: {account_id}. "
+                + (
+                    "Accessible accounts: " + ", ".join(available_accounts) + "."
+                    if available_accounts
+                    else "No accessible Amazon accounts were returned for this token."
+                )
+            )
+        skipped_profile_ids = []
+    else:
+        accessible_profile_ids = set(_amazon_profile_ids_from_profiles(accessible_profiles))
+        matched_profile_ids = [profile_id for profile_id in profile_ids if profile_id in accessible_profile_ids] if accessible_profile_ids else list(profile_ids)
+        skipped_profile_ids = [profile_id for profile_id in profile_ids if accessible_profile_ids and profile_id not in accessible_profile_ids]
+    if accessible_profiles and not matched_profile_ids:
         raise RuntimeError(
-            "Configured Amazon profile IDs are not accessible with the current token. "
-            f"Configured: {', '.join(profile_ids)}. Accessible: {', '.join(sorted(accessible_profile_ids))}."
+            "Configured Amazon profile scopes are not accessible with the current token."
         )
     rows = []
     pending_profiles = []
@@ -8250,6 +8323,8 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
             "message": message,
         }
     message = f"Fetched {len(rows)} Amazon campaign-day rows across {len(matched_profile_ids)} profile(s)."
+    if account_id:
+        message += f" Target account: {account_id}."
     if skipped_profile_ids:
         message += " Skipped inaccessible profile IDs: " + ", ".join(skipped_profile_ids) + "."
     return {
@@ -26584,6 +26659,7 @@ def settings_page():
                 "ads_amazon_client_id": request.form.get("ads_amazon_client_id", ""),
                 "ads_amazon_client_secret": request.form.get("ads_amazon_client_secret", ""),
                 "ads_amazon_refresh_token": request.form.get("ads_amazon_refresh_token", ""),
+                "ads_amazon_account_id": request.form.get("ads_amazon_account_id", ""),
                 "ads_amazon_profile_ids": request.form.get("ads_amazon_profile_ids", ""),
                 "ads_amazon_region": request.form.get("ads_amazon_region", "na"),
                 "ads_roku_developer_app_uid": request.form.get("ads_roku_developer_app_uid", ""),
@@ -27437,6 +27513,9 @@ def amazon_oauth_callback():
         if refresh_token and session.get("auth_ok"):
             set_setting(db, "ads_amazon_refresh_token", refresh_token)
             profile_ids = _amazon_profile_ids_from_profiles(profiles)
+            account_ids = _amazon_account_ids_from_profiles(profiles)
+            if len(account_ids) == 1:
+                set_setting(db, "ads_amazon_account_id", account_ids[0])
             if profile_ids:
                 set_setting(db, "ads_amazon_profile_ids", ", ".join(profile_ids))
             db.commit()
@@ -27524,6 +27603,8 @@ def amazon_oauth_test():
             settings.get("amazon_region") or "na",
         )
         profile_ids = _amazon_profile_ids_from_profiles(profiles)
+        account_ids = _amazon_account_ids_from_profiles(profiles)
+        configured_account_id = normalize_whitespace(settings.get("amazon_account_id"))
         configured_profile_ids = list(dict.fromkeys(settings.get("amazon_profile_ids") or []))
         matched_profile_ids = sorted(set(configured_profile_ids).intersection(profile_ids)) if configured_profile_ids else profile_ids
         notice_parts = [
@@ -27531,14 +27612,24 @@ def amazon_oauth_test():
             "Refreshed access token successfully.",
             f"Detected {len(profile_ids)} Amazon profile(s).",
         ]
+        if configured_account_id:
+            matched_account = configured_account_id in account_ids
+            notice_parts.append(f"Configured account match: {'yes' if matched_account else 'no'}.")
+            if not matched_account and account_ids:
+                notice_parts.append("Accessible account IDs: " + ", ".join(account_ids) + ".")
         if configured_profile_ids:
             notice_parts.append(f"Configured profile matches: {len(matched_profile_ids)}/{len(configured_profile_ids)}.")
             if matched_profile_ids:
                 notice_parts.append("Matched IDs: " + ", ".join(matched_profile_ids) + ".")
         elif profile_ids:
             set_setting(db, "ads_amazon_profile_ids", ", ".join(profile_ids))
+            if len(account_ids) == 1:
+                set_setting(db, "ads_amazon_account_id", account_ids[0])
             db.commit()
-            notice_parts.append("Saved detected Amazon profile IDs into Ad Platforms.")
+            if len(account_ids) == 1:
+                notice_parts.append("Saved detected Amazon account ID and profile IDs into Ad Platforms.")
+            else:
+                notice_parts.append("Saved detected Amazon profile IDs into Ad Platforms.")
         return redirect(url_for("settings_page", tab="ads", notice=" ".join(notice_parts)))
     except Exception as exc:
         db.rollback()

@@ -449,7 +449,9 @@
                                 <strong>Reisift</strong>
                                 <span>
                                     {% if row.open_record_url %}
-                                    <a href="{{ row.open_record_url }}" target="_blank">Open in Sift</a>
+                                    <a class="action-icon-link" href="{{ row.open_record_url }}" target="_blank" title="Open in REISift" aria-label="Open in REISift">
+                                        <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+                                    </a>
                                     {% else %}
                                     -
                                     {% endif %}
@@ -567,13 +569,18 @@
                     <td>
                         <strong>{{ row.label or ('Lead ' ~ loop.index) }}</strong><br>
                         {% if row.property_id %}
-                        <a href="{{ url_for('property_detail', property_id=row.property_id) }}">DeepSift Property {{ row.property_id }}</a><br>
+                        DeepSift Property {{ row.property_id }}
+                        <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.property_id) }}" title="Open in Deep Dive" aria-label="Open in Deep Dive">
+                            <img class="tiny-link-icon" src="{{ url_for('favicon') }}" alt="Deep Dive">
+                        </a><br>
                         {% endif %}
                         {% if row.reisift_property_uuid %}
                         ReiSIFT UUID: {{ row.reisift_property_uuid }}<br>
                         {% endif %}
                         {% if row.open_record_url %}
-                        <a href="{{ row.open_record_url }}" target="_blank">Open in Sift</a><br>
+                        <a class="action-icon-link" href="{{ row.open_record_url }}" target="_blank" title="Open in REISift" aria-label="Open in REISift">
+                            <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+                        </a><br>
                         {% endif %}
                         {% if row.phones %}
                         Phone(s): {{ row.phones|join(', ') }}
@@ -588,7 +595,9 @@
                     <td>
                         {% if row.referral and row.referral.property_uuid %}
                         Referral {{ row.referral.referral_status or '-' }}, Listing {{ row.referral.status or '-' }}.<br>
-                        <a href="https://app.reisift.io/records/properties/{{ row.referral.property_uuid }}/details?page=1" target="_blank">Open in Sift</a>
+                        <a class="action-icon-link" href="https://app.reisift.io/records/properties/{{ row.referral.property_uuid }}/details?page=1" target="_blank" title="Open in REISift" aria-label="Open in REISift">
+                            <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+                        </a>
                         {% else %}
                         -
                         {% endif %}

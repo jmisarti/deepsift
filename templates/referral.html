@@ -4,22 +4,18 @@
     <article>
         <h3>Leads</h3>
         <p>{{ referral_summary.lead_count }}</p>
-        <small>Total referral leads in the current view.</small>
     </article>
     <article>
         <h3>Untouched</h3>
         <p>{{ referral_summary.untouched_count }}</p>
-        <small>Still sitting in the default referral status.</small>
     </article>
     <article>
         <h3>Referred</h3>
         <p>{{ referral_summary.referred_count }}</p>
-        <small>Sent or progressed past the untouched stage.</small>
     </article>
     <article>
         <h3>On Market</h3>
         <p>{{ referral_summary.on_market_count }}</p>
-        <small>Currently marked as listed or active.</small>
     </article>
 </section>
 
@@ -95,8 +91,8 @@
                         {% endif %}
                     </td>
                     <td>
-                        <a href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener">
-                            Open in Sift
+                        <a class="action-icon-link" href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener" title="Open in REISift" aria-label="Open in REISift">
+                            <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
                         </a>
                     </td>
                 </tr>

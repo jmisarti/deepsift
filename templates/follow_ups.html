@@ -2,24 +2,20 @@
 {% block content %}
 <section class="cards page-summary-cards">
     <article>
-        <h3>Leads</h3>
-        <p>{{ followup_summary.lead_count }}</p>
-        <small>Total new-lead rows in the current view.</small>
-    </article>
-    <article>
         <h3>Outbound Calls</h3>
         <p>{{ followup_summary.outbound_calls }}</p>
-        <small>All call attempts across these leads.</small>
     </article>
     <article>
-        <h3>Outbound Messages</h3>
-        <p>{{ followup_summary.outbound_messages }}</p>
-        <small>SMS {{ followup_summary.outbound_sms }} and email {{ followup_summary.outbound_email }} combined.</small>
+        <h3>Outbound SMS</h3>
+        <p>{{ followup_summary.outbound_sms }}</p>
+    </article>
+    <article>
+        <h3>Outbound Email</h3>
+        <p>{{ followup_summary.outbound_email }}</p>
     </article>
     <article>
         <h3>Inbound Responses</h3>
         <p>{{ followup_summary.inbound_responses }}</p>
-        <small>Any reply or response logged for this view.</small>
     </article>
 </section>
 
@@ -93,7 +89,11 @@
                     <td>{{ row.outbound_email or 0 }}</td>
                     <td>{{ row.inbound_responses or 0 }}</td>
                     <td>{{ row.property_lists or "-" }}</td>
-                    <td><a href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener">Open</a></td>
+                    <td>
+                        <a class="action-icon-link" href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener" title="Open in REISift" aria-label="Open in REISift">
+                            <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+                        </a>
+                    </td>
                 </tr>
                 <tr id="followup-detail-{{ row.property_uuid }}" class="followup-detail-row hidden">
                     <td colspan="10">
@@ -103,7 +103,9 @@
                         <div class="inline-actions" style="justify-content:space-between; margin: 0.35rem 0 0.6rem;">
                             <p style="margin:0;"><strong>Synced:</strong> {{ row.last_synced_at|fmt_est_datetime }}</p>
                             {% if row.deep_dive_property_id %}
-                            <a href="{{ url_for('property_detail', property_id=row.deep_dive_property_id) }}">Open In Deep Dive</a>
+                            <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.deep_dive_property_id) }}" title="Open in Deep Dive" aria-label="Open in Deep Dive">
+                                <img class="tiny-link-icon" src="{{ url_for('favicon') }}" alt="Deep Dive">
+                            </a>
                             {% else %}
                             <form method="post" action="{{ url_for('follow_up_add_to_deep_dive', property_uuid=row.property_uuid) }}" onsubmit="return confirm('Add this lead into Deep Dive?');">
                                 <input type="hidden" name="days" value="{{ lookback_days }}">

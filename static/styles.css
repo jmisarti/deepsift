@@ -452,19 +452,28 @@ body {
 
 .cards h3, .cards p { margin: 0; }
 .cards p { margin-top: 0.4rem; font-size: 1.5rem; font-weight: 700; color: var(--accent); }
-.cards small {
-    color: var(--muted);
-    display: block;
-    font-size: 0.78rem;
-    margin-top: 0.35rem;
-}
-
 .panel { margin-top: 1rem; }
 .panel h2, .panel h3, .panel h4 { margin-top: 0; }
 
 .table-wrap {
     overflow-x: auto;
     width: 100%;
+}
+
+.action-icon-link {
+    align-items: center;
+    display: inline-flex;
+    justify-content: center;
+    line-height: 1;
+    text-decoration: none;
+    vertical-align: middle;
+}
+
+.tiny-link-icon {
+    border-radius: 4px;
+    display: block;
+    height: 14px;
+    width: 14px;
 }
 
 .home-hero {

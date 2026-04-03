@@ -8493,6 +8493,7 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
         )
     rows = []
     pending_profile_ids = []
+    empty_metric_profile_ids = []
     for profile_id in matched_profile_ids:
         snapshots = _fetch_amazon_campaign_snapshots(settings, access_token, profile_id)
         rows.extend(snapshots)
@@ -8519,6 +8520,8 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
             if report_status in {"COMPLETED", "SUCCESS", "DONE"} and download_url:
                 _delete_pending_ad_report(db, "amazon", profile_id, start_date, end_date)
                 report_rows = _download_amazon_report_rows(download_url)
+                if not report_rows:
+                    empty_metric_profile_ids.append(profile_id)
             elif report_status in {"FAILURE", "FAILED", "ERROR", "CANCELLED"}:
                 _delete_pending_ad_report(db, "amazon", profile_id, start_date, end_date)
                 raise RuntimeError(f"Amazon Sponsored TV report failed for profile {profile_id}: {report_meta}")
@@ -8562,6 +8565,12 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
             + ", ".join(pending_profile_ids)
             + ". Refresh again in about a minute.",
         }
+    if empty_metric_profile_ids:
+        message += (
+            " Sponsored TV report completed but returned no dated metric rows for profile(s): "
+            + ", ".join(empty_metric_profile_ids)
+            + ". Campaign metadata is connected, but the current Sponsored TV report contract still needs adjustment."
+        )
     if pending_profile_ids:
         message += " Sponsored TV performance metrics are still processing for profile(s): " + ", ".join(pending_profile_ids) + "."
     elif not rows:

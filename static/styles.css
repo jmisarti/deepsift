@@ -1036,13 +1036,13 @@ button:hover { filter: brightness(1.05); }
 }
 
 .ads-table {
-    table-layout: auto;
+    table-layout: fixed;
     width: 100%;
 }
 
 .ads-table th,
 .ads-table td {
-    font-size: 0.76rem;
+    font-size: 0.72rem;
     line-height: 1.15;
     vertical-align: middle;
     white-space: nowrap;
@@ -1051,6 +1051,57 @@ button:hover { filter: brightness(1.05); }
 .ads-table td {
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+.ads-col-status {
+    width: 8%;
+}
+
+.ads-col-platform {
+    width: 7%;
+}
+
+.ads-col-name {
+    width: 17%;
+}
+
+.ads-col-goal {
+    width: 12%;
+}
+
+.ads-col-money {
+    width: 8%;
+}
+
+.ads-col-metric {
+    width: 8%;
+}
+
+.ads-cell-name,
+.ads-cell-goal {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ads-cell-name {
+    font-weight: 500;
+}
+
+.ads-cell-status,
+.ads-cell-platform,
+.ads-cell-money,
+.ads-cell-metric {
+    text-align: center;
+}
+
+.ads-status-live {
+    background: #dcfce7;
+    color: #166534;
+    font-weight: 700;
+}
+
+.ads-row-live td {
+    background-image: linear-gradient(to right, rgba(220, 252, 231, 0.45), rgba(220, 252, 231, 0));
 }
 
 .ads-filter-row th {

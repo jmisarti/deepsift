@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Ads Dashboard</h2>
+    <p>Cached campaign metrics across ad platforms. Refresh pulls into the local cache, and the table reads locally from there.</p>
+    {% if notice %}
+    <div class="notice-banner">{{ notice }}</div>
+    {% endif %}
+    <div class="inline-actions ads-toolbar">
+        <div class="ads-toolbar-summary">
+            <strong>{{ campaigns|length }}</strong> campaign{% if campaigns|length != 1 %}s{% endif %} |
+            Live: <strong>{{ totals.live_count }}</strong> |
+            Spend: <strong>${{ '%.2f'|format(totals.spend or 0) }}</strong> |
+            {{ start_date }} to {{ end_date }}
+            {% if latest_refresh and latest_refresh.started_at %}
+            <span class="muted-text">| Last refresh: {{ latest_refresh.started_at|fmt_est_datetime }}{% if latest_refresh.status %} ({{ latest_refresh.status }}){% endif %}</span>
+            {% endif %}
+        </div>
+        <form id="adsRefreshForm" class="inline-form">
+            <input type="hidden" name="lookback_days" value="{{ days }}">
+            <button type="submit" id="adsRefreshButton">Refresh</button>
+            <span id="adsRefreshBusy" class="busy-inline hidden"><span class="busy-spinner"></span><span>Refreshing ad cache…</span></span>
+        </form>
+    </div>
+    <p id="adsRefreshStatus" class="muted-text ads-refresh-status"></p>
+    <p class="muted-text">Configured platforms: Google {% if ad_settings.google_ready %}ready{% else %}pending{% endif %}, Meta {% if ad_settings.meta_ready %}ready{% else %}pending{% endif %}, Amazon {% if ad_settings.amazon_ready %}ready{% else %}pending{% endif %}, Roku {% if ad_settings.roku_ready %}ready{% else %}pending{% endif %}.</p>
+    {% if latest_refresh.summary and latest_refresh.summary.platforms %}
+    <details class="collapsed-section" style="margin-top:0.75rem;">
+        <summary>Last refresh summary</summary>
+        <ul class="simple-list">
+            {% for item in latest_refresh.summary.platforms %}
+            <li>{{ item.label }}: {{ item.status }}{% if item.message %} - {{ item.message }}{% endif %}</li>
+            {% endfor %}
+        </ul>
+    </details>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <div class="table-wrap ads-table-wrap">
+        <form id="adsFilterForm" method="get"></form>
+        <table class="compact-table ads-table">
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>Platform</th>
+                    <th>Campaign Name</th>
+                    <th>Spend</th>
+                    <th>Impressions</th>
+                    <th>Clicks</th>
+                    <th>Reach</th>
+                    <th>Conversions</th>
+                    <th>Updated</th>
+                </tr>
+                <tr class="ads-filter-row">
+                    <th>
+                        <select name="status" form="adsFilterForm">
+                            <option value="">All</option>
+                            {% for option in status_options %}
+                            <option value="{{ option }}" {% if status == option %}selected{% endif %}>{{ option }}</option>
+                            {% endfor %}
+                        </select>
+                    </th>
+                    <th>
+                        <select name="platform" form="adsFilterForm">
+                            <option value="">All</option>
+                            {% for item in platform_options %}
+                            <option value="{{ item.value }}" {% if platform == item.value %}selected{% endif %}>{{ item.label }}</option>
+                            {% endfor %}
+                        </select>
+                    </th>
+                    <th>
+                        <input name="q" form="adsFilterForm" value="{{ q }}" placeholder="campaign or account">
+                    </th>
+                    <th>
+                        <select name="sort" form="adsFilterForm">
+                            <option value="spend" {% if sort == 'spend' %}selected{% endif %}>Sort</option>
+                            <option value="status" {% if sort == 'status' %}selected{% endif %}>Status</option>
+                            <option value="platform" {% if sort == 'platform' %}selected{% endif %}>Platform</option>
+                            <option value="name" {% if sort == 'name' %}selected{% endif %}>Name</option>
+                            <option value="impressions" {% if sort == 'impressions' %}selected{% endif %}>Impr.</option>
+                            <option value="clicks" {% if sort == 'clicks' %}selected{% endif %}>Clicks</option>
+                            <option value="reach" {% if sort == 'reach' %}selected{% endif %}>Reach</option>
+                            <option value="conversions" {% if sort == 'conversions' %}selected{% endif %}>Conv.</option>
+                            <option value="updated" {% if sort == 'updated' %}selected{% endif %}>Updated</option>
+                        </select>
+                    </th>
+                    <th colspan="2">
+                        <div class="ads-filter-inline">
+                            <select name="direction" form="adsFilterForm">
+                                <option value="desc" {% if direction == 'desc' %}selected{% endif %}>High-Low</option>
+                                <option value="asc" {% if direction == 'asc' %}selected{% endif %}>Low-High</option>
+                            </select>
+                            <select name="days" form="adsFilterForm">
+                                {% for option in [7, 14, 30, 60, 90] %}
+                                <option value="{{ option }}" {% if days == option %}selected{% endif %}>{{ option }}d</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </th>
+                    <th colspan="3">
+                        <div class="ads-filter-actions">
+                            <button type="submit" form="adsFilterForm">Apply</button>
+                            <a href="{{ url_for('ads_dashboard') }}">Clear</a>
+                        </div>
+                    </th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in campaigns %}
+                <tr>
+                    <td>{{ row.campaign_status or 'Unknown' }}</td>
+                    <td>{{ row.platform|title }}</td>
+                    <td title="{{ row.campaign_site }}">{{ row.campaign_name }}</td>
+                    <td>${{ '%.2f'|format(row.spend or 0) }}</td>
+                    <td>{{ row.impressions or 0 }}</td>
+                    <td>{{ row.clicks or 0 }}</td>
+                    <td>{{ row.reach or 0 }}</td>
+                    <td>{{ '%.2f'|format(row.conversions or 0) }}</td>
+                    <td>{{ row.last_refreshed_at|fmt_est_datetime if row.last_refreshed_at else '-' }}</td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="9">No ad campaigns cached yet. Save platform credentials in Settings, then run Refresh.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    const form = document.getElementById('adsRefreshForm');
+    const button = document.getElementById('adsRefreshButton');
+    const busy = document.getElementById('adsRefreshBusy');
+    const status = document.getElementById('adsRefreshStatus');
+    if (!form || !button || !busy || !status) return;
+    form.addEventListener('submit', async function (event) {
+        event.preventDefault();
+        button.disabled = true;
+        busy.classList.remove('hidden');
+        status.textContent = 'Refreshing ad cache...';
+        try {
+            const response = await fetch('/ads/refresh', {
+                method: 'POST',
+                headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                body: new FormData(form)
+            });
+            const data = await response.json();
+            if (!response.ok || !data.ok) {
+                throw new Error((data && data.error) ? data.error : 'Refresh failed.');
+            }
+            status.textContent = data.message || 'Ad cache refreshed.';
+            window.setTimeout(function () { window.location.reload(); }, 900);
+        } catch (error) {
+            status.textContent = error.message || 'Refresh failed.';
+        } finally {
+            button.disabled = false;
+            busy.classList.add('hidden');
+        }
+    });
+});
+</script>
+{% endblock %}

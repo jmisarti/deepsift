@@ -14,6 +14,7 @@
         <a class="settings-tab {% if active_tab == 'deep_dive' %}active{% endif %}" href="{{ url_for('settings_page', tab='deep_dive') }}">Deep Dive Settings</a>
         <a class="settings-tab {% if active_tab == 'referral' %}active{% endif %}" href="{{ url_for('settings_page', tab='referral') }}">Referral Settings</a>
         <a class="settings-tab {% if active_tab == 'email' %}active{% endif %}" href="{{ url_for('settings_page', tab='email') }}">Email Settings</a>
+        <a class="settings-tab {% if active_tab == 'ads' %}active{% endif %}" href="{{ url_for('settings_page', tab='ads') }}">Ad Platforms</a>
         <a class="settings-tab {% if active_tab == 'integrations' %}active{% endif %}" href="{{ url_for('settings_page', tab='integrations') }}">Integration Settings</a>
         <a class="settings-tab {% if active_tab == 'automations' %}active{% endif %}" href="{{ url_for('settings_page', tab='automations') }}">Automations</a>
         <a class="settings-tab {% if active_tab == 'helpers' %}active{% endif %}" href="{{ url_for('settings_page', tab='helpers') }}">Helpers</a>
@@ -97,6 +98,65 @@
         </form>
         <p><strong>Gmail webhook endpoint:</strong> <code>POST /webhooks/gmail/pubsub?token=&lt;your_token&gt;</code></p>
         <p class="muted-text">You can also authenticate this endpoint using your Integration API key: <code>X-Integration-Key</code> header or <code>?integration_key=...</code>.</p>
+    {% elif active_tab == 'ads' %}
+        <p>Store API credentials and account IDs for the ads dashboard refresh job. Account/profile IDs can be comma-separated.</p>
+        <form method="post" class="grid-form">
+            <input type="hidden" name="settings_tab" value="ads">
+            <label class="span2">Google Ads Developer Token
+                <input name="ads_google_developer_token" value="{{ ad_platform_settings.google_developer_token }}">
+            </label>
+            <label>Google OAuth Client ID
+                <input name="ads_google_client_id" value="{{ ad_platform_settings.google_client_id }}">
+            </label>
+            <label>Google OAuth Client Secret
+                <input name="ads_google_client_secret" value="{{ ad_platform_settings.google_client_secret }}">
+            </label>
+            <label class="span2">Google OAuth Refresh Token
+                <input name="ads_google_refresh_token" value="{{ ad_platform_settings.google_refresh_token }}">
+            </label>
+            <label class="span2">Google Customer IDs
+                <input name="ads_google_customer_ids" value="{{ ad_platform_settings.google_customer_ids_raw }}" placeholder="1234567890, 9988776655">
+            </label>
+            <label>Google Login Customer ID (optional)
+                <input name="ads_google_login_customer_id" value="{{ ad_platform_settings.google_login_customer_id }}">
+            </label>
+
+            <label class="span2">Meta Access Token
+                <input name="ads_meta_access_token" value="{{ ad_platform_settings.meta_access_token }}">
+            </label>
+            <label class="span2">Meta Ad Account IDs
+                <input name="ads_meta_account_ids" value="{{ ad_platform_settings.meta_account_ids_raw }}" placeholder="1234567890, 9988776655">
+            </label>
+
+            <label>Amazon Ads Client ID
+                <input name="ads_amazon_client_id" value="{{ ad_platform_settings.amazon_client_id }}">
+            </label>
+            <label>Amazon Ads Client Secret
+                <input name="ads_amazon_client_secret" value="{{ ad_platform_settings.amazon_client_secret }}">
+            </label>
+            <label class="span2">Amazon Ads Refresh Token
+                <input name="ads_amazon_refresh_token" value="{{ ad_platform_settings.amazon_refresh_token }}">
+            </label>
+            <label class="span2">Amazon Ads Profile IDs
+                <input name="ads_amazon_profile_ids" value="{{ ad_platform_settings.amazon_profile_ids_raw }}" placeholder="123456789012345, 998877665544332">
+            </label>
+            <label>Amazon Region
+                <select name="ads_amazon_region">
+                    <option value="na" {% if ad_platform_settings.amazon_region == 'na' %}selected{% endif %}>North America</option>
+                    <option value="eu" {% if ad_platform_settings.amazon_region == 'eu' %}selected{% endif %}>Europe</option>
+                    <option value="fe" {% if ad_platform_settings.amazon_region == 'fe' %}selected{% endif %}>Far East</option>
+                </select>
+            </label>
+
+            <label class="span2">Roku Ads API Token / Key
+                <input name="ads_roku_api_token" value="{{ ad_platform_settings.roku_api_token }}">
+            </label>
+            <label class="span2">Roku Ad Account IDs
+                <input name="ads_roku_account_ids" value="{{ ad_platform_settings.roku_account_ids_raw }}" placeholder="account-1, account-2">
+            </label>
+            <button type="submit">Save Ad Platform Settings</button>
+        </form>
+        <p class="muted-text">Current ready state: Google {% if ad_platform_settings.google_ready %}ready{% else %}pending{% endif %}, Meta {% if ad_platform_settings.meta_ready %}ready{% else %}pending{% endif %}, Amazon {% if ad_platform_settings.amazon_ready %}ready{% else %}pending{% endif %}, Roku {% if ad_platform_settings.roku_ready %}ready{% else %}pending{% endif %}.</p>
     {% elif active_tab == 'integrations' %}
         <p>Configure external system ingress and Slack notifications.</p>
         <form method="post" class="grid-form">

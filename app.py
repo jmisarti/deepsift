@@ -177,6 +177,9 @@ UNTITLED_LEADS_WORKER_STARTED = False
 EMAIL_VALIDATION_QUEUE_WORKER_STARTED = False
 PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTES") or "60").strip() or "60"), 5)
 PROVIDER_ALERT_SOURCE_PREFIX = "provider_"
+ADS_DEFAULT_LOOKBACK_DAYS = max(int((os.getenv("ADS_DEFAULT_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
+ADS_REFRESH_LOOKBACK_DAYS = max(int((os.getenv("ADS_REFRESH_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
+ADS_REFRESH_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
     "running": False,
@@ -218,6 +221,12 @@ NJ_COUNTIES = [
     "Union",
     "Warren",
 ]
+AD_PLATFORM_LABELS = {
+    "google": "Google Ads",
+    "meta": "Facebook / Meta",
+    "amazon": "Amazon Ads",
+    "roku": "Roku Ads",
+}
 
 US_STATE_NAME_TO_ABBR = {
     "alabama": "AL",
@@ -872,6 +881,69 @@ def migrate_db(db):
     )
     ensure_column(db, "buyers", "buyer_categories", "buyer_categories TEXT")
     ensure_column(db, "buyers", "property_types", "property_types TEXT")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ad_campaign_current (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            account_id TEXT,
+            campaign_id TEXT NOT NULL,
+            campaign_name TEXT NOT NULL,
+            campaign_status TEXT NOT NULL DEFAULT 'Unknown',
+            campaign_site TEXT NOT NULL,
+            spend REAL NOT NULL DEFAULT 0,
+            impressions INTEGER NOT NULL DEFAULT 0,
+            clicks INTEGER NOT NULL DEFAULT 0,
+            reach INTEGER NOT NULL DEFAULT 0,
+            conversions REAL NOT NULL DEFAULT 0,
+            last_metric_date TEXT,
+            raw_json TEXT,
+            first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_refreshed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(platform, campaign_id)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ad_campaign_daily_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            account_id TEXT,
+            campaign_id TEXT NOT NULL,
+            metric_date TEXT NOT NULL,
+            campaign_name TEXT NOT NULL,
+            campaign_status TEXT NOT NULL DEFAULT 'Unknown',
+            campaign_site TEXT NOT NULL,
+            spend REAL NOT NULL DEFAULT 0,
+            impressions INTEGER NOT NULL DEFAULT 0,
+            clicks INTEGER NOT NULL DEFAULT 0,
+            reach INTEGER NOT NULL DEFAULT 0,
+            conversions REAL NOT NULL DEFAULT 0,
+            raw_json TEXT,
+            fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(platform, campaign_id, metric_date)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ad_campaign_refresh_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            triggered_by TEXT NOT NULL DEFAULT 'manual',
+            requested_by TEXT,
+            lookback_days INTEGER NOT NULL DEFAULT 30,
+            status TEXT NOT NULL DEFAULT 'Running',
+            summary_json TEXT,
+            error_message TEXT,
+            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_ad_campaign_current_platform ON ad_campaign_current(platform, campaign_status, campaign_name)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_ad_campaign_daily_date ON ad_campaign_daily_metrics(metric_date, platform, campaign_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_ad_refresh_runs_started ON ad_campaign_refresh_runs(started_at DESC, id DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_properties_is_d4d ON properties(is_d4d, id DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_buyers_name ON buyers(lower(last_name), lower(first_name), id DESC)")
     db.execute(
@@ -6844,6 +6916,614 @@ def get_anonymous_email_marketing_settings(db):
             or os.getenv("EMAILOCTOPUS_LIST_ID", "")
         ).strip(),
         "emailoctopus_contact_status": contact_status,
+    }
+
+
+def _split_csv_values(raw_value):
+    if raw_value is None:
+        return []
+    values = []
+    seen = set()
+    for part in re.split(r"[,;\n]+", str(raw_value or "")):
+        cleaned = normalize_whitespace(part)
+        if cleaned and cleaned.lower() not in seen:
+            seen.add(cleaned.lower())
+            values.append(cleaned)
+    return values
+
+
+def _normalize_ad_platform(value):
+    raw = normalize_whitespace(value).lower().replace("ads", "").replace("advertising", "").strip()
+    if raw in {"google", "google ads"}:
+        return "google"
+    if raw in {"facebook", "fb", "meta", "facebook / meta"}:
+        return "meta"
+    if raw in {"amazon", "amazon ads"}:
+        return "amazon"
+    if raw in {"roku", "roku ads"}:
+        return "roku"
+    return raw
+
+
+def _ad_platform_label(platform):
+    key = _normalize_ad_platform(platform)
+    return AD_PLATFORM_LABELS.get(key, normalize_whitespace(platform).title() or "Unknown")
+
+
+def _normalize_ad_campaign_status(value):
+    raw = normalize_whitespace(value)
+    low = raw.lower()
+    if not low:
+        return "Unknown"
+    mapping = {
+        "enabled": "Live",
+        "active": "Live",
+        "live": "Live",
+        "serving": "Live",
+        "delivery": "Live",
+        "paused": "Paused",
+        "pause": "Paused",
+        "stopped": "Stopped",
+        "removed": "Stopped",
+        "deleted": "Stopped",
+        "archived": "Stopped",
+        "in review": "In Review",
+        "review": "In Review",
+        "under review": "In Review",
+        "disapproved": "Disapproved",
+        "rejected": "Disapproved",
+        "limited": "Limited",
+        "pending": "Pending",
+        "draft": "Draft",
+    }
+    return mapping.get(low, raw.title())
+
+
+def _ad_status_is_live(value):
+    status = _normalize_ad_campaign_status(value).lower()
+    return status in {"live", "active", "enabled", "serving"}
+
+
+def _normalize_metric_float(value):
+    if value in (None, ""):
+        return 0.0
+    try:
+        return round(float(value), 4)
+    except Exception:
+        digits = re.sub(r"[^0-9.\-]", "", str(value))
+        try:
+            return round(float(digits), 4)
+        except Exception:
+            return 0.0
+
+
+def _normalize_metric_int(value):
+    if value in (None, ""):
+        return 0
+    try:
+        return int(round(float(value)))
+    except Exception:
+        digits = re.sub(r"[^0-9\-]", "", str(value))
+        try:
+            return int(digits)
+        except Exception:
+            return 0
+
+
+def _parse_iso_date_only(value):
+    text = normalize_whitespace(value)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _ads_period_bounds(start_date="", end_date="", lookback_days=ADS_DEFAULT_LOOKBACK_DAYS):
+    today = datetime.now(EST_TZ).date()
+    end = _parse_iso_date_only(end_date) or today
+    start = _parse_iso_date_only(start_date)
+    if not start:
+        days = max(int(lookback_days or ADS_DEFAULT_LOOKBACK_DAYS), 1)
+        start = end - timedelta(days=days - 1)
+    if start > end:
+        start, end = end, start
+    return start.isoformat(), end.isoformat()
+
+
+def get_ads_dashboard_settings(db):
+    settings = {
+        "google_developer_token": (get_setting(db, "ads_google_developer_token", "") or os.getenv("ADS_GOOGLE_DEVELOPER_TOKEN", "")).strip(),
+        "google_client_id": (get_setting(db, "ads_google_client_id", "") or os.getenv("ADS_GOOGLE_CLIENT_ID", "")).strip(),
+        "google_client_secret": (get_setting(db, "ads_google_client_secret", "") or os.getenv("ADS_GOOGLE_CLIENT_SECRET", "")).strip(),
+        "google_refresh_token": (get_setting(db, "ads_google_refresh_token", "") or os.getenv("ADS_GOOGLE_REFRESH_TOKEN", "")).strip(),
+        "google_customer_ids_raw": (get_setting(db, "ads_google_customer_ids", "") or os.getenv("ADS_GOOGLE_CUSTOMER_IDS", "")).strip(),
+        "google_login_customer_id": (get_setting(db, "ads_google_login_customer_id", "") or os.getenv("ADS_GOOGLE_LOGIN_CUSTOMER_ID", "")).strip(),
+        "meta_access_token": (get_setting(db, "ads_meta_access_token", "") or os.getenv("ADS_META_ACCESS_TOKEN", "")).strip(),
+        "meta_account_ids_raw": (get_setting(db, "ads_meta_account_ids", "") or os.getenv("ADS_META_ACCOUNT_IDS", "")).strip(),
+        "amazon_client_id": (get_setting(db, "ads_amazon_client_id", "") or os.getenv("ADS_AMAZON_CLIENT_ID", "")).strip(),
+        "amazon_client_secret": (get_setting(db, "ads_amazon_client_secret", "") or os.getenv("ADS_AMAZON_CLIENT_SECRET", "")).strip(),
+        "amazon_refresh_token": (get_setting(db, "ads_amazon_refresh_token", "") or os.getenv("ADS_AMAZON_REFRESH_TOKEN", "")).strip(),
+        "amazon_profile_ids_raw": (get_setting(db, "ads_amazon_profile_ids", "") or os.getenv("ADS_AMAZON_PROFILE_IDS", "")).strip(),
+        "amazon_region": (get_setting(db, "ads_amazon_region", "") or os.getenv("ADS_AMAZON_REGION", "na")).strip().lower() or "na",
+        "roku_api_token": (get_setting(db, "ads_roku_api_token", "") or os.getenv("ADS_ROKU_API_TOKEN", "")).strip(),
+        "roku_account_ids_raw": (get_setting(db, "ads_roku_account_ids", "") or os.getenv("ADS_ROKU_ACCOUNT_IDS", "")).strip(),
+    }
+    settings["google_customer_ids"] = _split_csv_values(settings["google_customer_ids_raw"])
+    settings["meta_account_ids"] = _split_csv_values(settings["meta_account_ids_raw"])
+    settings["amazon_profile_ids"] = _split_csv_values(settings["amazon_profile_ids_raw"])
+    settings["roku_account_ids"] = _split_csv_values(settings["roku_account_ids_raw"])
+    settings["google_ready"] = bool(
+        settings["google_developer_token"]
+        and settings["google_client_id"]
+        and settings["google_client_secret"]
+        and settings["google_refresh_token"]
+        and settings["google_customer_ids"]
+    )
+    settings["meta_ready"] = bool(settings["meta_access_token"] and settings["meta_account_ids"])
+    settings["amazon_ready"] = bool(
+        settings["amazon_client_id"]
+        and settings["amazon_client_secret"]
+        and settings["amazon_refresh_token"]
+        and settings["amazon_profile_ids"]
+    )
+    settings["roku_ready"] = bool(settings["roku_api_token"] and settings["roku_account_ids"])
+    return settings
+
+
+def _ad_platform_config_state(settings, platform):
+    key = _normalize_ad_platform(platform)
+    if key == "google":
+        missing = []
+        if not settings.get("google_developer_token"):
+            missing.append("developer token")
+        if not settings.get("google_client_id"):
+            missing.append("OAuth client ID")
+        if not settings.get("google_client_secret"):
+            missing.append("OAuth client secret")
+        if not settings.get("google_refresh_token"):
+            missing.append("refresh token")
+        if not settings.get("google_customer_ids"):
+            missing.append("customer IDs")
+        return {"ready": not missing, "missing": missing}
+    if key == "meta":
+        missing = []
+        if not settings.get("meta_access_token"):
+            missing.append("access token")
+        if not settings.get("meta_account_ids"):
+            missing.append("ad account IDs")
+        return {"ready": not missing, "missing": missing}
+    if key == "amazon":
+        missing = []
+        if not settings.get("amazon_client_id"):
+            missing.append("client ID")
+        if not settings.get("amazon_client_secret"):
+            missing.append("client secret")
+        if not settings.get("amazon_refresh_token"):
+            missing.append("refresh token")
+        if not settings.get("amazon_profile_ids"):
+            missing.append("profile IDs")
+        return {"ready": not missing, "missing": missing}
+    if key == "roku":
+        missing = []
+        if not settings.get("roku_api_token"):
+            missing.append("API token")
+        if not settings.get("roku_account_ids"):
+            missing.append("account IDs")
+        return {"ready": not missing, "missing": missing}
+    return {"ready": False, "missing": ["unknown platform"]}
+
+
+def _pending_ads_fetch_result(platform):
+    return {
+        "status": "pending_setup",
+        "rows": [],
+        "message": f"{_ad_platform_label(platform)} fetcher scaffolded; credentials/account access still need to be finalized.",
+    }
+
+
+def _fetch_google_ads_campaign_rows(settings, start_date, end_date):
+    return _pending_ads_fetch_result("google")
+
+
+def _fetch_meta_ads_campaign_rows(settings, start_date, end_date):
+    return _pending_ads_fetch_result("meta")
+
+
+def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date):
+    return _pending_ads_fetch_result("amazon")
+
+
+def _fetch_roku_ads_campaign_rows(settings, start_date, end_date):
+    return _pending_ads_fetch_result("roku")
+
+
+def _ad_campaign_site(platform, account_id=""):
+    label = _ad_platform_label(platform)
+    account = normalize_whitespace(account_id)
+    return f"{label} ({account})" if account else label
+
+
+def _upsert_ad_campaign_daily_metric(db, row):
+    platform = _normalize_ad_platform(row.get("platform"))
+    if not platform:
+        return
+    metric_date = str(row.get("metric_date") or "").strip()
+    campaign_id = normalize_whitespace(row.get("campaign_id"))
+    if not metric_date or not campaign_id:
+        return
+    payload = {
+        "platform": platform,
+        "account_id": normalize_whitespace(row.get("account_id")),
+        "campaign_id": campaign_id,
+        "metric_date": metric_date,
+        "campaign_name": normalize_whitespace(row.get("campaign_name")) or campaign_id,
+        "campaign_status": _normalize_ad_campaign_status(row.get("campaign_status")),
+        "campaign_site": normalize_whitespace(row.get("campaign_site")) or _ad_campaign_site(platform, row.get("account_id")),
+        "spend": _normalize_metric_float(row.get("spend")),
+        "impressions": _normalize_metric_int(row.get("impressions")),
+        "clicks": _normalize_metric_int(row.get("clicks")),
+        "reach": _normalize_metric_int(row.get("reach")),
+        "conversions": _normalize_metric_float(row.get("conversions")),
+        "raw_json": json.dumps(row.get("raw") or row, ensure_ascii=True, sort_keys=True, default=str),
+    }
+    db.execute(
+        """
+        INSERT INTO ad_campaign_daily_metrics (
+            platform, account_id, campaign_id, metric_date, campaign_name, campaign_status, campaign_site,
+            spend, impressions, clicks, reach, conversions, raw_json, fetched_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(platform, campaign_id, metric_date) DO UPDATE SET
+            account_id = excluded.account_id,
+            campaign_name = excluded.campaign_name,
+            campaign_status = excluded.campaign_status,
+            campaign_site = excluded.campaign_site,
+            spend = excluded.spend,
+            impressions = excluded.impressions,
+            clicks = excluded.clicks,
+            reach = excluded.reach,
+            conversions = excluded.conversions,
+            raw_json = excluded.raw_json,
+            fetched_at = CURRENT_TIMESTAMP
+        """,
+        (
+            payload["platform"],
+            payload["account_id"],
+            payload["campaign_id"],
+            payload["metric_date"],
+            payload["campaign_name"],
+            payload["campaign_status"],
+            payload["campaign_site"],
+            payload["spend"],
+            payload["impressions"],
+            payload["clicks"],
+            payload["reach"],
+            payload["conversions"],
+            payload["raw_json"],
+        ),
+    )
+
+
+def _upsert_ad_campaign_current(db, row):
+    platform = _normalize_ad_platform(row.get("platform"))
+    campaign_id = normalize_whitespace(row.get("campaign_id"))
+    if not platform or not campaign_id:
+        return
+    payload = {
+        "platform": platform,
+        "account_id": normalize_whitespace(row.get("account_id")),
+        "campaign_id": campaign_id,
+        "campaign_name": normalize_whitespace(row.get("campaign_name")) or campaign_id,
+        "campaign_status": _normalize_ad_campaign_status(row.get("campaign_status")),
+        "campaign_site": normalize_whitespace(row.get("campaign_site")) or _ad_campaign_site(platform, row.get("account_id")),
+        "spend": _normalize_metric_float(row.get("spend")),
+        "impressions": _normalize_metric_int(row.get("impressions")),
+        "clicks": _normalize_metric_int(row.get("clicks")),
+        "reach": _normalize_metric_int(row.get("reach")),
+        "conversions": _normalize_metric_float(row.get("conversions")),
+        "last_metric_date": str(row.get("metric_date") or "").strip(),
+        "raw_json": json.dumps(row.get("raw") or row, ensure_ascii=True, sort_keys=True, default=str),
+    }
+    db.execute(
+        """
+        INSERT INTO ad_campaign_current (
+            platform, account_id, campaign_id, campaign_name, campaign_status, campaign_site,
+            spend, impressions, clicks, reach, conversions, last_metric_date, raw_json, first_seen_at, last_refreshed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(platform, campaign_id) DO UPDATE SET
+            account_id = excluded.account_id,
+            campaign_name = excluded.campaign_name,
+            campaign_status = excluded.campaign_status,
+            campaign_site = excluded.campaign_site,
+            spend = excluded.spend,
+            impressions = excluded.impressions,
+            clicks = excluded.clicks,
+            reach = excluded.reach,
+            conversions = excluded.conversions,
+            last_metric_date = excluded.last_metric_date,
+            raw_json = excluded.raw_json,
+            last_refreshed_at = CURRENT_TIMESTAMP
+        """,
+        (
+            payload["platform"],
+            payload["account_id"],
+            payload["campaign_id"],
+            payload["campaign_name"],
+            payload["campaign_status"],
+            payload["campaign_site"],
+            payload["spend"],
+            payload["impressions"],
+            payload["clicks"],
+            payload["reach"],
+            payload["conversions"],
+            payload["last_metric_date"],
+            payload["raw_json"],
+        ),
+    )
+
+
+def _store_ad_campaign_rows(db, rows):
+    rows = rows if isinstance(rows, list) else []
+    latest_by_campaign = {}
+    for raw_row in rows:
+        if not isinstance(raw_row, dict):
+            continue
+        _upsert_ad_campaign_daily_metric(db, raw_row)
+        platform = _normalize_ad_platform(raw_row.get("platform"))
+        campaign_id = normalize_whitespace(raw_row.get("campaign_id"))
+        metric_date = str(raw_row.get("metric_date") or "").strip()
+        if not platform or not campaign_id:
+            continue
+        key = (platform, campaign_id)
+        current_best = latest_by_campaign.get(key)
+        if current_best is None or metric_date >= str(current_best.get("metric_date") or ""):
+            latest_by_campaign[key] = raw_row
+    for row in latest_by_campaign.values():
+        _upsert_ad_campaign_current(db, row)
+    return {"rows_written": len(rows), "campaigns_updated": len(latest_by_campaign)}
+
+
+def refresh_ad_campaign_cache(db, triggered_by="manual", requested_by="", lookback_days=ADS_REFRESH_LOOKBACK_DAYS):
+    start_date, end_date = _ads_period_bounds(lookback_days=lookback_days)
+    with ADS_REFRESH_LOCK:
+        run_cur = db.execute(
+            """
+            INSERT INTO ad_campaign_refresh_runs (triggered_by, requested_by, lookback_days, status, summary_json)
+            VALUES (?, ?, ?, 'Running', ?)
+            """,
+            (triggered_by or "manual", normalize_whitespace(requested_by), int(lookback_days or ADS_REFRESH_LOOKBACK_DAYS), "{}"),
+        )
+        run_id = int(run_cur.lastrowid or 0)
+        settings = get_ads_dashboard_settings(db)
+        summary = {
+            "run_id": run_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "rows_written": 0,
+            "campaigns_updated": 0,
+            "platforms": [],
+        }
+        status = "Completed"
+        error_message = ""
+        fetchers = {
+            "google": _fetch_google_ads_campaign_rows,
+            "meta": _fetch_meta_ads_campaign_rows,
+            "amazon": _fetch_amazon_ads_campaign_rows,
+            "roku": _fetch_roku_ads_campaign_rows,
+        }
+        try:
+            for platform, fetcher in fetchers.items():
+                config_state = _ad_platform_config_state(settings, platform)
+                if not config_state["ready"]:
+                    summary["platforms"].append(
+                        {
+                            "platform": platform,
+                            "label": _ad_platform_label(platform),
+                            "status": "missing_config",
+                            "message": "Missing " + ", ".join(config_state["missing"]),
+                            "rows_written": 0,
+                            "campaigns_updated": 0,
+                        }
+                    )
+                    continue
+                try:
+                    fetch_result = fetcher(settings, start_date, end_date) or {}
+                except Exception as exc:
+                    emit_provider_alert(
+                        source=f"provider_ads_{platform}",
+                        error_message=f"{_ad_platform_label(platform)} refresh failed.",
+                        details=str(exc),
+                        route="refresh_ad_campaign_cache",
+                        status_code=500,
+                    )
+                    summary["platforms"].append(
+                        {
+                            "platform": platform,
+                            "label": _ad_platform_label(platform),
+                            "status": "error",
+                            "message": str(exc),
+                            "rows_written": 0,
+                            "campaigns_updated": 0,
+                        }
+                    )
+                    status = "CompletedWithErrors"
+                    continue
+                platform_status = str(fetch_result.get("status") or "ok").strip()
+                platform_rows = fetch_result.get("rows") if isinstance(fetch_result.get("rows"), list) else []
+                store_summary = {"rows_written": 0, "campaigns_updated": 0}
+                if platform_status == "ok" and platform_rows:
+                    store_summary = _store_ad_campaign_rows(db, platform_rows)
+                    summary["rows_written"] += int(store_summary["rows_written"])
+                    summary["campaigns_updated"] += int(store_summary["campaigns_updated"])
+                elif platform_status == "error":
+                    status = "CompletedWithErrors"
+                summary["platforms"].append(
+                    {
+                        "platform": platform,
+                        "label": _ad_platform_label(platform),
+                        "status": platform_status,
+                        "message": str(fetch_result.get("message") or "").strip(),
+                        "rows_written": int(store_summary["rows_written"]),
+                        "campaigns_updated": int(store_summary["campaigns_updated"]),
+                    }
+                )
+            db.execute(
+                """
+                UPDATE ad_campaign_refresh_runs
+                SET status = ?, summary_json = ?, error_message = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, json.dumps(summary, ensure_ascii=True, sort_keys=True), error_message, run_id),
+            )
+            return {"ok": True, **summary, "status": status}
+        except Exception as exc:
+            db.execute(
+                """
+                UPDATE ad_campaign_refresh_runs
+                SET status = 'Failed', summary_json = ?, error_message = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (json.dumps(summary, ensure_ascii=True, sort_keys=True), str(exc), run_id),
+            )
+            raise
+
+
+def query_ad_dashboard_rows(db, q="", platform="", status="", days=ADS_DEFAULT_LOOKBACK_DAYS, sort="spend", direction="desc"):
+    start_date, end_date = _ads_period_bounds(lookback_days=days)
+    where = ["1=1"]
+    params = [start_date, end_date]
+    platform_norm = _normalize_ad_platform(platform)
+    status_norm = _normalize_ad_campaign_status(status) if status else ""
+    if q:
+        like = f"%{q.strip().lower()}%"
+        where.append("(lower(c.campaign_name) LIKE ? OR lower(COALESCE(c.campaign_site, '')) LIKE ? OR lower(COALESCE(c.account_id, '')) LIKE ?)")
+        params.extend([like, like, like])
+    if platform_norm:
+        where.append("lower(c.platform) = ?")
+        params.append(platform_norm)
+    if status_norm:
+        where.append("lower(c.campaign_status) = ?")
+        params.append(status_norm.lower())
+    sort_map = {
+        "status": "c.campaign_status",
+        "platform": "c.platform",
+        "name": "c.campaign_name",
+        "spend": "spend",
+        "impressions": "impressions",
+        "clicks": "clicks",
+        "reach": "reach",
+        "conversions": "conversions",
+        "updated": "c.last_refreshed_at",
+    }
+    sort_sql = sort_map.get((sort or "").strip().lower(), "spend")
+    direction_sql = "ASC" if str(direction or "").strip().lower() == "asc" else "DESC"
+    rows = db.execute(
+        f"""
+        SELECT
+            c.platform,
+            c.account_id,
+            c.campaign_id,
+            c.campaign_name,
+            c.campaign_status,
+            c.campaign_site,
+            c.last_refreshed_at,
+            COALESCE(SUM(d.spend), 0) AS spend,
+            COALESCE(SUM(d.impressions), 0) AS impressions,
+            COALESCE(SUM(d.clicks), 0) AS clicks,
+            COALESCE(SUM(d.reach), 0) AS reach,
+            COALESCE(SUM(d.conversions), 0) AS conversions
+        FROM ad_campaign_current c
+        LEFT JOIN ad_campaign_daily_metrics d
+            ON d.platform = c.platform
+           AND d.campaign_id = c.campaign_id
+           AND date(d.metric_date) BETWEEN date(?) AND date(?)
+        WHERE {' AND '.join(where)}
+        GROUP BY c.platform, c.account_id, c.campaign_id, c.campaign_name, c.campaign_status, c.campaign_site, c.last_refreshed_at
+        ORDER BY {sort_sql} {direction_sql}, lower(c.campaign_name) ASC
+        """,
+        tuple(params),
+    ).fetchall()
+    return [dict(row) for row in rows], start_date, end_date
+
+
+def summarize_ad_campaign_cache(db, days=ADS_DEFAULT_LOOKBACK_DAYS, platform=""):
+    rows, start_date, end_date = query_ad_dashboard_rows(db, platform=platform, days=days, sort="spend", direction="desc")
+    summary = {
+        "rows": rows,
+        "start_date": start_date,
+        "end_date": end_date,
+        "spend": 0.0,
+        "impressions": 0,
+        "clicks": 0,
+        "reach": 0,
+        "conversions": 0.0,
+        "live_rows": [],
+    }
+    for row in rows:
+        summary["spend"] += _normalize_metric_float(row.get("spend"))
+        summary["impressions"] += _normalize_metric_int(row.get("impressions"))
+        summary["clicks"] += _normalize_metric_int(row.get("clicks"))
+        summary["reach"] += _normalize_metric_int(row.get("reach"))
+        summary["conversions"] += _normalize_metric_float(row.get("conversions"))
+        if _ad_status_is_live(row.get("campaign_status")):
+            summary["live_rows"].append(row)
+    return summary
+
+
+def get_latest_ad_refresh_run(db):
+    row = db.execute(
+        """
+        SELECT id, triggered_by, requested_by, lookback_days, status, summary_json, error_message, started_at, completed_at
+        FROM ad_campaign_refresh_runs
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return {}
+    item = dict(row)
+    item["summary"] = parse_json_object(item.get("summary_json") or "{}", default={})
+    return item
+
+
+def get_ad_status_filter_options(db):
+    rows = db.execute(
+        """
+        SELECT DISTINCT campaign_status
+        FROM ad_campaign_current
+        WHERE COALESCE(campaign_status, '') <> ''
+        ORDER BY lower(campaign_status) ASC
+        """
+    ).fetchall()
+    return [str(row["campaign_status"] or "").strip() for row in rows if str(row["campaign_status"] or "").strip()]
+
+
+def parse_slack_ads_command(raw_text):
+    original = normalize_whitespace(raw_text or "")
+    platform_raw, remaining = _extract_wrapped_slack_arg(original, "platform")
+    from_raw, remaining = _extract_wrapped_slack_arg(remaining, "from")
+    to_raw, remaining = _extract_wrapped_slack_arg(remaining, "to")
+    lookback_days = ADS_DEFAULT_LOOKBACK_DAYS
+    remaining_low = remaining.lower()
+    if "today" in remaining_low:
+        today = datetime.now(EST_TZ).date().isoformat()
+        return {"ok": True, "days": 1, "start_date": today, "end_date": today, "platform": _normalize_ad_platform(platform_raw)}
+    if "yesterday" in remaining_low:
+        day = (datetime.now(EST_TZ).date() - timedelta(days=1)).isoformat()
+        return {"ok": True, "days": 1, "start_date": day, "end_date": day, "platform": _normalize_ad_platform(platform_raw)}
+    match = re.search(r"\b(\d{1,3})d\b", remaining_low)
+    if match:
+        lookback_days = max(1, min(365, int(match.group(1))))
+    start_date, end_date = _ads_period_bounds(from_raw, to_raw, lookback_days=lookback_days)
+    return {
+        "ok": True,
+        "days": lookback_days,
+        "start_date": start_date,
+        "end_date": end_date,
+        "platform": _normalize_ad_platform(platform_raw),
     }
 
 
@@ -23892,6 +24572,100 @@ def buyer_delete(buyer_id):
     return redirect(url_for("buyers_page", q=q, county=county, notice="Buyer deleted."))
 
 
+@app.route("/ads", methods=["GET"])
+def ads_dashboard():
+    ensure_db()
+    db = get_db()
+    notice = (request.args.get("notice") or "").strip()
+    q = (request.args.get("q") or "").strip()
+    platform = _normalize_ad_platform(request.args.get("platform") or "")
+    status = _normalize_ad_campaign_status(request.args.get("status") or "") if (request.args.get("status") or "").strip() else ""
+    sort = (request.args.get("sort") or "spend").strip().lower()
+    direction = (request.args.get("direction") or "desc").strip().lower()
+    days_raw = (request.args.get("days") or str(ADS_DEFAULT_LOOKBACK_DAYS)).strip()
+    try:
+        days = max(1, min(365, int(days_raw)))
+    except ValueError:
+        days = ADS_DEFAULT_LOOKBACK_DAYS
+    rows, start_date, end_date = query_ad_dashboard_rows(
+        db,
+        q=q,
+        platform=platform,
+        status=status,
+        days=days,
+        sort=sort,
+        direction=direction,
+    )
+    totals = {
+        "spend": round(sum(_normalize_metric_float(row.get("spend")) for row in rows), 2),
+        "impressions": sum(_normalize_metric_int(row.get("impressions")) for row in rows),
+        "clicks": sum(_normalize_metric_int(row.get("clicks")) for row in rows),
+        "reach": sum(_normalize_metric_int(row.get("reach")) for row in rows),
+        "conversions": round(sum(_normalize_metric_float(row.get("conversions")) for row in rows), 2),
+        "live_count": sum(1 for row in rows if _ad_status_is_live(row.get("campaign_status"))),
+    }
+    return render_template(
+        "ads.html",
+        notice=notice,
+        campaigns=rows,
+        q=q,
+        platform=platform,
+        status=status,
+        sort=sort,
+        direction=direction,
+        days=days,
+        start_date=start_date,
+        end_date=end_date,
+        totals=totals,
+        status_options=get_ad_status_filter_options(db),
+        platform_options=[{"value": key, "label": label} for key, label in AD_PLATFORM_LABELS.items()],
+        latest_refresh=get_latest_ad_refresh_run(db),
+        ad_settings=get_ads_dashboard_settings(db),
+    )
+
+
+@app.route("/ads/refresh", methods=["POST"])
+def refresh_ads_dashboard_route():
+    ensure_db()
+    db = get_db()
+    ajax = _is_ajax_request(request)
+    payload = request.get_json(silent=True) if request.is_json else {}
+    payload = payload if isinstance(payload, dict) else {}
+    lookback_raw = request.form.get("lookback_days") or payload.get("lookback_days") or ""
+    lookback_raw = str(lookback_raw or ADS_REFRESH_LOOKBACK_DAYS).strip()
+    try:
+        lookback_days = max(1, min(365, int(lookback_raw)))
+    except ValueError:
+        lookback_days = ADS_REFRESH_LOOKBACK_DAYS
+    try:
+        result = refresh_ad_campaign_cache(db, triggered_by="manual", requested_by="web_ui", lookback_days=lookback_days)
+        db.commit()
+        messages = []
+        for item in result.get("platforms", []):
+            messages.append(f"{item.get('label')}: {item.get('status')}{(' - ' + item.get('message')) if item.get('message') else ''}")
+        message = (
+            f"Ads refresh finished. Campaigns updated: {result.get('campaigns_updated', 0)}, rows written: {result.get('rows_written', 0)}."
+            + (f" {' | '.join(messages)}" if messages else "")
+        )
+        if ajax:
+            return jsonify({"ok": True, "message": message, "result": result})
+        return redirect(url_for("ads_dashboard", notice=message))
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="ads_refresh",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/ads/refresh",
+            status_code=500,
+        )
+        db.commit()
+        if ajax:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        return redirect(url_for("ads_dashboard", notice=f"Ads refresh failed: {exc}"))
+
+
 @app.route("/referral/realtors/upload", methods=["POST"])
 def referral_realtors_upload():
     ensure_db()
@@ -24495,6 +25269,27 @@ def settings_page():
                     )
             else:
                 notice = "Email settings saved."
+        elif active_tab == "ads":
+            fields = {
+                "ads_google_developer_token": request.form.get("ads_google_developer_token", ""),
+                "ads_google_client_id": request.form.get("ads_google_client_id", ""),
+                "ads_google_client_secret": request.form.get("ads_google_client_secret", ""),
+                "ads_google_refresh_token": request.form.get("ads_google_refresh_token", ""),
+                "ads_google_customer_ids": request.form.get("ads_google_customer_ids", ""),
+                "ads_google_login_customer_id": request.form.get("ads_google_login_customer_id", ""),
+                "ads_meta_access_token": request.form.get("ads_meta_access_token", ""),
+                "ads_meta_account_ids": request.form.get("ads_meta_account_ids", ""),
+                "ads_amazon_client_id": request.form.get("ads_amazon_client_id", ""),
+                "ads_amazon_client_secret": request.form.get("ads_amazon_client_secret", ""),
+                "ads_amazon_refresh_token": request.form.get("ads_amazon_refresh_token", ""),
+                "ads_amazon_profile_ids": request.form.get("ads_amazon_profile_ids", ""),
+                "ads_amazon_region": request.form.get("ads_amazon_region", "na"),
+                "ads_roku_api_token": request.form.get("ads_roku_api_token", ""),
+                "ads_roku_account_ids": request.form.get("ads_roku_account_ids", ""),
+            }
+            for key, value in fields.items():
+                set_setting(db, key, value)
+            notice = "Ad platform settings saved."
         elif active_tab == "integrations":
             test_action = (request.form.get("integration_action") or "").strip().lower()
             if test_action == "clear_notifications":
@@ -24667,6 +25462,7 @@ def settings_page():
     anonymous_email_settings = get_anonymous_email_marketing_settings(db)
     slack_settings = get_slack_settings(db)
     automation_settings = get_automation_settings(db)
+    ad_platform_settings = get_ads_dashboard_settings(db)
     integration_api_key = get_integration_api_key(db)
     deep_dive_smrtphone_from = get_setting(db, "deep_dive_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     referral_smrtphone_from = get_setting(db, "referral_smrtphone_from", SMRTPHONE_FROM_NUMBER)
@@ -24754,6 +25550,7 @@ def settings_page():
         anonymous_email_settings=anonymous_email_settings,
         slack_settings=slack_settings,
         automation_settings=automation_settings,
+        ad_platform_settings=ad_platform_settings,
         integration_api_key=integration_api_key,
         active_tab=active_tab,
         deep_dive_smrtphone_from=deep_dive_smrtphone_from,
@@ -27567,6 +28364,7 @@ def slack_command_webhook():
                     "• `unresolved` - unresolved lead-watch items\n"
                     "• `d4d <address>` - add or flag a Driving For Dollars lead\n"
                     "• `buyer <phone> [name] county(x,y) category(x,y) type(x,y)` - add or update a buyer\n"
+                    "• `ads [30d] [platform(google,meta,...)]` - cached ad snapshot and spend\n"
                     "• `health` - agent endpoint health\n"
                     "• `help` - command list"
                 ),
@@ -27654,6 +28452,48 @@ def slack_command_webhook():
             msg_lines.append(f"Property Types: {buyer.get('property_types')}")
         msg_lines.append(f"Buyer ID: {result.get('buyer_id')}")
         return jsonify({"response_type": "in_channel", "text": "\n".join(msg_lines)})
+    if sub == "ads":
+        parsed = parse_slack_ads_command(text)
+        if not parsed.get("ok"):
+            return jsonify({"response_type": "ephemeral", "text": parsed.get("error") or "Could not parse ads command."})
+        summary = summarize_ad_campaign_cache(db, days=parsed.get("days") or ADS_DEFAULT_LOOKBACK_DAYS, platform=parsed.get("platform") or "")
+        rows = summary.get("rows") or []
+        if not rows:
+            return jsonify(
+                {
+                    "response_type": "ephemeral",
+                    "text": "No ad data is cached yet. Open the Ads page and run Refresh first.",
+                }
+            )
+        platform_rollup = {}
+        for row in rows:
+            key = row.get("platform") or "unknown"
+            bucket = platform_rollup.setdefault(key, {"label": _ad_platform_label(key), "spend": 0.0, "live": 0})
+            bucket["spend"] += _normalize_metric_float(row.get("spend"))
+            if _ad_status_is_live(row.get("campaign_status")):
+                bucket["live"] += 1
+        lines = [
+            f"Ads snapshot for @{user_name or 'user'}",
+            f"Range: {summary.get('start_date')} to {summary.get('end_date')}",
+            f"Spend: ${summary.get('spend', 0):,.2f}",
+            f"Impressions: {summary.get('impressions', 0):,}",
+            f"Clicks: {summary.get('clicks', 0):,}",
+            f"Reach: {summary.get('reach', 0):,}",
+            f"Conversions: {summary.get('conversions', 0):,.2f}",
+            f"Live campaigns: {len(summary.get('live_rows') or [])}",
+        ]
+        if platform_rollup:
+            lines.append("By platform:")
+            for item in sorted(platform_rollup.values(), key=lambda x: x["spend"], reverse=True):
+                lines.append(f"• {item['label']}: spend ${item['spend']:,.2f}, live {item['live']}")
+        live_rows = sorted(summary.get("live_rows") or [], key=lambda row: _normalize_metric_float(row.get("spend")), reverse=True)
+        if live_rows:
+            lines.append("Top live campaigns:")
+            for row in live_rows[:5]:
+                lines.append(
+                    f"• {_ad_platform_label(row.get('platform'))} | {row.get('campaign_name')} | ${_normalize_metric_float(row.get('spend')):,.2f}"
+                )
+        return jsonify({"response_type": "in_channel", "text": "\n".join(lines)})
     if sub in {"status", "overview"}:
         snap = build_agent_advisor_snapshot(db, window_hours=72)
         signals = snap.get("signals", {})

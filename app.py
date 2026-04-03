@@ -2,6 +2,7 @@
 import copy
 import csv
 import base64
+import gzip
 import hmac
 import hashlib
 import io
@@ -7317,6 +7318,129 @@ def _fetch_amazon_ads_profiles(client_id, access_token, region):
     return payload if isinstance(payload, list) else []
 
 
+def _exchange_amazon_refresh_token(client_id, client_secret, refresh_token):
+    response = requests.post(
+        AMAZON_LWA_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+        timeout=60,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text}
+    if not response.ok:
+        raise RuntimeError(f"Amazon refresh-token exchange failed ({response.status_code}): {payload}")
+    access_token = normalize_whitespace(payload.get("access_token"))
+    if not access_token:
+        raise RuntimeError("Amazon refresh-token exchange did not return an access token.")
+    return access_token
+
+
+def _amazon_ads_headers(settings, access_token, profile_id="", content_type="application/json"):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Amazon-Advertising-API-ClientId": settings.get("amazon_client_id", ""),
+        "Accept": "application/json",
+    }
+    if profile_id:
+        headers["Amazon-Advertising-API-Scope"] = normalize_whitespace(profile_id)
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def _create_amazon_report(settings, access_token, profile_id, start_date, end_date):
+    payload = {
+        "name": f"DeepSift Amazon SP Campaigns {start_date} to {end_date}",
+        "startDate": start_date,
+        "endDate": end_date,
+        "configuration": {
+            "adProduct": "SPONSORED_PRODUCTS",
+            "groupBy": ["campaign"],
+            "columns": [
+                "campaignId",
+                "campaignName",
+                "campaignStatus",
+                "date",
+                "impressions",
+                "clicks",
+                "cost",
+                "purchases14d",
+            ],
+            "reportTypeId": "spCampaigns",
+            "timeUnit": "DAILY",
+            "format": "GZIP_JSON",
+        },
+    }
+    response = requests.post(
+        f"{_amazon_ads_base_url(settings.get('amazon_region'))}/reporting/reports",
+        headers=_amazon_ads_headers(
+            settings,
+            access_token,
+            profile_id=profile_id,
+            content_type="application/vnd.createasyncreportrequest.v3+json",
+        ),
+        json=payload,
+        timeout=60,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text}
+    if not response.ok:
+        raise RuntimeError(f"Amazon report create failed ({response.status_code}): {body}")
+    report_id = normalize_whitespace(body.get("reportId"))
+    if not report_id:
+        raise RuntimeError(f"Amazon report create returned no reportId: {body}")
+    return report_id
+
+
+def _poll_amazon_report(settings, access_token, profile_id, report_id, timeout_seconds=120):
+    deadline = time.time() + max(int(timeout_seconds or 120), 30)
+    status_url = f"{_amazon_ads_base_url(settings.get('amazon_region'))}/reporting/reports/{report_id}"
+    last_status = ""
+    while time.time() < deadline:
+        response = requests.get(
+            status_url,
+            headers=_amazon_ads_headers(settings, access_token, profile_id=profile_id, content_type=""),
+            timeout=60,
+        )
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text}
+        if not response.ok:
+            raise RuntimeError(f"Amazon report status failed ({response.status_code}): {body}")
+        status = normalize_whitespace(body.get("status")).upper()
+        last_status = status or last_status
+        if status in {"COMPLETED", "SUCCESS"} and normalize_whitespace(body.get("url")):
+            return body
+        if status in {"FAILURE", "FAILED", "CANCELLED"}:
+            raise RuntimeError(f"Amazon report generation failed: {body}")
+        time.sleep(3)
+    raise RuntimeError(f"Amazon report polling timed out after {int(timeout_seconds)}s (last status: {last_status or 'unknown'}).")
+
+
+def _download_amazon_report_rows(report_url):
+    response = requests.get(report_url, timeout=120)
+    if not response.ok:
+        raise RuntimeError(f"Amazon report download failed ({response.status_code}).")
+    raw_bytes = response.content or b""
+    if not raw_bytes:
+        return []
+    try:
+        text = gzip.decompress(raw_bytes).decode("utf-8")
+    except Exception:
+        text = raw_bytes.decode("utf-8")
+    payload = json.loads(text)
+    return payload if isinstance(payload, list) else []
+
+
 def _fetch_meta_campaign_snapshots(settings, account_id):
     account_id = _normalize_meta_account_id(account_id)
     if not account_id:
@@ -7598,7 +7722,50 @@ def _fetch_meta_ads_campaign_rows(settings, start_date, end_date):
 
 
 def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date):
-    return _pending_ads_fetch_result("amazon")
+    profile_ids = settings.get("amazon_profile_ids")
+    if not isinstance(profile_ids, list):
+        profile_ids = _split_csv_values(settings.get("amazon_profile_ids_raw"))
+    if not profile_ids:
+        return {"status": "missing_config", "rows": [], "message": "No Amazon profile IDs configured."}
+    access_token = _exchange_amazon_refresh_token(
+        settings.get("amazon_client_id", ""),
+        settings.get("amazon_client_secret", ""),
+        settings.get("amazon_refresh_token", ""),
+    )
+    rows = []
+    for profile_id in profile_ids:
+        report_id = _create_amazon_report(settings, access_token, profile_id, start_date, end_date)
+        report_meta = _poll_amazon_report(settings, access_token, profile_id, report_id)
+        report_rows = _download_amazon_report_rows(report_meta.get("url") or "")
+        for item in report_rows:
+            if not isinstance(item, dict):
+                continue
+            campaign_id = normalize_whitespace(item.get("campaignId") or item.get("campaign_id"))
+            if not campaign_id:
+                continue
+            metric_date = normalize_whitespace(item.get("date"))
+            rows.append(
+                {
+                    "platform": "amazon",
+                    "account_id": normalize_whitespace(profile_id),
+                    "campaign_id": campaign_id,
+                    "campaign_name": normalize_whitespace(item.get("campaignName")) or campaign_id,
+                    "campaign_status": _normalize_ad_campaign_status(item.get("campaignStatus")),
+                    "campaign_site": _ad_campaign_site("amazon", profile_id),
+                    "metric_date": metric_date,
+                    "spend": _normalize_metric_float(item.get("cost")),
+                    "impressions": _normalize_metric_int(item.get("impressions")),
+                    "clicks": _normalize_metric_int(item.get("clicks")),
+                    "reach": 0,
+                    "conversions": _normalize_metric_float(item.get("purchases14d")),
+                    "raw": item,
+                }
+            )
+    return {
+        "status": "ok",
+        "rows": rows,
+        "message": f"Fetched {len(rows)} Amazon campaign-day rows across {len(profile_ids)} profile(s).",
+    }
 
 
 def _fetch_roku_ads_campaign_rows(settings, start_date, end_date):

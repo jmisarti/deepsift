@@ -7793,7 +7793,7 @@ def refresh_ad_campaign_cache(db, triggered_by="manual", requested_by="", lookba
             raise
 
 
-def query_ad_dashboard_rows(db, q="", platform="", status="", days=ADS_DEFAULT_LOOKBACK_DAYS, sort="spend", direction="desc"):
+def query_ad_dashboard_rows(db, q="", platform="", status="", days=ADS_DEFAULT_LOOKBACK_DAYS, sort="status", direction="asc"):
     start_date, end_date = _ads_period_bounds(lookback_days=days)
     where = ["1=1"]
     params = [start_date, end_date]
@@ -7809,8 +7809,21 @@ def query_ad_dashboard_rows(db, q="", platform="", status="", days=ADS_DEFAULT_L
     if status_norm:
         where.append("lower(c.campaign_status) = ?")
         params.append(status_norm.lower())
+    status_rank_sql = """
+        CASE lower(COALESCE(c.campaign_status, ''))
+            WHEN 'live' THEN 0
+            WHEN 'in review' THEN 1
+            WHEN 'limited' THEN 2
+            WHEN 'pending' THEN 3
+            WHEN 'paused' THEN 4
+            WHEN 'draft' THEN 5
+            WHEN 'stopped' THEN 6
+            WHEN 'disapproved' THEN 7
+            ELSE 8
+        END
+    """
     sort_map = {
-        "status": "c.campaign_status",
+        "status": status_rank_sql,
         "platform": "c.platform",
         "name": "c.campaign_name",
         "spend": "spend",
@@ -7820,8 +7833,17 @@ def query_ad_dashboard_rows(db, q="", platform="", status="", days=ADS_DEFAULT_L
         "conversions": "conversions",
         "updated": "c.last_refreshed_at",
     }
-    sort_sql = sort_map.get((sort or "").strip().lower(), "spend")
+    sort_key = (sort or "").strip().lower() or "status"
+    sort_sql = sort_map.get(sort_key, status_rank_sql)
     direction_sql = "ASC" if str(direction or "").strip().lower() == "asc" else "DESC"
+    if sort_key == "status":
+        order_sql = f"{status_rank_sql} {direction_sql}, lower(c.platform) ASC, lower(c.campaign_name) ASC"
+    elif sort_key == "platform":
+        order_sql = f"lower(c.platform) {direction_sql}, {status_rank_sql} ASC, lower(c.campaign_name) ASC"
+    elif sort_key == "name":
+        order_sql = f"lower(c.campaign_name) {direction_sql}, {status_rank_sql} ASC, lower(c.platform) ASC"
+    else:
+        order_sql = f"{sort_sql} {direction_sql}, {status_rank_sql} ASC, lower(c.platform) ASC, lower(c.campaign_name) ASC"
     rows = db.execute(
         f"""
         SELECT
@@ -7844,7 +7866,7 @@ def query_ad_dashboard_rows(db, q="", platform="", status="", days=ADS_DEFAULT_L
            AND date(d.metric_date) BETWEEN date(?) AND date(?)
         WHERE {' AND '.join(where)}
         GROUP BY c.platform, c.account_id, c.campaign_id, c.campaign_name, c.campaign_status, c.campaign_site, c.last_refreshed_at
-        ORDER BY {sort_sql} {direction_sql}, lower(c.campaign_name) ASC
+        ORDER BY {order_sql}
         """,
         tuple(params),
     ).fetchall()
@@ -24982,8 +25004,8 @@ def ads_dashboard():
     q = (request.args.get("q") or "").strip()
     platform = _normalize_ad_platform(request.args.get("platform") or "")
     status = _normalize_ad_campaign_status(request.args.get("status") or "") if (request.args.get("status") or "").strip() else ""
-    sort = (request.args.get("sort") or "spend").strip().lower()
-    direction = (request.args.get("direction") or "desc").strip().lower()
+    sort = (request.args.get("sort") or "status").strip().lower()
+    direction = (request.args.get("direction") or "asc").strip().lower()
     days_raw = (request.args.get("days") or str(ADS_DEFAULT_LOOKBACK_DAYS)).strip()
     try:
         days = max(1, min(365, int(days_raw)))

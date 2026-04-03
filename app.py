@@ -179,6 +179,7 @@ PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTE
 PROVIDER_ALERT_SOURCE_PREFIX = "provider_"
 ADS_DEFAULT_LOOKBACK_DAYS = max(int((os.getenv("ADS_DEFAULT_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
 ADS_REFRESH_LOOKBACK_DAYS = max(int((os.getenv("ADS_REFRESH_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
+GOOGLE_ADS_API_VERSION = (os.getenv("GOOGLE_ADS_API_VERSION") or "v22").strip() or "v22"
 ADS_REFRESH_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
@@ -6951,7 +6952,7 @@ def _ad_platform_label(platform):
 
 
 def _normalize_ad_campaign_status(value):
-    raw = normalize_whitespace(value)
+    raw = normalize_whitespace(str(value or "").replace("_", " "))
     low = raw.lower()
     if not low:
         return "Unknown"
@@ -6975,6 +6976,8 @@ def _normalize_ad_campaign_status(value):
         "limited": "Limited",
         "pending": "Pending",
         "draft": "Draft",
+        "not eligible": "Not Eligible",
+        "eligible": "Live",
     }
     return mapping.get(low, raw.title())
 
@@ -7032,6 +7035,148 @@ def _ads_period_bounds(start_date="", end_date="", lookback_days=ADS_DEFAULT_LOO
     return start.isoformat(), end.isoformat()
 
 
+def _normalize_google_ads_customer_id(value):
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _google_ads_headers(settings, access_token):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "developer-token": settings.get("google_developer_token", ""),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    login_customer_id = _normalize_google_ads_customer_id(settings.get("google_login_customer_id"))
+    if login_customer_id:
+        headers["login-customer-id"] = login_customer_id
+    return headers
+
+
+def _google_ads_exchange_refresh_token(settings):
+    response = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": settings.get("google_client_id", ""),
+            "client_secret": settings.get("google_client_secret", ""),
+            "refresh_token": settings.get("google_refresh_token", ""),
+            "grant_type": "refresh_token",
+        },
+        timeout=30,
+    )
+    if not response.ok:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = response.text
+        raise RuntimeError(f"Google Ads token exchange failed ({response.status_code}): {payload}")
+    payload = response.json() or {}
+    access_token = str(payload.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("Google Ads token exchange did not return an access token.")
+    return access_token
+
+
+def _google_ads_extract_error(response):
+    request_id = (response.headers.get("request-id") or "").strip()
+    try:
+        payload = response.json()
+    except Exception:
+        payload = response.text
+    if isinstance(payload, dict):
+        error_obj = payload.get("error")
+        if isinstance(error_obj, dict):
+            message = normalize_whitespace(error_obj.get("message"))
+            details = error_obj.get("details")
+            detail_text = ""
+            if isinstance(details, list) and details:
+                detail_text = normalize_whitespace(json.dumps(details, ensure_ascii=True, default=str))
+            parts = [part for part in [message, detail_text] if part]
+            combined = " | ".join(parts) if parts else normalize_whitespace(json.dumps(payload, ensure_ascii=True, default=str))
+        else:
+            combined = normalize_whitespace(json.dumps(payload, ensure_ascii=True, default=str))
+    else:
+        combined = normalize_whitespace(str(payload))
+    if request_id:
+        combined = f"{combined} (request-id: {request_id})" if combined else f"request-id: {request_id}"
+    return combined or f"HTTP {response.status_code}"
+
+
+def _google_ads_post(settings, customer_id, service_method, body):
+    customer_id = _normalize_google_ads_customer_id(customer_id)
+    if not customer_id:
+        raise RuntimeError("Google Ads customer ID is missing.")
+    access_token = _google_ads_exchange_refresh_token(settings)
+    response = requests.post(
+        f"https://googleads.googleapis.com/{GOOGLE_ADS_API_VERSION}/customers/{customer_id}/googleAds:{service_method}",
+        headers=_google_ads_headers(settings, access_token),
+        json=body,
+        timeout=90,
+    )
+    if not response.ok:
+        raise RuntimeError(f"Google Ads {service_method} failed ({response.status_code}): {_google_ads_extract_error(response)}")
+    try:
+        return response.json()
+    except Exception as exc:
+        raise RuntimeError(f"Google Ads {service_method} returned invalid JSON: {exc}") from exc
+
+
+def _google_ads_display_status(campaign_status, primary_status):
+    status = _normalize_ad_campaign_status(campaign_status)
+    primary = _normalize_ad_campaign_status(primary_status)
+    status_low = status.lower()
+    primary_low = primary.lower()
+    if status_low == "live":
+        if primary_low in {"paused", "stopped", "disapproved", "in review", "limited", "pending", "not eligible"}:
+            return primary
+        return "Live"
+    if status_low != "unknown":
+        return status
+    if primary_low != "unknown":
+        return primary
+    return "Unknown"
+
+
+def _google_ads_parse_search_stream_rows(stream_payload, customer_id):
+    batches = stream_payload if isinstance(stream_payload, list) else [stream_payload]
+    rows = []
+    for batch in batches:
+        if not isinstance(batch, dict):
+            continue
+        results = batch.get("results")
+        if not isinstance(results, list):
+            continue
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            campaign = item.get("campaign") or {}
+            metrics = item.get("metrics") or {}
+            segments = item.get("segments") or {}
+            customer = item.get("customer") or {}
+            campaign_id = normalize_whitespace(campaign.get("id"))
+            metric_date = normalize_whitespace(segments.get("date"))
+            if not campaign_id or not metric_date:
+                continue
+            cost_micros = _normalize_metric_float(metrics.get("costMicros"))
+            rows.append(
+                {
+                    "platform": "google",
+                    "account_id": normalize_whitespace(customer.get("id")) or customer_id,
+                    "campaign_id": campaign_id,
+                    "campaign_name": normalize_whitespace(campaign.get("name")) or campaign_id,
+                    "campaign_status": _google_ads_display_status(campaign.get("status"), campaign.get("primaryStatus")),
+                    "campaign_site": "Google",
+                    "metric_date": metric_date,
+                    "spend": round(cost_micros / 1_000_000.0, 4),
+                    "impressions": _normalize_metric_int(metrics.get("impressions")),
+                    "clicks": _normalize_metric_int(metrics.get("clicks")),
+                    "reach": _normalize_metric_int(metrics.get("uniqueUsers")),
+                    "conversions": _normalize_metric_float(metrics.get("conversions")),
+                    "raw": item,
+                }
+            )
+    return rows
+
+
 def get_ads_dashboard_settings(db):
     settings = {
         "google_developer_token": (get_setting(db, "ads_google_developer_token", "") or os.getenv("ADS_GOOGLE_DEVELOPER_TOKEN", "")).strip(),
@@ -7050,7 +7195,8 @@ def get_ads_dashboard_settings(db):
         "roku_api_token": (get_setting(db, "ads_roku_api_token", "") or os.getenv("ADS_ROKU_API_TOKEN", "")).strip(),
         "roku_account_ids_raw": (get_setting(db, "ads_roku_account_ids", "") or os.getenv("ADS_ROKU_ACCOUNT_IDS", "")).strip(),
     }
-    settings["google_customer_ids"] = _split_csv_values(settings["google_customer_ids_raw"])
+    settings["google_customer_ids"] = [value for value in (_normalize_google_ads_customer_id(item) for item in _split_csv_values(settings["google_customer_ids_raw"])) if value]
+    settings["google_login_customer_id"] = _normalize_google_ads_customer_id(settings.get("google_login_customer_id"))
     settings["meta_account_ids"] = _split_csv_values(settings["meta_account_ids_raw"])
     settings["amazon_profile_ids"] = _split_csv_values(settings["amazon_profile_ids_raw"])
     settings["roku_account_ids"] = _split_csv_values(settings["roku_account_ids_raw"])
@@ -7124,7 +7270,43 @@ def _pending_ads_fetch_result(platform):
 
 
 def _fetch_google_ads_campaign_rows(settings, start_date, end_date):
-    return _pending_ads_fetch_result("google")
+    customer_ids = settings.get("google_customer_ids") or []
+    if not customer_ids:
+        return {"status": "missing_config", "rows": [], "message": "No Google Ads customer IDs configured."}
+    query = f"""
+        SELECT
+          customer.id,
+          customer.descriptive_name,
+          campaign.id,
+          campaign.name,
+          campaign.status,
+          campaign.primary_status,
+          segments.date,
+          metrics.cost_micros,
+          metrics.impressions,
+          metrics.clicks,
+          metrics.unique_users,
+          metrics.conversions
+        FROM campaign
+        WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
+          AND campaign.status != 'REMOVED'
+    """
+    rows = []
+    for customer_id in customer_ids:
+        payload = _google_ads_post(
+            settings,
+            customer_id,
+            "searchStream",
+            {
+                "query": "\n".join(line.strip() for line in query.strip().splitlines()),
+            },
+        )
+        rows.extend(_google_ads_parse_search_stream_rows(payload, customer_id))
+    return {
+        "status": "ok",
+        "rows": rows,
+        "message": f"Fetched {len(rows)} Google Ads campaign-day rows across {len(customer_ids)} account(s).",
+    }
 
 
 def _fetch_meta_ads_campaign_rows(settings, start_date, end_date):

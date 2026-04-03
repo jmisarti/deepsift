@@ -139,6 +139,9 @@ WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
 MARKET_STATUS_REMOTE_URL = (os.getenv("MARKET_STATUS_REMOTE_URL") or "").strip()
 MARKET_STATUS_REMOTE_TOKEN = (os.getenv("MARKET_STATUS_REMOTE_TOKEN") or "").strip()
+RENTCAST_BASE_URL = (os.getenv("RENTCAST_BASE_URL") or "https://api.rentcast.io/v1").strip().rstrip("/") or "https://api.rentcast.io/v1"
+RENTCAST_API_KEY = os.getenv("RENTCAST_API_KEY", "").strip()
+RENTCAST_MARKET_STATUS_CACHE_HOURS = max(int((os.getenv("RENTCAST_MARKET_STATUS_CACHE_HOURS") or "24").strip() or "24"), 1)
 CALL_ANALYSIS_MAX_RETRIES = max(int((os.getenv("CALL_ANALYSIS_MAX_RETRIES") or "3").strip() or "3"), 1)
 APP_AUTH_ENABLED = env_flag("APP_AUTH_ENABLED", False)
 APP_AUTH_USERNAME = os.getenv("APP_AUTH_USERNAME", "").strip()
@@ -9323,6 +9326,17 @@ def get_skipsherpa_api_key(db=None):
     if db is not None:
         return (get_setting(db, "skipsherpa_api_key", "") or SKIPSHERPA_API_KEY).strip()
     return SKIPSHERPA_API_KEY
+
+
+def get_rentcast_api_key(db=None):
+    if db is None:
+        try:
+            db = get_db()
+        except Exception:
+            db = None
+    if db is not None:
+        return (get_setting(db, "rentcast_api_key", "") or RENTCAST_API_KEY).strip()
+    return RENTCAST_API_KEY
 
 
 def integration_auth_ok(db, req):
@@ -19517,6 +19531,175 @@ def infer_on_market_status_from_payload(payload):
     return "Unknown"
 
 
+def _build_rentcast_listing_snapshot(listing):
+    item = listing if isinstance(listing, dict) else {}
+    history = item.get("history") if isinstance(item.get("history"), dict) else {}
+    latest_history = None
+    if history:
+        try:
+            latest_key = sorted(history.keys())[-1]
+            latest_history = history.get(latest_key) if isinstance(history.get(latest_key), dict) else None
+        except Exception:
+            latest_history = None
+    return {
+        "id": str(item.get("id") or "").strip(),
+        "formattedAddress": str(item.get("formattedAddress") or "").strip(),
+        "status": str(item.get("status") or "").strip(),
+        "price": item.get("price"),
+        "daysOnMarket": item.get("daysOnMarket") or (latest_history or {}).get("daysOnMarket"),
+        "listedDate": item.get("listedDate") or item.get("listDate") or (latest_history or {}).get("listedDate"),
+        "removedDate": item.get("removedDate") or (latest_history or {}).get("removedDate"),
+        "listingAgent": item.get("listingAgent") if isinstance(item.get("listingAgent"), dict) else {},
+        "listingOffice": item.get("listingOffice") if isinstance(item.get("listingOffice"), dict) else {},
+    }
+
+
+def _rentcast_listing_matches_address(full_address, listing):
+    target_variants = {
+        normalize_address_match_text(v)
+        for v in _normalize_listing_address_variants(full_address)
+        if normalize_address_match_text(v)
+    }
+    if not target_variants:
+        return False
+    item = listing if isinstance(listing, dict) else {}
+    candidates = [
+        str(item.get("formattedAddress") or "").strip(),
+        format_property_address_line(
+            item.get("addressLine1"),
+            item.get("city"),
+            item.get("state"),
+            item.get("zipCode"),
+        ),
+    ]
+    for candidate in candidates:
+        normalized = normalize_address_match_text(candidate)
+        if normalized and normalized in target_variants:
+            return True
+    return False
+
+
+def infer_on_market_status_from_rentcast(db, full_address, previous_lookup=None):
+    checked_at = format_db_time(datetime.utcnow())
+    address = normalize_whitespace(full_address)
+    prior = previous_lookup if isinstance(previous_lookup, dict) else {}
+    previous_address = normalize_whitespace(prior.get("address") or "")
+    previous_checked_at = parse_db_time(prior.get("checked_at") or "")
+    if (
+        previous_address
+        and previous_address == address
+        and previous_checked_at is not None
+        and (datetime.utcnow() - previous_checked_at) < timedelta(hours=RENTCAST_MARKET_STATUS_CACHE_HOURS)
+    ):
+        cached_lookup = dict(prior)
+        cached_lookup["cached"] = True
+        return cached_lookup
+
+    api_key = get_rentcast_api_key(db)
+    if not api_key or not address:
+        return {
+            "status": "Unknown",
+            "address": address,
+            "checked_at": checked_at,
+            "cached": False,
+            "skipped": "missing_api_key_or_address",
+            "matched_listings": [],
+            "primary_listing": {},
+            "evidence": [],
+        }
+
+    response = None
+    response_body = None
+    try:
+        response = requests.get(
+            f"{RENTCAST_BASE_URL}/listings/sale",
+            headers={
+                "Accept": "application/json",
+                "X-Api-Key": api_key,
+            },
+            params={
+                "address": address,
+                "limit": 10,
+            },
+            timeout=30,
+        )
+        try:
+            response_body = response.json() if response.content else []
+        except ValueError:
+            response_body = {"raw_text": response.text}
+        if not response.ok:
+            log_app_error(
+                db,
+                source="rentcast_market_status",
+                error_message=f"RentCast sale listings failed ({response.status_code}).",
+                details=response_body,
+                route="infer_on_market_status_from_rentcast",
+                status_code=response.status_code,
+            )
+            return {
+                "status": "Unknown",
+                "address": address,
+                "checked_at": checked_at,
+                "cached": False,
+                "http_status": response.status_code,
+                "error": f"RentCast sale listings failed ({response.status_code})",
+                "matched_listings": [],
+                "primary_listing": {},
+                "evidence": [],
+            }
+    except Exception as exc:
+        return {
+            "status": "Unknown",
+            "address": address,
+            "checked_at": checked_at,
+            "cached": False,
+            "error": str(exc),
+            "matched_listings": [],
+            "primary_listing": {},
+            "evidence": [],
+        }
+
+    listings = response_body if isinstance(response_body, list) else []
+    matched = [item for item in listings if _rentcast_listing_matches_address(address, item)]
+    snapshots = [_build_rentcast_listing_snapshot(item) for item in matched[:5]]
+    primary_listing = snapshots[0] if snapshots else {}
+    resolved_status = "Unknown"
+    if any(str(item.get("status") or "").strip().lower() == "active" for item in snapshots):
+        resolved_status = "On Market"
+        for item in snapshots:
+            if str(item.get("status") or "").strip().lower() == "active":
+                primary_listing = item
+                break
+    elif snapshots:
+        resolved_status = "Off Market"
+
+    evidence = []
+    for item in snapshots[:3]:
+        evidence.append(
+            {
+                "source": "rentcast_sale_listing",
+                "listing_id": item.get("id"),
+                "formatted_address": item.get("formattedAddress"),
+                "status": item.get("status"),
+                "days_on_market": item.get("daysOnMarket"),
+                "listed_date": item.get("listedDate"),
+                "listing_agent": item.get("listingAgent"),
+                "listing_office": item.get("listingOffice"),
+            }
+        )
+
+    return {
+        "status": resolved_status,
+        "address": address,
+        "checked_at": checked_at,
+        "cached": False,
+        "matched_count": len(snapshots),
+        "matched_listings": snapshots,
+        "primary_listing": primary_listing,
+        "evidence": evidence,
+    }
+
+
 def _normalize_listing_address_variants(full_address):
     address = re.sub(r"\s+", " ", str(full_address or "").strip())
     if not address:
@@ -19733,12 +19916,14 @@ def upsert_reisift_referral(db, property_uuid, payload, is_active=1, preserve_ma
     merged_payload = dict(payload or {})
     source_override = {}
     existing_market_status = "Unknown"
+    existing_payload = {}
     if preserve_market_status:
         existing_row = db.execute(
             """
             SELECT
                 COALESCE(on_market_status, 'Unknown') AS on_market_status,
-                source_override_json
+                source_override_json,
+                payload_json
             FROM reisift_referrals
             WHERE property_uuid = ?
             """,
@@ -19746,17 +19931,33 @@ def upsert_reisift_referral(db, property_uuid, payload, is_active=1, preserve_ma
         ).fetchone()
         existing_market_status = str((existing_row["on_market_status"] if existing_row else "Unknown") or "Unknown").strip() or "Unknown"
         source_override = parse_json_object((existing_row["source_override_json"] if existing_row else "") or "{}")
+        existing_payload = parse_json_object((existing_row["payload_json"] if existing_row else "") or "{}")
     if source_override:
         merged_payload = apply_referral_source_override(merged_payload, source_override)
     summary = summarize_reisift_property(merged_payload)
     county = infer_county_from_reisift_payload(merged_payload)
     payload_market_status = infer_on_market_status_from_payload(merged_payload)
     override_market_status = str(source_override.get("on_market_status") or "").strip() if isinstance(source_override, dict) else ""
-    on_market_status = override_market_status or payload_market_status or "Unknown"
+    previous_inference = {}
+    if isinstance(existing_payload, dict):
+        previous_inference = existing_payload.get("market_status_inference") if isinstance(existing_payload.get("market_status_inference"), dict) else {}
+    rentcast_lookup = {}
+    if not override_market_status:
+        rentcast_lookup = infer_on_market_status_from_rentcast(
+            db,
+            summary["full_address"],
+            previous_lookup=previous_inference.get("rentcast_lookup"),
+        )
+    rentcast_status = str((rentcast_lookup or {}).get("status") or "Unknown").strip() or "Unknown"
+    on_market_status = override_market_status or rentcast_status or payload_market_status or "Unknown"
+    if on_market_status == "Unknown":
+        on_market_status = payload_market_status or "Unknown"
     if on_market_status == "Unknown" and existing_market_status != "Unknown":
         on_market_status = existing_market_status
     merged_payload["market_status_inference"] = {
         "payload_status": payload_market_status,
+        "rentcast_status": rentcast_status,
+        "rentcast_lookup": rentcast_lookup,
         "web_status": None,
         "web_evidence": [],
         "previous_local_status": existing_market_status if preserve_market_status else "",
@@ -27103,6 +27304,7 @@ def settings_page():
                     "slack_agent_ops_webhook_url": request.form.get("slack_agent_ops_webhook_url", ""),
                     "slack_agent_ops_channel": request.form.get("slack_agent_ops_channel", ""),
                     "skipsherpa_api_key": request.form.get("skipsherpa_api_key", ""),
+                    "rentcast_api_key": request.form.get("rentcast_api_key", ""),
                     "emaillistverify_api_key": request.form.get("emaillistverify_api_key", ""),
                     "emailoctopus_api_key": request.form.get("emailoctopus_api_key", ""),
                     "emailoctopus_list_id": request.form.get("emailoctopus_list_id", ""),
@@ -27237,6 +27439,7 @@ def settings_page():
     ad_platform_settings = get_ads_dashboard_settings(db)
     integration_api_key = get_integration_api_key(db)
     skipsherpa_api_key = get_skipsherpa_api_key(db)
+    rentcast_api_key = get_rentcast_api_key(db)
     deep_dive_smrtphone_from = get_setting(db, "deep_dive_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     referral_smrtphone_from = get_setting(db, "referral_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     postage_options = []
@@ -27326,6 +27529,7 @@ def settings_page():
         ad_platform_settings=ad_platform_settings,
         integration_api_key=integration_api_key,
         skipsherpa_api_key=skipsherpa_api_key,
+        rentcast_api_key=rentcast_api_key,
         active_tab=active_tab,
         deep_dive_smrtphone_from=deep_dive_smrtphone_from,
         referral_smrtphone_from=referral_smrtphone_from,

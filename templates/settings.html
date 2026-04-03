@@ -230,6 +230,9 @@
             <label class="span2">SkipSherpa API Key
                 <input name="skipsherpa_api_key" value="{{ skipsherpa_api_key }}">
             </label>
+            <label class="span2">RentCast API Key
+                <input name="rentcast_api_key" value="{{ rentcast_api_key }}">
+            </label>
             <label class="span2">EmailListVerify API Key
                 <input name="emaillistverify_api_key" value="{{ anonymous_email_settings.emaillistverify_api_key }}">
             </label>
@@ -252,6 +255,7 @@
                 <button type="submit" name="integration_action" value="test_slack_agent_ops">Save + Test Agent Ops Slack</button>
             </div>
         </form>
+        <p class="muted-text">RentCast is used for systematic sale-listing checks via <code>/v1/listings/sale</code>. If a matching listing returns <code>status=Active</code>, the referral is treated as on-market, and listing agent details are cached with the referral payload.</p>
         <p class="muted-text">Anonymous browse-stage leads are only validated/pushed when they remain outside <code>/step-2/</code> and <code>/thank-you/</code>. Imported EmailOctopus sent-email registry size: {{ anonymous_email_registry_count }}.</p>
         <form method="post" enctype="multipart/form-data" class="grid-form" style="margin-top:0.75rem;">
             <input type="hidden" name="settings_tab" value="integrations">

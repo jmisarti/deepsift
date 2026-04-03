@@ -8047,6 +8047,11 @@ def _amazon_legacy_report_status_once(settings, access_token, profile_id, report
     return body if isinstance(body, dict) else {}
 
 
+def _amazon_legacy_auth_contract_error(message):
+    text = normalize_whitespace(message).lower()
+    return "invalid key=value pair" in text and "authorization header" in text
+
+
 def _amazon_sponsored_tv_campaigns_once(settings, access_token, profile_id, next_token=""):
     base_url = _amazon_ads_base_url(settings.get("amazon_region"))
     normalized_token = normalize_whitespace(next_token)
@@ -8617,6 +8622,7 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
     rows = []
     pending_profile_days = []
     empty_metric_profile_days = []
+    legacy_endpoint_unsupported = False
     for profile_id in matched_profile_ids:
         snapshots = _fetch_amazon_campaign_snapshots(settings, access_token, profile_id)
         rows.extend(snapshots)
@@ -8662,7 +8668,13 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
                     )
                     pending_profile_days.append(f"{profile_id}:{metric_date}")
             else:
-                created = _amazon_create_legacy_campaign_day_report(settings, access_token, profile_id, metric_date)
+                try:
+                    created = _amazon_create_legacy_campaign_day_report(settings, access_token, profile_id, metric_date)
+                except RuntimeError as exc:
+                    if _amazon_legacy_auth_contract_error(str(exc)):
+                        legacy_endpoint_unsupported = True
+                        break
+                    raise
                 _upsert_pending_ad_report(
                     db,
                     "amazon_legacy",
@@ -8675,11 +8687,20 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
                 )
                 pending_profile_days.append(f"{profile_id}:{metric_date}")
             rows.extend(_amazon_legacy_report_rows_to_dashboard_rows(profile_id, metric_date, report_rows, snapshots_by_campaign))
+        if legacy_endpoint_unsupported:
+            break
     message = f"Fetched {len(rows)} Amazon campaign rows across {len(matched_profile_ids)} profile(s)."
     if account_id:
         message += f" Target account: {account_id}."
     if skipped_profile_ids:
         message += " Skipped inaccessible profile IDs: " + ", ".join(skipped_profile_ids) + "."
+    if legacy_endpoint_unsupported:
+        message += " Amazon legacy /campaigns/report rejected Bearer auth for this account, so Amazon historical metrics remain unavailable on that endpoint."
+        return {
+            "status": "ok",
+            "rows": rows,
+            "message": message,
+        }
     if pending_profile_days and not [row for row in rows if str(row.get("metric_date") or "").strip()]:
         return {
             "status": "pending",

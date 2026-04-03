@@ -185,6 +185,7 @@ META_GRAPH_API_VERSION = (os.getenv("META_GRAPH_API_VERSION") or "v23.0").strip(
 AMAZON_LWA_AUTHORIZE_URL = (os.getenv("AMAZON_LWA_AUTHORIZE_URL") or "https://www.amazon.com/ap/oa").strip() or "https://www.amazon.com/ap/oa"
 AMAZON_LWA_TOKEN_URL = (os.getenv("AMAZON_LWA_TOKEN_URL") or "https://api.amazon.com/auth/o2/token").strip() or "https://api.amazon.com/auth/o2/token"
 AMAZON_ADS_DEFAULT_SCOPE = (os.getenv("AMAZON_ADS_DEFAULT_SCOPE") or "advertising::campaign_management").strip() or "advertising::campaign_management"
+AMAZON_REPORT_POLL_SECONDS = max(int((os.getenv("AMAZON_REPORT_POLL_SECONDS") or "24").strip() or "24"), 10)
 ADS_REFRESH_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
@@ -7417,8 +7418,8 @@ def _create_amazon_report(settings, access_token, profile_id, start_date, end_da
     return report_id
 
 
-def _poll_amazon_report(settings, access_token, profile_id, report_id, timeout_seconds=120):
-    deadline = time.time() + max(int(timeout_seconds or 120), 30)
+def _poll_amazon_report(settings, access_token, profile_id, report_id, timeout_seconds=AMAZON_REPORT_POLL_SECONDS):
+    deadline = time.time() + max(int(timeout_seconds or AMAZON_REPORT_POLL_SECONDS), 10)
     status_url = f"{_amazon_ads_base_url(settings.get('amazon_region'))}/reporting/reports/{report_id}"
     last_status = ""
     while time.time() < deadline:
@@ -7750,9 +7751,16 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date):
         settings.get("amazon_refresh_token", ""),
     )
     rows = []
+    pending_profiles = []
     for profile_id in profile_ids:
         report_id = _create_amazon_report(settings, access_token, profile_id, start_date, end_date)
-        report_meta = _poll_amazon_report(settings, access_token, profile_id, report_id)
+        try:
+            report_meta = _poll_amazon_report(settings, access_token, profile_id, report_id)
+        except RuntimeError as exc:
+            if "timed out" in str(exc).lower():
+                pending_profiles.append(str(profile_id))
+                continue
+            raise
         report_rows = _download_amazon_report_rows(report_meta.get("url") or "")
         for item in report_rows:
             if not isinstance(item, dict):
@@ -7778,6 +7786,20 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date):
                     "raw": item,
                 }
             )
+    if pending_profiles and not rows:
+        return {
+            "status": "pending",
+            "rows": [],
+            "message": "Amazon report is still processing for profile(s): "
+            + ", ".join(pending_profiles)
+            + ". Try Refresh again in about a minute.",
+        }
+    if pending_profiles:
+        return {
+            "status": "ok",
+            "rows": rows,
+            "message": "Amazon data refreshed for ready profiles. Still processing: " + ", ".join(pending_profiles),
+        }
     return {
         "status": "ok",
         "rows": rows,

@@ -26296,8 +26296,8 @@ def import_referral_bundle_api():
 def settings_page():
     ensure_db()
     db = get_db()
-    notice = ""
-    error_notice = ""
+    notice = (request.args.get("notice") or "").strip()
+    error_notice = (request.args.get("error") or "").strip()
     active_tab = request.args.get("tab", "").strip() or "direct_mail"
     market_helper_address = (request.args.get("market_helper_address") or "").strip()
     market_helper_result = build_market_status_helper(market_helper_address) if market_helper_address else None
@@ -27287,6 +27287,81 @@ def roku_oauth_start():
         redirect_uri=url_for("roku_oauth_callback", _external=True),
     )
     return redirect(authorize_url)
+
+
+@app.route("/oauth/roku/test", methods=["GET"])
+def roku_oauth_test():
+    ensure_db()
+    db = get_db()
+    settings = get_ads_dashboard_settings(db)
+    missing = []
+    if not settings.get("roku_client_id"):
+        missing.append("client ID")
+    if not settings.get("roku_client_secret"):
+        missing.append("client secret")
+    if not settings.get("roku_refresh_token"):
+        missing.append("refresh token")
+    if missing:
+        return redirect(
+            url_for(
+                "settings_page",
+                tab="ads",
+                error="Save Roku " + ", ".join(missing) + " first.",
+            )
+        )
+    try:
+        access_token = _exchange_roku_refresh_token(
+            settings.get("roku_client_id", ""),
+            settings.get("roku_client_secret", ""),
+            settings.get("roku_refresh_token", ""),
+        )
+        accounts = _fetch_roku_accounts(access_token)
+        account_ids = {
+            _normalize_roku_account_id((account.get("uid") if isinstance(account, dict) else ""))
+            for account in accounts
+        }
+        account_ids = {value for value in account_ids if value}
+        configured_account_ids = {
+            _normalize_roku_account_id(value) for value in (settings.get("roku_account_ids") or []) if value
+        }
+        campaigns = _fetch_roku_campaign_snapshots(access_token)
+        visible_campaign_count = 0
+        if configured_account_ids:
+            visible_campaign_count = sum(
+                1 for row in campaigns if _normalize_roku_account_id(row.get("account_id")) in configured_account_ids
+            )
+        else:
+            visible_campaign_count = len(campaigns)
+        matched_accounts = sorted(configured_account_ids.intersection(account_ids))
+        notice_parts = [
+            "Roku connection OK.",
+            f"Refreshed access token successfully.",
+            f"Detected {len(account_ids)} Roku ad account(s).",
+            f"Visible campaigns: {visible_campaign_count}.",
+        ]
+        if configured_account_ids:
+            notice_parts.append(
+                f"Configured account matches: {len(matched_accounts)}/{len(configured_account_ids)}."
+            )
+            if matched_accounts:
+                notice_parts.append("Matched IDs: " + ", ".join(matched_accounts) + ".")
+        elif account_ids:
+            set_setting(db, "ads_roku_account_ids", ", ".join(sorted(account_ids)))
+            db.commit()
+            notice_parts.append("Saved detected Roku account IDs into Ad Platforms.")
+        return redirect(url_for("settings_page", tab="ads", notice=" ".join(notice_parts)))
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="roku_oauth_test",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/oauth/roku/test",
+            status_code=500,
+        )
+        db.commit()
+        return redirect(url_for("settings_page", tab="ads", error=f"Roku test failed: {exc}"))
 
 
 @app.route("/property/<int:property_id>/upload-contacts", methods=["POST"])

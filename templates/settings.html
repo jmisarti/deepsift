@@ -170,6 +170,7 @@
             <p class="muted-text span2">Roku redirect URI: <a href="{{ url_for('roku_oauth_callback', _external=True) }}" target="_blank" rel="noopener">{{ url_for('roku_oauth_callback', _external=True) }}</a></p>
             <div class="span2 inline-actions">
                 <a class="button-link" href="{{ url_for('roku_oauth_start') }}">Connect Roku And Get Refresh Token</a>
+                <a class="button-link" href="{{ url_for('roku_oauth_test') }}">Test Roku Connection</a>
             </div>
             <button type="submit">Save Ad Platform Settings</button>
         </form>

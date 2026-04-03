@@ -12,6 +12,7 @@
             <h2>Amazon Ads OAuth Callback</h2>
             <p class="muted-text">Register this exact redirect URI in your Amazon app and use it for the authorization flow.</p>
             <p><strong>Redirect URI:</strong> <a href="{{ result.callback_url }}">{{ result.callback_url }}</a></p>
+            <p><a class="button-link" href="{{ url_for('amazon_oauth_start') }}">Start Amazon OAuth</a></p>
 
             {% if result.notice %}
             <div class="notice-banner">{{ result.notice }}</div>

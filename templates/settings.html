@@ -148,6 +148,9 @@
                 </select>
             </label>
             <p class="muted-text span2">Amazon redirect URI: <a href="{{ url_for('amazon_oauth_callback', _external=True) }}" target="_blank" rel="noopener">{{ url_for('amazon_oauth_callback', _external=True) }}</a></p>
+            <div class="span2 inline-actions">
+                <a class="button-link" href="{{ url_for('amazon_oauth_start') }}">Connect Amazon And Get Refresh Token</a>
+            </div>
 
             <label class="span2">Roku Ads API Token / Key
                 <input name="ads_roku_api_token" value="{{ ad_platform_settings.roku_api_token }}">

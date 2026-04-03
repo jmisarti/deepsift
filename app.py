@@ -20,7 +20,7 @@ import threading
 import time
 import traceback
 from collections import Counter
-from urllib.parse import quote, quote_plus, urlsplit
+from urllib.parse import quote, quote_plus, urlsplit, urlencode
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from email import message_from_bytes
@@ -183,6 +183,7 @@ GOOGLE_ADS_API_VERSION = (os.getenv("GOOGLE_ADS_API_VERSION") or "v22").strip() 
 META_GRAPH_API_VERSION = (os.getenv("META_GRAPH_API_VERSION") or "v23.0").strip() or "v23.0"
 AMAZON_LWA_AUTHORIZE_URL = (os.getenv("AMAZON_LWA_AUTHORIZE_URL") or "https://www.amazon.com/ap/oa").strip() or "https://www.amazon.com/ap/oa"
 AMAZON_LWA_TOKEN_URL = (os.getenv("AMAZON_LWA_TOKEN_URL") or "https://api.amazon.com/auth/o2/token").strip() or "https://api.amazon.com/auth/o2/token"
+AMAZON_ADS_DEFAULT_SCOPE = (os.getenv("AMAZON_ADS_DEFAULT_SCOPE") or "advertising::campaign_management").strip() or "advertising::campaign_management"
 ADS_REFRESH_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
@@ -7057,6 +7058,17 @@ def _amazon_ads_base_url(region):
         "fe": "https://advertising-api-fe.amazon.com",
     }
     return mapping.get(region_key, mapping["na"])
+
+
+def _build_amazon_authorize_url(client_id, redirect_uri, state, scope=AMAZON_ADS_DEFAULT_SCOPE):
+    params = {
+        "client_id": client_id,
+        "scope": scope,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "state": state,
+    }
+    return f"{AMAZON_LWA_AUTHORIZE_URL}?{urlencode(params)}"
 
 
 def _google_ads_headers(settings, access_token):
@@ -26462,6 +26474,7 @@ def amazon_oauth_callback():
     error_description = normalize_whitespace(request.args.get("error_description"))
     code = normalize_whitespace(request.args.get("code"))
     state = normalize_whitespace(request.args.get("state"))
+    expected_state = normalize_whitespace(session.get("amazon_oauth_state"))
     result = {
         "ok": False,
         "notice": "",
@@ -26474,6 +26487,10 @@ def amazon_oauth_callback():
         "profiles": [],
         "saved_to_settings": False,
     }
+    if state and expected_state and state != expected_state:
+        result["error"] = "Amazon OAuth state mismatch. Start the flow again from Ad Platforms."
+        session.pop("amazon_oauth_state", None)
+        return render_template("amazon_oauth_callback.html", result=result)
     if error_value:
         result["error"] = error_description or error_value
         return render_template("amazon_oauth_callback.html", result=result)
@@ -26487,6 +26504,7 @@ def amazon_oauth_callback():
         return render_template("amazon_oauth_callback.html", result=result)
     try:
         token_payload = _exchange_amazon_authorization_code(client_id, client_secret, code, callback_url)
+        session.pop("amazon_oauth_state", None)
         refresh_token = normalize_whitespace(token_payload.get("refresh_token"))
         access_token = normalize_whitespace(token_payload.get("access_token"))
         expires_in = token_payload.get("expires_in")
@@ -26524,6 +26542,25 @@ def amazon_oauth_callback():
         )
         db.commit()
     return render_template("amazon_oauth_callback.html", result=result)
+
+
+@app.route("/oauth/amazon/start", methods=["GET"])
+def amazon_oauth_start():
+    ensure_db()
+    db = get_db()
+    settings = get_ads_dashboard_settings(db)
+    client_id = settings.get("amazon_client_id", "")
+    client_secret = settings.get("amazon_client_secret", "")
+    if not client_id or not client_secret:
+        return redirect(url_for("settings_page", tab="ads", notice="Save Amazon client ID and secret first."))
+    state = secrets.token_urlsafe(24)
+    session["amazon_oauth_state"] = state
+    authorize_url = _build_amazon_authorize_url(
+        client_id=client_id,
+        redirect_uri=url_for("amazon_oauth_callback", _external=True),
+        state=state,
+    )
+    return redirect(authorize_url)
 
 
 @app.route("/property/<int:property_id>/upload-contacts", methods=["POST"])

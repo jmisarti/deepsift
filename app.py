@@ -175,6 +175,8 @@ WEBSITE_LEADS_HOLD_WORKER_STARTED = False
 AGENT_REFRESH_WORKER_STARTED = False
 UNTITLED_LEADS_WORKER_STARTED = False
 EMAIL_VALIDATION_QUEUE_WORKER_STARTED = False
+PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTES") or "60").strip() or "60"), 5)
+PROVIDER_ALERT_SOURCE_PREFIX = "provider_"
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
     "running": False,
@@ -1410,6 +1412,105 @@ def log_app_error(db, source, error_message, details="", route="", status_code=N
         )
     except Exception:
         pass
+
+
+def _provider_alert_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _provider_alert_label(source):
+    label = str(source or "").strip()
+    if label.startswith(PROVIDER_ALERT_SOURCE_PREFIX):
+        label = label[len(PROVIDER_ALERT_SOURCE_PREFIX):]
+    if not label:
+        return "Provider"
+    words = [part.upper() if len(part) <= 3 else part.capitalize() for part in label.split("_") if part]
+    return " ".join(words) or "Provider"
+
+
+def _is_provider_capacity_issue(*parts):
+    haystack = " ".join(_provider_alert_text(part) for part in parts).lower()
+    if not haystack:
+        return False
+    keywords = (
+        "credit",
+        "credits",
+        "insufficient",
+        "out of",
+        "no more",
+        "balance",
+        "quota",
+        "limit exceeded",
+        "rate limit",
+        "payment required",
+        "billing",
+    )
+    return any(keyword in haystack for keyword in keywords)
+
+
+def emit_provider_alert(source, error_message, details="", route="", status_code=500):
+    ensure_db()
+    alert_db = open_sqlite_connection()
+    slack_result = {"ok": False, "error": ""}
+    try:
+        source_text = str(source or f"{PROVIDER_ALERT_SOURCE_PREFIX}unknown").strip()[:80] or f"{PROVIDER_ALERT_SOURCE_PREFIX}unknown"
+        message_text = str(error_message or "Provider error").strip()[:2000] or "Provider error"
+        duplicate = alert_db.execute(
+            """
+            SELECT id, created_at
+            FROM app_errors
+            WHERE source = ?
+              AND error_message = ?
+              AND datetime(created_at) >= datetime('now', ?)
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (source_text, message_text, f"-{int(PROVIDER_ALERT_DEDUPE_MINUTES)} minutes"),
+        ).fetchone()
+        if duplicate:
+            return {
+                "ok": True,
+                "duplicate": True,
+                "alert_id": int(duplicate["id"]),
+                "created_at": duplicate["created_at"],
+                "slack": slack_result,
+            }
+        log_app_error(
+            alert_db,
+            source=source_text,
+            error_message=message_text,
+            details=str(details or "")[:20000],
+            route=route,
+            status_code=status_code,
+        )
+        alert_id = int(alert_db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        alert_db.commit()
+        provider_label = _provider_alert_label(source_text)
+        slack_lines = [
+            "Provider alert in Deep Prospect CRM",
+            f"Provider: {provider_label}",
+            f"Error: {message_text}",
+        ]
+        if route:
+            slack_lines.append(f"Route: {route}")
+        if details:
+            detail_text = str(details).strip()
+            if detail_text:
+                slack_lines.append(f"Details: {detail_text[:1200]}")
+        try:
+            slack_result = send_agent_ops_notification(alert_db, "\n".join(slack_lines))
+        except Exception as exc:
+            slack_result = {"ok": False, "error": str(exc)}
+        return {"ok": True, "duplicate": False, "alert_id": alert_id, "slack": slack_result}
+    finally:
+        alert_db.close()
 
 
 def init_db():
@@ -3292,6 +3393,13 @@ def call_skipsherpa_person_lookup(first_name, last_name, street, city="", state=
     if not response.ok:
         if response.status_code == 404 and isinstance(data, dict) and "person_results" in data:
             return {"request": payload, "response": data}
+        emit_provider_alert(
+            source="provider_skipsherpa",
+            error_message=f"SkipSherpa person lookup failed ({response.status_code}).",
+            details=_provider_alert_text(data),
+            route="call_skipsherpa_person_lookup",
+            status_code=response.status_code,
+        )
         raise ValueError(f"SkipSherpa person lookup failed ({response.status_code}): {data}")
     return {"request": payload, "response": data}
 
@@ -3323,6 +3431,13 @@ def call_skipsherpa_property_lookup(street, city="", state="", zipcode=""):
     except ValueError:
         data = {"raw_text": response.text}
     if not response.ok:
+        emit_provider_alert(
+            source="provider_skipsherpa",
+            error_message=f"SkipSherpa property lookup failed ({response.status_code}).",
+            details=_provider_alert_text(data),
+            route="call_skipsherpa_property_lookup",
+            status_code=response.status_code,
+        )
         raise ValueError(f"SkipSherpa property lookup failed ({response.status_code}): {data}")
     return {"request": payload, "response": data}
 
@@ -6958,6 +7073,13 @@ def verify_email_with_emaillistverify(api_key, email_address):
     raw_text = (response.text or "").strip()
     provider_status = raw_text.strip().lower()
     if not response.ok:
+        emit_provider_alert(
+            source="provider_emaillistverify",
+            error_message=f"EmailListVerify request failed ({response.status_code}).",
+            details=raw_text or "Unknown error",
+            route="verify_email_with_emaillistverify",
+            status_code=response.status_code,
+        )
         raise ValueError(f"EmailListVerify failed ({response.status_code}): {raw_text or 'Unknown error'}")
     normalized_status = "error"
     if provider_status in {"ok", "valid"}:
@@ -6970,6 +7092,23 @@ def verify_email_with_emaillistverify(api_key, email_address):
         normalized_status = "awaiting_emaillistverify_config"
     elif "key" in provider_status and "valid" in provider_status:
         normalized_status = "awaiting_emaillistverify_config"
+    elif _is_provider_capacity_issue(provider_status, raw_text):
+        normalized_status = "awaiting_emaillistverify_provider_attention"
+        emit_provider_alert(
+            source="provider_emaillistverify",
+            error_message="EmailListVerify reported a provider credit or capacity issue.",
+            details=raw_text,
+            route="verify_email_with_emaillistverify",
+            status_code=response.status_code,
+        )
+    elif normalized_status == "error":
+        emit_provider_alert(
+            source="provider_emaillistverify",
+            error_message="EmailListVerify returned an unexpected provider status.",
+            details=raw_text or provider_status or "Empty provider status",
+            route="verify_email_with_emaillistverify",
+            status_code=response.status_code,
+        )
     return {
         "ok": normalized_status in {"valid", "invalid", "unknown"},
         "provider": "emaillistverify",
@@ -7131,7 +7270,8 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     "raw": str(exc),
                 }
             normalized_status = (validation_result.get("normalized_status") or "").strip().lower()
-            if normalized_status == "awaiting_emaillistverify_config":
+            if normalized_status in {"awaiting_emaillistverify_config", "awaiting_emaillistverify_provider_attention", "error"}:
+                retry_minutes = 15 if normalized_status == "awaiting_emaillistverify_config" else 60
                 db.execute(
                     """
                     UPDATE email_validation_queue
@@ -7146,7 +7286,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     (
                         normalized_status,
                         json.dumps(validation_result, ensure_ascii=True, sort_keys=True),
-                        format_db_time(datetime.utcnow() + timedelta(minutes=15)),
+                        format_db_time(datetime.utcnow() + timedelta(minutes=retry_minutes)),
                         queue_id,
                     ),
                 )
@@ -7563,6 +7703,7 @@ def sync_untitled_email_campaign_contact(db, prepared_row, snapshot_created_at, 
         contact_id = str(prior.get("contact_id") or "").strip()
         synced_at = str(prior.get("synced_at") or "").strip()
         last_error = str(prior.get("last_error") or "").strip()
+        validation_result = {}
 
         registry_status = ""
         if processed_email_statuses is not None:
@@ -7573,8 +7714,19 @@ def sync_untitled_email_campaign_contact(db, prepared_row, snapshot_created_at, 
         else:
             if not marketing_settings["emaillistverify_api_key"]:
                 validation_status = validation_status or "awaiting_emaillistverify_config"
-            elif not validation_status or validation_status in {"awaiting_emaillistverify_config", "error"}:
-                validation_result = verify_email_with_emaillistverify(marketing_settings["emaillistverify_api_key"], campaign_email)
+            elif not validation_status or validation_status in {"awaiting_emaillistverify_config", "awaiting_emaillistverify_provider_attention", "error"}:
+                try:
+                    validation_result = verify_email_with_emaillistverify(marketing_settings["emaillistverify_api_key"], campaign_email)
+                except Exception as exc:
+                    validation_result = {
+                        "ok": False,
+                        "provider": "emaillistverify",
+                        "email": campaign_email,
+                        "provider_status": "error",
+                        "normalized_status": "error",
+                        "is_valid": False,
+                        "raw": str(exc),
+                    }
                 validation_status = validation_result["normalized_status"]
                 validation_raw = json.dumps(validation_result, ensure_ascii=True, sort_keys=True)
                 validation_checked_at = snapshot_created_at
@@ -7628,9 +7780,9 @@ def sync_untitled_email_campaign_contact(db, prepared_row, snapshot_created_at, 
                 )
                 if processed_email_statuses is not None:
                     processed_email_statuses[campaign_email] = f"validation_{validation_status}"
-            elif validation_status == "awaiting_emaillistverify_config":
+            elif validation_status in {"awaiting_emaillistverify_config", "awaiting_emaillistverify_provider_attention"}:
                 sync_status = sync_status or ""
-                last_error = ""
+                last_error = str((validation_result or {}).get("raw") or last_error or "").strip()
             else:
                 sync_status = "error" if validation_status else sync_status
                 if validation_status == "error":
@@ -29641,6 +29793,41 @@ def api_app_errors():
         (limit,),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/provider-alerts/recent", methods=["GET"])
+def api_recent_provider_alerts():
+    ensure_db()
+    db = get_db()
+    limit_raw = (request.args.get("limit") or "15").strip()
+    try:
+        limit = max(1, min(50, int(limit_raw)))
+    except ValueError:
+        limit = 15
+    rows = db.execute(
+        """
+        SELECT id, source, route, status_code, error_message, created_at
+        FROM app_errors
+        WHERE source LIKE ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (f"{PROVIDER_ALERT_SOURCE_PREFIX}%", limit),
+    ).fetchall()
+    items = []
+    for row in rows:
+        items.append(
+            {
+                "id": int(row["id"]),
+                "source": row["source"],
+                "provider_label": _provider_alert_label(row["source"]),
+                "route": row["route"] or "",
+                "status_code": row["status_code"],
+                "error_message": row["error_message"] or "",
+                "created_at": row["created_at"] or "",
+            }
+        )
+    return jsonify({"ok": True, "items": items, "count": len(items)})
 
 
 @app.errorhandler(Exception)

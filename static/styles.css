@@ -178,6 +178,17 @@ body {
     font-size: 0.75rem;
 }
 
+.top-notify-alerts .top-notify-toggle {
+    background: #4a1d1f;
+    border-color: #8b2c2f;
+    color: #fff1f2;
+}
+
+.top-notify-alerts .top-notify-count {
+    background: #f59e0b;
+    color: #111827;
+}
+
 .top-notify-panel {
     position: absolute;
     top: 115%;
@@ -220,6 +231,24 @@ body {
     margin: 0.2rem 0 0;
     font-size: 0.78rem;
     color: var(--muted);
+}
+
+.top-notify-item-alert {
+    background: #fff7ed;
+    border-color: #fdba74;
+}
+
+.top-notify-alert-title {
+    color: #9a3412 !important;
+    font-size: 0.88rem !important;
+    font-weight: 700;
+    margin: 0 !important;
+}
+
+.top-notify-alert-body {
+    color: #7c2d12 !important;
+    font-size: 0.84rem !important;
+    margin: 0.25rem 0 0 !important;
 }
 
 .top-notify-empty {

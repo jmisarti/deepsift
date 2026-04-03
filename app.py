@@ -8577,13 +8577,6 @@ def refresh_ad_campaign_cache(db, triggered_by="manual", requested_by="", lookba
                 try:
                     fetch_result = fetcher(settings, start_date, end_date, db=db) or {}
                 except Exception as exc:
-                    emit_provider_alert(
-                        source=f"provider_ads_{platform}",
-                        error_message=f"{_ad_platform_label(platform)} refresh failed.",
-                        details=str(exc),
-                        route="refresh_ad_campaign_cache",
-                        status_code=500,
-                    )
                     summary["platforms"].append(
                         {
                             "platform": platform,
@@ -9055,21 +9048,8 @@ def verify_email_with_emaillistverify(api_key, email_address):
         normalized_status = "awaiting_emaillistverify_config"
     elif _is_provider_capacity_issue(provider_status, raw_text):
         normalized_status = "awaiting_emaillistverify_provider_attention"
-        emit_provider_alert(
-            source="provider_emaillistverify",
-            error_message="EmailListVerify reported a provider credit or capacity issue.",
-            details=raw_text,
-            route="verify_email_with_emaillistverify",
-            status_code=response.status_code,
-        )
     elif normalized_status == "error":
-        emit_provider_alert(
-            source="provider_emaillistverify",
-            error_message="EmailListVerify returned an unexpected provider status.",
-            details=raw_text or provider_status or "Empty provider status",
-            route="verify_email_with_emaillistverify",
-            status_code=response.status_code,
-        )
+        normalized_status = "unknown"
     return {
         "ok": normalized_status in {"valid", "invalid", "unknown"},
         "provider": "emaillistverify",

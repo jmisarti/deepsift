@@ -121,12 +121,19 @@
                 <input name="ads_google_login_customer_id" value="{{ ad_platform_settings.google_login_customer_id }}">
             </label>
 
+            <label>Meta App ID
+                <input name="ads_meta_app_id" value="{{ ad_platform_settings.meta_app_id }}">
+            </label>
+            <label>Meta App Secret
+                <input name="ads_meta_app_secret" value="{{ ad_platform_settings.meta_app_secret }}">
+            </label>
             <label class="span2">Meta Access Token
                 <input name="ads_meta_access_token" value="{{ ad_platform_settings.meta_access_token }}">
             </label>
             <label class="span2">Meta Ad Account IDs
                 <input name="ads_meta_account_ids" value="{{ ad_platform_settings.meta_account_ids_raw }}" placeholder="1234567890, 9988776655">
             </label>
+            <p class="muted-text span2">If Meta returns code 190 / subcode 463, the saved token is expired. Paste a fresh Meta user token below to exchange it for a long-lived token.</p>
 
             <label>Amazon Ads Client ID
                 <input name="ads_amazon_client_id" value="{{ ad_platform_settings.amazon_client_id }}">
@@ -181,6 +188,15 @@
             </label>
             <div class="span2 inline-actions">
                 <button type="submit">Exchange Code And Save Refresh Token</button>
+            </div>
+        </form>
+        <form method="post" action="{{ url_for('meta_oauth_exchange') }}" class="grid-form" style="margin-top:1rem;">
+            <label class="span2">Exchange Meta User Token
+                <input name="meta_user_access_token" placeholder="Paste a fresh Meta user access token here">
+            </label>
+            <div class="span2 inline-actions">
+                <button type="submit">Exchange For Long-Lived Token</button>
+                <a class="button-link" href="{{ url_for('meta_oauth_test') }}">Test Meta Connection</a>
             </div>
         </form>
         <p class="muted-text">Current ready state: Google {% if ad_platform_settings.google_ready %}ready{% else %}pending{% endif %}, Meta {% if ad_platform_settings.meta_ready %}ready{% else %}pending{% endif %}, Amazon {% if ad_platform_settings.amazon_ready %}ready{% else %}pending{% endif %}, Roku {% if ad_platform_settings.roku_ready %}ready{% else %}pending{% endif %}.</p>

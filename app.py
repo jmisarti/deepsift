@@ -1610,10 +1610,24 @@ def emit_provider_alert(source, error_message, details="", route="", status_code
             detail_text = str(details).strip()
             if detail_text:
                 slack_lines.append(f"Details: {detail_text[:1200]}")
-        try:
-            slack_result = send_agent_ops_notification(alert_db, "\n".join(slack_lines))
-        except Exception as exc:
-            slack_result = {"ok": False, "error": str(exc)}
+        send_to_agent_ops = True
+        source_low = source_text.lower()
+        detail_low = str(details or "").strip().lower()
+        message_low = message_text.lower()
+        if source_low.startswith("provider_ads_"):
+            send_to_agent_ops = False
+        if source_low == "provider_emaillistverify" and (
+            "ok_for_all" in detail_low
+            or "ok_for_all" in message_low
+            or "ok for all" in detail_low
+            or "ok for all" in message_low
+        ):
+            send_to_agent_ops = False
+        if send_to_agent_ops:
+            try:
+                slack_result = send_agent_ops_notification(alert_db, "\n".join(slack_lines))
+            except Exception as exc:
+                slack_result = {"ok": False, "error": str(exc)}
         return {"ok": True, "duplicate": False, "alert_id": alert_id, "slack": slack_result}
     finally:
         alert_db.close()
@@ -7289,6 +7303,14 @@ def _meta_graph_get(path, params, access_token):
                 error_payload = response.json()
             except Exception:
                 error_payload = response.text
+            if isinstance(error_payload, dict):
+                err = error_payload.get("error") if isinstance(error_payload.get("error"), dict) else {}
+                code = err.get("code")
+                subcode = err.get("error_subcode")
+                if int(code or 0) == 190 and int(subcode or 0) == 463:
+                    raise RuntimeError(
+                        "Meta access token expired. Exchange a fresh Meta user token for a long-lived token in Settings -> Ad Platforms."
+                    )
             raise RuntimeError(f"Meta API request failed ({response.status_code}): {error_payload}")
         data = response.json() or {}
         if isinstance(data.get("data"), list):
@@ -7303,6 +7325,41 @@ def _meta_graph_get(path, params, access_token):
         else:
             url = ""
     return items
+
+
+def _exchange_meta_long_lived_access_token(app_id, app_secret, user_access_token):
+    response = requests.get(
+        f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/oauth/access_token",
+        params={
+            "grant_type": "fb_exchange_token",
+            "client_id": app_id,
+            "client_secret": app_secret,
+            "fb_exchange_token": user_access_token,
+        },
+        timeout=60,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text}
+    if not response.ok:
+        raise RuntimeError(f"Meta long-lived token exchange failed ({response.status_code}): {payload}")
+    access_token = normalize_whitespace(payload.get("access_token"))
+    if not access_token:
+        raise RuntimeError("Meta long-lived token exchange did not return an access token.")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _fetch_meta_accessible_accounts(access_token):
+    rows = _meta_graph_get(
+        "me/adaccounts",
+        {
+            "fields": "id,account_id,name,account_status",
+            "limit": 200,
+        },
+        access_token,
+    )
+    return rows if isinstance(rows, list) else []
 
 
 def _meta_conversion_value(actions):
@@ -7865,6 +7922,8 @@ def get_ads_dashboard_settings(db):
         "google_refresh_token": (get_setting(db, "ads_google_refresh_token", "") or os.getenv("ADS_GOOGLE_REFRESH_TOKEN", "")).strip(),
         "google_customer_ids_raw": (get_setting(db, "ads_google_customer_ids", "") or os.getenv("ADS_GOOGLE_CUSTOMER_IDS", "")).strip(),
         "google_login_customer_id": (get_setting(db, "ads_google_login_customer_id", "") or os.getenv("ADS_GOOGLE_LOGIN_CUSTOMER_ID", "")).strip(),
+        "meta_app_id": (get_setting(db, "ads_meta_app_id", "") or os.getenv("ADS_META_APP_ID", "")).strip(),
+        "meta_app_secret": (get_setting(db, "ads_meta_app_secret", "") or os.getenv("ADS_META_APP_SECRET", "")).strip(),
         "meta_access_token": (get_setting(db, "ads_meta_access_token", "") or os.getenv("ADS_META_ACCESS_TOKEN", "")).strip(),
         "meta_account_ids_raw": (get_setting(db, "ads_meta_account_ids", "") or os.getenv("ADS_META_ACCOUNT_IDS", "")).strip(),
         "amazon_client_id": (get_setting(db, "ads_amazon_client_id", "") or os.getenv("ADS_AMAZON_CLIENT_ID", "")).strip(),
@@ -8969,6 +9028,8 @@ def verify_email_with_emaillistverify(api_key, email_address):
     normalized_status = "error"
     if provider_status in {"ok", "valid"}:
         normalized_status = "valid"
+    elif provider_status in {"ok_for_all", "ok for all", "accept_all", "accept all", "catch_all", "catch all"}:
+        normalized_status = "unknown"
     elif provider_status in {"failed", "invalid", "incorrect"}:
         normalized_status = "invalid"
     elif provider_status == "unknown":
@@ -26482,6 +26543,8 @@ def settings_page():
                 "ads_google_refresh_token": request.form.get("ads_google_refresh_token", ""),
                 "ads_google_customer_ids": request.form.get("ads_google_customer_ids", ""),
                 "ads_google_login_customer_id": request.form.get("ads_google_login_customer_id", ""),
+                "ads_meta_app_id": request.form.get("ads_meta_app_id", ""),
+                "ads_meta_app_secret": request.form.get("ads_meta_app_secret", ""),
                 "ads_meta_access_token": request.form.get("ads_meta_access_token", ""),
                 "ads_meta_account_ids": request.form.get("ads_meta_account_ids", ""),
                 "ads_amazon_client_id": request.form.get("ads_amazon_client_id", ""),
@@ -27179,6 +27242,111 @@ def buyers_template():
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=buyers-template.csv"},
     )
+
+
+@app.route("/oauth/meta/test", methods=["GET"])
+def meta_oauth_test():
+    ensure_db()
+    db = get_db()
+    settings = get_ads_dashboard_settings(db)
+    access_token = settings.get("meta_access_token", "")
+    if not access_token:
+        return redirect(url_for("settings_page", tab="ads", error="Save a Meta access token first."))
+    try:
+        accounts = _fetch_meta_accessible_accounts(access_token)
+        account_ids = []
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            normalized = _normalize_meta_account_id(account.get("account_id") or account.get("id"))
+            if normalized:
+                account_ids.append(normalized)
+        account_ids = list(dict.fromkeys(account_ids))
+        configured = list(dict.fromkeys(settings.get("meta_account_ids") or []))
+        if not configured and account_ids:
+            set_setting(db, "ads_meta_account_ids", ", ".join(account_ids))
+            db.commit()
+        matched = sorted(set(configured).intersection(account_ids)) if configured else account_ids
+        notice_parts = [
+            "Meta connection OK.",
+            f"Detected {len(account_ids)} accessible ad account(s).",
+        ]
+        if configured:
+            notice_parts.append(f"Configured account matches: {len(matched)}/{len(configured)}.")
+            if matched:
+                notice_parts.append("Matched IDs: " + ", ".join(matched) + ".")
+        elif account_ids:
+            notice_parts.append("Saved detected Meta ad account IDs into Ad Platforms.")
+        return redirect(url_for("settings_page", tab="ads", notice=" ".join(notice_parts)))
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="meta_oauth_test",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/oauth/meta/test",
+            status_code=500,
+        )
+        db.commit()
+        return redirect(url_for("settings_page", tab="ads", error=f"Meta test failed: {exc}"))
+
+
+@app.route("/oauth/meta/exchange", methods=["POST"])
+def meta_oauth_exchange():
+    ensure_db()
+    db = get_db()
+    settings = get_ads_dashboard_settings(db)
+    app_id = settings.get("meta_app_id", "")
+    app_secret = settings.get("meta_app_secret", "")
+    user_access_token = normalize_whitespace(request.form.get("meta_user_access_token"))
+    if not app_id or not app_secret:
+        return redirect(url_for("settings_page", tab="ads", error="Save Meta app ID and app secret first."))
+    if not user_access_token:
+        return redirect(url_for("settings_page", tab="ads", error="Paste a fresh Meta user access token first."))
+    try:
+        payload = _exchange_meta_long_lived_access_token(app_id, app_secret, user_access_token)
+        access_token = normalize_whitespace(payload.get("access_token"))
+        expires_in = payload.get("expires_in")
+        if not access_token:
+            raise RuntimeError("Meta exchange did not return an access token.")
+        set_setting(db, "ads_meta_access_token", access_token)
+        notice_parts = ["Meta long-lived token saved."]
+        if expires_in:
+            try:
+                days = max(int(round(float(expires_in) / 86400.0)), 1)
+                notice_parts.append(f"Token lifetime: about {days} day(s).")
+            except Exception:
+                pass
+        try:
+            accounts = _fetch_meta_accessible_accounts(access_token)
+            account_ids = []
+            for account in accounts:
+                if not isinstance(account, dict):
+                    continue
+                normalized = _normalize_meta_account_id(account.get("account_id") or account.get("id"))
+                if normalized:
+                    account_ids.append(normalized)
+            account_ids = list(dict.fromkeys(account_ids))
+            if account_ids:
+                set_setting(db, "ads_meta_account_ids", ", ".join(account_ids))
+                notice_parts.append(f"Saved {len(account_ids)} Meta ad account ID(s).")
+        except Exception as account_exc:
+            notice_parts.append(f"Account lookup did not complete: {account_exc}")
+        db.commit()
+        return redirect(url_for("settings_page", tab="ads", notice=" ".join(notice_parts)))
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="meta_oauth_exchange",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/oauth/meta/exchange",
+            status_code=500,
+        )
+        db.commit()
+        return redirect(url_for("settings_page", tab="ads", error=f"Meta token exchange failed: {exc}"))
 
 
 @app.route("/oauth/amazon/callback", methods=["GET"])
@@ -30032,7 +30200,7 @@ def slack_command_webhook():
             f"Impressions: {summary.get('impressions', 0):,}",
             f"Clicks: {summary.get('clicks', 0):,}",
             f"Reach: {summary.get('reach', 0):,}",
-            f"Conversions: {summary.get('conversions', 0):,.2f}",
+            f"Conversions: {_normalize_metric_int(summary.get('conversions', 0)):,}",
             f"Live campaigns: {len(summary.get('live_rows') or [])}",
         ]
         if platform_rollup:

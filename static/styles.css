@@ -36,24 +36,15 @@ body {
 }
 
 .sidebar-brand {
-    color: inherit;
-    display: inline-block;
+    display: block;
     text-decoration: none;
 }
 
-.sidebar-brand h1 {
-    font-size: 1.5rem;
-    margin: 0;
-}
-
-.sidebar-brand p {
-    color: #b9c8d3;
-    margin: 0.35rem 0 0;
-}
-
-.sidebar-brand:hover h1,
-.sidebar-brand:hover p {
-    color: #d9fbf7;
+.sidebar-brand-logo {
+    display: block;
+    height: auto;
+    max-width: 100%;
+    width: 210px;
 }
 
 .sidebar-nav {

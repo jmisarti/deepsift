@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Deep Prospect CRM</title>
+    <title>iWillBuyYourHouseForCash.com</title>
     <link rel="icon" href="{{ url_for('favicon') }}" sizes="any">
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
@@ -11,8 +11,11 @@
     <div class="app-shell">
         <aside class="app-sidebar">
             <a class="sidebar-brand" href="{{ url_for('home_page') }}">
-                <h1>Deep Prospect CRM</h1>
-                <p>Property-centric prospecting and relationship mapping</p>
+                <img
+                    class="sidebar-brand-logo"
+                    src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/04/logo.webp"
+                    alt="iWillBuyYourHouseForCash.com"
+                >
             </a>
 
             <nav class="sidebar-nav">
@@ -25,7 +28,12 @@
                 </div>
 
                 <div class="sidebar-group">
-                    <a class="sidebar-link {% if request.path == '/dashboard' or request.path.startswith('/property') or request.path.startswith('/person') or request.path.startswith('/authority') %}active{% endif %}" href="{{ url_for('dashboard') }}">Research (Deep Dive)</a>
+                    <p class="sidebar-group-title">Research</p>
+                    <a class="sidebar-link {% if request.path == '/dashboard' or request.path.startswith('/property') or request.path.startswith('/person') or request.path.startswith('/authority') %}active{% endif %}" href="{{ url_for('dashboard') }}">Deep Dive</a>
+                </div>
+
+                <div class="sidebar-group">
+                    <p class="sidebar-group-title">Other</p>
                     <a class="sidebar-link {% if request.path.startswith('/ads') %}active{% endif %}" href="{{ url_for('ads_dashboard') }}">Advertisements</a>
                     <a class="sidebar-link {% if request.path.startswith('/agents') %}active{% endif %}" href="{{ url_for('agents_page') }}">Agents</a>
                 </div>

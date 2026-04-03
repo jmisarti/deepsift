@@ -7815,6 +7815,7 @@ def _amazon_campaign_goal_label(ad_product):
         "SPONSORED_PRODUCTS": "Sponsored Products",
         "SPONSORED_DISPLAY": "Sponsored Display",
         "SPONSORED_BRANDS": "Sponsored Brands",
+        "SPONSORED_TV": "Sponsored TV",
         "SPONSORED_TELEVISION": "Sponsored TV",
     }
     key = normalize_whitespace(ad_product).upper()
@@ -7848,7 +7849,7 @@ def _amazon_create_sponsored_tv_report(settings, access_token, profile_id, start
     base_url = _amazon_ads_base_url(settings.get("amazon_region"))
     config_candidates = [
         {
-            "adProduct": "SPONSORED_TELEVISION",
+            "adProduct": "SPONSORED_TV",
             "reportTypeId": "stCampaigns",
             "columns": [
                 "campaignId",
@@ -7863,7 +7864,7 @@ def _amazon_create_sponsored_tv_report(settings, access_token, profile_id, start
             ],
         },
         {
-            "adProduct": "SPONSORED_TELEVISION",
+            "adProduct": "SPONSORED_TV",
             "reportTypeId": "stCampaigns",
             "columns": [
                 "campaignId",

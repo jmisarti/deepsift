@@ -7077,6 +7077,17 @@ def _normalize_roku_account_id(value):
     return normalize_whitespace(value)
 
 
+def _normalize_report_row_keys(row):
+    if not isinstance(row, dict):
+        return {}
+    normalized = {}
+    for key, value in row.items():
+        clean_key = re.sub(r"[^a-z0-9]+", "_", normalize_whitespace(key).lower()).strip("_")
+        if clean_key:
+            normalized[clean_key] = value
+    return normalized
+
+
 def _amazon_ads_base_url(region):
     region_key = normalize_whitespace(region or "na").lower()
     mapping = {
@@ -8171,7 +8182,13 @@ def _fetch_roku_ads_campaign_rows(settings, start_date, end_date, db=None):
         for item in report_rows:
             if not isinstance(item, dict):
                 continue
-            campaign_id = normalize_whitespace(item.get("campaign_id") or item.get("campaignId"))
+            normalized_item = _normalize_report_row_keys(item)
+            campaign_id = normalize_whitespace(
+                normalized_item.get("campaign_id")
+                or normalized_item.get("campaign_uid")
+                or item.get("campaign_id")
+                or item.get("campaignId")
+            )
             if not campaign_id:
                 continue
             seen_campaign_ids.add(campaign_id)
@@ -8180,15 +8197,32 @@ def _fetch_roku_ads_campaign_rows(settings, start_date, end_date, db=None):
                     "platform": "roku",
                     "account_id": account_id,
                     "campaign_id": campaign_id,
-                    "campaign_name": normalize_whitespace(item.get("campaign_name") or item.get("campaignName")) or campaign_id,
+                    "campaign_name": normalize_whitespace(
+                        normalized_item.get("campaign_name")
+                        or item.get("campaign_name")
+                        or item.get("campaignName")
+                    ) or campaign_id,
                     "campaign_status": next((snap.get("campaign_status") for snap in account_snapshots if snap.get("campaign_id") == campaign_id), "Unknown"),
                     "campaign_site": _ad_campaign_site("roku", account_id),
-                    "metric_date": normalize_whitespace(item.get("date")),
-                    "spend": _normalize_metric_float(item.get("spend")),
-                    "impressions": _normalize_metric_int(item.get("impressions")),
+                    "metric_date": normalize_whitespace(
+                        normalized_item.get("date")
+                        or normalized_item.get("report_date")
+                        or item.get("date")
+                    ),
+                    "spend": _normalize_metric_float(normalized_item.get("spend") or item.get("spend")),
+                    "impressions": _normalize_metric_int(normalized_item.get("impressions") or item.get("impressions")),
                     "clicks": 0,
-                    "reach": _normalize_metric_int(item.get("household_reach")),
-                    "conversions": _normalize_metric_float(item.get("total_unique_actions") or item.get("actions")),
+                    "reach": _normalize_metric_int(
+                        normalized_item.get("household_reach")
+                        or normalized_item.get("reach")
+                        or item.get("household_reach")
+                    ),
+                    "conversions": _normalize_metric_float(
+                        normalized_item.get("total_unique_actions")
+                        or normalized_item.get("actions")
+                        or item.get("total_unique_actions")
+                        or item.get("actions")
+                    ),
                     "raw": item,
                 }
             )
@@ -8200,7 +8234,7 @@ def _fetch_roku_ads_campaign_rows(settings, start_date, end_date, db=None):
         return {
             "status": "pending",
             "rows": [],
-            "message": "Roku report is still processing for account(s): "
+            "message": "Roku campaign metadata is connected, but performance metrics are still processing for account(s): "
             + ", ".join(pending_accounts)
             + ". Try Refresh again in about a minute.",
         }
@@ -8208,7 +8242,9 @@ def _fetch_roku_ads_campaign_rows(settings, start_date, end_date, db=None):
         return {
             "status": "ok",
             "rows": rows,
-            "message": "Roku data refreshed for ready accounts. Still processing: " + ", ".join(pending_accounts),
+            "message": "Roku campaign metadata loaded. Performance metrics are still processing for account(s): "
+            + ", ".join(pending_accounts)
+            + ". Refresh again in about a minute.",
         }
     return {
         "status": "ok",

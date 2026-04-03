@@ -1561,6 +1561,23 @@ def _is_provider_capacity_issue(*parts):
     return any(keyword in haystack for keyword in keywords)
 
 
+def _is_emaillistverify_accept_all_status(*parts):
+    haystack = " ".join(_provider_alert_text(part) for part in parts).lower()
+    if not haystack:
+        return False
+    return any(
+        token in haystack
+        for token in (
+            "ok_for_all",
+            "ok for all",
+            "accept_all",
+            "accept all",
+            "catch_all",
+            "catch all",
+        )
+    )
+
+
 def emit_provider_alert(source, error_message, details="", route="", status_code=500):
     ensure_db()
     alert_db = open_sqlite_connection()
@@ -1616,11 +1633,9 @@ def emit_provider_alert(source, error_message, details="", route="", status_code
         message_low = message_text.lower()
         if source_low.startswith("provider_ads_"):
             send_to_agent_ops = False
-        if source_low == "provider_emaillistverify" and (
-            "ok_for_all" in detail_low
-            or "ok_for_all" in message_low
-            or "ok for all" in detail_low
-            or "ok for all" in message_low
+        if source_low == "provider_emaillistverify" and _is_emaillistverify_accept_all_status(
+            detail_low,
+            message_low,
         ):
             send_to_agent_ops = False
         if send_to_agent_ops:
@@ -9028,7 +9043,7 @@ def verify_email_with_emaillistverify(api_key, email_address):
     normalized_status = "error"
     if provider_status in {"ok", "valid"}:
         normalized_status = "valid"
-    elif provider_status in {"ok_for_all", "ok for all", "accept_all", "accept all", "catch_all", "catch all"}:
+    elif _is_emaillistverify_accept_all_status(provider_status):
         normalized_status = "unknown"
     elif provider_status in {"failed", "invalid", "incorrect"}:
         normalized_status = "invalid"
@@ -9237,12 +9252,21 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     ),
                 )
                 continue
-            new_touch_status = "Valid" if normalized_status == "valid" else "Undeliverable"
+            if normalized_status == "valid":
+                new_touch_status = "Valid"
+            elif normalized_status == "unknown":
+                new_touch_status = "Unknown"
+            else:
+                new_touch_status = "Undeliverable"
             provider_status = (validation_result.get("provider_status") or normalized_status or "error").strip()
             note_line = (
                 f"EmailListVerify checked {now_stamp}: {provider_status}."
                 if new_touch_status == "Valid"
-                else f"EmailListVerify checked {now_stamp}: marked undeliverable ({provider_status})."
+                else (
+                    f"EmailListVerify checked {now_stamp}: marked unknown ({provider_status})."
+                    if new_touch_status == "Unknown"
+                    else f"EmailListVerify checked {now_stamp}: marked undeliverable ({provider_status})."
+                )
             )
             merged_note = _append_touchpoint_note(row["touchpoint_note"], note_line)
             db.execute(

@@ -7790,81 +7790,104 @@ def _amazon_campaign_next_token(payload):
     return normalize_whitespace(page.get("nextToken") or page.get("token"))
 
 
-def _amazon_campaign_list_once(settings, access_token, profile_id, ad_product, next_token=""):
-    payload = {
-        "adProductFilter": {"include": [normalize_whitespace(ad_product).upper()]},
-    }
-    if next_token:
-        payload["nextToken"] = normalize_whitespace(next_token)
-    response = requests.post(
-        f"{_amazon_ads_base_url(settings.get('amazon_region'))}/campaigns/list",
-        headers=_amazon_ads_headers(settings, access_token, profile_id=profile_id),
-        json=payload,
-        timeout=60,
-    )
-    try:
-        body = response.json()
-    except Exception:
-        body = {"raw": response.text}
-    if not response.ok:
-        raise RuntimeError(f"Amazon campaign list failed ({response.status_code}): {body}")
-    return body if isinstance(body, dict) else {"items": body if isinstance(body, list) else []}
+def _amazon_sponsored_tv_campaigns_once(settings, access_token, profile_id, next_token=""):
+    base_url = _amazon_ads_base_url(settings.get("amazon_region"))
+    normalized_token = normalize_whitespace(next_token)
+    attempts = []
+    candidates = [
+        {
+            "method": "get",
+            "url": f"{base_url}/st/campaigns",
+            "kwargs": {
+                "params": {"nextToken": normalized_token} if normalized_token else {},
+            },
+        },
+        {
+            "method": "post",
+            "url": f"{base_url}/st/campaigns/list",
+            "kwargs": {
+                "json": {"nextToken": normalized_token} if normalized_token else {},
+            },
+        },
+    ]
+    headers = _amazon_ads_headers(settings, access_token, profile_id=profile_id)
+    for candidate in candidates:
+        request_kwargs = dict(candidate["kwargs"])
+        request_kwargs["headers"] = headers
+        request_kwargs["timeout"] = 60
+        response = requests.request(candidate["method"], candidate["url"], **request_kwargs)
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text}
+        if response.ok:
+            return body if isinstance(body, dict) else {"items": body if isinstance(body, list) else []}
+        attempts.append(
+            {
+                "method": candidate["method"].upper(),
+                "url": candidate["url"],
+                "status_code": response.status_code,
+                "body": body,
+            }
+        )
+        if response.status_code not in {403, 404, 405}:
+            break
+    raise RuntimeError(f"Amazon Sponsored TV campaign fetch failed: {attempts}")
 
 
 def _fetch_amazon_campaign_snapshots(settings, access_token, profile_id):
     rows = []
     seen = set()
-    for ad_product in ("SPONSORED_PRODUCTS", "SPONSORED_DISPLAY", "SPONSORED_BRANDS", "SPONSORED_TELEVISION"):
-        next_token = ""
-        for _ in range(10):
-            body = _amazon_campaign_list_once(settings, access_token, profile_id, ad_product, next_token=next_token)
-            for item in _amazon_extract_campaign_list(body):
-                if not isinstance(item, dict):
-                    continue
-                raw_campaign_id = normalize_whitespace(
-                    item.get("campaignId")
-                    or item.get("campaign_id")
-                    or item.get("id")
-                    or item.get("campaignIdentifier")
-                )
-                if not raw_campaign_id:
-                    continue
-                dedupe_key = (normalize_whitespace(profile_id), normalize_whitespace(ad_product), raw_campaign_id)
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-                rows.append(
-                    {
-                        "platform": "amazon",
-                        "account_id": normalize_whitespace(profile_id),
-                        "campaign_id": raw_campaign_id,
-                        "campaign_name": normalize_whitespace(
-                            item.get("name")
-                            or item.get("campaignName")
-                            or item.get("campaign_name")
-                        )
-                        or raw_campaign_id,
-                        "campaign_status": _normalize_ad_campaign_status(
-                            item.get("state")
-                            or item.get("status")
-                            or item.get("campaignStatus")
-                            or item.get("servingStatus")
-                        ),
-                        "campaign_site": _ad_campaign_site("amazon", profile_id),
-                        "campaign_goal": _amazon_campaign_goal_label(ad_product),
-                        "metric_date": "",
-                        "spend": 0.0,
-                        "impressions": 0,
-                        "clicks": 0,
-                        "reach": 0,
-                        "conversions": 0.0,
-                        "_current_snapshot": True,
-                        "raw": item,
-                    }
-                )
-            next_token = _amazon_campaign_next_token(body)
-            if not next_token:
-                break
+    next_token = ""
+    for _ in range(10):
+        body = _amazon_sponsored_tv_campaigns_once(settings, access_token, profile_id, next_token=next_token)
+        for item in _amazon_extract_campaign_list(body):
+            if not isinstance(item, dict):
+                continue
+            raw_campaign_id = normalize_whitespace(
+                item.get("campaignId")
+                or item.get("campaign_id")
+                or item.get("id")
+                or item.get("campaignIdentifier")
+            )
+            if not raw_campaign_id:
+                continue
+            dedupe_key = (normalize_whitespace(profile_id), raw_campaign_id)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            rows.append(
+                {
+                    "platform": "amazon",
+                    "account_id": normalize_whitespace(profile_id),
+                    "campaign_id": raw_campaign_id,
+                    "campaign_name": normalize_whitespace(
+                        item.get("name")
+                        or item.get("campaignName")
+                        or item.get("campaign_name")
+                    )
+                    or raw_campaign_id,
+                    "campaign_status": _normalize_ad_campaign_status(
+                        item.get("state")
+                        or item.get("status")
+                        or item.get("campaignStatus")
+                        or item.get("servingStatus")
+                    ),
+                    "campaign_site": _ad_campaign_site("amazon", profile_id),
+                    "campaign_goal": "Sponsored TV",
+                    "metric_date": "",
+                    "spend": 0.0,
+                    "impressions": 0,
+                    "clicks": 0,
+                    "reach": 0,
+                    "conversions": 0.0,
+                    "_current_snapshot": True,
+                    "raw": item,
+                }
+            )
+        next_token = _amazon_campaign_next_token(body)
+        if not next_token:
+            break
     return rows
 
 
@@ -27517,7 +27540,7 @@ def amazon_oauth_test():
             "Amazon connection OK.",
             "Refreshed access token successfully.",
             f"Detected {len(profile_ids)} Amazon profile(s).",
-            f"Direct campaign endpoint returned {campaign_count} campaign(s).",
+            f"Sponsored TV campaign endpoint returned {campaign_count} campaign(s).",
         ]
         if configured_account_id:
             matched_account = configured_account_id in account_ids

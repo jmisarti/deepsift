@@ -426,6 +426,23 @@
                             </form>
                         </td>
                     </tr>
+                    <tr>
+                        <td><strong>Ads Dashboard Refresh</strong></td>
+                        <td>Refreshes the ads dashboard cache every hour using the saved platform credentials, so the page and Slack command read from fresh local data.</td>
+                        <td>
+                            <form method="post" class="automation-toggle-form">
+                                <input type="hidden" name="settings_tab" value="automations">
+                                <input type="hidden" name="automation_key" value="ads_dashboard">
+                                <label class="toggle-switch" title="Toggle Ads Dashboard hourly refresh">
+                                    <input type="checkbox" name="automation_ads_dashboard_enabled" value="1" {% if automation_settings.ads_dashboard_enabled %}checked{% endif %} onchange="this.form.submit()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span class="toggle-text {% if automation_settings.ads_dashboard_enabled %}on{% else %}off{% endif %}">
+                                    {% if automation_settings.ads_dashboard_enabled %}On{% else %}Off{% endif %}
+                                </span>
+                            </form>
+                        </td>
+                    </tr>
                 </tbody>
             </table>
         </div>

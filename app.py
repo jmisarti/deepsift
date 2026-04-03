@@ -177,6 +177,7 @@ BULK_SMS_WORKER_STARTED = False
 EMAIL_POLL_WORKER_STARTED = False
 CLEVER_LEADS_WORKER_STARTED = False
 REFERRAL_MARKET_WORKER_STARTED = False
+ADS_DASHBOARD_WORKER_STARTED = False
 CALL_RECORDING_WORKER_STARTED = False
 SMS_ANALYSIS_WORKER_STARTED = False
 WEBSITE_LEADS_HOLD_WORKER_STARTED = False
@@ -702,6 +703,7 @@ def require_login_if_enabled():
         start_clever_leads_worker()
         start_untitled_leads_worker()
         start_website_leads_hold_worker()
+        start_ads_dashboard_worker()
         if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
             start_referral_on_market_worker()
         start_call_recording_worker()
@@ -9587,12 +9589,14 @@ def get_automation_settings(db):
     auto_send_realtors_raw = get_setting(db, "automation_auto_send_realtors_enabled", "1")
     untitled_leads_raw = get_setting(db, "automation_untitled_leads_enabled", "1")
     smrtagent_slack_raw = get_setting(db, "automation_smrtagent_slack_enabled", "1")
+    ads_dashboard_raw = get_setting(db, "automation_ads_dashboard_enabled", "1")
     return {
         "clever_leads_enabled": (clever_enabled_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
         "reisift_placeholder_enabled": (reisift_placeholder_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
         "auto_send_realtors_enabled": (auto_send_realtors_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
         "untitled_leads_enabled": (untitled_leads_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
         "smrtagent_slack_enabled": (smrtagent_slack_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
+        "ads_dashboard_enabled": (ads_dashboard_raw or "0").strip() in {"1", "true", "TRUE", "yes", "on"},
     }
 
 
@@ -14546,6 +14550,65 @@ def run_referral_on_market_refresh_once():
         return {"ok": False, "error": str(exc)}
     finally:
         db.close()
+
+
+def run_ads_dashboard_refresh_once(triggered_by="automation"):
+    ensure_db()
+    db = open_sqlite_connection()
+    try:
+        automation = get_automation_settings(db)
+        if not automation.get("ads_dashboard_enabled"):
+            return {"ok": True, "skipped": "disabled"}
+        hour_key = datetime.now(EST_TZ).strftime("%Y-%m-%d %H")
+        last_run_hour = (get_setting(db, "automation_ads_dashboard_last_run_hour_et", "") or "").strip()
+        if triggered_by == "automation" and last_run_hour == hour_key:
+            return {"ok": True, "skipped": "already_ran_this_hour", "hour": hour_key}
+        result = refresh_ad_campaign_cache(
+            db,
+            triggered_by=triggered_by,
+            requested_by="system_hourly_worker" if triggered_by == "automation" else "",
+            lookback_days=ADS_REFRESH_LOOKBACK_DAYS,
+        )
+        if triggered_by == "automation":
+            set_setting(db, "automation_ads_dashboard_last_run_hour_et", hour_key)
+        db.commit()
+        return {"ok": True, "hour": hour_key, "result": result}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="ads_dashboard_worker",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="run_ads_dashboard_refresh_once",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+def start_ads_dashboard_worker():
+    global ADS_DASHBOARD_WORKER_STARTED
+    if ADS_DASHBOARD_WORKER_STARTED:
+        return
+    ADS_DASHBOARD_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                now_et = datetime.now(EST_TZ)
+                if now_et.minute < 5:
+                    run_ads_dashboard_refresh_once(triggered_by="automation")
+                    time.sleep(300)
+                    continue
+            except Exception:
+                pass
+            time.sleep(60)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
 
 
 def start_referral_on_market_worker():
@@ -27702,6 +27765,9 @@ def settings_page():
             elif automation_key == "smrtagent_slack":
                 smrtagent_slack_enabled = (request.form.get("automation_smrtagent_slack_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
                 set_setting(db, "automation_smrtagent_slack_enabled", "1" if smrtagent_slack_enabled else "0")
+            elif automation_key == "ads_dashboard":
+                ads_dashboard_enabled = (request.form.get("automation_ads_dashboard_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
+                set_setting(db, "automation_ads_dashboard_enabled", "1" if ads_dashboard_enabled else "0")
             notice = "Automation settings saved."
         elif active_tab == "helpers":
             market_helper_address = (request.form.get("market_helper_address") or "").strip()
@@ -33647,6 +33713,7 @@ if __name__ == "__main__":
         start_email_poll_worker()
         start_clever_leads_worker()
         start_untitled_leads_worker()
+        start_ads_dashboard_worker()
         if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
             start_referral_on_market_worker()
         start_call_recording_worker()

@@ -7441,6 +7441,17 @@ def _fetch_amazon_ads_profiles(client_id, access_token, region):
     return payload if isinstance(payload, list) else []
 
 
+def _amazon_profile_ids_from_profiles(profiles):
+    ids = []
+    for profile in profiles if isinstance(profiles, list) else []:
+        if not isinstance(profile, dict):
+            continue
+        profile_id = normalize_whitespace(profile.get("profileId") or profile.get("id"))
+        if profile_id:
+            ids.append(profile_id)
+    return list(dict.fromkeys(ids))
+
+
 def _exchange_amazon_refresh_token(client_id, client_secret, refresh_token):
     response = requests.post(
         AMAZON_LWA_TOKEN_URL,
@@ -8159,9 +8170,22 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
         settings.get("amazon_client_secret", ""),
         settings.get("amazon_refresh_token", ""),
     )
+    accessible_profiles = _fetch_amazon_ads_profiles(
+        settings.get("amazon_client_id", ""),
+        access_token,
+        settings.get("amazon_region") or "na",
+    )
+    accessible_profile_ids = set(_amazon_profile_ids_from_profiles(accessible_profiles))
+    matched_profile_ids = [profile_id for profile_id in profile_ids if profile_id in accessible_profile_ids] if accessible_profile_ids else list(profile_ids)
+    skipped_profile_ids = [profile_id for profile_id in profile_ids if accessible_profile_ids and profile_id not in accessible_profile_ids]
+    if accessible_profile_ids and not matched_profile_ids:
+        raise RuntimeError(
+            "Configured Amazon profile IDs are not accessible with the current token. "
+            f"Configured: {', '.join(profile_ids)}. Accessible: {', '.join(sorted(accessible_profile_ids))}."
+        )
     rows = []
     pending_profiles = []
-    for profile_id in profile_ids:
+    for profile_id in matched_profile_ids:
         report_meta = {}
         pending = _get_pending_ad_report(db, "amazon", profile_id, start_date, end_date)
         if pending:
@@ -8217,15 +8241,21 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
             + ". Try Refresh again in about a minute.",
         }
     if pending_profiles:
+        message = "Amazon data refreshed for ready profiles. Still processing: " + ", ".join(pending_profiles)
+        if skipped_profile_ids:
+            message += ". Skipped inaccessible profile IDs: " + ", ".join(skipped_profile_ids)
         return {
             "status": "ok",
             "rows": rows,
-            "message": "Amazon data refreshed for ready profiles. Still processing: " + ", ".join(pending_profiles),
+            "message": message,
         }
+    message = f"Fetched {len(rows)} Amazon campaign-day rows across {len(matched_profile_ids)} profile(s)."
+    if skipped_profile_ids:
+        message += " Skipped inaccessible profile IDs: " + ", ".join(skipped_profile_ids) + "."
     return {
         "status": "ok",
         "rows": rows,
-        "message": f"Fetched {len(rows)} Amazon campaign-day rows across {len(profile_ids)} profile(s).",
+        "message": message,
     }
 
 
@@ -27406,6 +27436,9 @@ def amazon_oauth_callback():
                 profile_error = str(exc)
         if refresh_token and session.get("auth_ok"):
             set_setting(db, "ads_amazon_refresh_token", refresh_token)
+            profile_ids = _amazon_profile_ids_from_profiles(profiles)
+            if profile_ids:
+                set_setting(db, "ads_amazon_profile_ids", ", ".join(profile_ids))
             db.commit()
             result["saved_to_settings"] = True
         result["ok"] = bool(refresh_token)
@@ -27416,7 +27449,14 @@ def amazon_oauth_callback():
         if profile_error:
             result["notice"] = f"Amazon authorization succeeded, but profile lookup did not complete: {profile_error}"
         elif refresh_token and result["profiles"]:
-            result["notice"] = "Amazon authorization succeeded. Use the profile IDs below in Ad Platforms."
+            result["notice"] = (
+                "Amazon authorization succeeded. "
+                + (
+                    "Refresh token and detected profile IDs were saved into Ad Platforms."
+                    if result["saved_to_settings"]
+                    else "Use the profile IDs below in Ad Platforms."
+                )
+            )
         elif refresh_token:
             result["notice"] = "Amazon authorization succeeded."
     except Exception as exc:
@@ -27450,6 +27490,68 @@ def amazon_oauth_start():
         state=state,
     )
     return redirect(authorize_url)
+
+
+@app.route("/oauth/amazon/test", methods=["GET"])
+def amazon_oauth_test():
+    ensure_db()
+    db = get_db()
+    settings = get_ads_dashboard_settings(db)
+    missing = []
+    if not settings.get("amazon_client_id"):
+        missing.append("client ID")
+    if not settings.get("amazon_client_secret"):
+        missing.append("client secret")
+    if not settings.get("amazon_refresh_token"):
+        missing.append("refresh token")
+    if missing:
+        return redirect(
+            url_for(
+                "settings_page",
+                tab="ads",
+                error="Save Amazon " + ", ".join(missing) + " first.",
+            )
+        )
+    try:
+        access_token = _exchange_amazon_refresh_token(
+            settings.get("amazon_client_id", ""),
+            settings.get("amazon_client_secret", ""),
+            settings.get("amazon_refresh_token", ""),
+        )
+        profiles = _fetch_amazon_ads_profiles(
+            settings.get("amazon_client_id", ""),
+            access_token,
+            settings.get("amazon_region") or "na",
+        )
+        profile_ids = _amazon_profile_ids_from_profiles(profiles)
+        configured_profile_ids = list(dict.fromkeys(settings.get("amazon_profile_ids") or []))
+        matched_profile_ids = sorted(set(configured_profile_ids).intersection(profile_ids)) if configured_profile_ids else profile_ids
+        notice_parts = [
+            "Amazon connection OK.",
+            "Refreshed access token successfully.",
+            f"Detected {len(profile_ids)} Amazon profile(s).",
+        ]
+        if configured_profile_ids:
+            notice_parts.append(f"Configured profile matches: {len(matched_profile_ids)}/{len(configured_profile_ids)}.")
+            if matched_profile_ids:
+                notice_parts.append("Matched IDs: " + ", ".join(matched_profile_ids) + ".")
+        elif profile_ids:
+            set_setting(db, "ads_amazon_profile_ids", ", ".join(profile_ids))
+            db.commit()
+            notice_parts.append("Saved detected Amazon profile IDs into Ad Platforms.")
+        return redirect(url_for("settings_page", tab="ads", notice=" ".join(notice_parts)))
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="amazon_oauth_test",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/oauth/amazon/test",
+            status_code=500,
+        )
+        db.commit()
+        return redirect(url_for("settings_page", tab="ads", error=f"Amazon test failed: {exc}"))
 
 
 @app.route("/oauth/roku/callback", methods=["GET"])

@@ -45,7 +45,7 @@
             {% endif %}
 
             {% if result.saved_to_settings %}
-            <p class="muted-text">The refresh token was also saved into <strong>Settings -> Ad Platforms</strong> because you were logged into DeepSift during the callback.</p>
+            <p class="muted-text">The refresh token and any detected profile IDs were also saved into <strong>Settings -> Ad Platforms</strong> because you were logged into DeepSift during the callback.</p>
             {% endif %}
 
             {% if result.profiles %}
@@ -76,7 +76,7 @@
                     </tbody>
                 </table>
             </div>
-            <p class="muted-text">Use the Profile ID values in <strong>Settings -> Ad Platforms</strong>.</p>
+            <p class="muted-text">These Profile ID values are the account scopes the dashboard uses. If you were logged in during the callback, they were also saved into <strong>Settings -> Ad Platforms</strong>.</p>
             {% endif %}
         </section>
     </main>

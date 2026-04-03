@@ -1,5 +1,28 @@
 {% extends "base.html" %}
 {% block content %}
+<section class="cards page-summary-cards">
+    <article>
+        <h3>Leads</h3>
+        <p>{{ referral_summary.lead_count }}</p>
+        <small>Total referral leads in the current view.</small>
+    </article>
+    <article>
+        <h3>Untouched</h3>
+        <p>{{ referral_summary.untouched_count }}</p>
+        <small>Still sitting in the default referral status.</small>
+    </article>
+    <article>
+        <h3>Referred</h3>
+        <p>{{ referral_summary.referred_count }}</p>
+        <small>Sent or progressed past the untouched stage.</small>
+    </article>
+    <article>
+        <h3>On Market</h3>
+        <p>{{ referral_summary.on_market_count }}</p>
+        <small>Currently marked as listed or active.</small>
+    </article>
+</section>
+
 <section class="panel">
     <h2>Referral Queue (SIFT)</h2>
     <p>Status filter: <strong>{{ status_slug }}</strong>. Showing {{ referrals|length }} cached rows.</p>
@@ -21,125 +44,131 @@
     </div>
     {% endif %}
 
-    <table>
-        <thead>
-            <tr>
-                <th>Address</th>
-                <th>Referral Status</th>
-                <th>Outreach</th>
-                <th>Status</th>
-                <th>On-Market</th>
-                <th>Owners</th>
-                <th>Phone(s)</th>
-                <th>Email(s)</th>
-                <th>Sift Link</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for row in referrals %}
-            <tr>
-                <td><a href="{{ url_for('referral_property_detail', property_uuid=row.property_uuid) }}">{{ row.full_address or "-" }}</a></td>
-                <td>
-                    <form method="post" action="{{ url_for('referral_update_status', property_uuid=row.property_uuid) }}">
-                        <select name="referral_status" onchange="this.form.submit()">
-                            {% for rs in referral_statuses %}
-                            <option value="{{ rs }}" {% if row.referral_status == rs %}selected{% endif %}>{{ rs }}</option>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Address</th>
+                    <th>Referral Status</th>
+                    <th>Outreach</th>
+                    <th>Status</th>
+                    <th>On-Market</th>
+                    <th>Owners</th>
+                    <th>Phone(s)</th>
+                    <th>Email(s)</th>
+                    <th>Sift Link</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in referrals %}
+                <tr>
+                    <td><a href="{{ url_for('referral_property_detail', property_uuid=row.property_uuid) }}">{{ row.full_address or "-" }}</a></td>
+                    <td>
+                        <form method="post" action="{{ url_for('referral_update_status', property_uuid=row.property_uuid) }}">
+                            <select name="referral_status" onchange="this.form.submit()">
+                                {% for rs in referral_statuses %}
+                                <option value="{{ rs }}" {% if row.referral_status == rs %}selected{% endif %}>{{ rs }}</option>
+                                {% endfor %}
+                            </select>
+                        </form>
+                    </td>
+                    <td>{{ 'Sent' if row.push_count else 'Not Sent' }}</td>
+                    <td><span class="pill">{{ row.status or "-" }}</span></td>
+                    <td><span class="pill">{{ row.on_market_status or "Unknown" }}</span></td>
+                    <td>{{ row.owner_names or "-" }}</td>
+                    <td>
+                        {% if row.phones %}
+                            {% for phone in row.phones %}
+                                {{ phone.value|fmt_phone }}{% if not loop.last %}, {% endif %}
                             {% endfor %}
-                        </select>
-                    </form>
-                </td>
-                <td>{{ 'Sent' if row.push_count else 'Not Sent' }}</td>
-                <td><span class="pill">{{ row.status or "-" }}</span></td>
-                <td><span class="pill">{{ row.on_market_status or "Unknown" }}</span></td>
-                <td>{{ row.owner_names or "-" }}</td>
-                <td>
-                    {% if row.phones %}
-                        {% for phone in row.phones %}
-                            {{ phone.value|fmt_phone }}{% if not loop.last %}, {% endif %}
-                        {% endfor %}
-                    {% else %}
-                        -
-                    {% endif %}
-                </td>
-                <td>
-                    {% if row.emails %}
-                        {% for email in row.emails %}
-                            {{ email.value }}{% if not loop.last %}, {% endif %}
-                        {% endfor %}
-                    {% else %}
-                        -
-                    {% endif %}
-                </td>
-                <td>
-                    <a href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener">
-                        Open in Sift
-                    </a>
-                </td>
-            </tr>
-            {% else %}
-            <tr>
-                <td colspan="9">No records found.</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+                        {% else %}
+                            -
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if row.emails %}
+                            {% for email in row.emails %}
+                                {{ email.value }}{% if not loop.last %}, {% endif %}
+                            {% endfor %}
+                        {% else %}
+                            -
+                        {% endif %}
+                    </td>
+                    <td>
+                        <a href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener">
+                            Open in Sift
+                        </a>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="9">No records found.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
 
     <h3 style="margin-top:1rem;">Realtor Send Activity</h3>
     <p>Click a realtor row to see the properties sent to that realtor.</p>
-    <table>
-        <thead>
-            <tr>
-                <th>Realtor</th>
-                <th>Brokerage</th>
-                <th>Total Sends</th>
-                <th>Unique Properties</th>
-                <th>Last Sent</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for realtor in realtor_activity %}
-            <tr class="expand-row-trigger" data-expand-target="realtor-activity-{{ realtor.realtor_id }}" style="cursor:pointer;">
-                <td>{{ realtor.name }}</td>
-                <td>{{ realtor.brokerage or "-" }}</td>
-                <td>{{ realtor.total_sent }}</td>
-                <td>{{ realtor.unique_properties }}</td>
-                <td>{{ realtor.last_sent_at|fmt_est_datetime if realtor.last_sent_at else "-" }}</td>
-            </tr>
-            <tr id="realtor-activity-{{ realtor.realtor_id }}" class="expand-row-content" style="display:none;">
-                <td colspan="5">
-                    {% if realtor.properties %}
-                    <table class="compact-table">
-                        <thead>
-                            <tr>
-                                <th>Property</th>
-                                <th>Push Status</th>
-                                <th>Referral Mgmt Status</th>
-                                <th>Last Sent</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for p in realtor.properties %}
-                            <tr>
-                                <td><a href="{{ url_for('referral_property_detail', property_uuid=p.property_uuid) }}">{{ p.full_address }}</a></td>
-                                <td><span class="pill">{{ p.last_push_status }}</span></td>
-                                <td>{% if p.referral_management_status %}<span class="pill">{{ p.referral_management_status }}</span>{% else %}-{% endif %}</td>
-                                <td>{{ p.last_sent_at|fmt_est_datetime if p.last_sent_at else "-" }}</td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                    {% else %}
-                    <p style="margin:0.25rem 0;">No properties sent to this realtor yet.</p>
-                    {% endif %}
-                </td>
-            </tr>
-            {% else %}
-            <tr>
-                <td colspan="5">No realtors found.</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Realtor</th>
+                    <th>Brokerage</th>
+                    <th>Total Sends</th>
+                    <th>Unique Properties</th>
+                    <th>Last Sent</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for realtor in realtor_activity %}
+                <tr class="expand-row-trigger" data-expand-target="realtor-activity-{{ realtor.realtor_id }}" style="cursor:pointer;">
+                    <td>{{ realtor.name }}</td>
+                    <td>{{ realtor.brokerage or "-" }}</td>
+                    <td>{{ realtor.total_sent }}</td>
+                    <td>{{ realtor.unique_properties }}</td>
+                    <td>{{ realtor.last_sent_at|fmt_est_datetime if realtor.last_sent_at else "-" }}</td>
+                </tr>
+                <tr id="realtor-activity-{{ realtor.realtor_id }}" class="expand-row-content" style="display:none;">
+                    <td colspan="5">
+                        {% if realtor.properties %}
+                        <div class="table-wrap">
+                            <table class="compact-table">
+                                <thead>
+                                    <tr>
+                                        <th>Property</th>
+                                        <th>Push Status</th>
+                                        <th>Referral Mgmt Status</th>
+                                        <th>Last Sent</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for p in realtor.properties %}
+                                    <tr>
+                                        <td><a href="{{ url_for('referral_property_detail', property_uuid=p.property_uuid) }}">{{ p.full_address }}</a></td>
+                                        <td><span class="pill">{{ p.last_push_status }}</span></td>
+                                        <td>{% if p.referral_management_status %}<span class="pill">{{ p.referral_management_status }}</span>{% else %}-{% endif %}</td>
+                                        <td>{{ p.last_sent_at|fmt_est_datetime if p.last_sent_at else "-" }}</td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                        {% else %}
+                        <p style="margin:0.25rem 0;">No properties sent to this realtor yet.</p>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="5">No realtors found.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
 </section>
 
 <section class="panel">
@@ -154,34 +183,36 @@
             </select>
         </label>
     </form>
-    <table>
-        <thead>
-            <tr>
-                <th>Property</th>
-                <th>County</th>
-                <th>Realtor</th>
-                <th>Queue Status</th>
-                <th>Note</th>
-                <th>Queued At</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for q in queue_rows %}
-            <tr>
-                <td>{{ q.full_address or q.property_uuid }}</td>
-                <td>{{ q.county or "-" }}</td>
-                <td>{% if q.realtor_id %}{{ q.first_name }} {{ q.last_name }}{% else %}-{% endif %}</td>
-                <td><span class="pill">{{ q.queue_status }}</span></td>
-                <td>{{ q.note or "-" }}</td>
-                    <td>{{ q.created_at|fmt_est_datetime }}</td>
-            </tr>
-            {% else %}
-            <tr>
-                <td colspan="6">No queued entries yet.</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Property</th>
+                    <th>County</th>
+                    <th>Realtor</th>
+                    <th>Queue Status</th>
+                    <th>Note</th>
+                    <th>Queued At</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for q in queue_rows %}
+                <tr>
+                    <td>{{ q.full_address or q.property_uuid }}</td>
+                    <td>{{ q.county or "-" }}</td>
+                    <td>{% if q.realtor_id %}{{ q.first_name }} {{ q.last_name }}{% else %}-{% endif %}</td>
+                    <td><span class="pill">{{ q.queue_status }}</span></td>
+                    <td>{{ q.note or "-" }}</td>
+                        <td>{{ q.created_at|fmt_est_datetime }}</td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="6">No queued entries yet.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
 </section>
 <script>
 document.addEventListener("click", function (event) {

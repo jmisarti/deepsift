@@ -26534,6 +26534,15 @@ def run_agent3_lead_watch_resolve_route():
 def referral_dashboard():
     ensure_db()
     db = get_db()
+    def _to_int(value):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            try:
+                return int(float(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
     raw_referrals = get_cached_referrals(db)
     referrals = []
     for row in raw_referrals:
@@ -26564,6 +26573,26 @@ def referral_dashboard():
             notice = f"Referral cache initialized ({data['synced']} synced)."
         except Exception as exc:
             error = str(exc)
+    referral_summary = {
+        "lead_count": total_count,
+        "untouched_count": 0,
+        "referred_count": 0,
+        "on_market_count": 0,
+    }
+    referred_statuses = {"referred", "on market", "appointment set", "under contract", "closed"}
+    on_market_statuses = {"on market", "listed", "active", "coming soon"}
+    for item in referrals:
+        referral_status = str(item.get("referral_status") or "").strip() or "Untouched"
+        referral_status_key = referral_status.lower()
+        push_count = _to_int(item.get("push_count"))
+        winning_realtor_id = item.get("winning_realtor_id")
+        on_market_status = str(item.get("on_market_status") or "").strip().lower()
+        if referral_status == "Untouched":
+            referral_summary["untouched_count"] += 1
+        if push_count > 0 or referral_status_key in referred_statuses or winning_realtor_id:
+            referral_summary["referred_count"] += 1
+        if on_market_status in on_market_statuses:
+            referral_summary["on_market_count"] += 1
     queue_filter = (request.args.get("queue_filter") or "all").strip().lower()
     valid_queue_filters = {"all", "queued", "no_realtor"}
     if queue_filter not in valid_queue_filters:
@@ -26652,6 +26681,7 @@ def referral_dashboard():
         realtor_activity=realtor_activity,
         queue_filter=queue_filter,
         total_count=total_count,
+        referral_summary=referral_summary,
         status_slug=status_slug,
         error=error,
         notice=notice,
@@ -26694,6 +26724,15 @@ def referral_clear_queue():
 def follow_ups_page():
     ensure_db()
     db = get_db()
+    def _to_int(value):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            try:
+                return int(float(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
     lookback_days_raw = (request.args.get("days") or "7").strip()
     sort_order = (request.args.get("sort") or "desc").strip().lower()
     if sort_order not in {"asc", "desc"}:
@@ -26731,6 +26770,10 @@ def follow_ups_page():
         )
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()
+    outbound_calls_total = sum(_to_int(row.get("outbound_calls")) for row in rows)
+    outbound_sms_total = sum(_to_int(row.get("outbound_sms")) for row in rows)
+    outbound_email_total = sum(_to_int(row.get("outbound_email")) for row in rows)
+    inbound_responses_total = sum(_to_int(row.get("inbound_responses")) for row in rows)
     return render_template(
         "follow_ups.html",
         rows=rows,
@@ -26739,6 +26782,14 @@ def follow_ups_page():
         lookback_days=lookback_days,
         sort_order=sort_order,
         auto_enrich=(request.args.get("enrich") or "0") == "1",
+        followup_summary={
+            "lead_count": len(rows),
+            "outbound_calls": outbound_calls_total,
+            "outbound_messages": outbound_sms_total + outbound_email_total,
+            "outbound_sms": outbound_sms_total,
+            "outbound_email": outbound_email_total,
+            "inbound_responses": inbound_responses_total,
+        },
     )
 
 

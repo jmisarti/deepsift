@@ -29,8 +29,10 @@ body {
     background: #11212d;
     color: #f3f7fb;
     display: flex;
+    flex: 0 0 260px;
     flex-direction: column;
     gap: 1.4rem;
+    min-width: 260px;
     padding: 1.4rem 1.1rem;
     width: 260px;
 }
@@ -427,9 +429,10 @@ body {
 }
 
 .container {
-    max-width: 1320px;
-    margin: 1rem auto 2rem;
+    margin: 1rem 0 2rem;
+    max-width: none;
     padding: 0 1.4rem;
+    width: 100%;
 }
 
 .cards {
@@ -449,9 +452,20 @@ body {
 
 .cards h3, .cards p { margin: 0; }
 .cards p { margin-top: 0.4rem; font-size: 1.5rem; font-weight: 700; color: var(--accent); }
+.cards small {
+    color: var(--muted);
+    display: block;
+    font-size: 0.78rem;
+    margin-top: 0.35rem;
+}
 
 .panel { margin-top: 1rem; }
 .panel h2, .panel h3, .panel h4 { margin-top: 0; }
+
+.table-wrap {
+    overflow-x: auto;
+    width: 100%;
+}
 
 .home-hero {
     align-items: center;
@@ -494,7 +508,9 @@ body {
     }
 
     .app-sidebar {
+        flex: 0 0 auto;
         gap: 1rem;
+        min-width: 0;
         width: 100%;
     }
 

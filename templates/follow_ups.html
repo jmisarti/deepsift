@@ -1,5 +1,28 @@
 {% extends "base.html" %}
 {% block content %}
+<section class="cards page-summary-cards">
+    <article>
+        <h3>Leads</h3>
+        <p>{{ followup_summary.lead_count }}</p>
+        <small>Total new-lead rows in the current view.</small>
+    </article>
+    <article>
+        <h3>Outbound Calls</h3>
+        <p>{{ followup_summary.outbound_calls }}</p>
+        <small>All call attempts across these leads.</small>
+    </article>
+    <article>
+        <h3>Outbound Messages</h3>
+        <p>{{ followup_summary.outbound_messages }}</p>
+        <small>SMS {{ followup_summary.outbound_sms }} and email {{ followup_summary.outbound_email }} combined.</small>
+    </article>
+    <article>
+        <h3>Inbound Responses</h3>
+        <p>{{ followup_summary.inbound_responses }}</p>
+        <small>Any reply or response logged for this view.</small>
+    </article>
+</section>
+
 <section class="panel">
     <h2>Follow Ups (SIFT)</h2>
     <p>Search filter: <strong>owner last updated date</strong> for the selected day range.</p>
@@ -36,134 +59,136 @@
         <span class="busy-spinner" aria-hidden="true"></span>
         <span id="followUpsBusyText">Retrieving additional details...</span>
     </div>
-    <table>
-        <thead>
-            <tr>
-                <th>Address</th>
-                <th>Status</th>
-                <th>Owner(s)</th>
-                <th>Date Added (SIFT)</th>
-                <th>Outbound Calls</th>
-                <th>Outbound SMS</th>
-                <th>Outbound Email</th>
-                <th>Inbound Responses</th>
-                <th>Property Lists</th>
-                <th>SIFT</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for row in rows %}
-            <tr class="followup-main-row" data-target="followup-detail-{{ row.property_uuid }}">
-                <td>
-                    {% if row.has_referral_cache %}
-                    <a href="{{ url_for('referral_property_detail', property_uuid=row.property_uuid) }}">{{ row.full_address or "-" }}</a>
-                    {% else %}
-                    {{ row.full_address or "-" }}
-                    {% endif %}
-                </td>
-                <td><span class="pill">{{ row.status or "-" }}</span></td>
-                <td>{{ row.owner_names or "-" }}</td>
-                <td>{{ row.added_at|fmt_long_date }}</td>
-                <td>{{ row.outbound_calls or 0 }}</td>
-                <td>{{ row.outbound_sms or 0 }}</td>
-                <td>{{ row.outbound_email or 0 }}</td>
-                <td>{{ row.inbound_responses or 0 }}</td>
-                <td>{{ row.property_lists or "-" }}</td>
-                <td><a href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener">Open</a></td>
-            </tr>
-            <tr id="followup-detail-{{ row.property_uuid }}" class="followup-detail-row hidden">
-                <td colspan="10">
-                    {% if row.has_referral_cache %}
-                    <p><strong>Local Record:</strong> <a href="{{ url_for('referral_property_detail', property_uuid=row.property_uuid) }}">Open cached referral detail</a></p>
-                    {% endif %}
-                    <div class="inline-actions" style="justify-content:space-between; margin: 0.35rem 0 0.6rem;">
-                        <p style="margin:0;"><strong>Synced:</strong> {{ row.last_synced_at|fmt_est_datetime }}</p>
-                        {% if row.deep_dive_property_id %}
-                        <a href="{{ url_for('property_detail', property_id=row.deep_dive_property_id) }}">Open In Deep Dive</a>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Address</th>
+                    <th>Status</th>
+                    <th>Owner(s)</th>
+                    <th>Date Added (SIFT)</th>
+                    <th>Outbound Calls</th>
+                    <th>Outbound SMS</th>
+                    <th>Outbound Email</th>
+                    <th>Inbound Responses</th>
+                    <th>Property Lists</th>
+                    <th>SIFT</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr class="followup-main-row" data-target="followup-detail-{{ row.property_uuid }}">
+                    <td>
+                        {% if row.has_referral_cache %}
+                        <a href="{{ url_for('referral_property_detail', property_uuid=row.property_uuid) }}">{{ row.full_address or "-" }}</a>
                         {% else %}
-                        <form method="post" action="{{ url_for('follow_up_add_to_deep_dive', property_uuid=row.property_uuid) }}" onsubmit="return confirm('Add this lead into Deep Dive?');">
-                            <input type="hidden" name="days" value="{{ lookback_days }}">
-                            <input type="hidden" name="sort" value="{{ sort_order }}">
-                            <button type="submit">Add To Deep Dive</button>
-                        </form>
+                        {{ row.full_address or "-" }}
                         {% endif %}
-                    </div>
-                    <div class="table-wrap">
-                        <table class="compact-table">
-                            <thead>
-                                <tr>
-                                    <th>Phone</th>
-                                    <th>Type</th>
-                                    <th>Status</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for phone in row.phones %}
-                                <tr>
-                                    <td>{{ phone.value|fmt_phone }}</td>
-                                    <td>{{ phone.type }}</td>
-                                    <td>{{ phone.status }}</td>
-                                </tr>
-                                {% else %}
-                                <tr><td colspan="3">No phone numbers in cached payload.</td></tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                    <div class="table-wrap" style="margin-top:0.6rem;">
-                        <table class="compact-table">
-                            <thead>
-                                <tr>
-                                    <th>Email</th>
-                                    <th>Status</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for email in row.emails %}
-                                <tr>
-                                    <td>{{ email.value }}</td>
-                                    <td>{{ email.status }}</td>
-                                </tr>
-                                {% else %}
-                                <tr><td colspan="2">No emails in cached payload.</td></tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                    <h4 style="margin-top:0.8rem;">Scheduled Tasks</h4>
-                    <div class="table-wrap" style="margin-top:0.6rem;">
-                        <table class="compact-table">
-                            <thead>
-                                <tr>
-                                    <th>Event Type</th>
-                                    <th>Title</th>
-                                    <th>Due Date</th>
-                                    <th>Created By</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for task in row.tasks %}
-                                <tr>
-                                    <td>{{ task.event_type or "task" }}</td>
-                                    <td>{{ task.title or "-" }}</td>
-                                    <td>{{ task.due_date|fmt_long_date }}</td>
-                                    <td>{{ task.created_by_name or "-" }}</td>
-                                </tr>
-                                {% else %}
-                                <tr><td colspan="4">No Events Scheduled</td></tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                </td>
-            </tr>
-            {% else %}
-            <tr>
-                <td colspan="10">No cached follow ups. Click Refresh Follow Ups.</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+                    </td>
+                    <td><span class="pill">{{ row.status or "-" }}</span></td>
+                    <td>{{ row.owner_names or "-" }}</td>
+                    <td>{{ row.added_at|fmt_long_date }}</td>
+                    <td>{{ row.outbound_calls or 0 }}</td>
+                    <td>{{ row.outbound_sms or 0 }}</td>
+                    <td>{{ row.outbound_email or 0 }}</td>
+                    <td>{{ row.inbound_responses or 0 }}</td>
+                    <td>{{ row.property_lists or "-" }}</td>
+                    <td><a href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener">Open</a></td>
+                </tr>
+                <tr id="followup-detail-{{ row.property_uuid }}" class="followup-detail-row hidden">
+                    <td colspan="10">
+                        {% if row.has_referral_cache %}
+                        <p><strong>Local Record:</strong> <a href="{{ url_for('referral_property_detail', property_uuid=row.property_uuid) }}">Open cached referral detail</a></p>
+                        {% endif %}
+                        <div class="inline-actions" style="justify-content:space-between; margin: 0.35rem 0 0.6rem;">
+                            <p style="margin:0;"><strong>Synced:</strong> {{ row.last_synced_at|fmt_est_datetime }}</p>
+                            {% if row.deep_dive_property_id %}
+                            <a href="{{ url_for('property_detail', property_id=row.deep_dive_property_id) }}">Open In Deep Dive</a>
+                            {% else %}
+                            <form method="post" action="{{ url_for('follow_up_add_to_deep_dive', property_uuid=row.property_uuid) }}" onsubmit="return confirm('Add this lead into Deep Dive?');">
+                                <input type="hidden" name="days" value="{{ lookback_days }}">
+                                <input type="hidden" name="sort" value="{{ sort_order }}">
+                                <button type="submit">Add To Deep Dive</button>
+                            </form>
+                            {% endif %}
+                        </div>
+                        <div class="table-wrap">
+                            <table class="compact-table">
+                                <thead>
+                                    <tr>
+                                        <th>Phone</th>
+                                        <th>Type</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for phone in row.phones %}
+                                    <tr>
+                                        <td>{{ phone.value|fmt_phone }}</td>
+                                        <td>{{ phone.type }}</td>
+                                        <td>{{ phone.status }}</td>
+                                    </tr>
+                                    {% else %}
+                                    <tr><td colspan="3">No phone numbers in cached payload.</td></tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="table-wrap" style="margin-top:0.6rem;">
+                            <table class="compact-table">
+                                <thead>
+                                    <tr>
+                                        <th>Email</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for email in row.emails %}
+                                    <tr>
+                                        <td>{{ email.value }}</td>
+                                        <td>{{ email.status }}</td>
+                                    </tr>
+                                    {% else %}
+                                    <tr><td colspan="2">No emails in cached payload.</td></tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                        <h4 style="margin-top:0.8rem;">Scheduled Tasks</h4>
+                        <div class="table-wrap" style="margin-top:0.6rem;">
+                            <table class="compact-table">
+                                <thead>
+                                    <tr>
+                                        <th>Event Type</th>
+                                        <th>Title</th>
+                                        <th>Due Date</th>
+                                        <th>Created By</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for task in row.tasks %}
+                                    <tr>
+                                        <td>{{ task.event_type or "task" }}</td>
+                                        <td>{{ task.title or "-" }}</td>
+                                        <td>{{ task.due_date|fmt_long_date }}</td>
+                                        <td>{{ task.created_by_name or "-" }}</td>
+                                    </tr>
+                                    {% else %}
+                                    <tr><td colspan="4">No Events Scheduled</td></tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="10">No cached follow ups. Click Refresh Follow Ups.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
 </section>
 <script>
 (() => {

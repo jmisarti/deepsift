@@ -180,6 +180,7 @@ PROVIDER_ALERT_SOURCE_PREFIX = "provider_"
 ADS_DEFAULT_LOOKBACK_DAYS = max(int((os.getenv("ADS_DEFAULT_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
 ADS_REFRESH_LOOKBACK_DAYS = max(int((os.getenv("ADS_REFRESH_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
 GOOGLE_ADS_API_VERSION = (os.getenv("GOOGLE_ADS_API_VERSION") or "v22").strip() or "v22"
+META_GRAPH_API_VERSION = (os.getenv("META_GRAPH_API_VERSION") or "v23.0").strip() or "v23.0"
 ADS_REFRESH_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
@@ -7039,6 +7040,11 @@ def _normalize_google_ads_customer_id(value):
     return re.sub(r"\D", "", str(value or ""))
 
 
+def _normalize_meta_account_id(value):
+    cleaned = normalize_whitespace(value).lower().replace("act_", "")
+    return re.sub(r"\D", "", cleaned)
+
+
 def _google_ads_headers(settings, access_token):
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -7193,6 +7199,137 @@ def _google_ads_parse_search_stream_rows(stream_payload, customer_id):
     return rows
 
 
+def _meta_graph_get(path, params, access_token):
+    url = f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/{path.lstrip('/')}"
+    payload = dict(params or {})
+    payload["access_token"] = access_token
+    items = []
+    while url:
+        response = requests.get(url, params=payload if "?" not in url else None, timeout=90)
+        if not response.ok:
+            try:
+                error_payload = response.json()
+            except Exception:
+                error_payload = response.text
+            raise RuntimeError(f"Meta API request failed ({response.status_code}): {error_payload}")
+        data = response.json() or {}
+        if isinstance(data.get("data"), list):
+            items.extend(data.get("data") or [])
+        else:
+            return data
+        paging = data.get("paging") or {}
+        next_url = paging.get("next")
+        if next_url:
+            url = next_url
+            payload = {}
+        else:
+            url = ""
+    return items
+
+
+def _meta_conversion_value(actions):
+    if not isinstance(actions, list):
+        return 0.0
+    total = 0.0
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        action_type = normalize_whitespace(action.get("action_type")).lower()
+        if not action_type:
+            continue
+        include = (
+            "lead" in action_type
+            or "purchase" in action_type
+            or "complete_registration" in action_type
+            or "submit_application" in action_type
+            or action_type in {"contact", "schedule", "subscribe", "start_trial"}
+        )
+        if not include:
+            continue
+        total += _normalize_metric_float(action.get("value"))
+    return round(total, 4)
+
+
+def _fetch_meta_campaign_snapshots(settings, account_id):
+    account_id = _normalize_meta_account_id(account_id)
+    if not account_id:
+        return {}
+    rows = _meta_graph_get(
+        f"act_{account_id}/campaigns",
+        {
+            "fields": "id,name,status,effective_status",
+            "limit": 500,
+        },
+        settings.get("meta_access_token", ""),
+    )
+    snapshots = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        campaign_id = normalize_whitespace(row.get("id"))
+        if not campaign_id:
+            continue
+        snapshots[campaign_id] = {
+            "campaign_id": campaign_id,
+            "campaign_name": normalize_whitespace(row.get("name")) or campaign_id,
+            "campaign_status": _normalize_ad_campaign_status(row.get("effective_status") or row.get("status")),
+        }
+    return snapshots
+
+
+def _fetch_meta_insights_rows(settings, account_id, start_date, end_date):
+    account_id = _normalize_meta_account_id(account_id)
+    if not account_id:
+        return []
+    rows = _meta_graph_get(
+        f"act_{account_id}/insights",
+        {
+            "level": "campaign",
+            "time_increment": 1,
+            "fields": ",".join(
+                [
+                    "campaign_id",
+                    "campaign_name",
+                    "date_start",
+                    "spend",
+                    "impressions",
+                    "clicks",
+                    "reach",
+                    "actions",
+                ]
+            ),
+            "time_range": json.dumps({"since": start_date, "until": end_date}),
+            "limit": 500,
+        },
+        settings.get("meta_access_token", ""),
+    )
+    parsed = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        campaign_id = normalize_whitespace(row.get("campaign_id"))
+        if not campaign_id:
+            continue
+        parsed.append(
+            {
+                "platform": "meta",
+                "account_id": account_id,
+                "campaign_id": campaign_id,
+                "campaign_name": normalize_whitespace(row.get("campaign_name")) or campaign_id,
+                "campaign_status": "Unknown",
+                "campaign_site": "Meta",
+                "metric_date": normalize_whitespace(row.get("date_start")),
+                "spend": _normalize_metric_float(row.get("spend")),
+                "impressions": _normalize_metric_int(row.get("impressions")),
+                "clicks": _normalize_metric_int(row.get("clicks")),
+                "reach": _normalize_metric_int(row.get("reach")),
+                "conversions": _meta_conversion_value(row.get("actions")),
+                "raw": row,
+            }
+        )
+    return parsed
+
+
 def get_ads_dashboard_settings(db):
     settings = {
         "google_developer_token": (get_setting(db, "ads_google_developer_token", "") or os.getenv("ADS_GOOGLE_DEVELOPER_TOKEN", "")).strip(),
@@ -7213,7 +7350,7 @@ def get_ads_dashboard_settings(db):
     }
     settings["google_customer_ids"] = [value for value in (_normalize_google_ads_customer_id(item) for item in _split_csv_values(settings["google_customer_ids_raw"])) if value]
     settings["google_login_customer_id"] = _normalize_google_ads_customer_id(settings.get("google_login_customer_id"))
-    settings["meta_account_ids"] = _split_csv_values(settings["meta_account_ids_raw"])
+    settings["meta_account_ids"] = [value for value in (_normalize_meta_account_id(item) for item in _split_csv_values(settings["meta_account_ids_raw"])) if value]
     settings["amazon_profile_ids"] = _split_csv_values(settings["amazon_profile_ids_raw"])
     settings["roku_account_ids"] = _split_csv_values(settings["roku_account_ids_raw"])
     settings["google_ready"] = bool(
@@ -7349,7 +7486,48 @@ def _fetch_google_ads_campaign_rows(settings, start_date, end_date):
 
 
 def _fetch_meta_ads_campaign_rows(settings, start_date, end_date):
-    return _pending_ads_fetch_result("meta")
+    account_ids = settings.get("meta_account_ids") or []
+    if not account_ids:
+        return {"status": "missing_config", "rows": [], "message": "No Meta ad account IDs configured."}
+    rows = []
+    for account_id in account_ids:
+        snapshots = _fetch_meta_campaign_snapshots(settings, account_id)
+        insight_rows = _fetch_meta_insights_rows(settings, account_id, start_date, end_date)
+        seen_campaign_ids = set()
+        for row in insight_rows:
+            campaign_id = normalize_whitespace(row.get("campaign_id"))
+            snapshot = snapshots.get(campaign_id) or {}
+            row["campaign_name"] = snapshot.get("campaign_name") or row.get("campaign_name") or campaign_id
+            row["campaign_status"] = snapshot.get("campaign_status") or row.get("campaign_status") or "Unknown"
+            row["campaign_site"] = _ad_campaign_site("meta", account_id)
+            seen_campaign_ids.add(campaign_id)
+            rows.append(row)
+        for campaign_id, snapshot in snapshots.items():
+            if campaign_id in seen_campaign_ids:
+                continue
+            rows.append(
+                {
+                    "platform": "meta",
+                    "account_id": account_id,
+                    "campaign_id": campaign_id,
+                    "campaign_name": snapshot.get("campaign_name") or campaign_id,
+                    "campaign_status": snapshot.get("campaign_status") or "Unknown",
+                    "campaign_site": _ad_campaign_site("meta", account_id),
+                    "metric_date": "",
+                    "spend": 0.0,
+                    "impressions": 0,
+                    "clicks": 0,
+                    "reach": 0,
+                    "conversions": 0.0,
+                    "_current_snapshot": True,
+                    "raw": snapshot,
+                }
+            )
+    return {
+        "status": "ok",
+        "rows": rows,
+        "message": f"Fetched {len(rows)} Meta campaign rows across {len(account_ids)} account(s).",
+    }
 
 
 def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date):

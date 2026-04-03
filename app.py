@@ -7341,6 +7341,18 @@ def _exchange_amazon_refresh_token(client_id, client_secret, refresh_token):
     return access_token
 
 
+def _amazon_duplicate_report_id(payload):
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("reportId", "report_id", "id"):
+        value = normalize_whitespace(payload.get(key))
+        if re.fullmatch(r"[0-9a-fA-F-]{36}", value or ""):
+            return value
+    detail = normalize_whitespace(payload.get("detail") or payload.get("message") or payload.get("error_description"))
+    match = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", detail)
+    return match.group(1) if match else ""
+
+
 def _amazon_ads_headers(settings, access_token, profile_id="", content_type="application/json"):
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -7356,7 +7368,7 @@ def _amazon_ads_headers(settings, access_token, profile_id="", content_type="app
 
 def _create_amazon_report(settings, access_token, profile_id, start_date, end_date):
     payload = {
-        "name": f"DeepSift Amazon SP Campaigns {start_date} to {end_date}",
+        "name": f"DeepSift Amazon SP Campaigns {profile_id} {start_date} to {end_date}",
         "startDate": start_date,
         "endDate": end_date,
         "configuration": {
@@ -7393,6 +7405,11 @@ def _create_amazon_report(settings, access_token, profile_id, start_date, end_da
     except Exception:
         body = {"raw": response.text}
     if not response.ok:
+        duplicate_report_id = ""
+        if response.status_code == 425:
+            duplicate_report_id = _amazon_duplicate_report_id(body)
+        if duplicate_report_id:
+            return duplicate_report_id
         raise RuntimeError(f"Amazon report create failed ({response.status_code}): {body}")
     report_id = normalize_whitespace(body.get("reportId"))
     if not report_id:

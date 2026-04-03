@@ -950,9 +950,27 @@ def migrate_db(db):
         )
         """
     )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ad_platform_pending_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            report_status TEXT NOT NULL DEFAULT 'Pending',
+            raw_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(platform, scope_id, start_date, end_date)
+        )
+        """
+    )
     db.execute("CREATE INDEX IF NOT EXISTS idx_ad_campaign_current_platform ON ad_campaign_current(platform, campaign_status, campaign_name)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_ad_campaign_daily_date ON ad_campaign_daily_metrics(metric_date, platform, campaign_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_ad_refresh_runs_started ON ad_campaign_refresh_runs(started_at DESC, id DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_ad_pending_reports_lookup ON ad_platform_pending_reports(platform, scope_id, start_date, end_date)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_properties_is_d4d ON properties(is_d4d, id DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_buyers_name ON buyers(lower(last_name), lower(first_name), id DESC)")
     db.execute(
@@ -7459,6 +7477,73 @@ def _download_amazon_report_rows(report_url):
     return payload if isinstance(payload, list) else []
 
 
+def _get_pending_ad_report(db, platform, scope_id, start_date, end_date):
+    if db is None:
+        return None
+    row = db.execute(
+        """
+        SELECT id, platform, scope_id, start_date, end_date, report_id, report_status, raw_json, created_at, updated_at
+        FROM ad_platform_pending_reports
+        WHERE platform = ? AND scope_id = ? AND start_date = ? AND end_date = ?
+        LIMIT 1
+        """,
+        (_normalize_ad_platform(platform), normalize_whitespace(scope_id), str(start_date or ""), str(end_date or "")),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _upsert_pending_ad_report(db, platform, scope_id, start_date, end_date, report_id, report_status="Pending", raw=None):
+    if db is None:
+        return
+    db.execute(
+        """
+        INSERT INTO ad_platform_pending_reports (platform, scope_id, start_date, end_date, report_id, report_status, raw_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(platform, scope_id, start_date, end_date) DO UPDATE SET
+            report_id = excluded.report_id,
+            report_status = excluded.report_status,
+            raw_json = excluded.raw_json,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            _normalize_ad_platform(platform),
+            normalize_whitespace(scope_id),
+            str(start_date or ""),
+            str(end_date or ""),
+            normalize_whitespace(report_id),
+            normalize_whitespace(report_status) or "Pending",
+            json.dumps(raw or {}, ensure_ascii=True, sort_keys=True, default=str),
+        ),
+    )
+
+
+def _delete_pending_ad_report(db, platform, scope_id, start_date, end_date):
+    if db is None:
+        return
+    db.execute(
+        """
+        DELETE FROM ad_platform_pending_reports
+        WHERE platform = ? AND scope_id = ? AND start_date = ? AND end_date = ?
+        """,
+        (_normalize_ad_platform(platform), normalize_whitespace(scope_id), str(start_date or ""), str(end_date or "")),
+    )
+
+
+def _amazon_report_status_once(settings, access_token, profile_id, report_id):
+    response = requests.get(
+        f"{_amazon_ads_base_url(settings.get('amazon_region'))}/reporting/reports/{report_id}",
+        headers=_amazon_ads_headers(settings, access_token, profile_id=profile_id, content_type=""),
+        timeout=60,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text}
+    if not response.ok:
+        raise RuntimeError(f"Amazon report status failed ({response.status_code}): {body}")
+    return body if isinstance(body, dict) else {}
+
+
 def _fetch_meta_campaign_snapshots(settings, account_id):
     account_id = _normalize_meta_account_id(account_id)
     if not account_id:
@@ -7631,7 +7716,7 @@ def _pending_ads_fetch_result(platform):
     }
 
 
-def _fetch_google_ads_campaign_rows(settings, start_date, end_date):
+def _fetch_google_ads_campaign_rows(settings, start_date, end_date, db=None):
     customer_ids = settings.get("google_customer_ids") or []
     if not customer_ids:
         return {"status": "missing_config", "rows": [], "message": "No Google Ads customer IDs configured."}
@@ -7694,7 +7779,7 @@ def _fetch_google_ads_campaign_rows(settings, start_date, end_date):
     }
 
 
-def _fetch_meta_ads_campaign_rows(settings, start_date, end_date):
+def _fetch_meta_ads_campaign_rows(settings, start_date, end_date, db=None):
     account_ids = settings.get("meta_account_ids") or []
     if not account_ids:
         return {"status": "missing_config", "rows": [], "message": "No Meta ad account IDs configured."}
@@ -7739,7 +7824,7 @@ def _fetch_meta_ads_campaign_rows(settings, start_date, end_date):
     }
 
 
-def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date):
+def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
     profile_ids = settings.get("amazon_profile_ids")
     if not isinstance(profile_ids, list):
         profile_ids = _split_csv_values(settings.get("amazon_profile_ids_raw"))
@@ -7753,14 +7838,26 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date):
     rows = []
     pending_profiles = []
     for profile_id in profile_ids:
-        report_id = _create_amazon_report(settings, access_token, profile_id, start_date, end_date)
-        try:
-            report_meta = _poll_amazon_report(settings, access_token, profile_id, report_id)
-        except RuntimeError as exc:
-            if "timed out" in str(exc).lower():
+        report_meta = {}
+        pending = _get_pending_ad_report(db, "amazon", profile_id, start_date, end_date)
+        if pending:
+            report_id = normalize_whitespace(pending.get("report_id"))
+            report_meta = _amazon_report_status_once(settings, access_token, profile_id, report_id)
+            report_status = normalize_whitespace(report_meta.get("status")).upper()
+            if report_status in {"COMPLETED", "SUCCESS"} and normalize_whitespace(report_meta.get("url")):
+                _delete_pending_ad_report(db, "amazon", profile_id, start_date, end_date)
+            elif report_status in {"FAILURE", "FAILED", "CANCELLED"}:
+                _delete_pending_ad_report(db, "amazon", profile_id, start_date, end_date)
+                raise RuntimeError(f"Amazon report generation failed for profile {profile_id}: {report_meta}")
+            else:
+                _upsert_pending_ad_report(db, "amazon", profile_id, start_date, end_date, report_id, report_status or "Pending", report_meta)
                 pending_profiles.append(str(profile_id))
                 continue
-            raise
+        else:
+            report_id = _create_amazon_report(settings, access_token, profile_id, start_date, end_date)
+            _upsert_pending_ad_report(db, "amazon", profile_id, start_date, end_date, report_id, "Pending", {"reportId": report_id})
+            pending_profiles.append(str(profile_id))
+            continue
         report_rows = _download_amazon_report_rows(report_meta.get("url") or "")
         for item in report_rows:
             if not isinstance(item, dict):
@@ -7807,7 +7904,7 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date):
     }
 
 
-def _fetch_roku_ads_campaign_rows(settings, start_date, end_date):
+def _fetch_roku_ads_campaign_rows(settings, start_date, end_date, db=None):
     return _pending_ads_fetch_result("roku")
 
 
@@ -8005,7 +8102,7 @@ def refresh_ad_campaign_cache(db, triggered_by="manual", requested_by="", lookba
                     )
                     continue
                 try:
-                    fetch_result = fetcher(settings, start_date, end_date) or {}
+                    fetch_result = fetcher(settings, start_date, end_date, db=db) or {}
                 except Exception as exc:
                     emit_provider_alert(
                         source=f"provider_ads_{platform}",

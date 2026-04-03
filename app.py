@@ -903,6 +903,7 @@ def migrate_db(db):
             campaign_name TEXT NOT NULL,
             campaign_status TEXT NOT NULL DEFAULT 'Unknown',
             campaign_site TEXT NOT NULL,
+            campaign_goal TEXT,
             spend REAL NOT NULL DEFAULT 0,
             impressions INTEGER NOT NULL DEFAULT 0,
             clicks INTEGER NOT NULL DEFAULT 0,
@@ -927,6 +928,7 @@ def migrate_db(db):
             campaign_name TEXT NOT NULL,
             campaign_status TEXT NOT NULL DEFAULT 'Unknown',
             campaign_site TEXT NOT NULL,
+            campaign_goal TEXT,
             spend REAL NOT NULL DEFAULT 0,
             impressions INTEGER NOT NULL DEFAULT 0,
             clicks INTEGER NOT NULL DEFAULT 0,
@@ -938,6 +940,8 @@ def migrate_db(db):
         )
         """
     )
+    ensure_column(db, "ad_campaign_current", "campaign_goal", "campaign_goal TEXT")
+    ensure_column(db, "ad_campaign_daily_metrics", "campaign_goal", "campaign_goal TEXT")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS ad_campaign_refresh_runs (
@@ -7259,6 +7263,7 @@ def _google_ads_parse_search_stream_rows(stream_payload, customer_id):
                     "campaign_name": normalize_whitespace(campaign.get("name")) or campaign_id,
                     "campaign_status": _google_ads_display_status(campaign.get("status"), campaign.get("primaryStatus")),
                     "campaign_site": "Google",
+                    "campaign_goal": normalize_whitespace(campaign.get("advertisingChannelType")),
                     "metric_date": metric_date,
                     "spend": round(cost_micros / 1_000_000.0, 4),
                     "impressions": _normalize_metric_int(metrics.get("impressions")),
@@ -7490,6 +7495,7 @@ def _fetch_roku_campaign_snapshots(access_token):
                 "campaign_name": normalize_whitespace(attrs.get("name")) or campaign_id,
                 "campaign_status": _normalize_ad_campaign_status(attrs.get("status")),
                 "campaign_site": _ad_campaign_site("roku", account_id),
+                "campaign_goal": _extract_campaign_goal(item, "roku"),
                 "metric_date": "",
                 "spend": 0.0,
                 "impressions": 0,
@@ -7776,7 +7782,7 @@ def _fetch_meta_campaign_snapshots(settings, account_id):
     rows = _meta_graph_get(
         f"act_{account_id}/campaigns",
         {
-            "fields": "id,name,status,effective_status",
+            "fields": "id,name,status,effective_status,objective",
             "limit": 500,
         },
         settings.get("meta_access_token", ""),
@@ -7792,6 +7798,7 @@ def _fetch_meta_campaign_snapshots(settings, account_id):
             "campaign_id": campaign_id,
             "campaign_name": normalize_whitespace(row.get("name")) or campaign_id,
             "campaign_status": _normalize_ad_campaign_status(row.get("effective_status") or row.get("status")),
+            "campaign_goal": normalize_whitespace(row.get("objective")),
         }
     return snapshots
 
@@ -7837,6 +7844,7 @@ def _fetch_meta_insights_rows(settings, account_id, start_date, end_date):
                 "campaign_name": normalize_whitespace(row.get("campaign_name")) or campaign_id,
                 "campaign_status": "Unknown",
                 "campaign_site": "Meta",
+                "campaign_goal": "",
                 "metric_date": normalize_whitespace(row.get("date_start")),
                 "spend": _normalize_metric_float(row.get("spend")),
                 "impressions": _normalize_metric_int(row.get("impressions")),
@@ -8034,6 +8042,7 @@ def _fetch_meta_ads_campaign_rows(settings, start_date, end_date, db=None):
             row["campaign_name"] = snapshot.get("campaign_name") or row.get("campaign_name") or campaign_id
             row["campaign_status"] = snapshot.get("campaign_status") or row.get("campaign_status") or "Unknown"
             row["campaign_site"] = _ad_campaign_site("meta", account_id)
+            row["campaign_goal"] = snapshot.get("campaign_goal") or row.get("campaign_goal") or ""
             seen_campaign_ids.add(campaign_id)
             rows.append(row)
         for campaign_id, snapshot in snapshots.items():
@@ -8047,6 +8056,7 @@ def _fetch_meta_ads_campaign_rows(settings, start_date, end_date, db=None):
                     "campaign_name": snapshot.get("campaign_name") or campaign_id,
                     "campaign_status": snapshot.get("campaign_status") or "Unknown",
                     "campaign_site": _ad_campaign_site("meta", account_id),
+                    "campaign_goal": snapshot.get("campaign_goal") or "",
                     "metric_date": "",
                     "spend": 0.0,
                     "impressions": 0,
@@ -8114,6 +8124,7 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
                     "campaign_name": normalize_whitespace(item.get("campaignName")) or campaign_id,
                     "campaign_status": _normalize_ad_campaign_status(item.get("campaignStatus")),
                     "campaign_site": _ad_campaign_site("amazon", profile_id),
+                    "campaign_goal": "Sponsored Products",
                     "metric_date": metric_date,
                     "spend": _normalize_metric_float(item.get("cost")),
                     "impressions": _normalize_metric_int(item.get("impressions")),
@@ -8204,6 +8215,7 @@ def _fetch_roku_ads_campaign_rows(settings, start_date, end_date, db=None):
                     ) or campaign_id,
                     "campaign_status": next((snap.get("campaign_status") for snap in account_snapshots if snap.get("campaign_id") == campaign_id), "Unknown"),
                     "campaign_site": _ad_campaign_site("roku", account_id),
+                    "campaign_goal": next((snap.get("campaign_goal") for snap in account_snapshots if snap.get("campaign_id") == campaign_id), ""),
                     "metric_date": normalize_whitespace(
                         normalized_item.get("date")
                         or normalized_item.get("report_date")
@@ -8259,6 +8271,42 @@ def _ad_campaign_site(platform, account_id=""):
     return f"{label} ({account})" if account else label
 
 
+def _extract_campaign_goal(raw, platform=""):
+    candidates = []
+    if isinstance(raw, dict):
+        attrs = raw.get("attributes") if isinstance(raw.get("attributes"), dict) else {}
+        campaign = raw.get("campaign") if isinstance(raw.get("campaign"), dict) else {}
+        candidates.extend(
+            [
+                raw.get("goal"),
+                raw.get("goal_name"),
+                raw.get("campaign_goal"),
+                raw.get("objective"),
+                raw.get("optimization_goal"),
+                raw.get("primary_goal"),
+                raw.get("kpi"),
+                raw.get("kpi_goal"),
+                attrs.get("goal"),
+                attrs.get("goal_name"),
+                attrs.get("campaign_goal"),
+                attrs.get("objective"),
+                attrs.get("optimization_goal"),
+                attrs.get("primary_goal"),
+                attrs.get("kpi"),
+                attrs.get("kpi_goal"),
+                campaign.get("advertisingChannelType"),
+                campaign.get("advertising_channel_type"),
+            ]
+        )
+    if str(platform or "").strip().lower() == "amazon":
+        candidates.append("Sponsored Products")
+    for value in candidates:
+        clean = normalize_whitespace(value)
+        if clean:
+            return clean
+    return ""
+
+
 def _upsert_ad_campaign_daily_metric(db, row):
     platform = _normalize_ad_platform(row.get("platform"))
     if not platform:
@@ -8275,6 +8323,7 @@ def _upsert_ad_campaign_daily_metric(db, row):
         "campaign_name": normalize_whitespace(row.get("campaign_name")) or campaign_id,
         "campaign_status": _normalize_ad_campaign_status(row.get("campaign_status")),
         "campaign_site": normalize_whitespace(row.get("campaign_site")) or _ad_campaign_site(platform, row.get("account_id")),
+        "campaign_goal": normalize_whitespace(row.get("campaign_goal")) or _extract_campaign_goal(row.get("raw") or row, platform),
         "spend": _normalize_metric_float(row.get("spend")),
         "impressions": _normalize_metric_int(row.get("impressions")),
         "clicks": _normalize_metric_int(row.get("clicks")),
@@ -8286,14 +8335,15 @@ def _upsert_ad_campaign_daily_metric(db, row):
         """
         INSERT INTO ad_campaign_daily_metrics (
             platform, account_id, campaign_id, metric_date, campaign_name, campaign_status, campaign_site,
-            spend, impressions, clicks, reach, conversions, raw_json, fetched_at
+            campaign_goal, spend, impressions, clicks, reach, conversions, raw_json, fetched_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(platform, campaign_id, metric_date) DO UPDATE SET
             account_id = excluded.account_id,
             campaign_name = excluded.campaign_name,
             campaign_status = excluded.campaign_status,
             campaign_site = excluded.campaign_site,
+            campaign_goal = excluded.campaign_goal,
             spend = excluded.spend,
             impressions = excluded.impressions,
             clicks = excluded.clicks,
@@ -8310,6 +8360,7 @@ def _upsert_ad_campaign_daily_metric(db, row):
             payload["campaign_name"],
             payload["campaign_status"],
             payload["campaign_site"],
+            payload["campaign_goal"],
             payload["spend"],
             payload["impressions"],
             payload["clicks"],
@@ -8332,6 +8383,7 @@ def _upsert_ad_campaign_current(db, row):
         "campaign_name": normalize_whitespace(row.get("campaign_name")) or campaign_id,
         "campaign_status": _normalize_ad_campaign_status(row.get("campaign_status")),
         "campaign_site": normalize_whitespace(row.get("campaign_site")) or _ad_campaign_site(platform, row.get("account_id")),
+        "campaign_goal": normalize_whitespace(row.get("campaign_goal")) or _extract_campaign_goal(row.get("raw") or row, platform),
         "spend": _normalize_metric_float(row.get("spend")),
         "impressions": _normalize_metric_int(row.get("impressions")),
         "clicks": _normalize_metric_int(row.get("clicks")),
@@ -8344,14 +8396,15 @@ def _upsert_ad_campaign_current(db, row):
         """
         INSERT INTO ad_campaign_current (
             platform, account_id, campaign_id, campaign_name, campaign_status, campaign_site,
-            spend, impressions, clicks, reach, conversions, last_metric_date, raw_json, first_seen_at, last_refreshed_at
+            campaign_goal, spend, impressions, clicks, reach, conversions, last_metric_date, raw_json, first_seen_at, last_refreshed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ON CONFLICT(platform, campaign_id) DO UPDATE SET
             account_id = excluded.account_id,
             campaign_name = excluded.campaign_name,
             campaign_status = excluded.campaign_status,
             campaign_site = excluded.campaign_site,
+            campaign_goal = excluded.campaign_goal,
             spend = excluded.spend,
             impressions = excluded.impressions,
             clicks = excluded.clicks,
@@ -8368,6 +8421,7 @@ def _upsert_ad_campaign_current(db, row):
             payload["campaign_name"],
             payload["campaign_status"],
             payload["campaign_site"],
+            payload["campaign_goal"],
             payload["spend"],
             payload["impressions"],
             payload["clicks"],
@@ -8541,11 +8595,14 @@ def query_ad_dashboard_rows(db, q="", platform="", status="", days=ADS_DEFAULT_L
         "status": status_rank_sql,
         "platform": "c.platform",
         "name": "c.campaign_name",
+        "goal": "lower(COALESCE(c.campaign_goal, ''))",
         "spend": "spend",
+        "cpm": "cpm",
         "impressions": "impressions",
         "clicks": "clicks",
         "reach": "reach",
         "conversions": "conversions",
+        "goal_cpa": "goal_cpa",
         "updated": "c.last_refreshed_at",
     }
     sort_key = (sort or "").strip().lower() or "status"
@@ -8568,19 +8625,28 @@ def query_ad_dashboard_rows(db, q="", platform="", status="", days=ADS_DEFAULT_L
             c.campaign_name,
             c.campaign_status,
             c.campaign_site,
+            COALESCE(c.campaign_goal, '') AS campaign_goal,
             c.last_refreshed_at,
             COALESCE(SUM(d.spend), 0) AS spend,
             COALESCE(SUM(d.impressions), 0) AS impressions,
             COALESCE(SUM(d.clicks), 0) AS clicks,
             COALESCE(SUM(d.reach), 0) AS reach,
-            COALESCE(SUM(d.conversions), 0) AS conversions
+            COALESCE(SUM(d.conversions), 0) AS conversions,
+            CASE
+                WHEN COALESCE(SUM(d.impressions), 0) > 0 THEN (COALESCE(SUM(d.spend), 0) * 1000.0) / COALESCE(SUM(d.impressions), 0)
+                ELSE 0
+            END AS cpm,
+            CASE
+                WHEN COALESCE(SUM(d.conversions), 0) > 0 THEN COALESCE(SUM(d.spend), 0) / COALESCE(SUM(d.conversions), 0)
+                ELSE 0
+            END AS goal_cpa
         FROM ad_campaign_current c
         LEFT JOIN ad_campaign_daily_metrics d
             ON d.platform = c.platform
            AND d.campaign_id = c.campaign_id
            AND date(d.metric_date) BETWEEN date(?) AND date(?)
         WHERE {' AND '.join(where)}
-        GROUP BY c.platform, c.account_id, c.campaign_id, c.campaign_name, c.campaign_status, c.campaign_site, c.last_refreshed_at
+        GROUP BY c.platform, c.account_id, c.campaign_id, c.campaign_name, c.campaign_status, c.campaign_site, c.campaign_goal, c.last_refreshed_at
         ORDER BY {order_sql}
         """,
         tuple(params),

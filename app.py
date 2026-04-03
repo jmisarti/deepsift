@@ -21445,6 +21445,191 @@ def run_reisift_uuid_skiptrace_sync(db, property_uuid, added_by="System", source
     }
 
 
+def collect_property_owner_person_ids_for_reisift_sync(db, property_id):
+    property_id = int(property_id or 0)
+    if property_id <= 0:
+        return []
+
+    row = db.execute(
+        "SELECT owner_person_id FROM properties WHERE id = ? LIMIT 1",
+        (property_id,),
+    ).fetchone()
+    owner_person_id = int((row["owner_person_id"] if row else 0) or 0)
+    if owner_person_id <= 0:
+        return []
+
+    person_ids = [owner_person_id]
+    seen_ids = {owner_person_id}
+    co_owner_rows = db.execute(
+        """
+        SELECT subject_person_id, related_person_id
+        FROM person_relationships
+        WHERE relationship_type = 'Co-Owner'
+          AND (subject_person_id = ? OR related_person_id = ?)
+        ORDER BY id ASC
+        """,
+        (owner_person_id, owner_person_id),
+    ).fetchall()
+    for rel in co_owner_rows:
+        subject_id = int(rel["subject_person_id"] or 0)
+        related_id = int(rel["related_person_id"] or 0)
+        candidate_id = related_id if subject_id == owner_person_id else subject_id
+        if candidate_id <= 0 or candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+        person_ids.append(candidate_id)
+    return person_ids
+
+
+def sync_d4d_property_to_reisift(db, property_id, added_by="", source="Slack D4D"):
+    property_id = int(property_id or 0)
+    if property_id <= 0:
+        raise ValueError("property_id is required")
+
+    prop = db.execute(
+        """
+        SELECT p.id,
+               p.owner_person_id,
+               p.reisift_property_uuid,
+               p.reisift_owner_uuid,
+               a.street,
+               a.city,
+               a.state,
+               a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if not prop:
+        raise ValueError("property not found")
+
+    owner_person_id = int(prop["owner_person_id"] or 0)
+    owner_person_ids = collect_property_owner_person_ids_for_reisift_sync(db, property_id)
+    phone_items, email_items = collect_person_contact_items_for_reisift_sync(db, owner_person_ids)
+
+    owner_first = "Unknown"
+    owner_last = "Owner"
+    if owner_person_id > 0:
+        owner_row = db.execute(
+            "SELECT first_name, last_name FROM people WHERE id = ? LIMIT 1",
+            (owner_person_id,),
+        ).fetchone()
+        if owner_row:
+            owner_first = normalize_whitespace(owner_row["first_name"] or "") or owner_first
+            owner_last = normalize_whitespace(owner_row["last_name"] or "") or owner_last
+
+    property_uuid = normalize_uuid(prop["reisift_property_uuid"] or "")
+    owner_uuid = normalize_uuid(prop["reisift_owner_uuid"] or "")
+    actor = normalize_whitespace(added_by) or "Slack"
+    now_text = format_db_time(datetime.utcnow())
+    address_line = format_property_address_line(prop["street"], prop["city"], prop["state"], prop["postal_code"])
+    notes = f"D4D lead synced from {source} on {now_text} by {actor}. Local property #{property_id}."
+    out = {
+        "ok": False,
+        "property_id": property_id,
+        "property_uuid": property_uuid,
+        "owner_uuid": owner_uuid,
+        "created": False,
+        "duplicate_existing": False,
+        "contact_sync": None,
+        "phones_count": len(phone_items),
+        "emails_count": len(email_items),
+        "owner_person_ids": owner_person_ids,
+        "sift_record_url": _sift_record_url(property_uuid),
+        "create_result": None,
+        "warnings": [],
+    }
+
+    token = None
+    create_result = None
+
+    if not property_uuid:
+        create_payload = {
+            "search": address_line,
+            "street": prop["street"],
+            "city": prop["city"],
+            "state": prop["state"],
+            "postal_code": prop["postal_code"],
+            "status": "New Lead",
+            "lists": "Driving For Dollars",
+            "tags": "Driving For Dollars,D4D",
+            "notes": notes,
+            "owner": {
+                "first_name": owner_first,
+                "last_name": owner_last,
+                "address_street": prop["street"],
+                "address_city": prop["city"],
+                "address_state": prop["state"],
+                "address_postal_code": prop["postal_code"],
+                "emails": email_items,
+                "phones": phone_items,
+            },
+        }
+        create_result = create_reisift_property_from_search(create_payload)
+        property_uuid = normalize_uuid(create_result.get("created_uuid") or "")
+        owner_uuid = normalize_uuid(create_result.get("owner_uuid") or "")
+        out["created"] = bool(property_uuid) and not bool(create_result.get("duplicate_existing"))
+        out["duplicate_existing"] = bool(create_result.get("duplicate_existing"))
+        out["create_result"] = create_result
+        out["property_uuid"] = property_uuid
+        out["owner_uuid"] = owner_uuid
+        if property_uuid:
+            _set_local_property_uuid(db, property_id, property_uuid)
+            out["sift_record_url"] = _sift_record_url(property_uuid)
+
+    if property_uuid:
+        token = reisift_get_access_token()
+        if not owner_uuid:
+            details = fetch_reisift_property_payload(token, property_uuid)
+            owner_uuid = normalize_uuid(_reisift_find_owner_uuid(details) or "")
+            out["owner_uuid"] = owner_uuid
+        if owner_uuid:
+            _set_local_owner_uuid(db, property_id, owner_uuid)
+        if owner_uuid and (phone_items or email_items):
+            out["contact_sync"] = sync_skiptrace_contacts_to_reisift_owner(
+                db,
+                property_id,
+                phone_items=phone_items,
+                email_items=email_items,
+            )
+    out["ok"] = bool(property_uuid)
+
+    activity_note = {
+        "source": source,
+        "added_by": actor,
+        "address": {
+            "street": prop["street"],
+            "city": prop["city"],
+            "state": prop["state"],
+            "postal_code": prop["postal_code"],
+        },
+        "property_uuid": property_uuid,
+        "owner_uuid": owner_uuid,
+        "created": out["created"],
+        "duplicate_existing": out["duplicate_existing"],
+        "phones_count": out["phones_count"],
+        "emails_count": out["emails_count"],
+        "contact_sync": out["contact_sync"],
+    }
+    db.execute(
+        """
+        INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            property_id,
+            owner_person_id or None,
+            "D4D Intake",
+            "Property synced to ReiSift" if out["ok"] else "Property sync to ReiSift pending",
+            json.dumps(activity_note, default=str),
+        ),
+    )
+    return out
+
+
 def build_d4d_property_url(base_url, property_id):
     root = (base_url or "").strip().rstrip("/")
     return f"{root}/property/{int(property_id)}" if root else f"/property/{int(property_id)}"
@@ -21455,12 +21640,23 @@ def build_d4d_dashboard_url(base_url):
     return f"{root}/d4d" if root else "/d4d"
 
 
-def build_d4d_completion_lines(db, property_id, intake, parsed, skip_trace_result=None, skip_trace_error="", base_url=""):
+def build_d4d_completion_lines(
+    db,
+    property_id,
+    intake,
+    parsed,
+    skip_trace_result=None,
+    skip_trace_error="",
+    reisift_sync_result=None,
+    reisift_sync_error="",
+    base_url="",
+):
     prop_row = db.execute(
         """
         SELECT p.id,
                p.status,
                p.owner_person_id,
+               p.reisift_property_uuid,
                a.street,
                a.city,
                a.state,
@@ -21528,6 +21724,20 @@ def build_d4d_completion_lines(db, property_id, intake, parsed, skip_trace_resul
         lines.append(f"Phones: {', '.join(owner_phone_numbers[:5])}")
     elif owner_name:
         lines.append("Phones: none on file yet.")
+    property_uuid = normalize_uuid((prop_row["reisift_property_uuid"] if prop_row else "") or "")
+    if reisift_sync_result and reisift_sync_result.get("ok") and (reisift_sync_result.get("property_uuid") or property_uuid):
+        effective_uuid = normalize_uuid(reisift_sync_result.get("property_uuid") or property_uuid)
+        sift_url = _sift_record_url(effective_uuid)
+        if reisift_sync_result.get("created"):
+            lines.append(f"ReiSift: created <{sift_url}|Open Sift record>.")
+        elif reisift_sync_result.get("duplicate_existing"):
+            lines.append(f"ReiSift: linked to existing record <{sift_url}|Open Sift record>.")
+        else:
+            lines.append(f"ReiSift: synced <{sift_url}|Open Sift record>.")
+    elif reisift_sync_error:
+        lines.append(f"ReiSift sync failed: {reisift_sync_error}")
+    elif property_uuid:
+        lines.append(f"ReiSift: <{_sift_record_url(property_uuid)}|Open Sift record>.")
     lines.append(f"SIFT record: <{property_url}|Open property #{property_id}>")
     lines.append(f"D4D queue: <{d4d_url}|Open D4D queue>")
     return lines
@@ -21548,6 +21758,8 @@ def process_d4d_slack_intake(response_url, address_text, raw_text="", added_by="
 
         skip_trace_result = None
         skip_trace_error = ""
+        reisift_sync_result = None
+        reisift_sync_error = ""
         should_skip_trace = bool(intake.get("created")) or not intake.get("owner_person_id")
         if should_skip_trace:
             try:
@@ -21582,6 +21794,46 @@ def process_d4d_slack_intake(response_url, address_text, raw_text="", added_by="
                 )
                 commit_with_retry(db)
 
+        try:
+            reisift_sync_result = sync_d4d_property_to_reisift(
+                db,
+                intake["property_id"],
+                added_by=added_by,
+                source="Slack D4D",
+            )
+            commit_with_retry(db)
+        except Exception as exc:
+            db.rollback()
+            reisift_sync_error = str(exc)
+            existing = db.execute(
+                "SELECT notes, owner_person_id FROM properties WHERE id = ?",
+                (intake["property_id"],),
+            ).fetchone()
+            db.execute(
+                "UPDATE properties SET notes = ? WHERE id = ?",
+                (
+                    append_note_line(
+                        existing["notes"] if existing else "",
+                        f"D4D ReiSift sync failed: {reisift_sync_error}",
+                    ),
+                    intake["property_id"],
+                ),
+            )
+            db.execute(
+                """
+                INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    intake["property_id"],
+                    existing["owner_person_id"] if existing else None,
+                    "D4D Intake",
+                    "Property sync to ReiSift failed",
+                    json.dumps({"error": reisift_sync_error, "address": parsed, "raw_input": raw_text}),
+                ),
+            )
+            commit_with_retry(db)
+
         lines = build_d4d_completion_lines(
             db,
             intake["property_id"],
@@ -21589,11 +21841,19 @@ def process_d4d_slack_intake(response_url, address_text, raw_text="", added_by="
             parsed,
             skip_trace_result=skip_trace_result,
             skip_trace_error=skip_trace_error,
+            reisift_sync_result=reisift_sync_result,
+            reisift_sync_error=reisift_sync_error,
             base_url=base_url,
         )
         if response_url:
             send_slack_response_url(response_url, "\n".join(lines), response_type="in_channel", replace_original=True)
-        return {"ok": True, "property_id": intake["property_id"], "lines": lines}
+        return {
+            "ok": True,
+            "property_id": intake["property_id"],
+            "lines": lines,
+            "reisift_sync_result": reisift_sync_result,
+            "reisift_sync_error": reisift_sync_error,
+        }
     except Exception as exc:
         db.rollback()
         message = (

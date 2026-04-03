@@ -190,6 +190,7 @@ ADS_DEFAULT_LOOKBACK_DAYS = max(int((os.getenv("ADS_DEFAULT_LOOKBACK_DAYS") or "
 ADS_REFRESH_LOOKBACK_DAYS = max(int((os.getenv("ADS_REFRESH_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
 GOOGLE_ADS_API_VERSION = (os.getenv("GOOGLE_ADS_API_VERSION") or "v22").strip() or "v22"
 META_GRAPH_API_VERSION = (os.getenv("META_GRAPH_API_VERSION") or "v23.0").strip() or "v23.0"
+DEFAULT_GA4_PROPERTY_ID = (os.getenv("GA4_PROPERTY_ID") or "116846440").strip() or "116846440"
 AMAZON_LWA_AUTHORIZE_URL = (os.getenv("AMAZON_LWA_AUTHORIZE_URL") or "https://www.amazon.com/ap/oa").strip() or "https://www.amazon.com/ap/oa"
 AMAZON_LWA_TOKEN_URL = (os.getenv("AMAZON_LWA_TOKEN_URL") or "https://api.amazon.com/auth/o2/token").strip() or "https://api.amazon.com/auth/o2/token"
 AMAZON_ADS_DEFAULT_SCOPE = (os.getenv("AMAZON_ADS_DEFAULT_SCOPE") or "advertising::campaign_management").strip() or "advertising::campaign_management"
@@ -7245,6 +7246,7 @@ def get_email_settings(db):
         "gmail_api_client_secret": get_setting(db, "email_gmail_api_client_secret", ""),
         "gmail_api_refresh_token": get_setting(db, "email_gmail_api_refresh_token", ""),
         "gmail_webhook_token": get_setting(db, "email_gmail_webhook_token", ""),
+        "ga4_property_id": (get_setting(db, "ga4_property_id", "") or DEFAULT_GA4_PROPERTY_ID).strip(),
     }
 
 
@@ -13960,6 +13962,208 @@ def _get_gmail_api_access_token(settings):
     if not access_token:
         raise ValueError("Gmail OAuth token refresh did not return an access_token.")
     return access_token
+
+
+def _ga4_api_headers(access_token):
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+
+def _ga4_run_report(property_id, access_token, body):
+    property_id = str(property_id or "").strip()
+    if not property_id:
+        raise ValueError("GA4 property ID is required.")
+    response = requests.post(
+        f"https://analyticsdata.googleapis.com/v1beta/properties/{property_id}:runReport",
+        headers=_ga4_api_headers(access_token),
+        json=body,
+        timeout=30,
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"raw_text": response.text}
+    if not response.ok:
+        raise ValueError(f"GA4 runReport failed ({response.status_code}): {payload}")
+    return payload
+
+
+def _coerce_metric_number(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return 0
+    try:
+        number = float(raw)
+    except Exception:
+        return 0
+    if abs(number - round(number)) < 1e-9:
+        return int(round(number))
+    return round(number, 2)
+
+
+def _format_home_metric_value(value):
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        if abs(value - round(value)) < 1e-9:
+            return f"{int(round(value)):,}"
+        return f"{value:,.2f}"
+    return str(value or "0")
+
+
+def _home_local_day_bounds_utc(target_day):
+    start_local = datetime.combine(target_day, datetime.min.time(), tzinfo=EST_TZ)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+    return format_db_time(start_utc), format_db_time(end_utc)
+
+
+def build_ga4_home_snapshot(db):
+    settings = get_email_settings(db)
+    property_id = (settings.get("ga4_property_id") or "").strip()
+    out = {
+        "ok": False,
+        "property_id": property_id,
+        "today_label": datetime.now(EST_TZ).strftime("%b %d, %Y"),
+        "snapshot_cards": [],
+        "trend_rows": [],
+        "error": "",
+    }
+    if not property_id:
+        out["error"] = "GA4 property ID is not configured."
+        return out
+
+    metrics = [
+        ("activeUsers", "Users"),
+        ("sessions", "Sessions"),
+        ("engagedSessions", "Engaged Sessions"),
+        ("screenPageViews", "Page Views"),
+        ("conversions", "Conversions"),
+    ]
+    try:
+        access_token = _get_gmail_api_access_token(settings)
+        today_str = datetime.now(EST_TZ).strftime("%Y-%m-%d")
+        trend_start = (datetime.now(EST_TZ) - timedelta(days=6)).strftime("%Y-%m-%d")
+        snapshot_payload = _ga4_run_report(
+            property_id,
+            access_token,
+            {
+                "metrics": [{"name": metric_name} for metric_name, _label in metrics],
+                "dateRanges": [{"startDate": today_str, "endDate": today_str}],
+            },
+        )
+        trend_payload = _ga4_run_report(
+            property_id,
+            access_token,
+            {
+                "dimensions": [{"name": "date"}],
+                "metrics": [{"name": metric_name} for metric_name, _label in metrics],
+                "dateRanges": [{"startDate": trend_start, "endDate": today_str}],
+                "keepEmptyRows": True,
+                "orderBys": [{"dimension": {"dimensionName": "date"}}],
+            },
+        )
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+
+    snapshot_values = []
+    snapshot_rows = snapshot_payload.get("rows") if isinstance(snapshot_payload, dict) else []
+    if snapshot_rows:
+        snapshot_values = (
+            snapshot_rows[0].get("metricValues")
+            if isinstance(snapshot_rows[0], dict)
+            else []
+        ) or []
+    out["snapshot_cards"] = [
+        {
+            "label": label,
+            "value": _format_home_metric_value(
+                _coerce_metric_number(snapshot_values[idx].get("value") if idx < len(snapshot_values) else 0)
+            ),
+        }
+        for idx, (_metric_name, label) in enumerate(metrics)
+    ]
+
+    trend_rows = []
+    payload_rows = trend_payload.get("rows") if isinstance(trend_payload, dict) else []
+    for row in payload_rows or []:
+        if not isinstance(row, dict):
+            continue
+        dim_values = row.get("dimensionValues") or []
+        metric_values = row.get("metricValues") or []
+        date_raw = (dim_values[0].get("value") if dim_values else "") or ""
+        try:
+            date_label = datetime.strptime(date_raw, "%Y%m%d").strftime("%a %b %d")
+        except Exception:
+            date_label = date_raw
+        metric_map = {}
+        for idx, (_metric_name, label) in enumerate(metrics):
+            metric_map[label] = _format_home_metric_value(
+                _coerce_metric_number(metric_values[idx].get("value") if idx < len(metric_values) else 0)
+            )
+        trend_rows.append({"date_raw": date_raw, "date_label": date_label, "metrics": metric_map})
+    out["trend_rows"] = trend_rows
+    out["ok"] = True
+    return out
+
+
+def build_home_lead_snapshot(db, days=7):
+    days = max(1, int(days or 7))
+    today_local = datetime.now(EST_TZ).date()
+    day_list = [today_local - timedelta(days=offset) for offset in range(days - 1, -1, -1)]
+    trend_rows = []
+    carrot_total = 0
+    clever_total = 0
+
+    for target_day in day_list:
+        start_utc, end_utc = _home_local_day_bounds_utc(target_day)
+        carrot_count = int(
+            db.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM website_lead_submissions
+                WHERE COALESCE(first_received_at, '') >= ?
+                  AND COALESCE(first_received_at, '') < ?
+                """,
+                (start_utc, end_utc),
+            ).fetchone()["c"]
+        )
+        clever_count = int(
+            db.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM integration_events
+                WHERE source = ?
+                  AND COALESCE(created_at, '') >= ?
+                  AND COALESCE(created_at, '') < ?
+                """,
+                (CLEVER_LEADS_EVENT_SOURCE, start_utc, end_utc),
+            ).fetchone()["c"]
+        )
+        carrot_total += carrot_count
+        clever_total += clever_count
+        trend_rows.append(
+            {
+                "date_raw": target_day.isoformat(),
+                "date_label": target_day.strftime("%a %b %d"),
+                "carrot": carrot_count,
+                "clever": clever_count,
+            }
+        )
+
+    today_row = trend_rows[-1] if trend_rows else {"carrot": 0, "clever": 0}
+    return {
+        "today_label": today_local.strftime("%b %d, %Y"),
+        "today_carrot": int(today_row.get("carrot") or 0),
+        "today_clever": int(today_row.get("clever") or 0),
+        "week_carrot": carrot_total,
+        "week_clever": clever_total,
+        "trend_rows": trend_rows,
+    }
 
 
 def _send_gmail_api_email(settings, to_email, subject, body, property_id=None, person_id=None, open_tracking_url=""):
@@ -24458,6 +24662,19 @@ def start_agent_refresh_worker():
 
 
 @app.route("/")
+def home_page():
+    ensure_db()
+    db = get_db()
+    ga = build_ga4_home_snapshot(db)
+    lead_snapshot = build_home_lead_snapshot(db, days=7)
+    return render_template(
+        "home.html",
+        ga=ga,
+        lead_snapshot=lead_snapshot,
+    )
+
+
+@app.route("/dashboard")
 def dashboard():
     ensure_db()
     db = get_db()
@@ -27874,6 +28091,7 @@ def settings_page():
                 "email_gmail_api_client_secret": request.form.get("email_gmail_api_client_secret", ""),
                 "email_gmail_api_refresh_token": request.form.get("email_gmail_api_refresh_token", ""),
                 "email_gmail_webhook_token": request.form.get("email_gmail_webhook_token", ""),
+                "ga4_property_id": request.form.get("ga4_property_id", ""),
             }
             for key, value in fields.items():
                 set_setting(db, key, value)

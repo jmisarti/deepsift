@@ -28,6 +28,15 @@ body {
 .topbar h1 { margin: 0; }
 .topbar p { margin: 0.25rem 0 0; color: #b9c8d3; }
 .topbar a { color: #9be3dc; text-decoration: none; font-weight: 600; }
+.topbar-brand {
+    color: inherit;
+    display: inline-block;
+    text-decoration: none;
+}
+.topbar-brand:hover h1,
+.topbar-brand:hover p {
+    color: #d9fbf7;
+}
 .topbar nav {
     display: flex;
     align-items: center;
@@ -320,6 +329,41 @@ body {
 
 .panel { margin-top: 1rem; }
 .panel h2, .panel h3, .panel h4 { margin-top: 0; }
+
+.home-hero {
+    align-items: center;
+    display: flex;
+    justify-content: space-between;
+}
+
+.home-section-header {
+    align-items: baseline;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.8rem;
+    justify-content: space-between;
+    margin-bottom: 0.85rem;
+}
+
+.home-meta-chip {
+    background: #e6f6f3;
+    border: 1px solid #bde5df;
+    border-radius: 999px;
+    color: #0c6d6d;
+    display: inline-flex;
+    font-size: 0.8rem;
+    font-weight: 700;
+    padding: 0.3rem 0.7rem;
+}
+
+.home-metric-cards {
+    margin-top: 0.2rem;
+}
+
+.home-trend-table td,
+.home-trend-table th {
+    white-space: nowrap;
+}
 
 table {
     width: 100%;

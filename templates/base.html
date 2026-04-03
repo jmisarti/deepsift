@@ -10,11 +10,13 @@
 <body>
     <header class="topbar">
         <div>
-            <h1>Deep Prospect CRM</h1>
-            <p>Property-centric prospecting and relationship mapping</p>
+            <a class="topbar-brand" href="{{ url_for('home_page') }}">
+                <h1>Deep Prospect CRM</h1>
+                <p>Property-centric prospecting and relationship mapping</p>
+            </a>
         </div>
         <nav>
-            <a class="module-link {% if not request.path.startswith('/buyers') and not request.path.startswith('/anon') and not request.path.startswith('/ads') and not request.path.startswith('/referral') and not request.path.startswith('/settings') and not request.path.startswith('/sequences') and not request.path.startswith('/follow-ups') and not request.path.startswith('/coming-soon') and not request.path.startswith('/agents') and not request.path.startswith('/d4d') and not request.path.startswith('/authority') %}active{% endif %}" href="{{ url_for('dashboard') }}">Deep Dive</a>
+            <a class="module-link {% if request.path != '/' and not request.path.startswith('/buyers') and not request.path.startswith('/anon') and not request.path.startswith('/ads') and not request.path.startswith('/referral') and not request.path.startswith('/settings') and not request.path.startswith('/sequences') and not request.path.startswith('/follow-ups') and not request.path.startswith('/coming-soon') and not request.path.startswith('/agents') and not request.path.startswith('/d4d') and not request.path.startswith('/authority') %}active{% endif %}" href="{{ url_for('dashboard') }}">Deep Dive</a>
             <a class="module-link {% if request.path.startswith('/buyers') %}active{% endif %}" href="{{ url_for('buyers_page') }}">Buyers</a>
             <a class="module-link {% if request.path.startswith('/anon') %}active{% endif %}" href="{{ url_for('anon_dashboard') }}">Anon</a>
             <a class="module-link {% if request.path.startswith('/ads') %}active{% endif %}" href="{{ url_for('ads_dashboard') }}">Ads</a>

@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel home-hero">
+    <div>
+        <h2>Home Snapshot</h2>
+        <p class="muted-text">Today's GA4 pulse and a 7-day lead-source trend in one place.</p>
+    </div>
+</section>
+
+<section class="panel">
+    <div class="home-section-header">
+        <div>
+            <h2>GA4 Snapshot</h2>
+            <p class="muted-text">Current day: {{ ga.today_label }}</p>
+        </div>
+        {% if ga.property_id %}
+        <span class="home-meta-chip">Property {{ ga.property_id }}</span>
+        {% endif %}
+    </div>
+    {% if ga.ok %}
+    <section class="cards home-metric-cards">
+        {% for card in ga.snapshot_cards %}
+        <article>
+            <h3>{{ card.label }}</h3>
+            <p>{{ card.value }}</p>
+        </article>
+        {% endfor %}
+    </section>
+    {% else %}
+    <div class="error-banner">{{ ga.error or 'GA4 snapshot is unavailable right now.' }}</div>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <div class="home-section-header">
+        <div>
+            <h2>GA4 Weekly Trend</h2>
+            <p class="muted-text">Last 7 days by report date.</p>
+        </div>
+    </div>
+    <table class="home-trend-table">
+        <thead>
+            <tr>
+                <th>Date</th>
+                <th>Users</th>
+                <th>Sessions</th>
+                <th>Engaged Sessions</th>
+                <th>Page Views</th>
+                <th>Conversions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% if ga.ok and ga.trend_rows %}
+                {% for row in ga.trend_rows %}
+                <tr>
+                    <td>{{ row.date_label }}</td>
+                    <td>{{ row.metrics['Users'] }}</td>
+                    <td>{{ row.metrics['Sessions'] }}</td>
+                    <td>{{ row.metrics['Engaged Sessions'] }}</td>
+                    <td>{{ row.metrics['Page Views'] }}</td>
+                    <td>{{ row.metrics['Conversions'] }}</td>
+                </tr>
+                {% endfor %}
+            {% else %}
+                <tr>
+                    <td colspan="6" class="muted-text">No GA4 trend data available yet.</td>
+                </tr>
+            {% endif %}
+        </tbody>
+    </table>
+</section>
+
+<section class="panel">
+    <div class="home-section-header">
+        <div>
+            <h2>Lead Source Snapshot</h2>
+            <p class="muted-text">Current day: {{ lead_snapshot.today_label }}</p>
+        </div>
+    </div>
+    <section class="cards home-metric-cards">
+        <article>
+            <h3>Carrot Today</h3>
+            <p>{{ lead_snapshot.today_carrot }}</p>
+        </article>
+        <article>
+            <h3>Clever Today</h3>
+            <p>{{ lead_snapshot.today_clever }}</p>
+        </article>
+        <article>
+            <h3>Carrot 7d</h3>
+            <p>{{ lead_snapshot.week_carrot }}</p>
+        </article>
+        <article>
+            <h3>Clever 7d</h3>
+            <p>{{ lead_snapshot.week_clever }}</p>
+        </article>
+    </section>
+</section>
+
+<section class="panel">
+    <div class="home-section-header">
+        <div>
+            <h2>Lead Weekly Trend</h2>
+            <p class="muted-text">New lead ingests by day.</p>
+        </div>
+    </div>
+    <table class="home-trend-table">
+        <thead>
+            <tr>
+                <th>Date</th>
+                <th>Carrot Leads</th>
+                <th>Clever Leads</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in lead_snapshot.trend_rows %}
+            <tr>
+                <td>{{ row.date_label }}</td>
+                <td>{{ row.carrot }}</td>
+                <td>{{ row.clever }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}
+

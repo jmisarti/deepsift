@@ -89,6 +89,7 @@
             <label>Gmail OAuth Client Secret <input name="email_gmail_api_client_secret" value="{{ email_settings.gmail_api_client_secret }}"></label>
             <label class="span2">Gmail OAuth Refresh Token <input name="email_gmail_api_refresh_token" value="{{ email_settings.gmail_api_refresh_token }}"></label>
             <label class="span2">Gmail Webhook Verify Token <input name="email_gmail_webhook_token" value="{{ email_settings.gmail_webhook_token }}" placeholder="optional shared secret"></label>
+            <label>GA4 Property ID <input name="ga4_property_id" value="{{ email_settings.ga4_property_id }}" placeholder="116846440"></label>
             <label>Resend API Key <input name="email_resend_api_key" value="{{ email_settings.resend_api_key }}"></label>
             <label>Resend Base URL <input name="email_resend_base_url" value="{{ email_settings.resend_base_url or 'https://api.resend.com' }}"></label>
             <div class="inline-actions span2">

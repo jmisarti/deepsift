@@ -167,12 +167,21 @@
             <label class="span2">Roku Ad Account IDs
                 <input name="ads_roku_account_ids" value="{{ ad_platform_settings.roku_account_ids_raw }}" placeholder="account-1, account-2">
             </label>
+            <p class="muted-text span2">Important: the Roku authorization code is not the same thing as the Roku refresh token. The refresh token is created after the code exchange.</p>
             <p class="muted-text span2">Roku redirect URI: <a href="{{ url_for('roku_oauth_callback', _external=True) }}" target="_blank" rel="noopener">{{ url_for('roku_oauth_callback', _external=True) }}</a></p>
             <div class="span2 inline-actions">
                 <a class="button-link" href="{{ url_for('roku_oauth_start') }}">Connect Roku And Get Refresh Token</a>
                 <a class="button-link" href="{{ url_for('roku_oauth_test') }}">Test Roku Connection</a>
             </div>
             <button type="submit">Save Ad Platform Settings</button>
+        </form>
+        <form method="post" action="{{ url_for('roku_oauth_exchange_code') }}" class="grid-form" style="margin-top:1rem;">
+            <label class="span2">Exchange Roku Authorization Code
+                <input name="roku_authorization_code" placeholder="Paste a fresh Roku authorization code here">
+            </label>
+            <div class="span2 inline-actions">
+                <button type="submit">Exchange Code And Save Refresh Token</button>
+            </div>
         </form>
         <p class="muted-text">Current ready state: Google {% if ad_platform_settings.google_ready %}ready{% else %}pending{% endif %}, Meta {% if ad_platform_settings.meta_ready %}ready{% else %}pending{% endif %}, Amazon {% if ad_platform_settings.amazon_ready %}ready{% else %}pending{% endif %}, Roku {% if ad_platform_settings.roku_ready %}ready{% else %}pending{% endif %}.</p>
     {% elif active_tab == 'integrations' %}

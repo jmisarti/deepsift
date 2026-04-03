@@ -27364,6 +27364,66 @@ def roku_oauth_test():
         return redirect(url_for("settings_page", tab="ads", error=f"Roku test failed: {exc}"))
 
 
+@app.route("/oauth/roku/exchange", methods=["POST"])
+def roku_oauth_exchange_code():
+    ensure_db()
+    db = get_db()
+    settings = get_ads_dashboard_settings(db)
+    client_id = settings.get("roku_client_id", "")
+    client_secret = settings.get("roku_client_secret", "")
+    code = normalize_whitespace(request.form.get("roku_authorization_code"))
+    if not client_id or not client_secret:
+        return redirect(
+            url_for(
+                "settings_page",
+                tab="ads",
+                error="Save Roku client ID and client secret first.",
+            )
+        )
+    if not code:
+        return redirect(url_for("settings_page", tab="ads", error="Paste a Roku authorization code first."))
+    try:
+        token_payload = _exchange_roku_authorization_code(
+            client_id,
+            client_secret,
+            code,
+            url_for("roku_oauth_callback", _external=True),
+        )
+        refresh_token = normalize_whitespace(token_payload.get("refresh_token"))
+        access_token = normalize_whitespace(token_payload.get("access_token"))
+        if not refresh_token:
+            raise RuntimeError("Roku token exchange did not return a refresh token.")
+        set_setting(db, "ads_roku_refresh_token", refresh_token)
+        notice_parts = ["Roku authorization code exchanged successfully. Refresh token saved."]
+        if access_token:
+            try:
+                accounts = _fetch_roku_accounts(access_token)
+                account_ids = [
+                    _normalize_roku_account_id((account.get("uid") if isinstance(account, dict) else ""))
+                    for account in accounts
+                ]
+                account_ids = [value for value in account_ids if value]
+                if account_ids:
+                    set_setting(db, "ads_roku_account_ids", ", ".join(account_ids))
+                    notice_parts.append(f"Saved {len(account_ids)} Roku ad account ID(s).")
+            except Exception as account_exc:
+                notice_parts.append(f"Account lookup did not complete: {account_exc}")
+        db.commit()
+        return redirect(url_for("settings_page", tab="ads", notice=" ".join(notice_parts)))
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="roku_oauth_exchange_code",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/oauth/roku/exchange",
+            status_code=500,
+        )
+        db.commit()
+        return redirect(url_for("settings_page", tab="ads", error=f"Roku code exchange failed: {exc}"))
+
+
 @app.route("/property/<int:property_id>/upload-contacts", methods=["POST"])
 def upload_owner_contacts(property_id):
     ensure_db()

@@ -104,7 +104,7 @@
                             <p style="margin:0;"><strong>Synced:</strong> {{ row.last_synced_at|fmt_est_datetime }}</p>
                             {% if row.deep_dive_property_id %}
                             <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.deep_dive_property_id) }}" title="Open in Deep Dive" aria-label="Open in Deep Dive">
-                                <img class="tiny-link-icon" src="{{ url_for('favicon') }}" alt="Deep Dive">
+                                <img class="tiny-link-icon" src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/08/cropped-nj-logo-tiny-32x32.png" alt="Deep Dive">
                             </a>
                             {% else %}
                             <form method="post" action="{{ url_for('follow_up_add_to_deep_dive', property_uuid=row.property_uuid) }}" onsubmit="return confirm('Add this lead into Deep Dive?');">

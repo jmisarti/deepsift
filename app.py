@@ -3494,7 +3494,8 @@ def analyze_call_transcript_with_openai(transcript_text, property_id=None, perso
 
 
 def call_skipsherpa_person_lookup(first_name, last_name, street, city="", state="", zipcode="", middle_name=""):
-    if not SKIPSHERPA_API_KEY:
+    api_key = get_skipsherpa_api_key()
+    if not api_key:
         raise ValueError("SKIPSHERPA_API_KEY is not set")
     first_name, middle_name, last_name = normalize_first_middle_last(first_name, middle_name, last_name)
 
@@ -3517,7 +3518,7 @@ def call_skipsherpa_person_lookup(first_name, last_name, street, city="", state=
     }
     response = requests.put(
         f"{SKIPSHERPA_BASE_URL}/api/beta6/person",
-        headers={"API-Key": SKIPSHERPA_API_KEY, "Content-Type": "application/json"},
+        headers={"API-Key": api_key, "Content-Type": "application/json"},
         json=payload,
         timeout=45,
     )
@@ -3540,7 +3541,8 @@ def call_skipsherpa_person_lookup(first_name, last_name, street, city="", state=
 
 
 def call_skipsherpa_property_lookup(street, city="", state="", zipcode=""):
-    if not SKIPSHERPA_API_KEY:
+    api_key = get_skipsherpa_api_key()
+    if not api_key:
         raise ValueError("SKIPSHERPA_API_KEY is not set")
 
     payload = {
@@ -3557,7 +3559,7 @@ def call_skipsherpa_property_lookup(street, city="", state="", zipcode=""):
     }
     response = requests.put(
         f"{SKIPSHERPA_BASE_URL}/api/beta6/properties",
-        headers={"API-Key": SKIPSHERPA_API_KEY, "Content-Type": "application/json"},
+        headers={"API-Key": api_key, "Content-Type": "application/json"},
         json=payload,
         timeout=60,
     )
@@ -9310,6 +9312,17 @@ def get_automation_settings(db):
 
 def get_integration_api_key(db):
     return (get_setting(db, "integration_api_key", "") or os.getenv("INTEGRATION_API_KEY", "")).strip()
+
+
+def get_skipsherpa_api_key(db=None):
+    if db is None:
+        try:
+            db = get_db()
+        except Exception:
+            db = None
+    if db is not None:
+        return (get_setting(db, "skipsherpa_api_key", "") or SKIPSHERPA_API_KEY).strip()
+    return SKIPSHERPA_API_KEY
 
 
 def integration_auth_ok(db, req):
@@ -27089,6 +27102,7 @@ def settings_page():
                     "slack_default_channel": request.form.get("slack_default_channel", ""),
                     "slack_agent_ops_webhook_url": request.form.get("slack_agent_ops_webhook_url", ""),
                     "slack_agent_ops_channel": request.form.get("slack_agent_ops_channel", ""),
+                    "skipsherpa_api_key": request.form.get("skipsherpa_api_key", ""),
                     "emaillistverify_api_key": request.form.get("emaillistverify_api_key", ""),
                     "emailoctopus_api_key": request.form.get("emailoctopus_api_key", ""),
                     "emailoctopus_list_id": request.form.get("emailoctopus_list_id", ""),
@@ -27222,6 +27236,7 @@ def settings_page():
     automation_settings = get_automation_settings(db)
     ad_platform_settings = get_ads_dashboard_settings(db)
     integration_api_key = get_integration_api_key(db)
+    skipsherpa_api_key = get_skipsherpa_api_key(db)
     deep_dive_smrtphone_from = get_setting(db, "deep_dive_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     referral_smrtphone_from = get_setting(db, "referral_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     postage_options = []
@@ -27310,6 +27325,7 @@ def settings_page():
         automation_settings=automation_settings,
         ad_platform_settings=ad_platform_settings,
         integration_api_key=integration_api_key,
+        skipsherpa_api_key=skipsherpa_api_key,
         active_tab=active_tab,
         deep_dive_smrtphone_from=deep_dive_smrtphone_from,
         referral_smrtphone_from=referral_smrtphone_from,

@@ -53,7 +53,6 @@
                     <th>Reach</th>
                     <th>Conversions</th>
                     <th>Goal CPA</th>
-                    <th>Updated</th>
                 </tr>
                 <tr class="ads-filter-row">
                     <th>
@@ -88,7 +87,6 @@
                             <option value="reach" {% if sort == 'reach' %}selected{% endif %}>Reach</option>
                             <option value="conversions" {% if sort == 'conversions' %}selected{% endif %}>Conv.</option>
                             <option value="goal_cpa" {% if sort == 'goal_cpa' %}selected{% endif %}>Goal CPA</option>
-                            <option value="updated" {% if sort == 'updated' %}selected{% endif %}>Updated</option>
                         </select>
                     </th>
                     <th colspan="3">
@@ -104,7 +102,7 @@
                             </select>
                         </div>
                     </th>
-                    <th colspan="5">
+                    <th colspan="4">
                         <div class="ads-filter-actions">
                             <button type="submit" form="adsFilterForm">Apply</button>
                             <a href="{{ url_for('ads_dashboard') }}">Clear</a>
@@ -126,11 +124,10 @@
                     <td>{{ row.reach or 0 }}</td>
                     <td>{{ '%.2f'|format(row.conversions or 0) }}</td>
                     <td>{% if row.goal_cpa and row.goal_cpa > 0 %}${{ '%.2f'|format(row.goal_cpa or 0) }}{% else %}-{% endif %}</td>
-                    <td>{{ row.last_refreshed_at|fmt_est_datetime if row.last_refreshed_at else '-' }}</td>
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="12">No ad campaigns cached yet. Save platform credentials in Settings, then run Refresh.</td>
+                    <td colspan="11">No ad campaigns cached yet. Save platform credentials in Settings, then run Refresh.</td>
                 </tr>
                 {% endfor %}
             </tbody>

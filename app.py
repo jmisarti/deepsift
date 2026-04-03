@@ -7106,18 +7106,33 @@ def _google_ads_post(settings, customer_id, service_method, body):
     if not customer_id:
         raise RuntimeError("Google Ads customer ID is missing.")
     access_token = _google_ads_exchange_refresh_token(settings)
-    response = requests.post(
-        f"https://googleads.googleapis.com/{GOOGLE_ADS_API_VERSION}/customers/{customer_id}/googleAds:{service_method}",
-        headers=_google_ads_headers(settings, access_token),
-        json=body,
-        timeout=90,
-    )
-    if not response.ok:
-        raise RuntimeError(f"Google Ads {service_method} failed ({response.status_code}): {_google_ads_extract_error(response)}")
-    try:
-        return response.json()
-    except Exception as exc:
-        raise RuntimeError(f"Google Ads {service_method} returned invalid JSON: {exc}") from exc
+    base_headers = _google_ads_headers(settings, access_token)
+    login_customer_id = _normalize_google_ads_customer_id(settings.get("google_login_customer_id"))
+    attempts = [dict(base_headers)]
+    if login_customer_id:
+        attempts.append({k: v for k, v in base_headers.items() if k.lower() != "login-customer-id"})
+        if login_customer_id != customer_id:
+            child_headers = dict(base_headers)
+            child_headers["login-customer-id"] = customer_id
+            attempts.append(child_headers)
+    last_error = ""
+    for headers in attempts:
+        response = requests.post(
+            f"https://googleads.googleapis.com/{GOOGLE_ADS_API_VERSION}/customers/{customer_id}/googleAds:{service_method}",
+            headers=headers,
+            json=body,
+            timeout=90,
+        )
+        if response.ok:
+            try:
+                return response.json()
+            except Exception as exc:
+                raise RuntimeError(f"Google Ads {service_method} returned invalid JSON: {exc}") from exc
+        current_error = _google_ads_extract_error(response)
+        last_error = current_error
+        if response.status_code != 403 or "USER_PERMISSION_DENIED" not in current_error.upper():
+            break
+    raise RuntimeError(f"Google Ads {service_method} failed ({response.status_code}): {last_error}")
 
 
 def _google_ads_display_status(campaign_status, primary_status):
@@ -7154,7 +7169,7 @@ def _google_ads_parse_search_stream_rows(stream_payload, customer_id):
             customer = item.get("customer") or {}
             campaign_id = normalize_whitespace(campaign.get("id"))
             metric_date = normalize_whitespace(segments.get("date"))
-            if not campaign_id or not metric_date:
+            if not campaign_id:
                 continue
             cost_micros = _normalize_metric_float(metrics.get("costMicros"))
             rows.append(
@@ -7171,6 +7186,7 @@ def _google_ads_parse_search_stream_rows(stream_payload, customer_id):
                     "clicks": _normalize_metric_int(metrics.get("clicks")),
                     "reach": _normalize_metric_int(metrics.get("uniqueUsers")),
                     "conversions": _normalize_metric_float(metrics.get("conversions")),
+                    "_current_snapshot": bool(not metric_date),
                     "raw": item,
                 }
             )
@@ -7273,10 +7289,9 @@ def _fetch_google_ads_campaign_rows(settings, start_date, end_date):
     customer_ids = settings.get("google_customer_ids") or []
     if not customer_ids:
         return {"status": "missing_config", "rows": [], "message": "No Google Ads customer IDs configured."}
-    query = f"""
+    daily_query = f"""
         SELECT
           customer.id,
-          customer.descriptive_name,
           campaign.id,
           campaign.name,
           campaign.status,
@@ -7291,17 +7306,41 @@ def _fetch_google_ads_campaign_rows(settings, start_date, end_date):
         WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
           AND campaign.status != 'REMOVED'
     """
+    snapshot_query = """
+        SELECT
+          customer.id,
+          campaign.id,
+          campaign.name,
+          campaign.status,
+          campaign.primary_status,
+          metrics.cost_micros,
+          metrics.impressions,
+          metrics.clicks,
+          metrics.unique_users,
+          metrics.conversions
+        FROM campaign
+        WHERE campaign.status != 'REMOVED'
+    """
     rows = []
     for customer_id in customer_ids:
-        payload = _google_ads_post(
+        daily_payload = _google_ads_post(
             settings,
             customer_id,
             "searchStream",
             {
-                "query": "\n".join(line.strip() for line in query.strip().splitlines()),
+                "query": "\n".join(line.strip() for line in daily_query.strip().splitlines()),
             },
         )
-        rows.extend(_google_ads_parse_search_stream_rows(payload, customer_id))
+        rows.extend(_google_ads_parse_search_stream_rows(daily_payload, customer_id))
+        snapshot_payload = _google_ads_post(
+            settings,
+            customer_id,
+            "searchStream",
+            {
+                "query": "\n".join(line.strip() for line in snapshot_query.strip().splitlines()),
+            },
+        )
+        rows.extend(_google_ads_parse_search_stream_rows(snapshot_payload, customer_id))
     return {
         "status": "ok",
         "rows": rows,
@@ -7461,7 +7500,10 @@ def _store_ad_campaign_rows(db, rows):
             continue
         key = (platform, campaign_id)
         current_best = latest_by_campaign.get(key)
-        if current_best is None or metric_date >= str(current_best.get("metric_date") or ""):
+        if raw_row.get("_current_snapshot"):
+            latest_by_campaign[key] = raw_row
+            continue
+        if current_best is None or (not current_best.get("_current_snapshot") and metric_date >= str(current_best.get("metric_date") or "")):
             latest_by_campaign[key] = raw_row
     for row in latest_by_campaign.values():
         _upsert_ad_campaign_current(db, row)

@@ -725,7 +725,7 @@ def require_login_if_enabled():
     # Third-party callbacks must stay unauthenticated.
     if request.path.startswith("/webhooks/"):
         return None
-    if request.path.startswith("/oauth/amazon/"):
+    if request.path.startswith("/oauth/amazon/") or request.path.startswith("/oauth/roku/"):
         return None
     # External integrations authenticate via API key header.
     if request.path.startswith("/api/integrations/"):
@@ -26864,6 +26864,23 @@ def amazon_oauth_start():
         state=state,
     )
     return redirect(authorize_url)
+
+
+@app.route("/oauth/roku/callback", methods=["GET"])
+def roku_oauth_callback():
+    result = {
+        "callback_url": request.base_url,
+        "state": normalize_whitespace(request.args.get("state")),
+        "code": normalize_whitespace(request.args.get("code")),
+        "error": normalize_whitespace(request.args.get("error")),
+        "error_description": normalize_whitespace(request.args.get("error_description")),
+        "params": [],
+    }
+    for key in sorted(request.args.keys()):
+        if key in {"code", "state", "error", "error_description"}:
+            continue
+        result["params"].append({"key": key, "value": normalize_whitespace(request.args.get(key))})
+    return render_template("roku_oauth_callback.html", result=result)
 
 
 @app.route("/property/<int:property_id>/upload-contacts", methods=["POST"])

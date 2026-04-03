@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Roku OAuth Callback</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="container">
+        <section class="panel">
+            <h2>Roku OAuth Callback</h2>
+            <p class="muted-text">Use this exact URL as the Roku redirect URI if Roku asks for one.</p>
+            <p><strong>Redirect URI:</strong> <a href="{{ result.callback_url }}">{{ result.callback_url }}</a></p>
+
+            {% if result.error %}
+            <div class="notice-banner error">{{ result.error_description or result.error }}</div>
+            {% elif result.code %}
+            <div class="notice-banner">Authorization code received.</div>
+            {% else %}
+            <div class="notice-banner">Callback is ready.</div>
+            {% endif %}
+
+            <div class="grid-form">
+                <label class="span2">Authorization Code
+                    <input value="{{ result.code }}" readonly>
+                </label>
+                <label class="span2">State
+                    <input value="{{ result.state }}" readonly>
+                </label>
+                <label class="span2">Error
+                    <input value="{{ result.error }}" readonly>
+                </label>
+                <label class="span2">Error Description
+                    <input value="{{ result.error_description }}" readonly>
+                </label>
+            </div>
+
+            {% if result.params %}
+            <h3>Additional Parameters</h3>
+            <div class="table-wrap">
+                <table class="compact-table">
+                    <thead>
+                        <tr>
+                            <th>Key</th>
+                            <th>Value</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for item in result.params %}
+                        <tr>
+                            <td>{{ item.key }}</td>
+                            <td>{{ item.value }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+        </section>
+    </main>
+</body>
+</html>

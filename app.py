@@ -8557,6 +8557,55 @@ def _amazon_zero_metric_rows_for_missing_snapshots(profile_id, metric_date, snap
     return rows
 
 
+def _amazon_live_campaign_history_diagnostics(snapshots_by_campaign, report_rows, end_date):
+    snapshots_by_campaign = snapshots_by_campaign if isinstance(snapshots_by_campaign, dict) else {}
+    report_index = {}
+    for item in report_rows if isinstance(report_rows, list) else []:
+        if not isinstance(item, dict):
+            continue
+        normalized_item = _normalize_report_row_keys(item)
+        campaign_id = normalize_whitespace(
+            normalized_item.get("campaign_id")
+            or item.get("campaignId")
+            or item.get("campaign_id")
+            or item.get("id")
+        )
+        metric_date = normalize_whitespace(
+            normalized_item.get("date")
+            or normalized_item.get("metric_date")
+            or item.get("date")
+        )
+        if not campaign_id or not metric_date:
+            continue
+        bucket = report_index.setdefault(campaign_id, {"dates": set(), "rows": 0})
+        bucket["rows"] += 1
+        bucket["dates"].add(metric_date)
+    diagnostics = []
+    for campaign_id, snapshot in snapshots_by_campaign.items():
+        status = _normalize_ad_campaign_status(snapshot.get("campaign_status"))
+        if not _ad_status_is_live(status):
+            continue
+        campaign_name = normalize_whitespace(snapshot.get("campaign_name")) or campaign_id
+        report_info = report_index.get(campaign_id)
+        if not report_info or not report_info["dates"]:
+            diagnostics.append(f"Live campaign '{campaign_name}' has no dated report rows yet.")
+            continue
+        dates = sorted(report_info["dates"])
+        includes_end_date = normalize_whitespace(end_date) in report_info["dates"]
+        diagnostics.append(
+            "Live campaign '"
+            + campaign_name
+            + "' has "
+            + str(len(dates))
+            + " dated row(s) from "
+            + dates[0]
+            + " to "
+            + dates[-1]
+            + (" and includes today." if includes_end_date else " but does not include today.")
+        )
+    return diagnostics
+
+
 def _amazon_legacy_report_rows_to_dashboard_rows(profile_id, metric_date, report_rows, snapshots_by_campaign):
     rows = []
     for item in report_rows if isinstance(report_rows, list) else []:
@@ -8962,6 +9011,7 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
     rows = []
     pending_profile_ids = []
     empty_metric_profile_ids = []
+    live_campaign_history_notes = []
     for profile_id in matched_profile_ids:
         snapshots = _fetch_amazon_campaign_snapshots(settings, access_token, profile_id)
         rows.extend(snapshots)
@@ -9021,6 +9071,9 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
         dashboard_rows = _amazon_report_rows_to_dashboard_rows(profile_id, report_rows, snapshots_by_campaign)
         rows.extend(dashboard_rows)
         if report_rows:
+            live_campaign_history_notes.extend(
+                _amazon_live_campaign_history_diagnostics(snapshots_by_campaign, report_rows, end_date)
+            )
             rows.extend(
                 _amazon_zero_metric_rows_for_missing_snapshots(
                     profile_id,
@@ -9032,6 +9085,7 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
     message = f"Fetched {len(rows)} Amazon campaign rows across {len(matched_profile_ids)} profile(s)."
     if account_id:
         message += f" Target account: {account_id}."
+    message += f" Requested report range: {start_date} to {end_date}."
     if skipped_profile_ids:
         message += " Skipped inaccessible profile IDs: " + ", ".join(skipped_profile_ids) + "."
     if pending_profile_ids and not [row for row in rows if str(row.get("metric_date") or "").strip()]:
@@ -9049,6 +9103,8 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
             + ", ".join(empty_metric_profile_ids)
             + ". Campaign metadata is connected, but the current Reporting v3 contract still needs adjustment."
         )
+    if live_campaign_history_notes:
+        message += " " + " ".join(live_campaign_history_notes)
     if pending_profile_ids:
         message += " Sponsored TV performance metrics are still processing for profile(s): " + ", ".join(pending_profile_ids) + "."
     elif not rows:

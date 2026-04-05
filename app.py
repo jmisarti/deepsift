@@ -8514,6 +8514,49 @@ def _amazon_report_rows_to_dashboard_rows(profile_id, report_rows, snapshots_by_
     return rows
 
 
+def _amazon_zero_metric_rows_for_missing_snapshots(profile_id, metric_date, snapshots_by_campaign, report_rows):
+    metric_date = normalize_whitespace(metric_date)
+    if not metric_date or not isinstance(snapshots_by_campaign, dict) or not snapshots_by_campaign:
+        return []
+    report_campaign_ids = set()
+    for item in report_rows if isinstance(report_rows, list) else []:
+        if not isinstance(item, dict):
+            continue
+        normalized_item = _normalize_report_row_keys(item)
+        campaign_id = normalize_whitespace(
+            normalized_item.get("campaign_id")
+            or item.get("campaignId")
+            or item.get("campaign_id")
+            or item.get("id")
+        )
+        if campaign_id:
+            report_campaign_ids.add(campaign_id)
+    rows = []
+    for campaign_id, snapshot in snapshots_by_campaign.items():
+        if campaign_id in report_campaign_ids:
+            continue
+        rows.append(
+            {
+                "platform": "amazon",
+                "account_id": normalize_whitespace(profile_id),
+                "campaign_id": campaign_id,
+                "campaign_name": snapshot.get("campaign_name") or campaign_id,
+                "campaign_status": snapshot.get("campaign_status") or "Unknown",
+                "campaign_site": snapshot.get("campaign_site") or _ad_campaign_site("amazon", profile_id),
+                "campaign_goal": snapshot.get("campaign_goal") or "Sponsored TV",
+                "metric_date": metric_date,
+                "spend": 0.0,
+                "impressions": 0,
+                "clicks": 0,
+                "reach": 0,
+                "conversions": 0.0,
+                "raw": snapshot.get("raw") or snapshot,
+                "_synthetic_zero_metric": True,
+            }
+        )
+    return rows
+
+
 def _amazon_legacy_report_rows_to_dashboard_rows(profile_id, metric_date, report_rows, snapshots_by_campaign):
     rows = []
     for item in report_rows if isinstance(report_rows, list) else []:
@@ -8975,7 +9018,17 @@ def _fetch_amazon_ads_campaign_rows(settings, start_date, end_date, db=None):
                 created,
             )
             pending_profile_ids.append(profile_id)
-        rows.extend(_amazon_report_rows_to_dashboard_rows(profile_id, report_rows, snapshots_by_campaign))
+        dashboard_rows = _amazon_report_rows_to_dashboard_rows(profile_id, report_rows, snapshots_by_campaign)
+        rows.extend(dashboard_rows)
+        if report_rows:
+            rows.extend(
+                _amazon_zero_metric_rows_for_missing_snapshots(
+                    profile_id,
+                    end_date,
+                    snapshots_by_campaign,
+                    report_rows,
+                )
+            )
     message = f"Fetched {len(rows)} Amazon campaign rows across {len(matched_profile_ids)} profile(s)."
     if account_id:
         message += f" Target account: {account_id}."
@@ -32685,11 +32738,16 @@ def smrtphone_agent_call_ended_webhook():
         extract_first_string_by_keys(payload, ["timestamp", "completed_at", "endedAt", "ended_at", "date"])
         or extract_first_string_by_keys(webhook, ["timestamp", "completed_at", "endedAt", "ended_at", "date"])
     ).strip()
+    counterparty_candidates = _counterparty_candidates(db, from_number, to_number)
+    follow_up_number = counterparty_candidates[0] if counterparty_candidates else normalize_phone(from_number or to_number)
+    follow_up_number_display = format_phone_display(follow_up_number)
 
     slack_title = "SmartAgent just completed a call"
     text_lines = [slack_title]
     if call_sid:
         text_lines.append(f"callid: {call_sid}")
+    if follow_up_number_display:
+        text_lines.append(f"Lead Number: {follow_up_number_display}")
     if summary:
         text_lines.append(f"Summary: {summary}")
 
@@ -32697,6 +32755,8 @@ def smrtphone_agent_call_ended_webhook():
     detail_lines = []
     if call_sid:
         detail_lines.append(f"*callid:* {call_sid}")
+    if follow_up_number_display:
+        detail_lines.append(f"*Lead Number:* {follow_up_number_display}")
     if summary:
         detail_lines.append(f"*Summary:* {summary}")
     if detail_lines:

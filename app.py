@@ -8139,38 +8139,42 @@ def _amazon_campaign_next_token(payload):
 
 def _amazon_create_sponsored_tv_report(settings, access_token, profile_id, start_date, end_date):
     base_url = _amazon_ads_base_url(settings.get("amazon_region"))
-    config_candidates = [
-        {
-            "adProduct": "SPONSORED_TV",
-            "reportTypeId": "stCampaigns",
-            "columns": [
-                "campaignId",
-                "campaignName",
-                "campaignStatus",
-                "date",
-                "impressions",
-                "clicks",
-                "cost",
-                "reach",
-                "householdReach",
-            ],
-        },
-        {
-            "adProduct": "SPONSORED_TV",
-            "reportTypeId": "stCampaigns",
-            "columns": [
-                "campaignId",
-                "campaignName",
-                "campaignStatus",
-                "date",
-                "impressions",
-                "clicks",
-                "spend",
-                "reach",
-                "householdReach",
-            ],
-        },
-    ]
+    config_candidates = []
+    for ad_product in ("SPONSORED_TELEVISION", "SPONSORED_TV"):
+        config_candidates.extend(
+            [
+                {
+                    "adProduct": ad_product,
+                    "reportTypeId": "stCampaigns",
+                    "columns": [
+                        "campaignId",
+                        "campaignName",
+                        "campaignStatus",
+                        "date",
+                        "impressions",
+                        "clicks",
+                        "cost",
+                        "reach",
+                        "householdReach",
+                    ],
+                },
+                {
+                    "adProduct": ad_product,
+                    "reportTypeId": "stCampaigns",
+                    "columns": [
+                        "campaignId",
+                        "campaignName",
+                        "campaignStatus",
+                        "date",
+                        "impressions",
+                        "clicks",
+                        "spend",
+                        "reach",
+                        "householdReach",
+                    ],
+                },
+            ]
+        )
     attempts = []
     for config in config_candidates:
         payload = {

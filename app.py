@@ -16258,6 +16258,90 @@ def _counterparty_candidates(db, from_number, to_number):
     return candidates
 
 
+def _extract_phone_values_by_keys(payload, keys):
+    keyset = {str(k).strip().lower() for k in (keys or []) if str(k).strip()}
+    if not keyset:
+        return []
+    queue = [payload]
+    values = []
+    seen = set()
+    while queue:
+        current = queue.pop(0)
+        if isinstance(current, dict):
+            for k, v in current.items():
+                if str(k).strip().lower() in keyset:
+                    if isinstance(v, list):
+                        for item in v:
+                            norm = normalize_phone(str(item or ""))
+                            if len(norm) == 10 and norm not in seen:
+                                seen.add(norm)
+                                values.append(norm)
+                    else:
+                        norm = normalize_phone(str(v or ""))
+                        if len(norm) == 10 and norm not in seen:
+                            seen.add(norm)
+                            values.append(norm)
+                if isinstance(v, (dict, list)):
+                    queue.append(v)
+        elif isinstance(current, list):
+            for item in current:
+                if isinstance(item, (dict, list)):
+                    queue.append(item)
+    return values
+
+
+def _smrtphone_external_number_candidates(db, payload, webhook, from_number="", to_number=""):
+    system_numbers = _known_system_numbers(db, refresh_seconds=300)
+    preferred_keys = [
+        "leadPhone",
+        "lead_phone",
+        "contactPhone",
+        "contact_phone",
+        "customerPhone",
+        "customer_phone",
+        "callerPhone",
+        "caller_phone",
+        "phone",
+        "phoneNumber",
+        "phone_number",
+        "mobile",
+        "mobilePhone",
+        "mobile_phone",
+        "counterpart",
+        "counterpart_number",
+        "customerNumber",
+        "customer_number",
+        "remoteNumber",
+        "remote_number",
+        "participantPhone",
+        "participant_phone",
+        "ani",
+        "dnis",
+        "from",
+        "from_number",
+        "fromNumber",
+        "to",
+        "to_number",
+        "toNumber",
+        "caller",
+        "callee",
+        "destination",
+    ]
+    candidates = []
+    seen = set()
+    for source in [payload, webhook]:
+        for number in _extract_phone_values_by_keys(source, preferred_keys):
+            if number and number not in seen:
+                seen.add(number)
+                candidates.append(number)
+    for number in _counterparty_candidates(db, from_number, to_number):
+        if number and number not in seen:
+            seen.add(number)
+            candidates.append(number)
+    external = [number for number in candidates if number not in system_numbers]
+    return external or candidates
+
+
 def resolve_shared_contact_context_by_numbers(
     db,
     numbers,
@@ -32794,7 +32878,7 @@ def smrtphone_agent_call_ended_webhook():
         extract_first_string_by_keys(payload, ["timestamp", "completed_at", "endedAt", "ended_at", "date"])
         or extract_first_string_by_keys(webhook, ["timestamp", "completed_at", "endedAt", "ended_at", "date"])
     ).strip()
-    counterparty_candidates = _counterparty_candidates(db, from_number, to_number)
+    counterparty_candidates = _smrtphone_external_number_candidates(db, payload, webhook, from_number, to_number)
     follow_up_number = counterparty_candidates[0] if counterparty_candidates else normalize_phone(from_number or to_number)
     follow_up_number_display = format_phone_display(follow_up_number)
 

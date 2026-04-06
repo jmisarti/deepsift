@@ -32956,12 +32956,12 @@ def smrtphone_agent_call_ended_webhook():
         or extract_first_string_by_keys(webhook, ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "callID", "id"])
     )
     caller_number = normalize_phone(
-        extract_first_string_by_keys(payload, ["phone_number_caller", "phoneNumberCaller", "callerPhone", "caller_phone"])
-        or extract_first_string_by_keys(webhook, ["phone_number_caller", "phoneNumberCaller", "callerPhone", "caller_phone"])
+        extract_first_string_by_keys(payload, ["phone_number_caller"])
+        or extract_first_string_by_keys(webhook, ["phone_number_caller"])
     )
     agent_number = normalize_phone(
-        extract_first_string_by_keys(payload, ["phone_number_agent", "phoneNumberAgent", "agentPhone", "agent_phone"])
-        or extract_first_string_by_keys(webhook, ["phone_number_agent", "phoneNumberAgent", "agentPhone", "agent_phone"])
+        extract_first_string_by_keys(payload, ["phone_number_agent"])
+        or extract_first_string_by_keys(webhook, ["phone_number_agent"])
     )
     from_number = normalize_phone(
         caller_number
@@ -32998,9 +32998,7 @@ def smrtphone_agent_call_ended_webhook():
         extract_first_string_by_keys(payload, ["timestamp", "completed_at", "endedAt", "ended_at", "date"])
         or extract_first_string_by_keys(webhook, ["timestamp", "completed_at", "endedAt", "ended_at", "date"])
     ).strip()
-    counterparty_candidates = _smrtphone_external_number_candidates(db, payload, webhook, from_number, to_number)
-    follow_up_number = caller_number or (counterparty_candidates[0] if counterparty_candidates else normalize_phone(from_number or to_number))
-    follow_up_number_display = format_phone_display(follow_up_number)
+    follow_up_number_display = format_phone_display(caller_number)
 
     slack_title = "SmartAgent just completed a call"
     text_lines = [slack_title]

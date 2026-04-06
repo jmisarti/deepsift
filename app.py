@@ -16399,6 +16399,10 @@ def _extract_phone_values_by_keys(payload, keys):
 def _smrtphone_external_number_candidates(db, payload, webhook, from_number="", to_number=""):
     system_numbers = _known_system_numbers(db, refresh_seconds=300)
     preferred_keys = [
+        "phone_number_caller",
+        "phoneNumberCaller",
+        "phone_number_agent",
+        "phoneNumberAgent",
         "leadPhone",
         "lead_phone",
         "contactPhone",
@@ -32951,12 +32955,22 @@ def smrtphone_agent_call_ended_webhook():
         extract_first_string_by_keys(payload, ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "callID", "id"])
         or extract_first_string_by_keys(webhook, ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "callID", "id"])
     )
+    caller_number = normalize_phone(
+        extract_first_string_by_keys(payload, ["phone_number_caller", "phoneNumberCaller", "callerPhone", "caller_phone"])
+        or extract_first_string_by_keys(webhook, ["phone_number_caller", "phoneNumberCaller", "callerPhone", "caller_phone"])
+    )
+    agent_number = normalize_phone(
+        extract_first_string_by_keys(payload, ["phone_number_agent", "phoneNumberAgent", "agentPhone", "agent_phone"])
+        or extract_first_string_by_keys(webhook, ["phone_number_agent", "phoneNumberAgent", "agentPhone", "agent_phone"])
+    )
     from_number = normalize_phone(
-        extract_first_string_by_keys(payload, ["from", "from_number", "fromNumber", "caller", "source", "ani"])
+        caller_number
+        or extract_first_string_by_keys(payload, ["from", "from_number", "fromNumber", "caller", "source", "ani"])
         or extract_first_string_by_keys(webhook, ["from", "from_number", "fromNumber", "caller", "source", "ani"])
     )
     to_number = normalize_phone(
-        extract_first_string_by_keys(payload, ["to", "to_number", "toNumber", "callee", "destination", "dnis"])
+        agent_number
+        or extract_first_string_by_keys(payload, ["to", "to_number", "toNumber", "callee", "destination", "dnis"])
         or extract_first_string_by_keys(webhook, ["to", "to_number", "toNumber", "callee", "destination", "dnis"])
     )
     agent_name = (
@@ -32985,7 +32999,7 @@ def smrtphone_agent_call_ended_webhook():
         or extract_first_string_by_keys(webhook, ["timestamp", "completed_at", "endedAt", "ended_at", "date"])
     ).strip()
     counterparty_candidates = _smrtphone_external_number_candidates(db, payload, webhook, from_number, to_number)
-    follow_up_number = counterparty_candidates[0] if counterparty_candidates else normalize_phone(from_number or to_number)
+    follow_up_number = caller_number or (counterparty_candidates[0] if counterparty_candidates else normalize_phone(from_number or to_number))
     follow_up_number_display = format_phone_display(follow_up_number)
 
     slack_title = "SmartAgent just completed a call"

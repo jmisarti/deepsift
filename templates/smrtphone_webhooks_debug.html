@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <div class="home-section-header">
+        <div>
+            <h2>{{ title }}</h2>
+            <p class="muted-text">Latest received SmrtPhone webhook payloads for <strong>{{ event_type_filter or 'all events' }}</strong>.</p>
+        </div>
+    </div>
+
+    {% if items %}
+        {% for item in items %}
+        <article class="panel" style="margin-top: 16px;">
+            <div class="home-section-header">
+                <div>
+                    <h3 style="margin-bottom: 6px;">{{ item.event_type or 'Unknown event' }}</h3>
+                    <p class="muted-text" style="margin: 0;">
+                        {{ item.logged_at or item.received_at or '-' }}
+                        {% if item.processing_status %} | {{ item.processing_status }}{% endif %}
+                        {% if item.from_number or item.to_number %}
+                            | {{ item.from_number or '-' }} -> {{ item.to_number or '-' }}
+                        {% endif %}
+                    </p>
+                </div>
+                <div>
+                    {% if item.source %}
+                    <span class="home-meta-chip">{{ item.source }}</span>
+                    {% endif %}
+                </div>
+            </div>
+            {% if item.error_text %}
+            <div class="error-banner" style="margin-bottom: 12px;">{{ item.error_text }}</div>
+            {% endif %}
+            <pre style="white-space: pre-wrap; word-break: break-word; overflow-x: auto; background: #f6f7fb; border: 1px solid #d9deea; border-radius: 12px; padding: 14px; margin: 0;">{{ item.payload | tojson(indent=2) }}</pre>
+        </article>
+        {% endfor %}
+    {% else %}
+    <div class="error-banner">No matching SmrtPhone webhook payloads were found yet.</div>
+    {% endif %}
+</section>
+{% endblock %}

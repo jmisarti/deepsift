@@ -33355,6 +33355,27 @@ def smrtphone_recent_webhook_debug_api():
     )
 
 
+@app.route("/debug/smrtphone-webhooks", methods=["GET"])
+def smrtphone_recent_webhook_debug_page():
+    ensure_db()
+    db = get_db()
+    limit_raw = (request.args.get("limit") or "20").strip()
+    event_type_filter = (request.args.get("event_type") or "agent_call_ended").strip().lower()
+    try:
+        limit = max(1, min(100, int(limit_raw)))
+    except ValueError:
+        limit = 20
+    items = get_recent_smrtphone_webhook_records(db, limit=max(limit * 3, 30))
+    if event_type_filter:
+        items = [item for item in items if str(item.get("event_type") or "").strip().lower() == event_type_filter]
+    return render_template(
+        "smrtphone_webhooks_debug.html",
+        title="SmrtPhone Webhooks",
+        event_type_filter=event_type_filter,
+        items=items[:limit],
+    )
+
+
 @app.route("/api/call-recording-jobs", methods=["GET"])
 def call_recording_jobs_api():
     ensure_db()

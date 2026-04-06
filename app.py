@@ -6905,6 +6905,26 @@ def log_smrtphone_webhook_event(
     error_text="",
 ):
     try:
+        logs_dir = BASE_DIR / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(EST_TZ).strftime("%Y%m%d")
+        log_path = logs_dir / f"smrtphone_webhooks_{stamp}.jsonl"
+        record = {
+            "logged_at": datetime.now(timezone.utc).isoformat(),
+            "event_type": (event_type or "").strip(),
+            "processing_status": (processing_status or "").strip(),
+            "sms_id": (sms_id or "").strip(),
+            "from_number": (from_number or "").strip(),
+            "to_number": (to_number or "").strip(),
+            "communication_id": communication_id,
+            "error_text": (error_text or "").strip(),
+            "payload": payload or {},
+        }
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+    try:
         db.execute(
             """
             INSERT INTO smrtphone_webhook_events

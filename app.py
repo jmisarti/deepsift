@@ -6946,6 +6946,92 @@ def log_smrtphone_webhook_event(
         pass
 
 
+def get_recent_smrtphone_webhook_records(db, limit=20):
+    try:
+        limit = max(1, min(int(limit or 20), 100))
+    except Exception:
+        limit = 20
+    records = []
+    seen_keys = set()
+    logs_dir = BASE_DIR / "logs"
+    for day_offset in range(0, 2):
+        stamp = (datetime.now(EST_TZ) - timedelta(days=day_offset)).strftime("%Y%m%d")
+        log_path = logs_dir / f"smrtphone_webhooks_{stamp}.jsonl"
+        if not log_path.exists():
+            continue
+        try:
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            if len(records) >= limit:
+                break
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            dedupe_key = (
+                str(item.get("logged_at") or "").strip(),
+                str(item.get("event_type") or "").strip(),
+                str(item.get("sms_id") or "").strip(),
+                str(item.get("from_number") or "").strip(),
+                str(item.get("to_number") or "").strip(),
+            )
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            records.append(
+                {
+                    "source": "jsonl",
+                    "source_path": str(log_path),
+                    "logged_at": str(item.get("logged_at") or "").strip(),
+                    "received_at": str(item.get("logged_at") or "").strip(),
+                    "event_type": str(item.get("event_type") or "").strip(),
+                    "processing_status": str(item.get("processing_status") or "").strip(),
+                    "sms_id": str(item.get("sms_id") or "").strip(),
+                    "from_number": str(item.get("from_number") or "").strip(),
+                    "to_number": str(item.get("to_number") or "").strip(),
+                    "error_text": str(item.get("error_text") or "").strip(),
+                    "payload": payload,
+                }
+            )
+        if len(records) >= limit:
+            break
+    if records:
+        return records[:limit]
+    try:
+        rows = db.execute(
+            """
+            SELECT id, event_type, processing_status, sms_id, from_number, to_number, error_text, received_at, payload_json
+            FROM smrtphone_webhook_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    except Exception:
+        rows = []
+    for row in rows:
+        payload = parse_json_object(row["payload_json"] or "{}", default={})
+        records.append(
+            {
+                "source": "db",
+                "source_path": "smrtphone_webhook_events",
+                "logged_at": str(row["received_at"] or "").strip(),
+                "received_at": str(row["received_at"] or "").strip(),
+                "event_type": str(row["event_type"] or "").strip(),
+                "processing_status": str(row["processing_status"] or "").strip(),
+                "sms_id": str(row["sms_id"] or "").strip(),
+                "from_number": str(row["from_number"] or "").strip(),
+                "to_number": str(row["to_number"] or "").strip(),
+                "error_text": str(row["error_text"] or "").strip(),
+                "payload": payload,
+            }
+        )
+    return records[:limit]
+
+
 def add_person_note(db, person_id, source, note_body, payload=None):
     if not person_id:
         return
@@ -33245,6 +33331,28 @@ def smrtphone_webhook_events_api():
         (n,),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/debug/smrtphone-webhooks/recent", methods=["GET"])
+def smrtphone_recent_webhook_debug_api():
+    ensure_db()
+    db = get_db()
+    limit_raw = (request.args.get("limit") or "20").strip()
+    event_type_filter = (request.args.get("event_type") or "").strip().lower()
+    try:
+        limit = max(1, min(100, int(limit_raw)))
+    except ValueError:
+        limit = 20
+    items = get_recent_smrtphone_webhook_records(db, limit=max(limit * 3, 30))
+    if event_type_filter:
+        items = [item for item in items if str(item.get("event_type") or "").strip().lower() == event_type_filter]
+    return jsonify(
+        {
+            "ok": True,
+            "count": min(len(items), limit),
+            "items": items[:limit],
+        }
+    )
 
 
 @app.route("/api/call-recording-jobs", methods=["GET"])

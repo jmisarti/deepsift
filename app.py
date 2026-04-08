@@ -7133,6 +7133,35 @@ def get_recent_clever_webhook_records(db, limit=20, event_type_filter=""):
     return items
 
 
+def _redact_clever_log_value(key, value):
+    key_text = str(key or "").strip().lower()
+    if any(token in key_text for token in ["authorization", "password", "token", "api_key", "integration_key", "secret", "key"]):
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {str(k): _redact_clever_log_value(k, v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_clever_log_value(key, item) for item in value]
+    return value
+
+
+def _clever_safe_header_map(req):
+    safe_keys = {
+        "Content-Type",
+        "User-Agent",
+        "X-Forwarded-For",
+        "X-Forwarded-Proto",
+        "X-Forwarded-Host",
+        "CF-Connecting-IP",
+        "CF-IPCountry",
+    }
+    out = {}
+    for key in safe_keys:
+        value = req.headers.get(key)
+        if value is not None and str(value).strip():
+            out[key] = str(value)
+    return out
+
+
 def add_person_note(db, person_id, source, note_body, payload=None):
     if not person_id:
         return
@@ -28336,11 +28365,10 @@ def clever_lead_capture_webhook():
                 "status": "ready",
             }
         ), 200
-    if not clever_integration_auth_ok(db, request):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         payload = request.form.to_dict() or {}
+    safe_headers = _clever_safe_header_map(request)
     event_type = _payload_value_by_keys(payload, ["event_type"])
     connection_id = _payload_value_by_keys(payload, ["connection_id"])
     record_id = _payload_value_by_keys(payload, ["record_id"])
@@ -28361,11 +28389,22 @@ def clever_lead_capture_webhook():
     if not event_key:
         payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
         event_key = f"clever:{payload_hash}"
-    header_map = {str(k): str(v) for k, v in request.headers.items()}
+    if not clever_integration_auth_ok(db, request):
+        log_clever_webhook_event(
+            db,
+            _redact_clever_log_value("", payload or {}),
+            headers=safe_headers,
+            processing_status="unauthorized",
+            event_type=event_type,
+            event_key=event_key,
+            error_text="Unauthorized",
+        )
+        db.commit()
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
     log_clever_webhook_event(
         db,
         payload,
-        headers=header_map,
+        headers=safe_headers,
         processing_status="captured",
         event_type=event_type,
         event_key=event_key,

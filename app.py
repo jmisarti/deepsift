@@ -11879,6 +11879,32 @@ def _website_campaign_group_label(attribution):
     return "Untracked"
 
 
+def website_has_google_ads_attribution(payload):
+    attribution = extract_website_campaign_attribution(payload)
+    if str(attribution.get("gclid") or "").strip():
+        return True
+    if str(attribution.get("gad_campaignid") or "").strip():
+        return True
+    return str(attribution.get("utm_source") or "").strip().lower() == "google"
+
+
+def build_website_reisift_tags(stage_value="", step1_payload=None):
+    tags = ["website", "webhook", "carrot"]
+    if website_has_google_ads_attribution(step1_payload):
+        tags.append("GoogleAds")
+    tags.append(str(stage_value or "stage_unknown").strip() or "stage_unknown")
+    seen = set()
+    ordered = []
+    for tag in tags:
+        clean = str(tag or "").strip()
+        key = clean.lower()
+        if not clean or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(clean)
+    return ",".join(ordered)
+
+
 def build_website_ad_lead_snapshot(db, q="", source=""):
     q = normalize_whitespace(q)
     source = normalize_whitespace(source).lower()
@@ -12228,7 +12254,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 "postal_code": merged_fields.get("postal_code") or "",
                 "status": "new_lead",
                 "lists": "Carrot",
-                "tags": f"website,webhook,carrot,{merged_fields.get('stage') or 'stage_unknown'}",
+                "tags": build_website_reisift_tags(merged_fields.get("stage"), step1_payload),
                 "notes": f"{notes}\n\n{additional_note}".strip() if additional_note else notes,
                 "owner": owner_payload,
                 "skip_map_lookup": True,
@@ -16231,7 +16257,7 @@ def run_website_step1_hold_once():
                         "postal_code": merged_fields.get("postal_code") or "",
                         "status": "new_lead",
                         "lists": "Carrot",
-                        "tags": f"website,webhook,carrot,{merged_fields.get('stage') or 'stage_unknown'}",
+                        "tags": build_website_reisift_tags(merged_fields.get("stage"), step1_payload),
                         "notes": f"{notes}\n\n{additional_note}".strip() if additional_note else notes,
                         "owner": owner_payload,
                         "skip_map_lookup": True,

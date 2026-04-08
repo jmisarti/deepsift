@@ -63,18 +63,19 @@
             <table class="home-trend-table rentcast-comparables-table">
                 <thead>
                     <tr>
-                        <th>Address 1</th>
-                        <th>Address 2</th>
+                        <th>Address</th>
                         <th>City</th>
-                        <th>Correlation</th>
-                        <th>Distance</th>
-                        <th>Price</th>
+                        <th>Beds</th>
+                        <th>Baths</th>
                         <th>Sqft</th>
+                        <th>Distance</th>
+                        <th>Correlation</th>
+                        <th>Price</th>
                     </tr>
                 </thead>
                 <tbody id="rentcastComparablesBody">
                     <tr>
-                        <td colspan="7" class="muted-text">Run a valuation to view comparables.</td>
+                        <td colspan="8" class="muted-text">Run a valuation to view comparables.</td>
                     </tr>
                 </tbody>
             </table>
@@ -161,6 +162,20 @@
         }).format(num);
     }
 
+    function formatCount(value) {
+        const num = Number(value);
+        if (!Number.isFinite(num)) return '';
+        return new Intl.NumberFormat('en-US', {
+            maximumFractionDigits: 1
+        }).format(num);
+    }
+
+    function formatAddress(item) {
+        const address1 = String(item.addressLine1 || '').trim();
+        const address2 = String(item.addressLine2 || '').trim();
+        return [address1, address2].filter(Boolean).join(' ');
+    }
+
     function updateSummaryCards(comparables) {
         if (!medianPriceEl || !averagePriceEl || !pricePerSqftEl) return;
         const prices = comparables
@@ -199,7 +214,7 @@
             : [];
         if (!comparables.length) {
             comparablesWrap.classList.add('hidden');
-            comparablesBody.innerHTML = '<tr><td colspan=\"7\" class=\"muted-text\">No comparable rows returned.</td></tr>';
+            comparablesBody.innerHTML = '<tr><td colspan=\"8\" class=\"muted-text\">No comparable rows returned.</td></tr>';
             updateSummaryCards([]);
             return;
         }
@@ -208,13 +223,14 @@
         comparablesBody.innerHTML = comparables.map(function (item) {
             return `
                 <tr>
-                    <td>${escapeHtml(item.addressLine1 || '')}</td>
-                    <td>${escapeHtml(item.addressLine2 || '')}</td>
+                    <td>${escapeHtml(formatAddress(item))}</td>
                     <td>${escapeHtml(item.city || '')}</td>
-                    <td>${escapeHtml(formatCorrelation(item.correlation))}</td>
-                    <td>${escapeHtml(formatDistance(item.distance))}</td>
-                    <td>${escapeHtml(formatPrice(item.price))}</td>
+                    <td>${escapeHtml(formatCount(item.bedrooms))}</td>
+                    <td>${escapeHtml(formatCount(item.bathrooms))}</td>
                     <td>${escapeHtml(formatSqft(item.squareFootage))}</td>
+                    <td>${escapeHtml(formatDistance(item.distance))}</td>
+                    <td>${escapeHtml(formatCorrelation(item.correlation))}</td>
+                    <td>${escapeHtml(formatPrice(item.price))}</td>
                 </tr>
             `;
         }).join('');

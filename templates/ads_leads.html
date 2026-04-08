@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Ad Lead Attribution</h2>
+    <p>Website submissions tied back to tracked campaign parameters from the stored step payloads. Google is derived from the step-1 landing URL when <code>gclid</code> or UTM values are present.</p>
+    <div class="inline-actions ads-toolbar">
+        <div class="ads-toolbar-summary">
+            <strong>{{ totals.tracked_leads }}</strong> tracked lead{% if totals.tracked_leads != 1 %}s{% endif %} |
+            Step-1 only: <strong>{{ totals.step1_only }}</strong> |
+            Step-2 complete: <strong>{{ totals.step2_complete }}</strong> |
+            Campaign buckets: <strong>{{ totals.campaigns }}</strong>
+        </div>
+        <a href="{{ url_for('ads_dashboard') }}">Back to Ads</a>
+    </div>
+</section>
+
+<section class="panel">
+    <form method="get" class="inline-form ad-leads-filter-form">
+        <input type="text" name="q" value="{{ q }}" placeholder="address, gclid, campaign">
+        <select name="source">
+            <option value="">All Sources</option>
+            {% for item in source_options %}
+            <option value="{{ item }}" {% if source == item %}selected{% endif %}>{{ item|title }}</option>
+            {% endfor %}
+        </select>
+        <button type="submit">Apply</button>
+        <a href="{{ url_for('ads_lead_attribution_page') }}">Clear</a>
+    </form>
+</section>
+
+<section class="panel">
+    <h3>Campaign Summary</h3>
+    <div class="table-wrap">
+        <table class="compact-table home-trend-table ad-leads-summary-table">
+            <thead>
+                <tr>
+                    <th>Source</th>
+                    <th>Campaign</th>
+                    <th>UTM Campaign</th>
+                    <th>GAD Campaign ID</th>
+                    <th>Leads</th>
+                    <th>Step-1 Only</th>
+                    <th>Step-2 Complete</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in campaign_rows %}
+                <tr>
+                    <td>{{ row.source|title }}</td>
+                    <td>{{ row.campaign_label }}</td>
+                    <td>{{ row.utm_campaign or '-' }}</td>
+                    <td>{{ row.gad_campaignid or '-' }}</td>
+                    <td>{{ row.lead_count }}</td>
+                    <td>{{ row.step1_only_count }}</td>
+                    <td>{{ row.step2_count }}</td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="7">No attributed website leads found yet.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<section class="panel">
+    <h3>Tracked Website Leads</h3>
+    <div class="table-wrap">
+        <table class="compact-table home-trend-table ad-leads-table">
+            <thead>
+                <tr>
+                    <th>Address</th>
+                    <th>Step-1</th>
+                    <th>Step-2</th>
+                    <th>Source</th>
+                    <th>Campaign</th>
+                    <th>UTM Campaign</th>
+                    <th>GAD Campaign ID</th>
+                    <th>GCLID</th>
+                    <th>Page URL</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in lead_rows %}
+                <tr>
+                    <td>{{ row.address or '-' }}</td>
+                    <td>{{ 'Yes' if row.step1_yes else 'No' }}</td>
+                    <td>{{ 'Yes' if row.step2_yes else 'No' }}</td>
+                    <td>{{ row.source|title }}</td>
+                    <td>{{ row.campaign_label }}</td>
+                    <td>{{ row.utm_campaign or '-' }}</td>
+                    <td>{{ row.gad_campaignid or '-' }}</td>
+                    <td class="ad-leads-gclid-cell" title="{{ row.gclid }}">{{ row.gclid or '-' }}</td>
+                    <td class="ad-leads-url-cell">
+                        {% if row.page_url %}
+                        <a href="{{ row.page_url }}" target="_blank" rel="noopener noreferrer">Open</a>
+                        {% else %}
+                        -
+                        {% endif %}
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="9">No attributed website leads found yet.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}

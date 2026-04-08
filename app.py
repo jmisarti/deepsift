@@ -21,7 +21,7 @@ import threading
 import time
 import traceback
 from collections import Counter
-from urllib.parse import quote, quote_plus, urlsplit, urlencode
+from urllib.parse import quote, quote_plus, urlsplit, urlencode, parse_qs
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from email import message_from_bytes
@@ -11760,6 +11760,248 @@ def _build_website_lead_notes(payload, fields, source_label="webhook"):
         if value:
             lines.append(f"{label}: {value}")
     return "\n".join(lines)
+
+
+def _iter_payload_text_values(payload, prefix="root", depth=0, max_depth=5):
+    if depth > max_depth:
+        return
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            child_prefix = f"{prefix}.{key}"
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    yield child_prefix, text
+            elif isinstance(value, (dict, list, tuple)):
+                yield from _iter_payload_text_values(value, child_prefix, depth + 1, max_depth=max_depth)
+    elif isinstance(payload, (list, tuple)):
+        for index, value in enumerate(payload):
+            child_prefix = f"{prefix}[{index}]"
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    yield child_prefix, text
+            elif isinstance(value, (dict, list, tuple)):
+                yield from _iter_payload_text_values(value, child_prefix, depth + 1, max_depth=max_depth)
+
+
+def _choose_best_website_campaign_url(candidates):
+    if not candidates:
+        return ""
+
+    def score(item):
+        url = str(item.get("url") or "")
+        lower = url.lower()
+        points = 0
+        if "gclid=" in lower:
+            points += 80
+        if "utm_" in lower:
+            points += 70
+        if "gad_campaignid=" in lower:
+            points += 40
+        if "iwillbuyyourhouseforcash.com" in lower:
+            points += 25
+        if "sell-my-mobile-home" in lower:
+            points += 10
+        return points
+
+    best = max(candidates, key=score)
+    return str(best.get("url") or "").strip()
+
+
+def extract_website_campaign_attribution(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    url_candidates = []
+    direct_values = {}
+    token_keys = {
+        "gclid": "gclid",
+        "utm_source": "utm_source",
+        "utm_campaign": "utm_campaign",
+        "utm_medium": "utm_medium",
+        "utm_keyword": "utm_keyword",
+        "utm_term": "utm_keyword",
+        "utm_placement": "utm_placement",
+        "gad_source": "gad_source",
+        "gad_campaignid": "gad_campaignid",
+    }
+    for path, text in _iter_payload_text_values(payload):
+        key_name = str(path.rsplit(".", 1)[-1] if "." in path else path).strip().lower()
+        normalized_key = token_keys.get(key_name)
+        if normalized_key and normalized_key not in direct_values:
+            direct_values[normalized_key] = text
+        if text.startswith("http://") or text.startswith("https://"):
+            url_candidates.append({"path": path, "url": text})
+    page_url = _choose_best_website_campaign_url(url_candidates)
+    query_map = {}
+    if page_url:
+        try:
+            parsed_query = parse_qs(urlsplit(page_url).query, keep_blank_values=True)
+            for key, values in parsed_query.items():
+                if values:
+                    query_map[str(key).strip().lower()] = str(values[0] or "").strip()
+        except Exception:
+            query_map = {}
+
+    def first_value(*keys):
+        for key in keys:
+            normalized = str(key).strip().lower()
+            value = query_map.get(normalized) or direct_values.get(normalized)
+            if value:
+                return str(value).strip()
+        return ""
+
+    return {
+        "page_url": page_url,
+        "gclid": first_value("gclid"),
+        "utm_source": first_value("utm_source"),
+        "utm_campaign": first_value("utm_campaign"),
+        "utm_medium": first_value("utm_medium"),
+        "utm_keyword": first_value("utm_keyword", "utm_term"),
+        "utm_placement": first_value("utm_placement"),
+        "gad_source": first_value("gad_source"),
+        "gad_campaignid": first_value("gad_campaignid"),
+    }
+
+
+def _website_campaign_group_label(attribution):
+    attribution = attribution if isinstance(attribution, dict) else {}
+    utm_campaign = str(attribution.get("utm_campaign") or "").strip()
+    gad_campaignid = str(attribution.get("gad_campaignid") or "").strip()
+    gclid = str(attribution.get("gclid") or "").strip()
+    if utm_campaign and gad_campaignid and utm_campaign != gad_campaignid:
+        return f"{utm_campaign} / {gad_campaignid}"
+    if utm_campaign:
+        return utm_campaign
+    if gad_campaignid:
+        return gad_campaignid
+    if gclid:
+        return f"gclid:{gclid[:18]}..."
+    return "Untracked"
+
+
+def build_website_ad_lead_snapshot(db, q="", source=""):
+    q = normalize_whitespace(q)
+    source = normalize_whitespace(source).lower()
+    rows = db.execute(
+        """
+        SELECT id,
+               lead_key,
+               reisift_property_uuid,
+               latest_address,
+               latest_phone,
+               latest_email,
+               latest_name,
+               latest_stage,
+               status,
+               first_received_at,
+               last_received_at,
+               step1_payload_json,
+               step2_payload_json
+        FROM website_lead_submissions
+        ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
+        LIMIT 1000
+        """
+    ).fetchall()
+    lead_rows = []
+    campaign_buckets = {}
+    for row in rows:
+        step1_payload = parse_json_object(row["step1_payload_json"] or "{}")
+        step2_payload = parse_json_object(row["step2_payload_json"] or "{}")
+        step1_attribution = extract_website_campaign_attribution(step1_payload)
+        step2_attribution = extract_website_campaign_attribution(step2_payload)
+        attribution = {}
+        for key in ["page_url", "gclid", "utm_source", "utm_campaign", "utm_medium", "utm_keyword", "utm_placement", "gad_source", "gad_campaignid"]:
+            attribution[key] = (
+                step1_attribution.get(key)
+                or step2_attribution.get(key)
+                or ""
+            )
+        has_tracking = any(
+            attribution.get(key)
+            for key in ["page_url", "gclid", "utm_source", "utm_campaign", "gad_campaignid"]
+        )
+        if not has_tracking:
+            continue
+        source_value = str(attribution.get("utm_source") or "").strip().lower()
+        if not source_value and attribution.get("gclid"):
+            source_value = "google"
+        if source and source_value != source:
+            continue
+        campaign_label = _website_campaign_group_label(attribution)
+        search_blob = " ".join(
+            [
+                str(row["latest_address"] or ""),
+                str(row["latest_name"] or ""),
+                str(row["latest_phone"] or ""),
+                str(row["latest_email"] or ""),
+                source_value,
+                campaign_label,
+                str(attribution.get("gclid") or ""),
+                str(attribution.get("page_url") or ""),
+            ]
+        ).lower()
+        if q and q.lower() not in search_blob:
+            continue
+        step1_yes = bool(str(row["step1_payload_json"] or "").strip())
+        step2_yes = bool(str(row["step2_payload_json"] or "").strip())
+        item = {
+            "id": int(row["id"]),
+            "lead_key": str(row["lead_key"] or ""),
+            "reisift_property_uuid": str(row["reisift_property_uuid"] or ""),
+            "address": str(row["latest_address"] or "").strip(),
+            "name": str(row["latest_name"] or "").strip(),
+            "phone": str(row["latest_phone"] or "").strip(),
+            "email": str(row["latest_email"] or "").strip(),
+            "stage": str(row["latest_stage"] or "").strip(),
+            "status": str(row["status"] or "").strip(),
+            "first_received_at": str(row["first_received_at"] or ""),
+            "last_received_at": str(row["last_received_at"] or ""),
+            "step1_yes": step1_yes,
+            "step2_yes": step2_yes,
+            "source": source_value or "unknown",
+            "campaign_label": campaign_label,
+            "page_url": str(attribution.get("page_url") or "").strip(),
+            "gclid": str(attribution.get("gclid") or "").strip(),
+            "utm_campaign": str(attribution.get("utm_campaign") or "").strip(),
+            "gad_campaignid": str(attribution.get("gad_campaignid") or "").strip(),
+        }
+        lead_rows.append(item)
+        bucket_key = (
+            item["source"],
+            item["campaign_label"],
+            item["utm_campaign"],
+            item["gad_campaignid"],
+        )
+        bucket = campaign_buckets.setdefault(
+            bucket_key,
+            {
+                "source": item["source"],
+                "campaign_label": item["campaign_label"],
+                "utm_campaign": item["utm_campaign"],
+                "gad_campaignid": item["gad_campaignid"],
+                "lead_count": 0,
+                "step1_only_count": 0,
+                "step2_count": 0,
+            },
+        )
+        bucket["lead_count"] += 1
+        if item["step1_yes"] and not item["step2_yes"]:
+            bucket["step1_only_count"] += 1
+        if item["step2_yes"]:
+            bucket["step2_count"] += 1
+
+    campaign_rows = sorted(
+        campaign_buckets.values(),
+        key=lambda item: (-int(item["lead_count"]), str(item["source"]), str(item["campaign_label"])),
+    )
+    totals = {
+        "tracked_leads": len(lead_rows),
+        "step1_only": sum(1 for row in lead_rows if row["step1_yes"] and not row["step2_yes"]),
+        "step2_complete": sum(1 for row in lead_rows if row["step2_yes"]),
+        "campaigns": len(campaign_rows),
+    }
+    source_options = sorted({row["source"] for row in lead_rows if row["source"]})
+    return lead_rows, campaign_rows, totals, source_options
 
 
 def process_website_lead_payload(db, payload, source_label="webhook"):
@@ -28712,6 +28954,24 @@ def ads_dashboard():
         platform_options=[{"value": key, "label": label} for key, label in AD_PLATFORM_LABELS.items()],
         latest_refresh=get_latest_ad_refresh_run(db),
         ad_settings=get_ads_dashboard_settings(db),
+    )
+
+
+@app.route("/ads/leads", methods=["GET"])
+def ads_lead_attribution_page():
+    ensure_db()
+    db = get_db()
+    q = (request.args.get("q") or "").strip()
+    source = (request.args.get("source") or "").strip().lower()
+    lead_rows, campaign_rows, totals, source_options = build_website_ad_lead_snapshot(db, q=q, source=source)
+    return render_template(
+        "ads_leads.html",
+        q=q,
+        source=source,
+        lead_rows=lead_rows,
+        campaign_rows=campaign_rows,
+        totals=totals,
+        source_options=source_options,
     )
 
 

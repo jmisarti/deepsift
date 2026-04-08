@@ -563,6 +563,22 @@ body {
     word-break: break-word;
 }
 
+.ad-leads-filter-form {
+    align-items: center;
+}
+
+.ad-leads-filter-form input {
+    min-width: 280px;
+}
+
+.ad-leads-gclid-cell,
+.ad-leads-url-cell {
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 @media (max-width: 980px) {
     .app-shell {
         flex-direction: column;

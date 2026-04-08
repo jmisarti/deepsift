@@ -16,6 +16,7 @@
             <span class="muted-text">| Last refresh: {{ latest_refresh.started_at|fmt_est_datetime }}{% if latest_refresh.status %} ({{ latest_refresh.status }}){% endif %}</span>
             {% endif %}
         </div>
+        <a href="{{ url_for('ads_lead_attribution_page') }}">Submitted Leads</a>
         <form id="adsRefreshForm" class="inline-form">
             <input type="hidden" name="lookback_days" value="{{ days }}">
             <button type="submit" id="adsRefreshButton">Refresh</button>

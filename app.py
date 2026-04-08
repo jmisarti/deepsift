@@ -28386,7 +28386,7 @@ def clever_lead_capture_webhook():
 def clever_webhook_events_api():
     ensure_db()
     db = get_db()
-    if not integration_auth_ok(db, request):
+    if not (integration_auth_ok(db, request) or session.get("auth_ok")):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     limit_raw = (request.args.get("limit") or "20").strip()
     event_type_filter = (request.args.get("event_type") or "").strip()
@@ -28396,6 +28396,25 @@ def clever_webhook_events_api():
         limit = 20
     items = get_recent_clever_webhook_records(db, limit=limit, event_type_filter=event_type_filter)
     return jsonify({"ok": True, "items": items}), 200
+
+
+@app.route("/debug/clever-webhooks", methods=["GET"])
+def clever_webhook_debug_page():
+    ensure_db()
+    db = get_db()
+    limit_raw = (request.args.get("limit") or "20").strip()
+    event_type_filter = (request.args.get("event_type") or "").strip()
+    try:
+        limit = max(1, min(100, int(limit_raw)))
+    except ValueError:
+        limit = 20
+    items = get_recent_clever_webhook_records(db, limit=limit, event_type_filter=event_type_filter)
+    return render_template(
+        "clever_webhooks_debug.html",
+        title="Clever Webhooks",
+        event_type_filter=event_type_filter,
+        items=items,
+    )
 
 
 @app.route("/api/integrations/website/lead", methods=["POST", "GET", "OPTIONS"])

@@ -11906,16 +11906,11 @@ def build_website_ad_lead_snapshot(db, q="", source=""):
     campaign_buckets = {}
     for row in rows:
         step1_payload = parse_json_object(row["step1_payload_json"] or "{}")
-        step2_payload = parse_json_object(row["step2_payload_json"] or "{}")
         step1_attribution = extract_website_campaign_attribution(step1_payload)
-        step2_attribution = extract_website_campaign_attribution(step2_payload)
-        attribution = {}
-        for key in ["page_url", "gclid", "utm_source", "utm_campaign", "utm_medium", "utm_keyword", "utm_placement", "gad_source", "gad_campaignid"]:
-            attribution[key] = (
-                step1_attribution.get(key)
-                or step2_attribution.get(key)
-                or ""
-            )
+        attribution = {
+            key: str(step1_attribution.get(key) or "").strip()
+            for key in ["page_url", "gclid", "utm_source", "utm_campaign", "utm_medium", "utm_keyword", "utm_placement", "gad_source", "gad_campaignid"]
+        }
         has_tracking = any(
             attribution.get(key)
             for key in ["page_url", "gclid", "utm_source", "utm_campaign", "gad_campaignid"]

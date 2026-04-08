@@ -38,6 +38,49 @@
         <span id="rentcastBusyText">Running request...</span>
     </div>
 
+    <div class="rentcast-output-wrap hidden" id="rentcastComparablesWrap">
+        <div class="home-section-header rentcast-output-head">
+            <div>
+                <h2>Comparables</h2>
+                <p class="muted-text">Parsed from the valuation response.</p>
+            </div>
+        </div>
+        <section class="cards rentcast-summary-cards" id="rentcastSummaryCards">
+            <article>
+                <h3>Median List Price</h3>
+                <p id="rentcastMedianPrice">$0</p>
+            </article>
+            <article>
+                <h3>Average List Price</h3>
+                <p id="rentcastAveragePrice">$0</p>
+            </article>
+            <article>
+                <h3>Comp $/Sqft</h3>
+                <p id="rentcastPricePerSqft">$0</p>
+            </article>
+        </section>
+        <div class="table-wrap">
+            <table class="home-trend-table rentcast-comparables-table">
+                <thead>
+                    <tr>
+                        <th>Address 1</th>
+                        <th>Address 2</th>
+                        <th>City</th>
+                        <th>Correlation</th>
+                        <th>Distance</th>
+                        <th>Price</th>
+                        <th>Sqft</th>
+                    </tr>
+                </thead>
+                <tbody id="rentcastComparablesBody">
+                    <tr>
+                        <td colspan="7" class="muted-text">Run a valuation to view comparables.</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
     <div class="rentcast-output-wrap">
         <div class="home-section-header rentcast-output-head">
             <div>
@@ -60,6 +103,11 @@
     const busyWrap = document.getElementById('rentcastBusy');
     const busyText = document.getElementById('rentcastBusyText');
     const output = document.getElementById('rentcastOutput');
+    const comparablesWrap = document.getElementById('rentcastComparablesWrap');
+    const comparablesBody = document.getElementById('rentcastComparablesBody');
+    const medianPriceEl = document.getElementById('rentcastMedianPrice');
+    const averagePriceEl = document.getElementById('rentcastAveragePrice');
+    const pricePerSqftEl = document.getElementById('rentcastPricePerSqft');
 
     function setBusy(isBusy, label) {
         if (busyWrap) busyWrap.classList.toggle('hidden', !isBusy);
@@ -74,6 +122,104 @@
         output.textContent = JSON.stringify(payload, null, 2);
     }
 
+    function escapeHtml(value) {
+        return String(value == null ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function formatCorrelation(value) {
+        const num = Number(value);
+        if (!Number.isFinite(num)) return '';
+        return `${Math.round(num * 100)}%`;
+    }
+
+    function formatDistance(value) {
+        const num = Number(value);
+        if (!Number.isFinite(num)) return '';
+        return num.toFixed(1);
+    }
+
+    function formatPrice(value) {
+        const num = Number(value);
+        if (!Number.isFinite(num)) return '';
+        return new Intl.NumberFormat('en-US', {
+            style: 'currency',
+            currency: 'USD',
+            maximumFractionDigits: 0
+        }).format(num);
+    }
+
+    function formatSqft(value) {
+        const num = Number(value);
+        if (!Number.isFinite(num)) return '';
+        return new Intl.NumberFormat('en-US', {
+            maximumFractionDigits: 0
+        }).format(num);
+    }
+
+    function updateSummaryCards(comparables) {
+        if (!medianPriceEl || !averagePriceEl || !pricePerSqftEl) return;
+        const prices = comparables
+            .map(function (item) { return Number(item.price); })
+            .filter(function (value) { return Number.isFinite(value); })
+            .sort(function (a, b) { return a - b; });
+        const totalPrice = prices.reduce(function (sum, value) { return sum + value; }, 0);
+        const medianPrice = !prices.length
+            ? null
+            : (prices.length % 2
+                ? prices[(prices.length - 1) / 2]
+                : (prices[(prices.length / 2) - 1] + prices[prices.length / 2]) / 2);
+        const averagePrice = prices.length ? (totalPrice / prices.length) : null;
+
+        let totalComparablePrice = 0;
+        let totalComparableSqft = 0;
+        comparables.forEach(function (item) {
+            const price = Number(item.price);
+            const sqft = Number(item.squareFootage);
+            if (Number.isFinite(price) && Number.isFinite(sqft) && sqft > 0) {
+                totalComparablePrice += price;
+                totalComparableSqft += sqft;
+            }
+        });
+        const pricePerSqft = totalComparableSqft > 0 ? (totalComparablePrice / totalComparableSqft) : null;
+
+        medianPriceEl.textContent = medianPrice == null ? '—' : formatPrice(medianPrice);
+        averagePriceEl.textContent = averagePrice == null ? '—' : formatPrice(averagePrice);
+        pricePerSqftEl.textContent = pricePerSqft == null ? '—' : formatPrice(pricePerSqft);
+    }
+
+    function renderComparables(payload) {
+        if (!comparablesWrap || !comparablesBody) return;
+        const comparables = Array.isArray(payload && payload.data && payload.data.comparables)
+            ? payload.data.comparables
+            : [];
+        if (!comparables.length) {
+            comparablesWrap.classList.add('hidden');
+            comparablesBody.innerHTML = '<tr><td colspan=\"7\" class=\"muted-text\">No comparable rows returned.</td></tr>';
+            updateSummaryCards([]);
+            return;
+        }
+        comparablesWrap.classList.remove('hidden');
+        updateSummaryCards(comparables);
+        comparablesBody.innerHTML = comparables.map(function (item) {
+            return `
+                <tr>
+                    <td>${escapeHtml(item.addressLine1 || '')}</td>
+                    <td>${escapeHtml(item.addressLine2 || '')}</td>
+                    <td>${escapeHtml(item.city || '')}</td>
+                    <td>${escapeHtml(formatCorrelation(item.correlation))}</td>
+                    <td>${escapeHtml(formatDistance(item.distance))}</td>
+                    <td>${escapeHtml(formatPrice(item.price))}</td>
+                    <td>${escapeHtml(formatSqft(item.squareFootage))}</td>
+                </tr>
+            `;
+        }).join('');
+    }
+
     async function runTool(action, label) {
         const address = (addressInput && addressInput.value || '').trim();
         if (!address) {
@@ -83,6 +229,7 @@
         }
 
         setBusy(true, label);
+        if (comparablesWrap) comparablesWrap.classList.add('hidden');
         renderJson({ ok: false, status: 'running', action, address });
 
         try {
@@ -108,8 +255,10 @@
                 payload = { ok: false, status_code: response.status, error: 'Request failed.' };
             }
             renderJson(payload);
+            renderComparables(payload);
         } catch (error) {
             renderJson({ ok: false, error: String(error) });
+            renderComparables({});
         } finally {
             setBusy(false);
         }

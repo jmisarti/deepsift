@@ -541,6 +541,15 @@ body {
     margin-bottom: 0.75rem;
 }
 
+.rentcast-summary-cards {
+    margin: 0 0 1rem;
+}
+
+.rentcast-summary-cards article p {
+    font-size: 1.6rem;
+    margin: 0.2rem 0 0;
+}
+
 .rentcast-output {
     background: #12212e;
     border-radius: 10px;

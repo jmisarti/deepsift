@@ -511,6 +511,49 @@ body {
     white-space: nowrap;
 }
 
+.rentcast-tool-panel {
+    display: grid;
+    gap: 1rem;
+}
+
+.rentcast-form-grid {
+    margin-top: 0;
+}
+
+.rentcast-action-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+}
+
+.rentcast-action-row button {
+    min-width: 210px;
+}
+
+.rentcast-output-wrap {
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: #f8fbfd;
+    padding: 1rem;
+}
+
+.rentcast-output-head {
+    margin-bottom: 0.75rem;
+}
+
+.rentcast-output {
+    background: #12212e;
+    border-radius: 10px;
+    color: #def2f4;
+    margin: 0;
+    max-height: 60vh;
+    min-height: 240px;
+    overflow: auto;
+    padding: 1rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 @media (max-width: 980px) {
     .app-shell {
         flex-direction: column;

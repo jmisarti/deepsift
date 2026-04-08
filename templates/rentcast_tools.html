@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel home-hero">
+    <div>
+        <h2>RentCast Tools</h2>
+        <p class="muted-text">Run a sale-listing lookup or valuation call and inspect the raw JSON response.</p>
+    </div>
+</section>
+
+<section class="panel rentcast-tool-panel">
+    <div class="home-section-header">
+        <div>
+            <h2>Address Lookup</h2>
+            <p class="muted-text">Uses the saved RentCast API key from Integration Settings.</p>
+        </div>
+    </div>
+
+    <div class="grid-form compact rentcast-form-grid">
+        <label class="span2">
+            <span>Property address</span>
+            <input
+                type="text"
+                id="rentcastAddress"
+                placeholder="123 Main St, Anytown, NJ 07000"
+                autocomplete="street-address"
+                spellcheck="false"
+            >
+        </label>
+    </div>
+
+    <div class="rentcast-action-row">
+        <button type="button" id="saleListingBtn">Run Sale Listing Check</button>
+        <button type="button" id="valuationBtn">Run Valuation</button>
+    </div>
+
+    <div class="busy-inline hidden" id="rentcastBusy">
+        <span class="busy-spinner" aria-hidden="true"></span>
+        <span id="rentcastBusyText">Running request...</span>
+    </div>
+
+    <div class="rentcast-output-wrap">
+        <div class="home-section-header rentcast-output-head">
+            <div>
+                <h2>JSON Response</h2>
+                <p class="muted-text">The raw API response will appear here.</p>
+            </div>
+        </div>
+        <pre class="rentcast-output" id="rentcastOutput">{
+  "status": "idle",
+  "message": "Enter an address and run a RentCast tool."
+}</pre>
+    </div>
+</section>
+
+<script>
+(function () {
+    const addressInput = document.getElementById('rentcastAddress');
+    const saleButton = document.getElementById('saleListingBtn');
+    const valuationButton = document.getElementById('valuationBtn');
+    const busyWrap = document.getElementById('rentcastBusy');
+    const busyText = document.getElementById('rentcastBusyText');
+    const output = document.getElementById('rentcastOutput');
+
+    function setBusy(isBusy, label) {
+        if (busyWrap) busyWrap.classList.toggle('hidden', !isBusy);
+        if (busyText) busyText.textContent = label || 'Running request...';
+        if (saleButton) saleButton.disabled = isBusy;
+        if (valuationButton) valuationButton.disabled = isBusy;
+        if (addressInput) addressInput.disabled = isBusy;
+    }
+
+    function renderJson(payload) {
+        if (!output) return;
+        output.textContent = JSON.stringify(payload, null, 2);
+    }
+
+    async function runTool(action, label) {
+        const address = (addressInput && addressInput.value || '').trim();
+        if (!address) {
+            renderJson({ ok: false, error: 'Address is required.' });
+            if (addressInput) addressInput.focus();
+            return;
+        }
+
+        setBusy(true, label);
+        renderJson({ ok: false, status: 'running', action, address });
+
+        try {
+            const response = await fetch('/api/tools/rentcast', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                body: JSON.stringify({ action, address })
+            });
+            let payload;
+            try {
+                payload = await response.json();
+            } catch (_err) {
+                payload = {
+                    ok: response.ok,
+                    status_code: response.status,
+                    error: 'Response was not valid JSON.'
+                };
+            }
+            if (!response.ok && (typeof payload !== 'object' || payload === null)) {
+                payload = { ok: false, status_code: response.status, error: 'Request failed.' };
+            }
+            renderJson(payload);
+        } catch (error) {
+            renderJson({ ok: false, error: String(error) });
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    if (saleButton) {
+        saleButton.addEventListener('click', function () {
+            runTool('sale_listing', 'Running sale listing check...');
+        });
+    }
+    if (valuationButton) {
+        valuationButton.addEventListener('click', function () {
+            runTool('valuation', 'Running valuation call...');
+        });
+    }
+    if (addressInput) {
+        addressInput.addEventListener('keydown', function (event) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                runTool('sale_listing', 'Running sale listing check...');
+            }
+        });
+    }
+})();
+</script>
+{% endblock %}

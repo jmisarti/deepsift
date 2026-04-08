@@ -15134,6 +15134,7 @@ def build_ga4_home_snapshot(db):
                 _coerce_metric_number(metric_values[idx].get("value") if idx < len(metric_values) else 0)
             )
         trend_rows.append({"date_raw": date_raw, "date_label": date_label, "metrics": metric_map})
+    trend_rows.sort(key=lambda item: str(item.get("date_raw") or ""), reverse=True)
     out["trend_rows"] = trend_rows
     out["ok"] = True
     return out
@@ -21391,6 +21392,76 @@ def infer_on_market_status_from_rentcast(db, full_address, previous_lookup=None)
     }
 
 
+def _rentcast_response_headers_map(response):
+    if response is None:
+        return {}
+    out = {}
+    for key in ["X-Total-Count", "Content-Type"]:
+        value = response.headers.get(key)
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def call_rentcast_address_tool(db, action, full_address):
+    action_key = normalize_whitespace(action).lower().replace("-", "_")
+    address = normalize_whitespace(full_address)
+    api_key = get_rentcast_api_key(db)
+    if not address:
+        raise ValueError("Address is required.")
+    if not api_key:
+        raise ValueError("RentCast API key is not configured.")
+
+    if action_key == "sale_listing":
+        endpoint_path = "/listings/sale"
+        params = {"address": address, "limit": 10}
+    elif action_key == "valuation":
+        endpoint_path = "/avm/value"
+        params = {"address": address}
+    else:
+        raise ValueError(f"Unsupported RentCast action: {action}")
+
+    response = None
+    response_body = None
+    try:
+        response = requests.get(
+            f"{RENTCAST_BASE_URL}{endpoint_path}",
+            headers={
+                "Accept": "application/json",
+                "X-Api-Key": api_key,
+            },
+            params=params,
+            timeout=30,
+        )
+        try:
+            response_body = response.json() if response.content else {}
+        except ValueError:
+            response_body = {"raw_text": response.text}
+    except Exception as exc:
+        raise ValueError(f"RentCast {action_key} request failed: {exc}") from exc
+
+    payload = {
+        "ok": bool(response.ok),
+        "action": action_key,
+        "address": address,
+        "endpoint": f"{RENTCAST_BASE_URL}{endpoint_path}",
+        "query": params,
+        "status_code": int(response.status_code),
+        "response_headers": _rentcast_response_headers_map(response),
+        "data": response_body,
+    }
+    if not response.ok:
+        log_app_error(
+            db,
+            source=f"rentcast_tool_{action_key}",
+            error_message=f"RentCast {action_key} failed ({response.status_code}).",
+            details=response_body,
+            route="/api/tools/rentcast",
+            status_code=response.status_code,
+        )
+    return payload
+
+
 def _normalize_listing_address_variants(full_address):
     address = re.sub(r"\s+", " ", str(full_address or "").strip())
     if not address:
@@ -25817,6 +25888,45 @@ def dashboard():
         status_filter=status_filter,
         q=q,
     )
+
+
+@app.route("/tools/rentcast")
+def rentcast_tools_page():
+    return render_template("rentcast_tools.html")
+
+
+@app.route("/api/tools/rentcast", methods=["POST"])
+def rentcast_tools_api():
+    ensure_db()
+    db = get_db()
+    action = ""
+    address = ""
+    try:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = {}
+        action = normalize_whitespace(payload.get("action") or request.form.get("action") or "")
+        address = normalize_whitespace(payload.get("address") or request.form.get("address") or "")
+        if not action:
+            raise ValueError("Action is required.")
+        if not address:
+            raise ValueError("Address is required.")
+        result = call_rentcast_address_tool(db, action, address)
+        db.commit()
+        status_code = int(result.get("status_code") or 200)
+        return jsonify(result), (200 if result.get("ok") else max(200, status_code))
+    except Exception as exc:
+        db.rollback()
+        return jsonify(
+            {
+                "ok": False,
+                "action": action,
+                "address": address,
+                "error": str(exc),
+            }
+        ), 400
+    finally:
+        db.close()
 
 
 def _anon_return_target():

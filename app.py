@@ -714,6 +714,7 @@ def require_login_if_enabled():
         return None
     integration_api_allowlist = {
         "/api/webhooks/smrtphone/events",
+        "/api/webhooks/clever/events",
         "/api/call-recording-jobs",
         "/api/integrations/agent-trace/search",
         "/api/integrations/agent-trace/property",
@@ -1062,6 +1063,20 @@ def migrate_db(db):
             note_body TEXT NOT NULL,
             payload_json TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clever_webhook_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT,
+            event_key TEXT,
+            processing_status TEXT NOT NULL DEFAULT 'received',
+            error_text TEXT,
+            payload_json TEXT,
+            headers_json TEXT,
+            received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
@@ -7032,6 +7047,92 @@ def get_recent_smrtphone_webhook_records(db, limit=20):
     return records[:limit]
 
 
+def log_clever_webhook_event(
+    db,
+    payload,
+    headers=None,
+    processing_status="received",
+    event_type="",
+    event_key="",
+    error_text="",
+):
+    try:
+        logs_dir = BASE_DIR / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(EST_TZ).strftime("%Y%m%d")
+        log_path = logs_dir / f"clever_webhooks_{stamp}.jsonl"
+        record = {
+            "logged_at": datetime.now(timezone.utc).isoformat(),
+            "event_type": (event_type or "").strip(),
+            "event_key": (event_key or "").strip(),
+            "processing_status": (processing_status or "").strip(),
+            "error_text": (error_text or "").strip(),
+            "headers": headers or {},
+            "payload": payload or {},
+        }
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+    try:
+        db.execute(
+            """
+            INSERT INTO clever_webhook_events
+            (event_type, event_key, processing_status, error_text, payload_json, headers_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (event_type or "").strip(),
+                (event_key or "").strip(),
+                (processing_status or "").strip(),
+                (error_text or "").strip(),
+                json.dumps(payload or {}),
+                json.dumps(headers or {}),
+            ),
+        )
+    except Exception:
+        pass
+
+
+def get_recent_clever_webhook_records(db, limit=20, event_type_filter=""):
+    try:
+        limit = max(1, min(int(limit or 20), 100))
+    except Exception:
+        limit = 20
+    filter_value = (event_type_filter or "").strip().lower()
+    rows = db.execute(
+        """
+        SELECT id, event_type, event_key, processing_status, error_text, payload_json, headers_json, received_at
+        FROM clever_webhook_events
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit * 5,),
+    ).fetchall()
+    items = []
+    for row in rows:
+        event_type = str(row["event_type"] or "").strip()
+        if filter_value and event_type.lower() != filter_value:
+            continue
+        payload = parse_json_object(row["payload_json"] or "{}", default={})
+        headers = parse_json_object(row["headers_json"] or "{}", default={})
+        items.append(
+            {
+                "id": int(row["id"]),
+                "received_at": str(row["received_at"] or "").strip(),
+                "event_type": event_type,
+                "event_key": str(row["event_key"] or "").strip(),
+                "processing_status": str(row["processing_status"] or "").strip(),
+                "error_text": str(row["error_text"] or "").strip(),
+                "headers": headers if isinstance(headers, dict) else {},
+                "payload": payload if isinstance(payload, dict) else {},
+            }
+        )
+        if len(items) >= limit:
+            break
+    return items
+
+
 def add_person_note(db, person_id, source, note_body, payload=None):
     if not person_id:
         return
@@ -9908,6 +10009,31 @@ def integration_auth_ok(db, req):
         (req.headers.get("X-Integration-Key") or "").strip()
         or (req.headers.get("Authorization") or "").replace("Bearer", "").strip()
     )
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, expected)
+
+
+def clever_integration_auth_ok(db, req):
+    expected = get_integration_api_key(db)
+    if not expected:
+        return False
+    provided = (
+        (req.headers.get("X-Integration-Key") or "").strip()
+        or (req.headers.get("Authorization") or "").replace("Bearer", "").strip()
+        or (req.args.get("key") or "").strip()
+        or (req.form.get("integration_key") or "").strip()
+        or (req.form.get("api_key") or "").strip()
+        or (req.form.get("key") or "").strip()
+    )
+    if not provided:
+        payload = req.get_json(silent=True)
+        if isinstance(payload, dict):
+            provided = (
+                (payload.get("integration_key") or "").strip()
+                or (payload.get("api_key") or "").strip()
+                or (payload.get("key") or "").strip()
+            )
     if not provided:
         return False
     return hmac.compare_digest(provided, expected)
@@ -28191,6 +28317,85 @@ def integrations_google_sheets_row_added_api():
     result = process_clever_lead_payload(db, payload, source_label="webhook")
     status_code = 500 if not result.get("ok") else 200
     return jsonify(result), status_code
+
+
+@app.route("/webhooks/clever/lead", methods=["POST", "GET", "OPTIONS"])
+def clever_lead_capture_webhook():
+    ensure_db()
+    db = get_db()
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True, "method": "OPTIONS"}), 200
+    if request.method == "GET":
+        return jsonify(
+            {
+                "ok": True,
+                "endpoint": "/webhooks/clever/lead",
+                "method": "POST",
+                "content_type": "application/x-www-form-urlencoded or application/json",
+                "auth": "X-Integration-Key, Authorization: Bearer <key>, or ?key=<integration_api_key>",
+                "status": "ready",
+            }
+        ), 200
+    if not clever_integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = request.form.to_dict() or {}
+    event_type = _payload_value_by_keys(payload, ["event_type"])
+    connection_id = _payload_value_by_keys(payload, ["connection_id"])
+    record_id = _payload_value_by_keys(payload, ["record_id"])
+    deal_id = _payload_value_by_keys(payload, ["deal_id"])
+    created_at_source = _payload_value_by_keys(payload, ["created_at_source"])
+    event_key_parts = [
+        p
+        for p in [
+            "clever",
+            event_type,
+            connection_id,
+            record_id or deal_id,
+            created_at_source,
+        ]
+        if str(p or "").strip()
+    ]
+    event_key = ":".join(event_key_parts)
+    if not event_key:
+        payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
+        event_key = f"clever:{payload_hash}"
+    header_map = {str(k): str(v) for k, v in request.headers.items()}
+    log_clever_webhook_event(
+        db,
+        payload,
+        headers=header_map,
+        processing_status="captured",
+        event_type=event_type,
+        event_key=event_key,
+    )
+    db.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "captured": True,
+            "event_type": event_type,
+            "event_key": event_key,
+            "field_count": len(payload),
+        }
+    ), 200
+
+
+@app.route("/api/webhooks/clever/events", methods=["GET"])
+def clever_webhook_events_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    limit_raw = (request.args.get("limit") or "20").strip()
+    event_type_filter = (request.args.get("event_type") or "").strip()
+    try:
+        limit = max(1, min(100, int(limit_raw)))
+    except ValueError:
+        limit = 20
+    items = get_recent_clever_webhook_records(db, limit=limit, event_type_filter=event_type_filter)
+    return jsonify({"ok": True, "items": items}), 200
 
 
 @app.route("/api/integrations/website/lead", methods=["POST", "GET", "OPTIONS"])

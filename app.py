@@ -28361,7 +28361,7 @@ def clever_lead_capture_webhook():
                 "endpoint": "/webhooks/clever/lead",
                 "method": "POST",
                 "content_type": "application/x-www-form-urlencoded or application/json",
-                "auth": "X-Integration-Key, Authorization: Bearer <key>, or ?key=<integration_api_key>",
+                "auth": "none",
                 "status": "ready",
             }
         ), 200
@@ -28389,18 +28389,6 @@ def clever_lead_capture_webhook():
     if not event_key:
         payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
         event_key = f"clever:{payload_hash}"
-    if not clever_integration_auth_ok(db, request):
-        log_clever_webhook_event(
-            db,
-            _redact_clever_log_value("", payload or {}),
-            headers=safe_headers,
-            processing_status="unauthorized",
-            event_type=event_type,
-            event_key=event_key,
-            error_text="Unauthorized",
-        )
-        db.commit()
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
     log_clever_webhook_event(
         db,
         payload,

@@ -1121,6 +1121,42 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_website_lead_status_expiry ON website_lead_submissions(status, hold_expires_at)")
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS clever_lead_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_key TEXT NOT NULL UNIQUE,
+            connection_id TEXT,
+            record_id TEXT,
+            deal_id TEXT,
+            reisift_property_uuid TEXT,
+            reisift_owner_uuid TEXT,
+            latest_address TEXT,
+            latest_phone TEXT,
+            latest_email TEXT,
+            latest_name TEXT,
+            latest_stage TEXT,
+            latest_event_type TEXT,
+            investor_id TEXT,
+            investor_name TEXT,
+            deal_name TEXT,
+            portal_connection_url TEXT,
+            source_created_at TEXT,
+            assignment_fee TEXT,
+            initial_offer_amount TEXT,
+            final_purchase_price TEXT,
+            latest_payload_json TEXT,
+            processing_result_json TEXT,
+            status TEXT NOT NULL DEFAULT 'captured',
+            first_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TEXT
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_connection_id ON clever_lead_submissions(connection_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_record_id ON clever_lead_submissions(record_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_status ON clever_lead_submissions(status, last_received_at)")
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS lead_monitor_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source TEXT NOT NULL DEFAULT 'manual',
@@ -11334,6 +11370,299 @@ def _find_existing_website_submission(db, fields):
     return None
 
 
+def _extract_clever_lead_fields(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    address = _payload_value_by_keys(payload, ["property_address", "address"])
+    parsed = _parse_search_address_simple(address)
+    normalized = _normalize_address_components(
+        street=parsed.get("street") or "",
+        city=parsed.get("city") or "",
+        state=_payload_value_by_keys(payload, ["property_state"]) or parsed.get("state") or "",
+        postal_code=_payload_value_by_keys(payload, ["property_zip"]) or parsed.get("postal_code") or "",
+        raw_address=address,
+    )
+    first_name = _payload_value_by_keys(payload, ["customer_first_name"])
+    last_name = _payload_value_by_keys(payload, ["customer_last_name"])
+    seller_name = normalize_whitespace(" ".join([x for x in [first_name, last_name] if x]))
+    return {
+        "event_type": _payload_value_by_keys(payload, ["event_type"]),
+        "connection_id": _payload_value_by_keys(payload, ["connection_id"]),
+        "record_id": _payload_value_by_keys(payload, ["record_id"]),
+        "deal_id": _payload_value_by_keys(payload, ["deal_id"]),
+        "investor_id": _payload_value_by_keys(payload, ["investor_id"]),
+        "investor_name": _payload_value_by_keys(payload, ["investor_name"]),
+        "deal_name": _payload_value_by_keys(payload, ["deal_name"]),
+        "address": normalized.get("address") or address,
+        "street": normalized.get("street") or "",
+        "city": normalized.get("city") or "",
+        "state": normalized.get("state") or "",
+        "postal_code": normalized.get("postal_code") or "",
+        "stage": _payload_value_by_keys(payload, ["clever_offers_deal_stage"]),
+        "source_created_at": _payload_value_by_keys(payload, ["created_at_source"]),
+        "assignment_fee": _payload_value_by_keys(payload, ["assignment_fee"]),
+        "initial_offer_amount": _payload_value_by_keys(payload, ["initial_offer_amount"]),
+        "final_purchase_price": _payload_value_by_keys(payload, ["final_purchase_price"]),
+        "portal_connection_url": _payload_value_by_keys(payload, ["portal_connection_url"]),
+        "first_name": first_name,
+        "last_name": last_name,
+        "seller_name": seller_name,
+        "email": _payload_value_by_keys(payload, ["customer_email"]),
+        "phone": _payload_value_by_keys(payload, ["customer_phone"]),
+    }
+
+
+def _derive_clever_lead_key(payload, fields):
+    fields = fields if isinstance(fields, dict) else {}
+    connection_id = str(fields.get("connection_id") or "").strip()
+    if connection_id:
+        return f"clever_connection:{connection_id}"
+    record_id = str(fields.get("record_id") or "").strip()
+    if record_id:
+        return f"clever_record:{record_id}"
+    deal_id = str(fields.get("deal_id") or "").strip()
+    if deal_id:
+        return f"clever_deal:{deal_id}"
+    clean_email = str(fields.get("email") or "").strip().lower()
+    clean_phone = normalize_phone(fields.get("phone") or "")
+    addr_key = _normalize_address_key(fields.get("address") or "")
+    if clean_email:
+        return f"clever_email:{clean_email}"
+    if clean_phone:
+        return f"clever_phone:{clean_phone}"
+    if addr_key:
+        return f"clever_address:{addr_key}"
+    payload_hash = hashlib.sha256(json.dumps(payload or {}, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
+    return f"clever_event:{payload_hash}"
+
+
+def _derive_clever_event_key(payload, fields):
+    fields = fields if isinstance(fields, dict) else {}
+    parts = [
+        "clever",
+        str(fields.get("event_type") or "").strip(),
+        str(fields.get("connection_id") or "").strip(),
+        str(fields.get("record_id") or fields.get("deal_id") or "").strip(),
+        str(fields.get("source_created_at") or "").strip(),
+    ]
+    parts = [p for p in parts if p]
+    if parts:
+        return ":".join(parts)
+    payload_hash = hashlib.sha256(json.dumps(payload or {}, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
+    return f"clever:{payload_hash}"
+
+
+def _find_existing_clever_submission(db, fields):
+    connection_id = str(fields.get("connection_id") or "").strip()
+    if connection_id:
+        row = db.execute(
+            "SELECT * FROM clever_lead_submissions WHERE connection_id = ? ORDER BY id DESC LIMIT 1",
+            (connection_id,),
+        ).fetchone()
+        if row:
+            return row
+    record_id = str(fields.get("record_id") or "").strip()
+    if record_id:
+        row = db.execute(
+            "SELECT * FROM clever_lead_submissions WHERE record_id = ? ORDER BY id DESC LIMIT 1",
+            (record_id,),
+        ).fetchone()
+        if row:
+            return row
+    deal_id = str(fields.get("deal_id") or "").strip()
+    if deal_id:
+        row = db.execute(
+            "SELECT * FROM clever_lead_submissions WHERE deal_id = ? ORDER BY id DESC LIMIT 1",
+            (deal_id,),
+        ).fetchone()
+        if row:
+            return row
+    target_email = str(fields.get("email") or "").strip().lower()
+    target_phone = normalize_phone(fields.get("phone") or "")
+    target_addr = _normalize_address_key(fields.get("address") or "")
+    if not (target_email or target_phone or target_addr):
+        return None
+    rows = db.execute(
+        """
+        SELECT *
+        FROM clever_lead_submissions
+        ORDER BY id DESC
+        LIMIT 500
+        """
+    ).fetchall()
+    for row in rows:
+        row_email = str(row["latest_email"] or "").strip().lower()
+        row_phone = normalize_phone(row["latest_phone"] or "")
+        row_addr = _normalize_address_key(row["latest_address"] or "")
+        if target_email and row_email and target_email == row_email:
+            return row
+        if target_phone and row_phone and target_phone == row_phone:
+            return row
+        if target_addr and row_addr and target_addr == row_addr:
+            return row
+    return None
+
+
+def _build_clever_lead_notes(payload, fields, source_label="webhook"):
+    fields = fields if isinstance(fields, dict) else {}
+    lines = [
+        "Source: Clever Webhook",
+        f"Ingest Source: {source_label}",
+    ]
+    ordered_fields = [
+        ("Event Type", fields.get("event_type")),
+        ("Connection ID", fields.get("connection_id")),
+        ("Record ID", fields.get("record_id")),
+        ("Deal ID", fields.get("deal_id")),
+        ("Investor ID", fields.get("investor_id")),
+        ("Investor Name", fields.get("investor_name")),
+        ("Deal Name", fields.get("deal_name")),
+        ("Clever Stage", fields.get("stage")),
+        ("Source Created At", fields.get("source_created_at")),
+        ("Property Address", fields.get("address")),
+        ("Property State", fields.get("state")),
+        ("Property Zip", fields.get("postal_code")),
+        ("Customer Name", fields.get("seller_name")),
+        ("Customer Email", fields.get("email")),
+        ("Customer Phone", fields.get("phone")),
+        ("Portal URL", fields.get("portal_connection_url")),
+        ("Assignment Fee", fields.get("assignment_fee")),
+        ("Initial Offer Amount", fields.get("initial_offer_amount")),
+        ("Final Purchase Price", fields.get("final_purchase_price")),
+    ]
+    for label, value in ordered_fields:
+        if str(value or "").strip():
+            lines.append(f"{label}: {value}")
+    missing_detail_labels = []
+    for label, value in [
+        ("Initial Offer Amount", fields.get("initial_offer_amount")),
+        ("Final Purchase Price", fields.get("final_purchase_price")),
+    ]:
+        if not str(value or "").strip():
+            missing_detail_labels.append(label)
+    if missing_detail_labels:
+        lines.append(f"Missing From Clever Payload: {', '.join(missing_detail_labels)}")
+    return "\n".join(lines)
+
+
+def _upsert_clever_submission_row(
+    db,
+    lead_key,
+    fields,
+    payload,
+    processing_result=None,
+    reisift_property_uuid="",
+    reisift_owner_uuid="",
+    status="processed",
+):
+    fields = fields if isinstance(fields, dict) else {}
+    payload_json = json.dumps(payload or {})
+    processing_json = json.dumps(processing_result or {})
+    current = db.execute(
+        "SELECT id FROM clever_lead_submissions WHERE lead_key = ? LIMIT 1",
+        (lead_key,),
+    ).fetchone()
+    if current:
+        db.execute(
+            """
+            UPDATE clever_lead_submissions
+            SET connection_id = ?,
+                record_id = ?,
+                deal_id = ?,
+                reisift_property_uuid = COALESCE(NULLIF(?, ''), reisift_property_uuid),
+                reisift_owner_uuid = COALESCE(NULLIF(?, ''), reisift_owner_uuid),
+                latest_address = ?,
+                latest_phone = ?,
+                latest_email = ?,
+                latest_name = ?,
+                latest_stage = ?,
+                latest_event_type = ?,
+                investor_id = ?,
+                investor_name = ?,
+                deal_name = ?,
+                portal_connection_url = ?,
+                source_created_at = ?,
+                assignment_fee = ?,
+                initial_offer_amount = ?,
+                final_purchase_price = ?,
+                latest_payload_json = ?,
+                processing_result_json = ?,
+                status = ?,
+                processed_at = ?,
+                last_received_at = CURRENT_TIMESTAMP
+            WHERE lead_key = ?
+            """,
+            (
+                fields.get("connection_id") or "",
+                fields.get("record_id") or "",
+                fields.get("deal_id") or "",
+                reisift_property_uuid or "",
+                reisift_owner_uuid or "",
+                fields.get("address") or "",
+                fields.get("phone") or "",
+                fields.get("email") or "",
+                fields.get("seller_name") or "",
+                fields.get("stage") or "",
+                fields.get("event_type") or "",
+                fields.get("investor_id") or "",
+                fields.get("investor_name") or "",
+                fields.get("deal_name") or "",
+                fields.get("portal_connection_url") or "",
+                fields.get("source_created_at") or "",
+                fields.get("assignment_fee") or "",
+                fields.get("initial_offer_amount") or "",
+                fields.get("final_purchase_price") or "",
+                payload_json,
+                processing_json,
+                status,
+                format_db_time(datetime.utcnow()),
+                lead_key,
+            ),
+        )
+        return "updated"
+    db.execute(
+        """
+        INSERT INTO clever_lead_submissions
+        (
+            lead_key, connection_id, record_id, deal_id,
+            reisift_property_uuid, reisift_owner_uuid,
+            latest_address, latest_phone, latest_email, latest_name,
+            latest_stage, latest_event_type,
+            investor_id, investor_name, deal_name, portal_connection_url,
+            source_created_at, assignment_fee, initial_offer_amount, final_purchase_price,
+            latest_payload_json, processing_result_json, status, processed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            lead_key,
+            fields.get("connection_id") or "",
+            fields.get("record_id") or "",
+            fields.get("deal_id") or "",
+            reisift_property_uuid or "",
+            reisift_owner_uuid or "",
+            fields.get("address") or "",
+            fields.get("phone") or "",
+            fields.get("email") or "",
+            fields.get("seller_name") or "",
+            fields.get("stage") or "",
+            fields.get("event_type") or "",
+            fields.get("investor_id") or "",
+            fields.get("investor_name") or "",
+            fields.get("deal_name") or "",
+            fields.get("portal_connection_url") or "",
+            fields.get("source_created_at") or "",
+            fields.get("assignment_fee") or "",
+            fields.get("initial_offer_amount") or "",
+            fields.get("final_purchase_price") or "",
+            payload_json,
+            processing_json,
+            status,
+            format_db_time(datetime.utcnow()),
+        ),
+    )
+    return "inserted"
+
+
 def _sift_record_url(property_uuid):
     pu = str(property_uuid or "").strip()
     if not pu:
@@ -13902,6 +14231,331 @@ def process_clever_lead_payload(db, payload, source_label="webhook"):
     return {"ok": True, "event_key": event_key}
 
 
+def process_clever_webhook_payload(db, payload, source_label="webhook"):
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "Invalid payload object.", "error_type": "validation"}
+
+    fields = _extract_clever_lead_fields(payload)
+    lead_key = _derive_clever_lead_key(payload, fields)
+    event_key = _derive_clever_event_key(payload, fields)
+    address = fields.get("address") or ""
+    seller_name = fields.get("seller_name") or ""
+    phone = fields.get("phone") or ""
+    email = fields.get("email") or ""
+
+    existing = db.execute(
+        "SELECT reisift_property_uuid FROM clever_lead_submissions WHERE lead_key = ? LIMIT 1",
+        (lead_key,),
+    ).fetchone()
+    existing_uuid = str(existing["reisift_property_uuid"] or "").strip() if existing else ""
+
+    automation = get_automation_settings(db)
+    if not automation.get("clever_leads_enabled"):
+        add_clever_webhook_note(
+            db,
+            event_key,
+            "\n".join(
+                [
+                    "Clever lead processing result",
+                    "Result: skipped",
+                    "Reason: Clever automation toggle is off",
+                ]
+            ),
+            {"lead_key": lead_key, "payload": payload},
+        )
+        db.commit()
+        return {
+            "ok": True,
+            "event_key": event_key,
+            "lead_key": lead_key,
+            "mode": "disabled",
+            "processing_skipped": True,
+        }
+
+    if not address:
+        add_clever_webhook_note(
+            db,
+            event_key,
+            "\n".join(
+                [
+                    "Clever lead processing result",
+                    "Result: skipped",
+                    "Reason: missing address",
+                ]
+            ),
+            {"lead_key": lead_key, "payload": payload},
+        )
+        db.commit()
+        return {
+            "ok": True,
+            "event_key": event_key,
+            "lead_key": lead_key,
+            "mode": "skipped_missing_address",
+            "processing_skipped": True,
+        }
+
+    is_new_event = upsert_integration_event(db, CLEVER_LEADS_EVENT_SOURCE, event_key, payload)
+    if source_label == "webhook" or is_new_event:
+        add_clever_webhook_note(
+            db,
+            event_key,
+            "\n".join(
+                [
+                    f"Clever webhook received ({source_label})",
+                    f"Lead Key: {lead_key}",
+                    f"Event Key: {event_key}",
+                    f"Event Type: {fields.get('event_type') or '-'}",
+                    f"Connection ID: {fields.get('connection_id') or '-'}",
+                    f"Record ID: {fields.get('record_id') or '-'}",
+                    f"Deal ID: {fields.get('deal_id') or '-'}",
+                    f"Address: {address or '-'}",
+                    f"Seller: {seller_name or '-'}",
+                    f"Phone: {phone or '-'}",
+                    f"Email: {email or '-'}",
+                ]
+            ),
+            payload,
+        )
+    db.commit()
+    if not is_new_event:
+        return {
+            "ok": True,
+            "duplicate": True,
+            "event_key": event_key,
+            "lead_key": lead_key,
+            "created_uuid": existing_uuid,
+        }
+
+    current = db.execute(
+        """
+        SELECT *
+        FROM clever_lead_submissions
+        WHERE lead_key = ?
+        LIMIT 1
+        """,
+        (lead_key,),
+    ).fetchone()
+    if current is None:
+        current = _find_existing_clever_submission(db, fields)
+        if current is not None:
+            lead_key = str(current["lead_key"] or lead_key)
+
+    previous_stage = str(current["latest_stage"] or "").strip() if current else ""
+    note_text = _build_clever_lead_notes(payload, fields, source_label=source_label)
+    owner_payload = {}
+    if fields.get("first_name") or fields.get("last_name"):
+        owner_payload["first_name"] = fields.get("first_name") or "Unknown"
+        owner_payload["last_name"] = fields.get("last_name") or "Owner"
+    if email:
+        owner_payload["emails"] = [email]
+    if phone:
+        owner_payload["phones"] = [{"number": phone, "type": "UNKNOWN", "status": "UNKNOWN"}]
+
+    create_payload = {
+        "search": address,
+        "street": fields.get("street") or "",
+        "city": fields.get("city") or "",
+        "state": fields.get("state") or "",
+        "postal_code": fields.get("postal_code") or "",
+        "status": "new_lead",
+        "lists": "Clever",
+        "tags": "clever,clever_webhook",
+        "notes": note_text,
+        "owner": owner_payload,
+        "skip_map_lookup": True,
+    }
+
+    created_uuid = str(current["reisift_property_uuid"] or "").strip() if current else ""
+    owner_uuid = str(current["reisift_owner_uuid"] or "").strip() if current else ""
+    duplicate_existing = False
+    duplicate_reason = ""
+    create_result = None
+    contact_sync = None
+    note_sync = None
+    post_status_result = {"ok": False, "skipped": True, "reason": "missing_created_uuid"}
+    referral_refresh_result = None
+    refresh_error = None
+    mode = "updated_existing" if current and created_uuid else "created"
+
+    try:
+        if not created_uuid:
+            create_result = create_reisift_property_from_search(create_payload)
+            created_uuid = str(create_result.get("created_uuid") or "").strip()
+            owner_uuid = str(create_result.get("owner_uuid") or "").strip()
+            duplicate_existing = bool(create_result.get("duplicate_existing"))
+            duplicate_reason = str(create_result.get("duplicate_reason") or "").strip()
+            contact_sync = create_result.get("owner_contact_sync")
+            if duplicate_existing:
+                mode = "sift_duplicate_existing"
+            else:
+                mode = "created"
+
+        token = reisift_get_access_token() if created_uuid else None
+        if token and not owner_uuid and created_uuid:
+            try:
+                owner_uuid = _reisift_find_owner_uuid(fetch_reisift_property_payload(token, created_uuid)) or owner_uuid
+            except Exception:
+                pass
+        if token and owner_uuid and not contact_sync and (phone or email):
+            contact_sync = reisift_upsert_owner_contacts(
+                token,
+                owner_uuid,
+                [{"number": phone, "type": "UNKNOWN"}] if phone else [],
+                [email] if email else [],
+            )
+        if token and created_uuid and (current is not None or duplicate_existing):
+            note_sync = reisift_append_property_note(token, created_uuid, note_text)
+        if token and created_uuid:
+            try:
+                post_status_result = reisift_update_property_status(token, created_uuid, "refer_lead")
+            except Exception as status_exc:
+                post_status_result = {"ok": False, "error": str(status_exc)}
+        if created_uuid:
+            for attempt in range(3):
+                try:
+                    if attempt > 0:
+                        time.sleep(2)
+                    referral_refresh_result = refresh_reisift_referrals_cache(db)
+                    refresh_error = None
+                    break
+                except Exception as refresh_exc:
+                    refresh_error = refresh_exc
+                    referral_refresh_result = {"ok": False, "error": str(refresh_exc), "attempt": attempt + 1}
+
+        processing_result = {
+            "lead_key": lead_key,
+            "mode": mode,
+            "created_uuid": created_uuid,
+            "owner_uuid": owner_uuid,
+            "duplicate_existing": duplicate_existing,
+            "duplicate_reason": duplicate_reason,
+            "create_result": create_result,
+            "contact_sync": contact_sync,
+            "note_sync": note_sync,
+            "post_status_result": post_status_result,
+            "referral_refresh_result": referral_refresh_result,
+        }
+        row_mode = _upsert_clever_submission_row(
+            db,
+            lead_key,
+            fields,
+            payload,
+            processing_result=processing_result,
+            reisift_property_uuid=created_uuid,
+            reisift_owner_uuid=owner_uuid,
+            status="processed",
+        )
+        should_slack = source_label == "webhook" and (current is None or previous_stage != (fields.get("stage") or ""))
+        if should_slack:
+            msg_lines = [
+                "New Clever Lead Received" if current is None else "Clever Lead Updated",
+                f"Mode: {mode}",
+                f"Connection ID: {fields.get('connection_id') or '-'}",
+                f"Stage: {fields.get('stage') or '-'}",
+                f"Address: {address or '-'}",
+                f"Seller: {seller_name or '-'}",
+                f"Phone: {phone or '-'}",
+                f"Email: {email or '-'}",
+            ]
+            if fields.get("portal_connection_url"):
+                msg_lines.append(f"Portal: {fields.get('portal_connection_url')}")
+            if created_uuid:
+                msg_lines.append(f"SIFT Record: {_sift_record_url(created_uuid)}")
+            slack_result = send_slack_notification(db, "\n".join(msg_lines))
+            if not slack_result.get("ok"):
+                log_app_error(
+                    db,
+                    source="clever_slack_notify",
+                    error_message=f"Slack notification failed: {slack_result.get('error') or 'Unknown error'}",
+                    details=json.dumps({"event_key": event_key, "lead_key": lead_key}),
+                    route="/webhooks/clever/lead",
+                    status_code=500,
+                )
+        add_clever_webhook_note(
+            db,
+            event_key,
+            "\n".join(
+                [
+                    "Clever lead processing result",
+                    "Result: success",
+                    f"Lead Key: {lead_key}",
+                    f"Mode: {mode}",
+                    f"Local Row: {row_mode}",
+                    f"SIFT Record: {_sift_record_url(created_uuid) or '-'}",
+                    f"Post-Enrich Status: {'refer_lead' if post_status_result and post_status_result.get('response') is not None else (post_status_result.get('error') or post_status_result.get('reason') or '-')}",
+                    f"Referral Queue: {'refreshed' if refresh_error is None else f'error ({refresh_error})'}",
+                ]
+            ),
+            processing_result,
+        )
+        db.commit()
+        return {
+            "ok": True,
+            "event_key": event_key,
+            "lead_key": lead_key,
+            "mode": mode,
+            "created_uuid": created_uuid,
+            "owner_uuid": owner_uuid,
+            "duplicate_existing": duplicate_existing,
+            "processing_result": processing_result,
+        }
+    except Exception as exc:
+        err_text = str(exc)
+        db.rollback()
+        try:
+            _upsert_clever_submission_row(
+                db,
+                lead_key,
+                fields,
+                payload,
+                processing_result={"error": err_text},
+                reisift_property_uuid=created_uuid,
+                reisift_owner_uuid=owner_uuid,
+                status="failed",
+            )
+            add_clever_webhook_note(
+                db,
+                event_key,
+                "\n".join(
+                    [
+                        "Clever lead processing result",
+                        "Result: failed",
+                        f"Lead Key: {lead_key}",
+                        f"Error: {err_text}",
+                    ]
+                ),
+                {"payload": payload, "error": err_text},
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+        try:
+            send_slack_notification(
+                db,
+                "\n".join(
+                    [
+                        "New Clever Lead Received",
+                        "Mode: failed",
+                        f"Address: {address or '-'}",
+                        f"Seller: {seller_name or '-'}",
+                        f"Error: {err_text}",
+                    ]
+                ),
+            )
+        except Exception:
+            pass
+        log_app_error(
+            db,
+            source="clever_webhook_process",
+            error_message=err_text,
+            details=traceback.format_exc(),
+            route="/webhooks/clever/lead",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "error": err_text, "event_key": event_key, "lead_key": lead_key}
+
+
 def email_sender_label(settings):
     provider = ((settings or {}).get("provider") or "gmail_api").strip().lower()
     if provider == "resend":
@@ -14510,12 +15164,11 @@ def build_home_lead_snapshot(db, days=7):
             db.execute(
                 """
                 SELECT COUNT(*) AS c
-                FROM integration_events
-                WHERE source = ?
-                  AND COALESCE(created_at, '') >= ?
-                  AND COALESCE(created_at, '') < ?
+                FROM clever_lead_submissions
+                WHERE COALESCE(first_received_at, '') >= ?
+                  AND COALESCE(first_received_at, '') < ?
                 """,
-                (CLEVER_LEADS_EVENT_SOURCE, start_utc, end_utc),
+                (start_utc, end_utc),
             ).fetchone()["c"]
         )
         carrot_total += carrot_count
@@ -15219,34 +15872,7 @@ def run_clever_leads_poll_once():
         automation = get_automation_settings(db)
         if not automation.get("clever_leads_enabled"):
             return {"ok": True, "skipped": "disabled"}
-        if not GOOGLE_SHEETS_SPREADSHEET_ID or not (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip():
-            return {"ok": True, "skipped": "missing_google_sheets_config"}
-        if service_account is None or GoogleAuthRequest is None:
-            return {"ok": True, "skipped": "google_auth_dependency_missing"}
-        rows = fetch_google_sheet_rows()
-        if GOOGLE_SHEETS_POLL_MODE == "latest_only" and rows:
-            rows = [rows[-1]]
-        processed = 0
-        duplicates = 0
-        failed = 0
-        for item in rows:
-            row_index = item.get("row_index")
-            row_data = item.get("row_data") if isinstance(item.get("row_data"), dict) else {}
-            payload = {
-                "spreadsheet_id": GOOGLE_SHEETS_SPREADSHEET_ID,
-                "sheet_name": GOOGLE_SHEETS_WORKSHEET_NAME,
-                "row_index": row_index,
-                "event_key": f"{GOOGLE_SHEETS_SPREADSHEET_ID}:{GOOGLE_SHEETS_WORKSHEET_NAME}:{row_index}",
-                "row_data": row_data,
-            }
-            result = process_clever_lead_payload(db, payload, source_label="poller")
-            if result.get("duplicate"):
-                duplicates += 1
-            elif result.get("ok"):
-                processed += 1
-            else:
-                failed += 1
-        return {"ok": True, "processed": processed, "duplicates": duplicates, "failed": failed, "rows": len(rows)}
+        return {"ok": True, "skipped": "webhook_only"}
     except Exception as exc:
         db.rollback()
         log_app_error(
@@ -28398,15 +29024,16 @@ def clever_lead_capture_webhook():
         event_key=event_key,
     )
     db.commit()
-    return jsonify(
-        {
-            "ok": True,
-            "captured": True,
-            "event_type": event_type,
-            "event_key": event_key,
-            "field_count": len(payload),
-        }
-    ), 200
+    result = process_clever_webhook_payload(db, payload, source_label="webhook")
+    status_code = 500 if not result.get("ok") else 200
+    response_payload = {
+        "captured": True,
+        "event_type": event_type,
+        "event_key": event_key,
+        "field_count": len(payload),
+    }
+    response_payload.update(result)
+    return jsonify(response_payload), status_code
 
 
 @app.route("/api/webhooks/clever/events", methods=["GET"])

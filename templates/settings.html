@@ -344,7 +344,7 @@
                 <tbody>
                     <tr>
                         <td><strong>Clever Leads</strong></td>
-                        <td>Polls Google Sheets on a recurring interval, ingests new rows from <em>List of Customers</em>, logs the payload, pushes to ReiSIFT, and notifies Slack.</td>
+                        <td>Receives Clever webhook leads, logs the raw payload, processes first-time connections into ReiSIFT, and refreshes the referral view. Turning this off stops Clever lead processing while still allowing raw webhook capture for debugging.</td>
                         <td>
                             <form method="post" class="automation-toggle-form">
                                 <input type="hidden" name="settings_tab" value="automations">

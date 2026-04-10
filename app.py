@@ -11888,11 +11888,11 @@ def website_has_google_ads_attribution(payload):
     return str(attribution.get("utm_source") or "").strip().lower() == "google"
 
 
-def build_website_reisift_tags(stage_value="", step1_payload=None):
+def build_website_reisift_tags(step_tag="", step1_payload=None):
     tags = ["website", "webhook", "carrot"]
     if website_has_google_ads_attribution(step1_payload):
         tags.append("GoogleAds")
-    tags.append(str(stage_value or "stage_unknown").strip() or "stage_unknown")
+    tags.append(str(step_tag or "Stage1").strip() or "Stage1")
     seen = set()
     ordered = []
     for tag in tags:
@@ -12254,7 +12254,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 "postal_code": merged_fields.get("postal_code") or "",
                 "status": "new_lead",
                 "lists": "Carrot",
-                "tags": build_website_reisift_tags(merged_fields.get("stage"), step1_payload),
+                "tags": build_website_reisift_tags("Stage2", step1_payload),
                 "notes": f"{notes}\n\n{additional_note}".strip() if additional_note else notes,
                 "owner": owner_payload,
                 "skip_map_lookup": True,
@@ -16257,7 +16257,7 @@ def run_website_step1_hold_once():
                         "postal_code": merged_fields.get("postal_code") or "",
                         "status": "new_lead",
                         "lists": "Carrot",
-                        "tags": build_website_reisift_tags(merged_fields.get("stage"), step1_payload),
+                        "tags": build_website_reisift_tags("Stage1", step1_payload),
                         "notes": f"{notes}\n\n{additional_note}".strip() if additional_note else notes,
                         "owner": owner_payload,
                         "skip_map_lookup": True,

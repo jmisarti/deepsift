@@ -37,6 +37,7 @@
                     <p class="sidebar-group-title">Other</p>
                     <a class="sidebar-link {% if request.path.startswith('/ads') %}active{% endif %}" href="{{ url_for('ads_dashboard') }}">Advertisements</a>
                     <a class="sidebar-link {% if request.path.startswith('/agents') %}active{% endif %}" href="{{ url_for('agents_page') }}">Agents</a>
+                    <a class="sidebar-link {% if request.path.startswith('/buyers') %}active{% endif %}" href="{{ url_for('buyers_page') }}">Buyers</a>
                 </div>
             </nav>
         </aside>

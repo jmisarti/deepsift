@@ -77,7 +77,6 @@
                     <th>Step-1</th>
                     <th>Step-2</th>
                     <th>Source</th>
-                    <th>GCLID</th>
                     <th>Open</th>
                 </tr>
             </thead>
@@ -88,7 +87,6 @@
                     <td>{{ 'Y' if row.step1_yes else 'N' }}</td>
                     <td>{{ 'Y' if row.step2_yes else 'N' }}</td>
                     <td title="{{ row.source|title }}">{{ row.source_short }}</td>
-                    <td class="ad-leads-gclid-cell" title="{{ row.gclid }}">{{ row.gclid or '-' }}</td>
                     <td class="ad-leads-links-cell">
                         <span class="ad-leads-link-icons">
                             {% if row.reisift_url %}
@@ -96,20 +94,15 @@
                                 <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
                             </a>
                             {% endif %}
-                            {% if row.page_url %}
-                            <a class="action-icon-link" href="{{ row.page_url }}" target="_blank" rel="noopener noreferrer" title="Open IWBYHFC page URL" aria-label="Open IWBYHFC page URL">
+                            <a class="action-icon-link" href="{{ url_for('ads_lead_detail_page', lead_id=row.id) }}" title="Open stored website lead" aria-label="Open stored website lead">
                                 <img class="tiny-link-icon" src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/08/cropped-nj-logo-tiny-32x32.png" alt="IWBYHFC">
                             </a>
-                            {% endif %}
-                            {% if not row.reisift_url and not row.page_url %}
-                            -
-                            {% endif %}
                         </span>
                     </td>
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="6">No attributed website leads found yet.</td>
+                    <td colspan="5">No attributed website leads found yet.</td>
                 </tr>
                 {% endfor %}
             </tbody>

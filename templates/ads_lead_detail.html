@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <div class="inline-actions ads-toolbar">
+        <div>
+            <h2>Tracked Website Lead #{{ lead.id }}</h2>
+            <p class="anon-muted">Stored website submission record with attribution, processing details, and raw step payloads.</p>
+        </div>
+        <div class="ad-lead-detail-actions">
+            <a href="{{ url_for('ads_lead_attribution_page') }}">Back to Tracked Leads</a>
+            {% if lead.reisift_url %}
+            <a class="action-icon-link" href="{{ lead.reisift_url }}" target="_blank" rel="noopener noreferrer" title="Open in REISift" aria-label="Open in REISift">
+                <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+            </a>
+            {% endif %}
+        </div>
+    </div>
+</section>
+
+<section class="panel">
+    <div class="ad-lead-meta-grid">
+        <article class="ad-lead-meta-card">
+            <h3>Address</h3>
+            <p>{{ lead.address or '-' }}</p>
+        </article>
+        <article class="ad-lead-meta-card">
+            <h3>Contact</h3>
+            <p>{{ lead.name or '-' }}</p>
+            <p>{{ lead.phone or '-' }}</p>
+            <p>{{ lead.email or '-' }}</p>
+        </article>
+        <article class="ad-lead-meta-card">
+            <h3>Submission</h3>
+            <p>Step-1: {{ 'Y' if lead.step1_yes else 'N' }}</p>
+            <p>Step-2: {{ 'Y' if lead.step2_yes else 'N' }}</p>
+            <p>Status: {{ lead.status or '-' }}</p>
+        </article>
+        <article class="ad-lead-meta-card">
+            <h3>Attribution</h3>
+            <p>Source: {{ lead.source|title }}</p>
+            <p>Campaign: {{ lead.campaign_label or '-' }}</p>
+            <p>UTM Campaign: {{ lead.utm_campaign or '-' }}</p>
+            <p>GAD Campaign ID: {{ lead.gad_campaignid or '-' }}</p>
+            <p>GCLID: {{ lead.gclid or '-' }}</p>
+        </article>
+        <article class="ad-lead-meta-card">
+            <h3>Timing</h3>
+            <p>First Received: {{ lead.first_received_at or '-' }}</p>
+            <p>Last Received: {{ lead.last_received_at or '-' }}</p>
+            <p>Hold Expires: {{ lead.hold_expires_at or '-' }}</p>
+            <p>Processed: {{ lead.processed_at or '-' }}</p>
+        </article>
+        <article class="ad-lead-meta-card">
+            <h3>Keys</h3>
+            <p>Lead Key: {{ lead.lead_key or '-' }}</p>
+            <p>ReiSift UUID: {{ lead.reisift_property_uuid or '-' }}</p>
+            <p>Owner UUID: {{ lead.reisift_owner_uuid or '-' }}</p>
+        </article>
+    </div>
+</section>
+
+<section class="panel">
+    <h3>Processing Result</h3>
+    <pre class="payload-output">{{ lead.processing_result | tojson(indent=2) }}</pre>
+</section>
+
+<section class="panel">
+    <h3>Webhook Notes</h3>
+    {% for note in lead.notes %}
+    <details class="ad-lead-note-item" {% if loop.first %}open{% endif %}>
+        <summary>{{ note.created_at or '-' }} | Note #{{ note.id }}</summary>
+        <pre class="payload-output">{{ note.note_body }}</pre>
+        {% if note.payload %}
+        <pre class="payload-output">{{ note.payload | tojson(indent=2) }}</pre>
+        {% endif %}
+    </details>
+    {% else %}
+    <p class="anon-muted">No webhook notes recorded for this lead.</p>
+    {% endfor %}
+</section>
+
+<section class="panel">
+    <h3>Step-1 Payload</h3>
+    <pre class="payload-output">{{ lead.step1_payload | tojson(indent=2) }}</pre>
+</section>
+
+<section class="panel">
+    <h3>Step-2 Payload</h3>
+    <pre class="payload-output">{{ lead.step2_payload | tojson(indent=2) }}</pre>
+</section>
+{% endblock %}

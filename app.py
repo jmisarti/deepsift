@@ -11944,6 +11944,8 @@ def _build_website_attribution_hover(item):
         parts.append(f"UTM Campaign: {item.get('utm_campaign')}")
     if item.get("gad_campaignid"):
         parts.append(f"GAD Campaign ID: {item.get('gad_campaignid')}")
+    if item.get("gclid"):
+        parts.append(f"GCLID: {item.get('gclid')}")
     return "\n".join(parts)
 
 
@@ -29080,6 +29082,98 @@ def ads_lead_attribution_page():
         source_options=source_options,
         pagination=pagination,
     )
+
+
+@app.route("/ads/leads/<int:lead_id>", methods=["GET"])
+def ads_lead_detail_page(lead_id):
+    ensure_db()
+    db = get_db()
+    row = db.execute(
+        """
+        SELECT id,
+               lead_key,
+               reisift_property_uuid,
+               reisift_owner_uuid,
+               latest_address,
+               latest_phone,
+               latest_email,
+               latest_name,
+               latest_stage,
+               status,
+               first_received_at,
+               last_received_at,
+               hold_expires_at,
+               processed_at,
+               processing_result_json,
+               step1_payload_json,
+               step2_payload_json
+        FROM website_lead_submissions
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (lead_id,),
+    ).fetchone()
+    if not row:
+        return redirect(url_for("ads_lead_attribution_page", notice=f"Tracked website lead #{lead_id} was not found."))
+
+    step1_payload = parse_json_object(row["step1_payload_json"] or "{}")
+    step2_payload = parse_json_object(row["step2_payload_json"] or "{}")
+    processing_result = parse_json_object(row["processing_result_json"] or "{}")
+    attribution = extract_website_campaign_attribution(step1_payload if isinstance(step1_payload, dict) else {})
+    source_value = str(attribution.get("utm_source") or "").strip().lower()
+    if not source_value and str(attribution.get("gclid") or "").strip():
+        source_value = "google"
+    notes = db.execute(
+        """
+        SELECT id, note_body, payload_json, created_at
+        FROM website_lead_webhook_notes
+        WHERE lead_key = ?
+        ORDER BY id DESC
+        LIMIT 50
+        """,
+        (str(row["lead_key"] or ""),),
+    ).fetchall()
+    note_rows = []
+    for note in notes:
+        note_rows.append(
+            {
+                "id": int(note["id"]),
+                "created_at": str(note["created_at"] or ""),
+                "note_body": str(note["note_body"] or "").strip(),
+                "payload": parse_json_object(note["payload_json"] or "{}"),
+            }
+        )
+    lead = {
+        "id": int(row["id"]),
+        "lead_key": str(row["lead_key"] or "").strip(),
+        "reisift_property_uuid": str(row["reisift_property_uuid"] or "").strip(),
+        "reisift_owner_uuid": str(row["reisift_owner_uuid"] or "").strip(),
+        "reisift_url": _sift_record_url(row["reisift_property_uuid"]),
+        "address": str(row["latest_address"] or "").strip(),
+        "phone": str(row["latest_phone"] or "").strip(),
+        "email": str(row["latest_email"] or "").strip(),
+        "name": str(row["latest_name"] or "").strip(),
+        "stage": str(row["latest_stage"] or "").strip(),
+        "status": str(row["status"] or "").strip(),
+        "first_received_at": str(row["first_received_at"] or ""),
+        "last_received_at": str(row["last_received_at"] or ""),
+        "hold_expires_at": str(row["hold_expires_at"] or ""),
+        "processed_at": str(row["processed_at"] or ""),
+        "step1_yes": bool(str(row["step1_payload_json"] or "").strip()),
+        "step2_yes": bool(str(row["step2_payload_json"] or "").strip()),
+        "source": source_value or "unknown",
+        "source_short": _compact_source_label(source_value),
+        "campaign_label": _website_campaign_group_label(attribution),
+        "utm_campaign": str(attribution.get("utm_campaign") or "").strip(),
+        "gad_campaignid": str(attribution.get("gad_campaignid") or "").strip(),
+        "gclid": str(attribution.get("gclid") or "").strip(),
+        "page_url": str(attribution.get("page_url") or "").strip(),
+        "step1_payload": step1_payload,
+        "step2_payload": step2_payload,
+        "processing_result": processing_result,
+        "notes": note_rows,
+    }
+    return render_template("ads_lead_detail.html", lead=lead)
 
 
 @app.route("/ads/refresh", methods=["POST"])

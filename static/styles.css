@@ -590,6 +590,56 @@ body {
     min-width: 2rem;
 }
 
+.ad-lead-detail-actions {
+    align-items: center;
+    display: inline-flex;
+    gap: 0.75rem;
+}
+
+.ad-lead-meta-grid {
+    display: grid;
+    gap: 0.9rem;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.ad-lead-meta-card {
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 0.9rem 1rem;
+}
+
+.ad-lead-meta-card h3 {
+    margin-bottom: 0.55rem;
+}
+
+.ad-lead-meta-card p {
+    margin: 0.2rem 0;
+}
+
+.ad-lead-note-item {
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    margin-bottom: 0.75rem;
+    padding: 0.7rem 0.9rem;
+}
+
+.ad-lead-note-item summary {
+    cursor: pointer;
+    font-weight: 700;
+    margin-bottom: 0.75rem;
+}
+
+.payload-output {
+    background: #12212e;
+    border-radius: 10px;
+    color: #def2f4;
+    margin: 0;
+    overflow: auto;
+    padding: 1rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 .ad-leads-pagination-summary {
     color: var(--muted);
     font-size: 0.9rem;

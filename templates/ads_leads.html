@@ -66,6 +66,9 @@
 
 <section class="panel">
     <h3>Tracked Website Leads</h3>
+    {% if pagination.total_rows %}
+    <p class="ad-leads-pagination-summary">Showing {{ pagination.start_index }}-{{ pagination.end_index }} of {{ pagination.total_rows }} tracked leads.</p>
+    {% endif %}
     <div class="table-wrap">
         <table class="compact-table home-trend-table ad-leads-table">
             <thead>
@@ -74,39 +77,64 @@
                     <th>Step-1</th>
                     <th>Step-2</th>
                     <th>Source</th>
-                    <th>Campaign</th>
-                    <th>UTM Campaign</th>
-                    <th>GAD Campaign ID</th>
                     <th>GCLID</th>
-                    <th>Page URL</th>
+                    <th>Open</th>
                 </tr>
             </thead>
             <tbody>
                 {% for row in lead_rows %}
                 <tr>
-                    <td>{{ row.address or '-' }}</td>
-                    <td>{{ 'Yes' if row.step1_yes else 'No' }}</td>
-                    <td>{{ 'Yes' if row.step2_yes else 'No' }}</td>
-                    <td>{{ row.source|title }}</td>
-                    <td>{{ row.campaign_label }}</td>
-                    <td>{{ row.utm_campaign or '-' }}</td>
-                    <td>{{ row.gad_campaignid or '-' }}</td>
+                    <td title="{{ row.address_hover }}">{{ row.address or '-' }}</td>
+                    <td>{{ 'Y' if row.step1_yes else 'N' }}</td>
+                    <td>{{ 'Y' if row.step2_yes else 'N' }}</td>
+                    <td title="{{ row.source|title }}">{{ row.source_short }}</td>
                     <td class="ad-leads-gclid-cell" title="{{ row.gclid }}">{{ row.gclid or '-' }}</td>
-                    <td class="ad-leads-url-cell">
-                        {% if row.page_url %}
-                        <a href="{{ row.page_url }}" target="_blank" rel="noopener noreferrer">Open</a>
-                        {% else %}
-                        -
-                        {% endif %}
+                    <td class="ad-leads-links-cell">
+                        <span class="ad-leads-link-icons">
+                            {% if row.reisift_url %}
+                            <a class="action-icon-link" href="{{ row.reisift_url }}" target="_blank" rel="noopener noreferrer" title="Open in REISift" aria-label="Open in REISift">
+                                <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+                            </a>
+                            {% endif %}
+                            {% if row.page_url %}
+                            <a class="action-icon-link" href="{{ row.page_url }}" target="_blank" rel="noopener noreferrer" title="Open IWBYHFC page URL" aria-label="Open IWBYHFC page URL">
+                                <img class="tiny-link-icon" src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/08/cropped-nj-logo-tiny-32x32.png" alt="IWBYHFC">
+                            </a>
+                            {% endif %}
+                            {% if not row.reisift_url and not row.page_url %}
+                            -
+                            {% endif %}
+                        </span>
                     </td>
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="9">No attributed website leads found yet.</td>
+                    <td colspan="6">No attributed website leads found yet.</td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
+    {% if pagination.total_pages > 1 %}
+    <nav class="anon-pagination ad-leads-pagination" aria-label="Tracked website leads pages">
+        {% if pagination.has_prev %}
+        <a href="{{ url_for('ads_lead_attribution_page', q=q, source=source, page=pagination.prev_page) }}">Previous</a>
+        {% else %}
+        <span class="is-disabled">Previous</span>
+        {% endif %}
+        {% for page_number in pagination.page_numbers %}
+            {% if page_number == pagination.page %}
+            <span class="is-current">{{ page_number }}</span>
+            {% else %}
+            <a href="{{ url_for('ads_lead_attribution_page', q=q, source=source, page=page_number) }}">{{ page_number }}</a>
+            {% endif %}
+        {% endfor %}
+        {% if pagination.has_next %}
+        <a href="{{ url_for('ads_lead_attribution_page', q=q, source=source, page=pagination.next_page) }}">Next</a>
+        {% else %}
+        <span class="is-disabled">Next</span>
+        {% endif %}
+    </nav>
+    {% endif %}
 </section>
 {% endblock %}

@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import imaplib
+import math
 import mimetypes
 import os
 import random
@@ -11759,6 +11760,23 @@ def _build_website_lead_notes(payload, fields, source_label="webhook"):
     for label, value in standard:
         if value:
             lines.append(f"{label}: {value}")
+    attribution = extract_website_campaign_attribution(payload if isinstance(payload, dict) else {})
+    source_value = str(attribution.get("utm_source") or "").strip().lower()
+    if not source_value and str(attribution.get("gclid") or "").strip():
+        source_value = "google"
+    campaign_label = _website_campaign_group_label(attribution)
+    if source_value or campaign_label != "Untracked":
+        lines.append("Attribution:")
+        if source_value:
+            lines.append(f"Ad Source: {source_value.title()}")
+        if campaign_label and campaign_label != "Untracked":
+            lines.append(f"Campaign: {campaign_label}")
+        if attribution.get("utm_campaign"):
+            lines.append(f"UTM Campaign: {attribution.get('utm_campaign')}")
+        if attribution.get("gad_campaignid"):
+            lines.append(f"GAD Campaign ID: {attribution.get('gad_campaignid')}")
+        if attribution.get("gclid"):
+            lines.append(f"GCLID: {attribution.get('gclid')}")
     return "\n".join(lines)
 
 
@@ -11905,9 +11923,41 @@ def build_website_reisift_tags(step_tag="", step1_payload=None):
     return ",".join(ordered)
 
 
-def build_website_ad_lead_snapshot(db, q="", source=""):
+def _compact_source_label(source_value):
+    source_value = str(source_value or "").strip().lower()
+    if not source_value:
+        return "-"
+    if source_value == "google":
+        return "G"
+    first = next((char.upper() for char in source_value if char.isalpha()), "")
+    return first or source_value[:1].upper() or "-"
+
+
+def _build_website_attribution_hover(item):
+    item = item if isinstance(item, dict) else {}
+    parts = []
+    if item.get("source"):
+        parts.append(f"Source: {str(item.get('source') or '').title()}")
+    if item.get("campaign_label") and str(item.get("campaign_label") or "").strip() != "Untracked":
+        parts.append(f"Campaign: {item.get('campaign_label')}")
+    if item.get("utm_campaign"):
+        parts.append(f"UTM Campaign: {item.get('utm_campaign')}")
+    if item.get("gad_campaignid"):
+        parts.append(f"GAD Campaign ID: {item.get('gad_campaignid')}")
+    return "\n".join(parts)
+
+
+def build_website_ad_lead_snapshot(db, q="", source="", page=1, per_page=50):
     q = normalize_whitespace(q)
     source = normalize_whitespace(source).lower()
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        per_page = max(1, min(200, int(per_page)))
+    except (TypeError, ValueError):
+        per_page = 50
     rows = db.execute(
         """
         SELECT id,
@@ -11969,6 +12019,7 @@ def build_website_ad_lead_snapshot(db, q="", source=""):
             "id": int(row["id"]),
             "lead_key": str(row["lead_key"] or ""),
             "reisift_property_uuid": str(row["reisift_property_uuid"] or ""),
+            "reisift_url": _sift_record_url(row["reisift_property_uuid"]),
             "address": str(row["latest_address"] or "").strip(),
             "name": str(row["latest_name"] or "").strip(),
             "phone": str(row["latest_phone"] or "").strip(),
@@ -11986,6 +12037,8 @@ def build_website_ad_lead_snapshot(db, q="", source=""):
             "utm_campaign": str(attribution.get("utm_campaign") or "").strip(),
             "gad_campaignid": str(attribution.get("gad_campaignid") or "").strip(),
         }
+        item["source_short"] = _compact_source_label(item["source"])
+        item["address_hover"] = _build_website_attribution_hover(item)
         lead_rows.append(item)
         bucket_key = (
             item["source"],
@@ -12022,7 +12075,24 @@ def build_website_ad_lead_snapshot(db, q="", source=""):
         "campaigns": len(campaign_rows),
     }
     source_options = sorted({row["source"] for row in lead_rows if row["source"]})
-    return lead_rows, campaign_rows, totals, source_options
+    total_pages = max(1, math.ceil(len(lead_rows) / per_page)) if lead_rows else 1
+    page = min(page, total_pages)
+    start_index = (page - 1) * per_page
+    paged_rows = lead_rows[start_index : start_index + per_page]
+    pagination = {
+        "page": page,
+        "per_page": per_page,
+        "total_rows": len(lead_rows),
+        "total_pages": total_pages,
+        "start_index": start_index + 1 if paged_rows else 0,
+        "end_index": start_index + len(paged_rows),
+        "has_prev": page > 1,
+        "has_next": page < total_pages,
+        "prev_page": page - 1 if page > 1 else 1,
+        "next_page": page + 1 if page < total_pages else total_pages,
+        "page_numbers": list(range(max(1, page - 2), min(total_pages, page + 2) + 1)),
+    }
+    return paged_rows, campaign_rows, totals, source_options, pagination
 
 
 def process_website_lead_payload(db, payload, source_label="webhook"):
@@ -28989,7 +29059,17 @@ def ads_lead_attribution_page():
     db = get_db()
     q = (request.args.get("q") or "").strip()
     source = (request.args.get("source") or "").strip().lower()
-    lead_rows, campaign_rows, totals, source_options = build_website_ad_lead_snapshot(db, q=q, source=source)
+    page_raw = (request.args.get("page") or "1").strip()
+    try:
+        page = max(1, int(page_raw))
+    except ValueError:
+        page = 1
+    lead_rows, campaign_rows, totals, source_options, pagination = build_website_ad_lead_snapshot(
+        db,
+        q=q,
+        source=source,
+        page=page,
+    )
     return render_template(
         "ads_leads.html",
         q=q,
@@ -28998,6 +29078,7 @@ def ads_lead_attribution_page():
         campaign_rows=campaign_rows,
         totals=totals,
         source_options=source_options,
+        pagination=pagination,
     )
 
 

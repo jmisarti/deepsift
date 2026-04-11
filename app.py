@@ -29123,6 +29123,19 @@ def ads_lead_detail_page(lead_id):
     source_value = str(attribution.get("utm_source") or "").strip().lower()
     if not source_value and str(attribution.get("gclid") or "").strip():
         source_value = "google"
+    parsed_address = _parse_search_address_simple(str(row["latest_address"] or "").strip())
+    local_property_id = 0
+    if parsed_address.get("street") and parsed_address.get("city"):
+        local_property_id = int(
+            find_local_property_by_address(
+                db,
+                parsed_address.get("street"),
+                parsed_address.get("city"),
+                parsed_address.get("state"),
+                parsed_address.get("postal_code"),
+            )
+            or 0
+        )
     notes = db.execute(
         """
         SELECT id, note_body, payload_json, created_at
@@ -29149,6 +29162,7 @@ def ads_lead_detail_page(lead_id):
         "reisift_property_uuid": str(row["reisift_property_uuid"] or "").strip(),
         "reisift_owner_uuid": str(row["reisift_owner_uuid"] or "").strip(),
         "reisift_url": _sift_record_url(row["reisift_property_uuid"]),
+        "local_property_id": local_property_id,
         "address": str(row["latest_address"] or "").strip(),
         "phone": str(row["latest_phone"] or "").strip(),
         "email": str(row["latest_email"] or "").strip(),
@@ -29168,6 +29182,7 @@ def ads_lead_detail_page(lead_id):
         "gad_campaignid": str(attribution.get("gad_campaignid") or "").strip(),
         "gclid": str(attribution.get("gclid") or "").strip(),
         "page_url": str(attribution.get("page_url") or "").strip(),
+        "parsed_address": parsed_address,
         "step1_payload": step1_payload,
         "step2_payload": step2_payload,
         "processing_result": processing_result,

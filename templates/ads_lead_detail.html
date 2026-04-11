@@ -1,66 +1,72 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="panel">
+    <h2>Tracked Website Lead #{{ lead.id }}</h2>
+    <p class="anon-muted">Stored website submission record with attribution, processing details, and raw step payloads.</p>
     <div class="inline-actions ads-toolbar">
-        <div>
-            <h2>Tracked Website Lead #{{ lead.id }}</h2>
-            <p class="anon-muted">Stored website submission record with attribution, processing details, and raw step payloads.</p>
-        </div>
-        <div class="ad-lead-detail-actions">
-            <a href="{{ url_for('ads_lead_attribution_page') }}">Back to Tracked Leads</a>
-            {% if lead.reisift_url %}
-            <a class="action-icon-link" href="{{ lead.reisift_url }}" target="_blank" rel="noopener noreferrer" title="Open in REISift" aria-label="Open in REISift">
-                <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
-            </a>
-            {% endif %}
-        </div>
+        <a href="{{ url_for('ads_lead_attribution_page') }}">Back to Tracked Leads</a>
+        {% if lead.reisift_url %}
+        <a href="{{ lead.reisift_url }}" target="_blank" rel="noopener noreferrer">Open REISift Record</a>
+        {% endif %}
+        {% if lead.local_property_id %}
+        <a href="{{ url_for('property_detail', property_id=lead.local_property_id) }}">Open Deep Dive Record</a>
+        {% endif %}
     </div>
 </section>
 
 <section class="panel">
-    <div class="ad-lead-meta-grid">
-        <article class="ad-lead-meta-card">
-            <h3>Address</h3>
-            <p>{{ lead.address or '-' }}</p>
-        </article>
-        <article class="ad-lead-meta-card">
-            <h3>Contact</h3>
-            <p>{{ lead.name or '-' }}</p>
-            <p>{{ lead.phone or '-' }}</p>
-            <p>{{ lead.email or '-' }}</p>
-        </article>
-        <article class="ad-lead-meta-card">
-            <h3>Submission</h3>
-            <p>Step-1: {{ 'Y' if lead.step1_yes else 'N' }}</p>
-            <p>Step-2: {{ 'Y' if lead.step2_yes else 'N' }}</p>
-            <p>Status: {{ lead.status or '-' }}</p>
-        </article>
-        <article class="ad-lead-meta-card">
-            <h3>Attribution</h3>
-            <p>Source: {{ lead.source|title }}</p>
-            <p>Campaign: {{ lead.campaign_label or '-' }}</p>
-            <p>UTM Campaign: {{ lead.utm_campaign or '-' }}</p>
-            <p>GAD Campaign ID: {{ lead.gad_campaignid or '-' }}</p>
-            <p>GCLID: {{ lead.gclid or '-' }}</p>
-        </article>
-        <article class="ad-lead-meta-card">
-            <h3>Timing</h3>
-            <p>First Received: {{ lead.first_received_at or '-' }}</p>
-            <p>Last Received: {{ lead.last_received_at or '-' }}</p>
-            <p>Hold Expires: {{ lead.hold_expires_at or '-' }}</p>
-            <p>Processed: {{ lead.processed_at or '-' }}</p>
-        </article>
-        <article class="ad-lead-meta-card">
-            <h3>Keys</h3>
-            <p>Lead Key: {{ lead.lead_key or '-' }}</p>
-            <p>ReiSift UUID: {{ lead.reisift_property_uuid or '-' }}</p>
-            <p>Owner UUID: {{ lead.reisift_owner_uuid or '-' }}</p>
-        </article>
+    <h3>Summary</h3>
+    <div class="table-wrap">
+        <table class="compact-table home-trend-table">
+            <tbody>
+                <tr><th>Address</th><td>{{ lead.address or '-' }}</td></tr>
+                <tr><th>Name</th><td>{{ lead.name or '-' }}</td></tr>
+                <tr><th>Phone</th><td>{{ lead.phone or '-' }}</td></tr>
+                <tr><th>Email</th><td>{{ lead.email or '-' }}</td></tr>
+                <tr><th>Step-1</th><td>{{ 'Y' if lead.step1_yes else 'N' }}</td></tr>
+                <tr><th>Step-2</th><td>{{ 'Y' if lead.step2_yes else 'N' }}</td></tr>
+                <tr><th>Status</th><td>{{ lead.status or '-' }}</td></tr>
+                <tr><th>Lead Key</th><td>{{ lead.lead_key or '-' }}</td></tr>
+                <tr><th>REISift UUID</th><td>{{ lead.reisift_property_uuid or '-' }}</td></tr>
+                <tr><th>REISift Owner UUID</th><td>{{ lead.reisift_owner_uuid or '-' }}</td></tr>
+                <tr><th>Deep Dive Property</th><td>{% if lead.local_property_id %}<a href="{{ url_for('property_detail', property_id=lead.local_property_id) }}">Property #{{ lead.local_property_id }}</a>{% else %}-{% endif %}</td></tr>
+            </tbody>
+        </table>
     </div>
 </section>
 
 <section class="panel">
-    <h3>Processing Result</h3>
+    <h3>Attribution</h3>
+    <div class="table-wrap">
+        <table class="compact-table home-trend-table">
+            <tbody>
+                <tr><th>Source</th><td>{{ lead.source|title }}</td></tr>
+                <tr><th>Campaign</th><td>{{ lead.campaign_label or '-' }}</td></tr>
+                <tr><th>UTM Campaign</th><td>{{ lead.utm_campaign or '-' }}</td></tr>
+                <tr><th>GAD Campaign ID</th><td>{{ lead.gad_campaignid or '-' }}</td></tr>
+                <tr><th>GCLID</th><td>{{ lead.gclid or '-' }}</td></tr>
+                <tr><th>Tracked Page URL</th><td>{% if lead.page_url %}<a href="{{ lead.page_url }}" target="_blank" rel="noopener noreferrer">{{ lead.page_url }}</a>{% else %}-{% endif %}</td></tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<section class="panel">
+    <h3>Processing</h3>
+    <div class="table-wrap">
+        <table class="compact-table home-trend-table">
+            <tbody>
+                <tr><th>First Received</th><td>{{ lead.first_received_at or '-' }}</td></tr>
+                <tr><th>Last Received</th><td>{{ lead.last_received_at or '-' }}</td></tr>
+                <tr><th>Hold Expires</th><td>{{ lead.hold_expires_at or '-' }}</td></tr>
+                <tr><th>Processed</th><td>{{ lead.processed_at or '-' }}</td></tr>
+                <tr><th>Parsed Street</th><td>{{ lead.parsed_address.street or '-' }}</td></tr>
+                <tr><th>Parsed City</th><td>{{ lead.parsed_address.city or '-' }}</td></tr>
+                <tr><th>Parsed State</th><td>{{ lead.parsed_address.state or '-' }}</td></tr>
+                <tr><th>Parsed Postal</th><td>{{ lead.parsed_address.postal_code or '-' }}</td></tr>
+            </tbody>
+        </table>
+    </div>
     <pre class="payload-output">{{ lead.processing_result | tojson(indent=2) }}</pre>
 </section>
 

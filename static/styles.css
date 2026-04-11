@@ -590,32 +590,6 @@ body {
     min-width: 2rem;
 }
 
-.ad-lead-detail-actions {
-    align-items: center;
-    display: inline-flex;
-    gap: 0.75rem;
-}
-
-.ad-lead-meta-grid {
-    display: grid;
-    gap: 0.9rem;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-}
-
-.ad-lead-meta-card {
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 0.9rem 1rem;
-}
-
-.ad-lead-meta-card h3 {
-    margin-bottom: 0.55rem;
-}
-
-.ad-lead-meta-card p {
-    margin: 0.2rem 0;
-}
-
 .ad-lead-note-item {
     border: 1px solid var(--line);
     border-radius: 12px;

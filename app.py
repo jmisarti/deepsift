@@ -16235,6 +16235,7 @@ def run_website_step1_hold_once():
             }
             should_notify = False
             slack_result = {"sent": False, "error": ""}
+            error_text = ""
 
             try:
                 if merged_fields["address"] and not created_uuid:
@@ -16302,6 +16303,8 @@ def run_website_step1_hold_once():
                 if "Could not parse property address without map lookup." in err:
                     mode = "step1_only_timeout_incomplete_address"
                     status_value = "timed_out_step1_only_incomplete_address"
+                error_text = err
+                should_notify = True
                 note_body = f"Website lead processing result\nResult: timed_out_failed\nMode: {mode}\nError: {err}"
                 note_payload.update({"error": err, "create_result": create_result})
                 processing_result = {
@@ -16342,6 +16345,8 @@ def run_website_step1_hold_once():
                 ]
                 if duplicate_reason:
                     slack_lines.append(f"Reason Detail: {duplicate_reason}")
+                if error_text:
+                    slack_lines.append(f"Error: {error_text}")
                 try:
                     send_slack_notification(db, "\n".join(slack_lines))
                     slack_result["sent"] = True
@@ -20475,7 +20480,7 @@ def _normalize_address_components(street="", city="", state="", postal_code="", 
 
 def _parse_search_address_simple(search):
     text = (search or "").strip()
-    text = re.sub(r"\s*,\s*United States\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*,\s*(?:United States|USA|US)\s*$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
     # Clever lead format can include: "7 Jessica Lane in Dover, NJ 07801"
     text = re.sub(

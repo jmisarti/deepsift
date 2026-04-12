@@ -4136,6 +4136,38 @@ def place_openletterconnect_order(db, contacts, property_row, template_id=None, 
     }
 
 
+def extract_openletterconnect_order_fields(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    order_id = str(
+        payload.get("id")
+        or payload.get("orderId")
+        or payload.get("order_id")
+        or data.get("id")
+        or data.get("orderId")
+        or data.get("order_id")
+        or ""
+    ).strip()
+    status = str(
+        payload.get("status")
+        or payload.get("order_status")
+        or data.get("status")
+        or data.get("order_status")
+        or ""
+    ).strip()
+    cost = (
+        payload.get("totalCost")
+        or payload.get("cost")
+        or data.get("totalCost")
+        or data.get("cost")
+    )
+    return {
+        "order_id": order_id,
+        "status": status,
+        "cost": cost,
+    }
+
+
 def _format_person_contact_for_mail(db, property_row, person_id, person_address_id=None):
     person = db.execute(
         "SELECT id, first_name, last_name, primary_phone, primary_email, deceased FROM people WHERE id = ?",
@@ -6811,11 +6843,10 @@ def run_sequence_tick():
                         mode="sequence-mail",
                     )
                     response_payload = result.get("response") if isinstance(result, dict) and isinstance(result.get("response"), dict) else {}
-                    external_order_id = str(
-                        response_payload.get("id") or response_payload.get("orderId") or response_payload.get("order_id") or ""
-                    )
-                    order_status = str(response_payload.get("status") or "Submitted").strip() or "Submitted"
-                    cost = response_payload.get("totalCost") or response_payload.get("cost")
+                    order_fields = extract_openletterconnect_order_fields(response_payload)
+                    external_order_id = order_fields["order_id"]
+                    order_status = order_fields["status"] or "Submitted"
+                    cost = order_fields["cost"]
                     db.execute(
                         """
                         INSERT INTO mail_orders (
@@ -33317,9 +33348,10 @@ def mail_single_relative_route(property_id, person_id):
     try:
         result = place_openletterconnect_order(db, [contact], prop, template_id=template_id, mode="mail-individual-relative")
         res = result["response"] if isinstance(result, dict) else {}
-        external_order_id = str(res.get("id") or res.get("orderId") or res.get("order_id") or "")
-        status = str(res.get("status") or "")
-        cost = res.get("totalCost") or res.get("cost")
+        order_fields = extract_openletterconnect_order_fields(res)
+        external_order_id = order_fields["order_id"]
+        status = order_fields["status"]
+        cost = order_fields["cost"]
         db.execute(
             """
             INSERT INTO mail_orders (
@@ -33406,9 +33438,10 @@ def mail_single_relative_address_route(property_id, person_id, person_address_id
             mode="mail-individual-address-override",
         )
         res = result["response"] if isinstance(result, dict) else {}
-        external_order_id = str(res.get("id") or res.get("orderId") or res.get("order_id") or "")
-        status = str(res.get("status") or "")
-        cost = res.get("totalCost") or res.get("cost")
+        order_fields = extract_openletterconnect_order_fields(res)
+        external_order_id = order_fields["order_id"]
+        status = order_fields["status"]
+        cost = order_fields["cost"]
         db.execute(
             """
             INSERT INTO mail_orders (
@@ -33626,9 +33659,10 @@ def mail_all_relatives_route(property_id):
     try:
         result = place_openletterconnect_order(db, contacts, prop, template_id=template_id, mode="mail-all-relatives")
         res = result["response"] if isinstance(result, dict) else {}
-        external_order_id = str(res.get("id") or res.get("orderId") or res.get("order_id") or "")
-        status = str(res.get("status") or "")
-        cost = res.get("totalCost") or res.get("cost")
+        order_fields = extract_openletterconnect_order_fields(res)
+        external_order_id = order_fields["order_id"]
+        status = order_fields["status"]
+        cost = order_fields["cost"]
         db.execute(
             """
             INSERT INTO mail_orders (
@@ -35445,7 +35479,7 @@ def _summarize_property_mail_orders(db, property_id):
     rows = db.execute(
         """
         SELECT id, mode, external_order_id, status, status_updated_at, mailed_at, in_transit_at,
-               delivered_at, bad_address_at, qr_scanned_at, created_at
+               delivered_at, bad_address_at, qr_scanned_at, created_at, response_json
         FROM mail_orders
         WHERE property_id = ?
         ORDER BY COALESCE(status_updated_at, created_at) DESC, id DESC
@@ -35455,7 +35489,15 @@ def _summarize_property_mail_orders(db, property_id):
     ).fetchall()
     items = []
     for row in rows:
-        status_label = _normalize_openletterconnect_status(row["status"] or "Pending")
+        response_payload = {}
+        raw_response = str(row["response_json"] or "").strip()
+        if raw_response:
+            try:
+                response_payload = json.loads(raw_response)
+            except Exception:
+                response_payload = {}
+        order_fields = extract_openletterconnect_order_fields(response_payload)
+        status_label = _normalize_openletterconnect_status((row["status"] or order_fields["status"] or "Pending"))
         status_at = (
             row["bad_address_at"]
             if status_label == "Bad Address" and row["bad_address_at"]
@@ -35472,7 +35514,7 @@ def _summarize_property_mail_orders(db, property_id):
             {
                 "id": int(row["id"]),
                 "mode": str(row["mode"] or "").strip(),
-                "external_order_id": str(row["external_order_id"] or "").strip(),
+                "external_order_id": str(row["external_order_id"] or order_fields["order_id"] or "").strip(),
                 "status": status_label,
                 "status_at": str(status_at or "").strip(),
                 "mailed_at": str(row["mailed_at"] or "").strip(),

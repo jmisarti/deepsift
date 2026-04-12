@@ -229,9 +229,30 @@ CREATE TABLE IF NOT EXISTS mail_orders (
     recipient_count INTEGER NOT NULL DEFAULT 0,
     request_json TEXT,
     response_json TEXT,
+    status_updated_at TEXT,
+    last_event_type TEXT,
+    mailed_at TEXT,
+    in_transit_at TEXT,
+    delivered_at TEXT,
+    bad_address_at TEXT,
+    qr_scanned_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(property_id) REFERENCES properties(id),
     FOREIGN KEY(person_id) REFERENCES people(id)
+);
+
+CREATE TABLE IF NOT EXISTS openletterconnect_webhook_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT,
+    event_type TEXT,
+    external_order_id TEXT,
+    external_order_item_id TEXT,
+    verification_status TEXT NOT NULL DEFAULT 'unverified',
+    processing_status TEXT NOT NULL DEFAULT 'received',
+    error_text TEXT,
+    payload_json TEXT,
+    headers_json TEXT,
+    received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS app_settings (

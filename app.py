@@ -128,6 +128,7 @@ REISIFT_DISABLE_MAP_LOOKUP = env_flag("REISIFT_DISABLE_MAP_LOOKUP", True)
 OPENLETTERCONNECT_BASE_URL = os.getenv("OPENLETTERCONNECT_BASE_URL", "https://api.openletterconnect.com/api/v1")
 OPENLETTERCONNECT_TEMPLATE_ID = int(os.getenv("OPENLETTERCONNECT_TEMPLATE_ID", "9256"))
 OPENLETTERCONNECT_API_KEY = os.getenv("OPENLETTERCONNECT_API_KEY", "").strip()
+OPENLETTERCONNECT_WEBHOOK_SECRET = os.getenv("OPENLETTERCONNECT_WEBHOOK_SECRET", "").strip()
 CALL_RECORDING_WORKER_ENABLED = env_flag("CALL_RECORDING_WORKER_ENABLED", True)
 CALL_RECORDING_POLL_SECONDS = max(int((os.getenv("CALL_RECORDING_POLL_SECONDS") or "60").strip() or "60"), 15)
 SMS_ANALYSIS_WORKER_ENABLED = env_flag("SMS_ANALYSIS_WORKER_ENABLED", True)
@@ -875,6 +876,13 @@ def migrate_db(db):
     ensure_column(db, "reisift_referrals", "source_override_json", "source_override_json TEXT")
     ensure_column(db, "reisift_followups", "events_json", "events_json TEXT")
     ensure_column(db, "reisift_followups", "tasks_json", "tasks_json TEXT")
+    ensure_column(db, "mail_orders", "status_updated_at", "status_updated_at TEXT")
+    ensure_column(db, "mail_orders", "last_event_type", "last_event_type TEXT")
+    ensure_column(db, "mail_orders", "mailed_at", "mailed_at TEXT")
+    ensure_column(db, "mail_orders", "in_transit_at", "in_transit_at TEXT")
+    ensure_column(db, "mail_orders", "delivered_at", "delivered_at TEXT")
+    ensure_column(db, "mail_orders", "bad_address_at", "bad_address_at TEXT")
+    ensure_column(db, "mail_orders", "qr_scanned_at", "qr_scanned_at TEXT")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS app_errors (
@@ -6792,8 +6800,11 @@ def run_sequence_tick():
                     cost = response_payload.get("totalCost") or response_payload.get("cost")
                     db.execute(
                         """
-                        INSERT INTO mail_orders (property_id, person_id, mode, template_id, external_order_id, status, cost, recipient_count, request_json, response_json)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO mail_orders (
+                            property_id, person_id, mode, template_id, external_order_id, status, cost,
+                            recipient_count, request_json, response_json, status_updated_at, last_event_type
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             enr["property_id"],
@@ -6806,6 +6817,8 @@ def run_sequence_tick():
                             1,
                             json.dumps(result.get("request")),
                             json.dumps(response_payload),
+                            format_db_time(now),
+                            "order_submitted",
                         ),
                     )
                     cur = db.execute(
@@ -10044,6 +10057,24 @@ def get_openletterconnect_api_key(db=None):
     return OPENLETTERCONNECT_API_KEY
 
 
+def get_openletterconnect_webhook_secret(db=None):
+    if db is None:
+        try:
+            db = get_db()
+        except Exception:
+            db = None
+    if db is not None:
+        return (get_setting(db, "openletterconnect_webhook_secret", "") or OPENLETTERCONNECT_WEBHOOK_SECRET).strip()
+    return OPENLETTERCONNECT_WEBHOOK_SECRET
+
+
+def get_openletterconnect_events_webhook_url(db=None):
+    base_url = get_public_app_base_url(db)
+    if not base_url:
+        return ""
+    return f"{base_url.rstrip('/')}/webhooks/openletterconnect/events"
+
+
 def get_skipsherpa_api_key(db=None):
     if db is None:
         try:
@@ -11780,6 +11811,38 @@ def build_reisift_direct_mail_tags(when=None):
     return ["directmail", f"DM{stamp}"]
 
 
+def _reisift_mail_status_tag_variants(base_tag, when=None):
+    clean_base = str(base_tag or "").strip()
+    if not clean_base:
+        return []
+    stamp = _reisift_date_stamp_for_tag(when)
+    return [clean_base, f"{clean_base}{stamp}"]
+
+
+def build_reisift_mail_status_tag_plan(status_label, when=None):
+    normalized = str(status_label or "").strip().lower()
+    mapping = {
+        "pending": "DMPending",
+        "mailed": "DMMailed",
+        "in transit": "DMInTransit",
+        "delivered": "DMDelivered",
+        "bad address": "DMBadAddress",
+        "qr scanned": "DMQRScanned",
+    }
+    base_tag = mapping.get(normalized)
+    if not base_tag:
+        return {"add": [], "remove_prefixes": []}
+    transient_prefixes = ["DMPending", "DMInTransit", "DMDelivered", "DMBadAddress"]
+    remove_prefixes = list(transient_prefixes) if normalized != "qr scanned" else []
+    add_tags = _reisift_mail_status_tag_variants(base_tag, when=when)
+    if normalized in {"in transit", "delivered", "bad address"}:
+        add_tags.extend(_reisift_mail_status_tag_variants("DMMailed", when=when))
+    return {
+        "add": add_tags,
+        "remove_prefixes": remove_prefixes,
+    }
+
+
 def build_reisift_skiptrace_tags(when=None):
     stamp = _reisift_date_stamp_for_tag(when)
     return ["skiptraced", f"skipped{stamp}"]
@@ -11826,16 +11889,27 @@ def _extract_reisift_property_tags(property_payload):
     return tags
 
 
-def reisift_append_property_tags(token, property_uuid, tags_to_add):
+def reisift_sync_property_tags(token, property_uuid, tags_to_add=None, tags_to_remove=None, remove_prefixes=None):
     property_uuid = str(property_uuid or "").strip()
     desired_tags = [str(tag or "").strip() for tag in (tags_to_add or []) if str(tag or "").strip()]
-    if not property_uuid or not desired_tags:
+    tags_to_remove = {str(tag or "").strip().lower() for tag in (tags_to_remove or []) if str(tag or "").strip()}
+    remove_prefixes = [str(prefix or "").strip().lower() for prefix in (remove_prefixes or []) if str(prefix or "").strip()]
+    if not property_uuid or (not desired_tags and not tags_to_remove and not remove_prefixes):
         return {"ok": False, "skipped": True, "reason": "missing_property_uuid_or_tags"}
     current_payload = fetch_reisift_property_payload(token, property_uuid)
     existing_tags = _extract_reisift_property_tags(current_payload)
+    filtered_existing = []
+    for tag in existing_tags:
+        clean = str(tag or "").strip()
+        clean_lower = clean.lower()
+        if clean_lower in tags_to_remove:
+            continue
+        if any(clean_lower.startswith(prefix) for prefix in remove_prefixes):
+            continue
+        filtered_existing.append(clean)
     merged_tags = []
     seen = set()
-    for tag in list(existing_tags) + list(desired_tags):
+    for tag in list(filtered_existing) + list(desired_tags):
         clean = str(tag or "").strip()
         key = clean.lower()
         if not clean or key in seen:
@@ -11872,6 +11946,10 @@ def reisift_append_property_tags(token, property_uuid, tags_to_add):
             return {"ok": True, "request": body, "response": payload, "attempted": attempted}
         errors.append({"status_code": response.status_code, "response": payload, "request": body})
     raise ValueError(f"ReiSift tag update failed for {property_uuid}: {errors}")
+
+
+def reisift_append_property_tags(token, property_uuid, tags_to_add):
+    return reisift_sync_property_tags(token, property_uuid, tags_to_add=tags_to_add)
 
 
 def _build_website_lead_notes(payload, fields, source_label="webhook"):
@@ -30147,6 +30225,7 @@ def settings_page():
                     "slack_agent_ops_webhook_url": request.form.get("slack_agent_ops_webhook_url", ""),
                     "slack_agent_ops_channel": request.form.get("slack_agent_ops_channel", ""),
                     "openletterconnect_api_key": request.form.get("openletterconnect_api_key", ""),
+                    "openletterconnect_webhook_secret": request.form.get("openletterconnect_webhook_secret", ""),
                     "skipsherpa_api_key": request.form.get("skipsherpa_api_key", ""),
                     "rentcast_api_key": request.form.get("rentcast_api_key", ""),
                     "slybroadcast_uid": request.form.get("slybroadcast_uid", ""),
@@ -30291,6 +30370,8 @@ def settings_page():
     integration_api_key = get_integration_api_key(db)
     public_app_base_url = get_public_app_base_url(db)
     openletterconnect_api_key = get_openletterconnect_api_key(db)
+    openletterconnect_webhook_secret = get_openletterconnect_webhook_secret(db)
+    openletterconnect_events_webhook_url = get_openletterconnect_events_webhook_url(db)
     skipsherpa_api_key = get_skipsherpa_api_key(db)
     rentcast_api_key = get_rentcast_api_key(db)
     slybroadcast_settings = get_slybroadcast_settings(db)
@@ -30384,6 +30465,8 @@ def settings_page():
         public_app_base_url=public_app_base_url,
         integration_api_key=integration_api_key,
         openletterconnect_api_key=openletterconnect_api_key,
+        openletterconnect_webhook_secret=openletterconnect_webhook_secret,
+        openletterconnect_events_webhook_url=openletterconnect_events_webhook_url,
         skipsherpa_api_key=skipsherpa_api_key,
         rentcast_api_key=rentcast_api_key,
         slybroadcast_settings=slybroadcast_settings,
@@ -31589,6 +31672,8 @@ def property_detail(property_id):
                         "verified_social_count": verified_social,
                     }
                 )
+    property_mail_summary = _summarize_property_mail_orders(db, property_id)
+    property_skiptrace_summary = _summarize_property_skiptrace_runs(db, property_id)
     summary_people = []
     if owner:
         summary_people.append(
@@ -31665,6 +31750,8 @@ def property_detail(property_id):
         sms_rollup=sms_rollup,
         property_comm_summary_rows=property_comm_summary_rows,
         verified_contacts=verified_contacts,
+        property_mail_summary=property_mail_summary,
+        property_skiptrace_summary=property_skiptrace_summary,
         touchpoints=touchpoints,
         socials=socials,
         activities=activities,
@@ -33137,8 +33224,11 @@ def mail_single_relative_route(property_id, person_id):
         cost = res.get("totalCost") or res.get("cost")
         db.execute(
             """
-            INSERT INTO mail_orders (property_id, person_id, mode, template_id, external_order_id, status, cost, recipient_count, request_json, response_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO mail_orders (
+                property_id, person_id, mode, template_id, external_order_id, status, cost,
+                recipient_count, request_json, response_json, status_updated_at, last_event_type
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 property_id,
@@ -33151,6 +33241,8 @@ def mail_single_relative_route(property_id, person_id):
                 1,
                 json.dumps(result.get("request")),
                 json.dumps(res),
+                format_db_time(datetime.utcnow()),
+                "order_submitted",
             ),
         )
         add_person_note(
@@ -33298,8 +33390,11 @@ def mail_all_relatives_route(property_id):
         cost = res.get("totalCost") or res.get("cost")
         db.execute(
             """
-            INSERT INTO mail_orders (property_id, person_id, mode, template_id, external_order_id, status, cost, recipient_count, request_json, response_json)
-            VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO mail_orders (
+                property_id, person_id, mode, template_id, external_order_id, status, cost,
+                recipient_count, request_json, response_json, status_updated_at, last_event_type
+            )
+            VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 property_id,
@@ -33311,6 +33406,8 @@ def mail_all_relatives_route(property_id):
                 len(contacts),
                 json.dumps(result.get("request")),
                 json.dumps(res),
+                format_db_time(datetime.utcnow()),
+                "order_submitted",
             ),
         )
         db.execute(
@@ -34774,6 +34871,554 @@ def _mail_order_person_ids(order_row):
             if str(pid).isdigit():
                 ids.add(int(pid))
     return sorted(ids)
+
+
+def _openletterconnect_safe_header_map(req):
+    safe_keys = {
+        "Content-Type",
+        "User-Agent",
+        "X-Forwarded-For",
+        "X-Forwarded-Proto",
+        "X-Forwarded-Host",
+        "X-Real-Ip",
+    }
+    out = {}
+    for key in safe_keys:
+        value = (req.headers.get(key) or "").strip()
+        if value:
+            out[key] = value
+    return out
+
+
+def _openletterconnect_payload_hash(payload):
+    try:
+        blob = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        blob = str(payload or "")
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _parse_openletterconnect_event_time(value):
+    dt = parse_flexible_datetime(value)
+    if dt is not None:
+        return format_db_time(dt)
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    cleaned = re.sub(r"\s+[A-Z]{2,4}$", "", text).strip()
+    for fmt in ("%m/%d/%Y %I:%M%p", "%m/%d/%Y %I:%M %p"):
+        try:
+            parsed = datetime.strptime(cleaned, fmt).replace(tzinfo=EST_TZ)
+            return format_db_time(parsed.astimezone(timezone.utc).replace(tzinfo=None))
+        except ValueError:
+            continue
+    return ""
+
+
+def _normalize_openletterconnect_status(raw_status, event_type=""):
+    raw_text = str(raw_status or "").strip()
+    event_text = str(event_type or "").strip().lower()
+    if "qr_code_scanned" in event_text:
+        return "QR Scanned"
+    lower = raw_text.lower()
+    if not lower:
+        return "Pending"
+    if "delivered" in lower:
+        return "Delivered"
+    if "in transit" in lower or "re-routed" in lower or "rerouted" in lower:
+        return "In Transit"
+    if "returned" in lower or "failed" in lower or "bad address" in lower or "undeliverable" in lower or "canceled" in lower:
+        return "Bad Address"
+    if "mailed" in lower:
+        return "Mailed"
+    if "processing" in lower or "not mailed" in lower or "pending" in lower or "created" in lower or "submitted" in lower or "queued" in lower:
+        return "Pending"
+    return raw_text.title()
+
+
+def _openletterconnect_event_status_update(display_status):
+    normalized = str(display_status or "").strip().lower()
+    if normalized == "qr scanned":
+        return ""
+    return str(display_status or "").strip()
+
+
+def _openletterconnect_build_note_text(record):
+    lines = [f"OpenLetterConnect: {record.get('display_status') or 'Update'}"]
+    if record.get("event_type"):
+        lines.append(f"Event: {record['event_type']}")
+    if record.get("order_id"):
+        lines.append(f"Order ID: {record['order_id']}")
+    if record.get("order_item_id"):
+        lines.append(f"Mail Piece ID: {record['order_item_id']}")
+    if record.get("contact_name"):
+        lines.append(f"Contact: {record['contact_name']}")
+    if record.get("event_at"):
+        lines.append(f"At: {record['event_at']}")
+    if record.get("scan_count"):
+        lines.append(f"Scan Count: {record['scan_count']}")
+    utm_details = record.get("utm_details") if isinstance(record.get("utm_details"), dict) else {}
+    if utm_details:
+        if utm_details.get("utm_source"):
+            lines.append(f"UTM Source: {utm_details.get('utm_source')}")
+        if utm_details.get("utm_campaign"):
+            lines.append(f"UTM Campaign: {utm_details.get('utm_campaign')}")
+        if utm_details.get("utm_property_address"):
+            lines.append(f"UTM Property Address: {utm_details.get('utm_property_address')}")
+    return "\n".join(lines)
+
+
+def _extract_openletterconnect_contact_name(contact_obj):
+    if not isinstance(contact_obj, dict):
+        return ""
+    first = str(contact_obj.get("contact_first") or contact_obj.get("firstName") or contact_obj.get("first_name") or "").strip()
+    last = str(contact_obj.get("contact_last") or contact_obj.get("lastName") or contact_obj.get("last_name") or "").strip()
+    company = str(contact_obj.get("contact_company") or contact_obj.get("companyName") or "").strip()
+    full_name = " ".join([part for part in [first, last] if part]).strip()
+    return full_name or company
+
+
+def _extract_openletterconnect_events(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    event_type = str(payload.get("event") or payload.get("type") or payload.get("event_type") or "").strip()
+    data = payload.get("data")
+    payload_hash = _openletterconnect_payload_hash(payload)
+    default_at = format_db_time(datetime.utcnow())
+    events = []
+
+    def build_record(index, order_id="", order_item_id="", raw_status="", event_at="", contact_name="", scan_count="", utm_details=None):
+        display_status = _normalize_openletterconnect_status(raw_status, event_type=event_type)
+        return {
+            "event_key": f"{payload_hash}:{index}",
+            "event_type": event_type or "openletterconnect.event",
+            "order_id": str(order_id or "").strip(),
+            "order_item_id": str(order_item_id or "").strip(),
+            "raw_status": str(raw_status or "").strip(),
+            "display_status": display_status,
+            "status_update": _openletterconnect_event_status_update(display_status),
+            "event_at": event_at or default_at,
+            "contact_name": contact_name,
+            "scan_count": str(scan_count or "").strip(),
+            "utm_details": utm_details if isinstance(utm_details, dict) else {},
+        }
+
+    event_type_lower = event_type.lower()
+    if event_type_lower in {"order_items.updated", "order_item.updated"}:
+        items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            order_block = item.get("order") if isinstance(item.get("order"), dict) else {}
+            order_item_block = item.get("orderItem") if isinstance(item.get("orderItem"), dict) else {}
+            if not order_item_block and isinstance(item.get("order_item"), dict):
+                order_item_block = item.get("order_item")
+            contact_block = item.get("contact") if isinstance(item.get("contact"), dict) else {}
+            order_id = (
+                order_block.get("id")
+                or item.get("orderId")
+                or item.get("order_id")
+                or order_item_block.get("orderId")
+                or order_item_block.get("order_id")
+                or ""
+            )
+            order_item_id = (
+                order_item_block.get("id")
+                or item.get("orderItemId")
+                or item.get("order_item_id")
+                or item.get("id")
+                or ""
+            )
+            raw_status = order_item_block.get("status") or item.get("status") or order_block.get("status") or ""
+            event_at = _parse_openletterconnect_event_time(
+                order_item_block.get("updated_at")
+                or order_item_block.get("updatedAt")
+                or item.get("updated_at")
+                or item.get("updatedAt")
+                or order_block.get("updated_at")
+                or order_block.get("updatedAt")
+                or payload.get("updated_at")
+            )
+            events.append(
+                build_record(
+                    idx,
+                    order_id=order_id,
+                    order_item_id=order_item_id,
+                    raw_status=raw_status,
+                    event_at=event_at,
+                    contact_name=_extract_openletterconnect_contact_name(contact_block),
+                )
+            )
+    elif "qr_code_scanned" in event_type_lower:
+        data_dict = data if isinstance(data, dict) else {}
+        order_details = data_dict.get("order_details") if isinstance(data_dict.get("order_details"), dict) else {}
+        events.append(
+            build_record(
+                0,
+                order_id=order_details.get("order_id") or data_dict.get("order_id") or payload.get("order_id") or "",
+                raw_status="QR Scanned",
+                event_at=_parse_openletterconnect_event_time(data_dict.get("scan_timestamp") or payload.get("created_at")),
+                contact_name=_extract_openletterconnect_contact_name(data_dict.get("scanned_by")),
+                scan_count=data_dict.get("number_of_scans") or "",
+                utm_details=data_dict.get("utm_details"),
+            )
+        )
+    else:
+        data_dict = data if isinstance(data, dict) else payload
+        events.append(
+            build_record(
+                0,
+                order_id=data_dict.get("id") or data_dict.get("order_id") or data_dict.get("orderId") or payload.get("order_id") or "",
+                raw_status=data_dict.get("status") or data_dict.get("order_status") or data_dict.get("state") or payload.get("status") or "",
+                event_at=_parse_openletterconnect_event_time(
+                    data_dict.get("updated_at")
+                    or data_dict.get("updatedAt")
+                    or data_dict.get("created_at")
+                    or data_dict.get("createdAt")
+                    or payload.get("updated_at")
+                    or payload.get("created_at")
+                ),
+            )
+        )
+    return [event for event in events if event.get("order_id")]
+
+
+def _apply_openletterconnect_event_to_mail_order(db, mail_order_row, record, payload):
+    event_at = str(record.get("event_at") or format_db_time(datetime.utcnow())).strip()
+    status_update = str(record.get("status_update") or "").strip()
+    update_bits = [
+        "response_json = ?",
+        "last_event_type = ?",
+    ]
+    params = [
+        json.dumps(payload or {}, default=str),
+        str(record.get("event_type") or "").strip(),
+    ]
+    if status_update:
+        update_bits.extend(["status = ?", "status_updated_at = ?"])
+        params.extend([status_update, event_at])
+        if status_update in {"Mailed", "In Transit", "Delivered", "Bad Address"}:
+            update_bits.append("mailed_at = COALESCE(mailed_at, ?)")
+            params.append(event_at)
+        if status_update == "In Transit":
+            update_bits.append("in_transit_at = ?")
+            params.append(event_at)
+        elif status_update == "Delivered":
+            update_bits.append("delivered_at = ?")
+            params.append(event_at)
+        elif status_update == "Bad Address":
+            update_bits.append("bad_address_at = ?")
+            params.append(event_at)
+    if str(record.get("display_status") or "").strip().lower() == "qr scanned":
+        update_bits.append("qr_scanned_at = ?")
+        params.append(event_at)
+    params.append(int(mail_order_row["id"]))
+    db.execute(f"UPDATE mail_orders SET {', '.join(update_bits)} WHERE id = ?", tuple(params))
+    if status_update and str(mail_order_row["external_order_id"] or "").strip():
+        db.execute(
+            """
+            UPDATE communications
+            SET status = COALESCE(NULLIF(?, ''), status)
+            WHERE external_id = ? AND upper(COALESCE(channel, '')) = 'MAIL'
+            """,
+            (status_update, str(mail_order_row["external_order_id"] or "").strip()),
+        )
+
+
+def _process_openletterconnect_event_record(db, record, payload):
+    order_id = str(record.get("order_id") or "").strip()
+    if not order_id:
+        return {"updated_orders": 0, "ignored": True, "reason": "missing_order_id"}
+    rows = db.execute(
+        """
+        SELECT *
+        FROM mail_orders
+        WHERE external_order_id = ?
+        ORDER BY id DESC
+        """,
+        (order_id,),
+    ).fetchall()
+    if not rows:
+        return {"updated_orders": 0, "ignored": True, "reason": "unknown_order_id"}
+
+    unique_person_ids = set()
+    unique_property_ids = set()
+    unique_property_uuids = set()
+    for row in rows:
+        _apply_openletterconnect_event_to_mail_order(db, row, record, payload)
+        for pid in _mail_order_person_ids(row):
+            unique_person_ids.add(int(pid))
+        if row["property_id"]:
+            unique_property_ids.add(int(row["property_id"]))
+            property_uuid = _get_local_property_uuid(db, int(row["property_id"]))
+            if property_uuid:
+                unique_property_uuids.add(property_uuid)
+        db.execute(
+            """
+            INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+            VALUES (?, ?, 'Direct Mail Webhook', ?, ?)
+            """,
+            (
+                row["property_id"],
+                (row["person_id"] or (next(iter(unique_person_ids)) if unique_person_ids else None)),
+                str(record.get("display_status") or "Update"),
+                json.dumps({"record": record, "payload": payload}, default=str),
+            ),
+        )
+
+    note_text = _openletterconnect_build_note_text(record)
+    for pid in sorted(unique_person_ids):
+        add_person_note(
+            db,
+            pid,
+            "OpenLetterConnect Webhook",
+            note_text,
+            {"record": record, "payload": payload},
+        )
+
+    tag_plan = build_reisift_mail_status_tag_plan(record.get("display_status"), when=parse_db_time(record.get("event_at")))
+    if unique_property_uuids:
+        try:
+            token = reisift_get_access_token()
+            for property_uuid in sorted(unique_property_uuids):
+                reisift_append_property_note(token, property_uuid, note_text)
+                if tag_plan.get("add") or tag_plan.get("remove_prefixes"):
+                    reisift_sync_property_tags(
+                        token,
+                        property_uuid,
+                        tags_to_add=tag_plan.get("add"),
+                        remove_prefixes=tag_plan.get("remove_prefixes"),
+                    )
+        except Exception as exc:
+            log_app_error(
+                db,
+                source="openletterconnect_reisift_sync",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="/webhooks/openletterconnect/events",
+                status_code=500,
+            )
+    return {"updated_orders": len(rows), "ignored": False, "reason": ""}
+
+
+def _summarize_property_mail_orders(db, property_id):
+    rows = db.execute(
+        """
+        SELECT id, mode, external_order_id, status, status_updated_at, mailed_at, in_transit_at,
+               delivered_at, bad_address_at, qr_scanned_at, created_at
+        FROM mail_orders
+        WHERE property_id = ?
+        ORDER BY COALESCE(status_updated_at, created_at) DESC, id DESC
+        LIMIT 10
+        """,
+        (property_id,),
+    ).fetchall()
+    items = []
+    for row in rows:
+        status_label = _normalize_openletterconnect_status(row["status"] or "Pending")
+        status_at = (
+            row["bad_address_at"]
+            if status_label == "Bad Address" and row["bad_address_at"]
+            else row["delivered_at"]
+            if status_label == "Delivered" and row["delivered_at"]
+            else row["in_transit_at"]
+            if status_label == "In Transit" and row["in_transit_at"]
+            else row["mailed_at"]
+            if status_label == "Mailed" and row["mailed_at"]
+            else row["status_updated_at"]
+            or row["created_at"]
+        )
+        items.append(
+            {
+                "id": int(row["id"]),
+                "mode": str(row["mode"] or "").strip(),
+                "external_order_id": str(row["external_order_id"] or "").strip(),
+                "status": status_label,
+                "status_at": str(status_at or "").strip(),
+                "mailed_at": str(row["mailed_at"] or "").strip(),
+                "qr_scanned_at": str(row["qr_scanned_at"] or "").strip(),
+            }
+        )
+    return {
+        "has_mail": bool(items),
+        "latest": items[0] if items else None,
+        "items": items,
+        "count": len(items),
+    }
+
+
+def _summarize_property_skiptrace_runs(db, property_id):
+    rows = db.execute(
+        """
+        SELECT sr.id, sr.provider, sr.created_at, sr.summary_json, sr.person_id, p.first_name, p.last_name
+        FROM skiptrace_runs sr
+        LEFT JOIN people p ON p.id = sr.person_id
+        WHERE sr.property_id = ?
+        ORDER BY sr.id DESC
+        LIMIT 10
+        """,
+        (property_id,),
+    ).fetchall()
+    items = []
+    for row in rows:
+        summary = parse_json_object(row["summary_json"] or "{}", default={})
+        items.append(
+            {
+                "id": int(row["id"]),
+                "provider": str(row["provider"] or "").strip() or "Skip trace",
+                "created_at": str(row["created_at"] or "").strip(),
+                "person_name": " ".join([str(row["first_name"] or "").strip(), str(row["last_name"] or "").strip()]).strip(),
+                "phones_added": int(summary.get("phones_added") or 0),
+                "emails_added": int(summary.get("emails_added") or 0),
+                "addresses_added": int(summary.get("addresses_added") or 0),
+                "relatives_added": int(summary.get("relatives_added") or 0),
+            }
+        )
+    return {
+        "has_runs": bool(items),
+        "latest": items[0] if items else None,
+        "items": items,
+        "count": len(items),
+    }
+
+
+@app.route("/webhooks/openletterconnect/events", methods=["POST"])
+def openletterconnect_events_webhook():
+    ensure_db()
+    db = get_db()
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    payload = payload if isinstance(payload, dict) else {}
+    safe_headers = _openletterconnect_safe_header_map(request)
+    safe_payload = _redact_clever_log_value("root", payload)
+    event_type = str(payload.get("event") or payload.get("type") or payload.get("event_type") or "").strip()
+    payload_hash = _openletterconnect_payload_hash(payload)
+
+    existing = db.execute(
+        """
+        SELECT id, processing_status
+        FROM openletterconnect_webhook_events
+        WHERE event_key = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (payload_hash,),
+    ).fetchone()
+    if existing and str(existing["processing_status"] or "").strip().lower() == "processed":
+        return jsonify({"ok": True, "duplicate": True, "event_key": payload_hash}), 200
+
+    records = _extract_openletterconnect_events(payload)
+    first_record = records[0] if records else {}
+    log_cur = db.execute(
+        """
+        INSERT INTO openletterconnect_webhook_events
+        (event_key, event_type, external_order_id, external_order_item_id, verification_status, processing_status, error_text, payload_json, headers_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload_hash,
+            event_type,
+            str(first_record.get("order_id") or "").strip(),
+            str(first_record.get("order_item_id") or "").strip(),
+            "unverified",
+            "received",
+            "",
+            json.dumps(safe_payload or {}, default=str),
+            json.dumps(safe_headers or {}, default=str),
+        ),
+    )
+    log_id = int(log_cur.lastrowid or 0)
+
+    expected_secret = get_openletterconnect_webhook_secret(db)
+    provided_secret = str(payload.get("token") or "").strip()
+    verification_status = "verified"
+    if expected_secret:
+        if not provided_secret or not hmac.compare_digest(provided_secret, expected_secret):
+            verification_status = "unauthorized"
+        else:
+            verification_status = "verified"
+    else:
+        verification_status = "unverified"
+
+    if verification_status == "unauthorized":
+        db.execute(
+            """
+            UPDATE openletterconnect_webhook_events
+            SET verification_status = ?, processing_status = ?, error_text = ?
+            WHERE id = ?
+            """,
+            ("unauthorized", "unauthorized", "Webhook secret mismatch", log_id),
+        )
+        db.commit()
+        return jsonify({"error": "Invalid webhook secret"}), 401
+
+    if not records:
+        db.execute(
+            """
+            UPDATE openletterconnect_webhook_events
+            SET verification_status = ?, processing_status = ?, error_text = ?
+            WHERE id = ?
+            """,
+            (verification_status, "ignored", "No recognizable OpenLetterConnect order id found in payload", log_id),
+        )
+        db.commit()
+        return jsonify({"ok": True, "ignored": True, "reason": "missing_order_id"}), 200
+
+    try:
+        processed_orders = 0
+        ignored_records = 0
+        ignored_reasons = []
+        for record in records:
+            result = _process_openletterconnect_event_record(db, record, payload)
+            processed_orders += int(result.get("updated_orders") or 0)
+            if result.get("ignored"):
+                ignored_records += 1
+                if result.get("reason"):
+                    ignored_reasons.append(str(result.get("reason")))
+        processing_status = "processed" if processed_orders > 0 else "ignored"
+        error_text = "; ".join(sorted(set(ignored_reasons)))[:500]
+        db.execute(
+            """
+            UPDATE openletterconnect_webhook_events
+            SET verification_status = ?, processing_status = ?, error_text = ?, external_order_id = ?, external_order_item_id = ?
+            WHERE id = ?
+            """,
+            (
+                verification_status,
+                processing_status,
+                error_text,
+                str(first_record.get("order_id") or "").strip(),
+                str(first_record.get("order_item_id") or "").strip(),
+                log_id,
+            ),
+        )
+        db.commit()
+        return jsonify(
+            {
+                "ok": True,
+                "event_key": payload_hash,
+                "records_seen": len(records),
+                "updated_orders": processed_orders,
+                "ignored_records": ignored_records,
+            }
+        ), 200
+    except Exception as exc:
+        db.execute(
+            """
+            UPDATE openletterconnect_webhook_events
+            SET verification_status = ?, processing_status = ?, error_text = ?
+            WHERE id = ?
+            """,
+            (verification_status, "error", str(exc)[:500], log_id),
+        )
+        log_app_error(
+            db,
+            source="openletterconnect_events_webhook",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/webhooks/openletterconnect/events",
+            status_code=500,
+        )
+        db.commit()
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/webhooks/openletterconnect/order-status", methods=["POST"])

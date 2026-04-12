@@ -234,6 +234,9 @@
             <label class="span2">OpenLetterConnect API Key
                 <input name="openletterconnect_api_key" value="{{ openletterconnect_api_key }}">
             </label>
+            <label class="span2">OpenLetterConnect Webhook Secret Key
+                <input name="openletterconnect_webhook_secret" value="{{ openletterconnect_webhook_secret }}">
+            </label>
             <label class="span2">SkipSherpa API Key
                 <input name="skipsherpa_api_key" value="{{ skipsherpa_api_key }}">
             </label>
@@ -275,6 +278,8 @@
             </div>
         </form>
         <p class="muted-text">Sequence <code>MAIL</code> steps use the OpenLetterConnect API key above plus the sender/template values from Direct Mail Settings.</p>
+        <p class="muted-text">OpenLetterConnect events webhook URL: <code>{{ openletterconnect_events_webhook_url or 'Set Public App Base URL to generate the OpenLetterConnect events webhook URL.' }}</code></p>
+        <p class="muted-text">The webhook secret key above should match the secret/token configured in OpenLetterConnect for the new events webhook.</p>
         <p class="muted-text">Sequence <code>VM_DROP</code> steps use the Slybroadcast credentials above. The step body should be the recording name for that drop. Callback URL: <code>{{ slybroadcast_settings.callback_url or 'Set Public App Base URL to generate the Slybroadcast callback URL.' }}</code></p>
         <p class="muted-text">RentCast is used for systematic sale-listing checks via <code>/v1/listings/sale</code>. If a matching listing returns <code>status=Active</code>, the referral is treated as on-market, and listing agent details are cached with the referral payload.</p>
         <p class="muted-text">Anonymous browse-stage leads are only validated/pushed when they remain outside <code>/step-2/</code> and <code>/thank-you/</code>. Imported EmailOctopus sent-email registry size: {{ anonymous_email_registry_count }}.</p>

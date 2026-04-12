@@ -60,6 +60,70 @@
             {% endif %}
         </tbody>
     </table>
+    <div class="property-tracking-callouts">
+        <article class="property-tracking-card">
+            <h5>Direct Mail</h5>
+            {% if property_mail_summary['has_mail'] %}
+            <p><strong>Mailer Submitted:</strong> Yes</p>
+            <p>
+                <strong>Latest Status:</strong>
+                <span class="pill">{{ property_mail_summary['latest']['status'] }}</span>
+                {% if property_mail_summary['latest']['status_at'] %} on {{ property_mail_summary['latest']['status_at']|fmt_est_datetime }}{% endif %}
+            </p>
+            {% if property_mail_summary['latest']['qr_scanned_at'] %}
+            <p><strong>QR Scan:</strong> {{ property_mail_summary['latest']['qr_scanned_at']|fmt_est_datetime }}</p>
+            {% endif %}
+            <table class="compact-table">
+                <thead><tr><th>Status</th><th>Date</th><th>Mode</th><th>Order</th></tr></thead>
+                <tbody>
+                    {% for item in property_mail_summary['items'][:5] %}
+                    <tr>
+                        <td>{{ item.status }}</td>
+                        <td>{{ item.status_at|fmt_est_datetime if item.status_at else '-' }}</td>
+                        <td>{{ item.mode or '-' }}</td>
+                        <td>{{ item.external_order_id or '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="muted-text">No direct mail orders have been recorded for this property yet.</p>
+            {% endif %}
+        </article>
+        <article class="property-tracking-card">
+            <h5>Skip Trace</h5>
+            {% if property_skiptrace_summary['has_runs'] %}
+            <p><strong>Skip Traced:</strong> Yes</p>
+            <p>
+                <strong>Latest Run:</strong>
+                {{ property_skiptrace_summary['latest']['provider'] }}
+                on {{ property_skiptrace_summary['latest']['created_at']|fmt_est_datetime }}
+            </p>
+            <p class="muted-text">
+                Phones +{{ property_skiptrace_summary['latest']['phones_added'] }},
+                Emails +{{ property_skiptrace_summary['latest']['emails_added'] }},
+                Addresses +{{ property_skiptrace_summary['latest']['addresses_added'] }},
+                Relatives +{{ property_skiptrace_summary['latest']['relatives_added'] }}
+            </p>
+            <table class="compact-table">
+                <thead><tr><th>Date</th><th>Provider</th><th>Person</th><th>Phones</th><th>Emails</th></tr></thead>
+                <tbody>
+                    {% for item in property_skiptrace_summary['items'][:5] %}
+                    <tr>
+                        <td>{{ item.created_at|fmt_est_datetime }}</td>
+                        <td>{{ item.provider }}</td>
+                        <td>{{ item.person_name or '-' }}</td>
+                        <td>{{ item.phones_added }}</td>
+                        <td>{{ item.emails_added }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="muted-text">No skip trace runs have been recorded for this property yet.</p>
+            {% endif %}
+        </article>
+    </div>
 </section>
 
 <section class="panel">

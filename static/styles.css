@@ -2055,3 +2055,21 @@ button:hover { filter: brightness(1.05); }
     gap: 0.7rem;
     margin-top: 0.55rem;
 }
+
+.property-tracking-callouts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+}
+
+.property-tracking-card {
+    border: 1px solid #d8dee6;
+    border-radius: 12px;
+    padding: 1rem;
+    background: #fafbfd;
+}
+
+.property-tracking-card h5 {
+    margin: 0 0 0.75rem;
+}

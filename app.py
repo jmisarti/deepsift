@@ -4104,7 +4104,28 @@ def place_openletterconnect_order(db, contacts, property_row, template_id=None, 
         data = {"raw_text": response.text}
     if not response.ok:
         raise ValueError(f"OpenLetterConnect order failed ({response.status_code}): {data}")
-    return {"request": payload, "response": data, "template": built.get("template")}
+    reisift_tag_sync = None
+    property_id = int((property_row["id"] if property_row and "id" in property_row.keys() else 0) or 0)
+    property_uuid = _get_local_property_uuid(db, property_id) if property_id else ""
+    if property_uuid:
+        try:
+            reisift_tag_sync = reisift_append_property_tags(
+                reisift_get_access_token(),
+                property_uuid,
+                build_reisift_direct_mail_tags(),
+            )
+        except Exception as exc:
+            reisift_tag_sync = {
+                "ok": False,
+                "property_uuid": property_uuid,
+                "error": str(exc),
+            }
+    return {
+        "request": payload,
+        "response": data,
+        "template": built.get("template"),
+        "reisift_tag_sync": reisift_tag_sync,
+    }
 
 
 def _format_person_contact_for_mail(db, property_row, person_id):
@@ -11743,6 +11764,114 @@ def reisift_append_property_note(token, property_uuid, note_text):
     if not response.ok:
         raise ValueError(f"ReiSift note update failed ({response.status_code}): {body}")
     return {"ok": True, "request": {"notes": merged}, "response": body}
+
+
+def _reisift_date_stamp_for_tag(when=None):
+    dt = when if isinstance(when, datetime) else datetime.now(EST_TZ)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=EST_TZ)
+    else:
+        dt = dt.astimezone(EST_TZ)
+    return dt.strftime("%m%d%y")
+
+
+def build_reisift_direct_mail_tags(when=None):
+    stamp = _reisift_date_stamp_for_tag(when)
+    return ["directmail", f"DM{stamp}"]
+
+
+def build_reisift_skiptrace_tags(when=None):
+    stamp = _reisift_date_stamp_for_tag(when)
+    return ["skiptraced", f"skipped{stamp}"]
+
+
+def _extract_reisift_property_tags(property_payload):
+    payload = property_payload if isinstance(property_payload, dict) else {}
+    raw = payload.get("tags")
+    tags = []
+    seen = set()
+
+    def add_tag(value):
+        text = str(value or "").strip()
+        key = text.lower()
+        if not text or key in seen:
+            return
+        seen.add(key)
+        tags.append(text)
+
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                add_tag(item)
+            elif isinstance(item, dict):
+                if "name" in item:
+                    add_tag(item.get("name"))
+                elif "title" in item:
+                    add_tag(item.get("title"))
+                elif "tag" in item:
+                    add_tag(item.get("tag"))
+                elif "value" in item:
+                    add_tag(item.get("value"))
+                else:
+                    for key, value in item.items():
+                        if value in (True, "true", "True", 1, "1"):
+                            add_tag(key)
+    elif isinstance(raw, dict):
+        for key, value in raw.items():
+            if value in (True, "true", "True", 1, "1"):
+                add_tag(key)
+    elif isinstance(raw, str):
+        for part in parse_csv_list(raw):
+            add_tag(part)
+    return tags
+
+
+def reisift_append_property_tags(token, property_uuid, tags_to_add):
+    property_uuid = str(property_uuid or "").strip()
+    desired_tags = [str(tag or "").strip() for tag in (tags_to_add or []) if str(tag or "").strip()]
+    if not property_uuid or not desired_tags:
+        return {"ok": False, "skipped": True, "reason": "missing_property_uuid_or_tags"}
+    current_payload = fetch_reisift_property_payload(token, property_uuid)
+    existing_tags = _extract_reisift_property_tags(current_payload)
+    merged_tags = []
+    seen = set()
+    for tag in list(existing_tags) + list(desired_tags):
+        clean = str(tag or "").strip()
+        key = clean.lower()
+        if not clean or key in seen:
+            continue
+        seen.add(key)
+        merged_tags.append(clean)
+    if [tag.lower() for tag in merged_tags] == [tag.lower() for tag in existing_tags]:
+        return {"ok": True, "skipped": True, "reason": "tags_already_present", "tags": existing_tags}
+
+    raw_current = current_payload.get("tags")
+    request_bodies = []
+    if isinstance(raw_current, dict):
+        request_bodies.append({"tags": {tag: True for tag in merged_tags}})
+        request_bodies.append({"tags": merged_tags})
+    else:
+        request_bodies.append({"tags": merged_tags})
+        request_bodies.append({"tags": {tag: True for tag in merged_tags}})
+
+    errors = []
+    attempted = []
+    for body in request_bodies:
+        response = requests.patch(
+            f"{REISIFT_BASE_URL}/api/internal/property/{property_uuid}/",
+            headers=reisift_auth_headers(token),
+            json=body,
+            timeout=30,
+        )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {"raw_text": response.text}
+        attempted.append({"status_code": response.status_code, "request": body})
+        if response.ok:
+            return {"ok": True, "request": body, "response": payload, "attempted": attempted}
+        errors.append({"status_code": response.status_code, "response": payload, "request": body})
+    raise ValueError(f"ReiSift tag update failed for {property_uuid}: {errors}")
 
 
 def _build_website_lead_notes(payload, fields, source_label="webhook"):
@@ -20972,6 +21101,7 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
         "emails_attempted": 0,
         "error": "",
         "result": None,
+        "tag_sync": None,
     }
 
     phones = []
@@ -21075,6 +21205,19 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
 
     out["ok"] = bool(sync_result.get("ok"))
     out["result"] = sync_result
+    if out["ok"] and phones and out["property_uuid"]:
+        try:
+            out["tag_sync"] = reisift_append_property_tags(
+                token,
+                out["property_uuid"],
+                build_reisift_skiptrace_tags(),
+            )
+        except Exception as exc:
+            out["tag_sync"] = {
+                "ok": False,
+                "property_uuid": out["property_uuid"],
+                "error": str(exc),
+            }
     return out
 
 

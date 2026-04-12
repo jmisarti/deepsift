@@ -20525,6 +20525,39 @@ def _reisift_parse_owner_emails(owner):
     return emails
 
 
+def _reisift_parse_phone_tags(raw_tags):
+    tags = []
+    seen = set()
+
+    def add_tag(value):
+        text = str(value or "").strip()
+        key = text.lower()
+        if not text or key in seen:
+            return
+        seen.add(key)
+        tags.append(text)
+
+    if isinstance(raw_tags, list):
+        for item in raw_tags:
+            if isinstance(item, str):
+                add_tag(item)
+            elif isinstance(item, dict):
+                for key, value in item.items():
+                    if value in (True, "true", "True", 1, "1"):
+                        add_tag(key)
+            else:
+                add_tag(item)
+    elif isinstance(raw_tags, dict):
+        for key, value in raw_tags.items():
+            if value in (True, "true", "True", 1, "1"):
+                add_tag(key)
+    elif isinstance(raw_tags, str):
+        for part in parse_csv_list(raw_tags):
+            add_tag(part)
+
+    return tags
+
+
 def _reisift_parse_owner_phones(owner):
     phones = []
     seen = set()
@@ -20538,13 +20571,22 @@ def _reisift_parse_owner_phones(owner):
             number = (item.get("number") or item.get("phone") or "").strip()
             p_type = (item.get("type") or "UNKNOWN").strip().upper()
             p_status = (item.get("status") or "UNKNOWN").strip().upper()
+            raw_tags = item.get("tags")
         else:
             number = str(item or "").strip()
+            raw_tags = []
         norm = normalize_phone(number)
         if not number or not norm or norm in seen:
             continue
         seen.add(norm)
-        phones.append({"number": norm, "type": p_type, "tags": [], "status": p_status})
+        phones.append(
+            {
+                "number": norm,
+                "type": p_type,
+                "tags": _reisift_parse_phone_tags(raw_tags),
+                "status": p_status,
+            }
+        )
     return phones
 
 
@@ -21208,8 +21250,6 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
         seen_email.add(value)
         emails.append(value)
 
-    out["phones_attempted"] = len(phones)
-    out["emails_attempted"] = len(emails)
     if not phones and not emails:
         out["ok"] = True
         out["result"] = {"skipped": True, "reason": "no_contacts"}
@@ -21232,12 +21272,30 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
         out["error"] = str(exc)
         return out
 
-    if not owner_uuid and out["property_uuid"]:
+    property_payload = {}
+    existing_owner = {}
+    existing_phone_numbers = set()
+    existing_emails = set()
+    if out["property_uuid"]:
         try:
-            owner_uuid = _reisift_find_owner_uuid(fetch_reisift_property_payload(token, out["property_uuid"])) or ""
+            property_payload = fetch_reisift_property_payload(token, out["property_uuid"]) or {}
         except Exception as exc:
-            out["error"] = f"Owner UUID lookup failed: {exc}"
+            out["error"] = f"Owner lookup failed before skiptrace sync: {exc}"
             return out
+        existing_owner = _reisift_find_first_owner_dict(property_payload)
+        existing_phone_numbers = {
+            normalize_phone(item.get("number") or "")
+            for item in _reisift_parse_owner_phones(existing_owner)
+            if normalize_phone(item.get("number") or "")
+        }
+        existing_emails = {
+            str(value or "").strip().lower()
+            for value in _reisift_parse_owner_emails(existing_owner)
+            if str(value or "").strip()
+        }
+
+    if not owner_uuid and property_payload:
+        owner_uuid = _reisift_find_owner_uuid(property_payload) or ""
         if owner_uuid and has_owner_col:
             try:
                 db.execute(
@@ -21254,6 +21312,15 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
     out["owner_uuid"] = owner_uuid
     if not owner_uuid:
         out["error"] = "No ReiSift owner UUID available for skiptrace contact sync."
+        return out
+
+    phones = [item for item in phones if normalize_phone(item.get("number") or "") not in existing_phone_numbers]
+    emails = [value for value in emails if str(value or "").strip().lower() not in existing_emails]
+    out["phones_attempted"] = len(phones)
+    out["emails_attempted"] = len(emails)
+    if not phones and not emails:
+        out["ok"] = True
+        out["result"] = {"skipped": True, "reason": "no_new_contacts"}
         return out
 
     try:

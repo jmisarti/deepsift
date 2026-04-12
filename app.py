@@ -4136,7 +4136,7 @@ def place_openletterconnect_order(db, contacts, property_row, template_id=None, 
     }
 
 
-def _format_person_contact_for_mail(db, property_row, person_id):
+def _format_person_contact_for_mail(db, property_row, person_id, person_address_id=None):
     person = db.execute(
         "SELECT id, first_name, last_name, primary_phone, primary_email, deceased FROM people WHERE id = ?",
         (person_id,),
@@ -4146,21 +4146,36 @@ def _format_person_contact_for_mail(db, property_row, person_id):
     if int(person["deceased"] or 0) == 1:
         return None
 
-    addr = db.execute(
-        """
-        SELECT a.street, a.city, a.state, a.postal_code
-        FROM person_addresses pa
-        JOIN addresses a ON a.id = pa.address_id
-        WHERE pa.person_id = ?
-        ORDER BY pa.id DESC
-        LIMIT 1
-        """,
-        (person_id,),
-    ).fetchone()
+    if person_address_id:
+        addr = db.execute(
+            """
+            SELECT pa.id AS person_address_id, pa.label, a.id AS address_id, a.street, a.city, a.state, a.postal_code
+            FROM person_addresses pa
+            JOIN addresses a ON a.id = pa.address_id
+            WHERE pa.person_id = ? AND pa.id = ?
+            LIMIT 1
+            """,
+            (person_id, int(person_address_id)),
+        ).fetchone()
+    else:
+        addr = db.execute(
+            """
+            SELECT pa.id AS person_address_id, pa.label, a.id AS address_id, a.street, a.city, a.state, a.postal_code
+            FROM person_addresses pa
+            JOIN addresses a ON a.id = pa.address_id
+            WHERE pa.person_id = ?
+            ORDER BY pa.id DESC
+            LIMIT 1
+            """,
+            (person_id,),
+        ).fetchone()
 
     # Fallback for the primary owner if a dedicated mailing address is unavailable.
-    if not addr and person_id == property_row["owner_person_id"]:
+    if not addr and not person_address_id and person_id == property_row["owner_person_id"]:
         addr = {
+            "person_address_id": None,
+            "label": "Property Address",
+            "address_id": property_row["property_address_id"] if "property_address_id" in property_row.keys() else None,
             "street": property_row["street"],
             "city": property_row["city"],
             "state": property_row["state"],
@@ -4220,9 +4235,12 @@ def _format_person_contact_for_mail(db, property_row, person_id):
         "propertyState": property_row["state"],
         "propertyZip": property_row["postal_code"],
         "propertyOwnerName": owner_name or None,
+        "mailingAddressLabel": (addr["label"] or "").strip() if addr else None,
         "meta_data": {
             "property_id": property_row["id"],
             "person_id": person["id"],
+            "person_address_id": addr["person_address_id"] if addr else None,
+            "address_id": addr["address_id"] if addr else None,
             "subject_property": {
                 "street": property_row["street"],
                 "city": property_row["city"],
@@ -31918,14 +31936,26 @@ def person_detail(person_id):
 
     addresses = db.execute(
         """
-        SELECT pa.label, a.street, a.city, a.state, a.postal_code
+        SELECT pa.id AS person_address_id, pa.address_id, pa.label, pa.created_at,
+               a.street, a.city, a.state, a.postal_code
         FROM person_addresses pa
         JOIN addresses a ON a.id = pa.address_id
         WHERE pa.person_id = ?
-        ORDER BY pa.created_at DESC
+        ORDER BY pa.created_at DESC, pa.id DESC
         """,
         (person_id,),
     ).fetchall()
+    current_mail_address_row = db.execute(
+        """
+        SELECT pa.id AS person_address_id
+        FROM person_addresses pa
+        WHERE pa.person_id = ?
+        ORDER BY pa.id DESC
+        LIMIT 1
+        """,
+        (person_id,),
+    ).fetchone()
+    current_mail_person_address_id = int(current_mail_address_row["person_address_id"] or 0) if current_mail_address_row else 0
 
 
     property_context = None
@@ -32060,6 +32090,7 @@ def person_detail(person_id):
         socials=socials,
         relationship_rows=relationship_rows,
         addresses=addresses,
+        current_mail_person_address_id=current_mail_person_address_id,
         person_notes=person_notes,
         communications=communications,
         property_context=property_context,
@@ -33339,6 +33370,98 @@ def mail_single_relative_route(property_id, person_id):
         return jsonify({"error": str(exc)}), 400
 
 
+@app.route("/api/properties/<int:property_id>/mail/relative/<int:person_id>/address/<int:person_address_id>", methods=["POST"])
+def mail_single_relative_address_route(property_id, person_id, person_address_id):
+    ensure_db()
+    db = get_db()
+    template_id = direct_mail_template_id_from_request(db)
+    prop = db.execute(
+        """
+        SELECT p.id, p.owner_person_id, a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        """,
+        (property_id,),
+    ).fetchone()
+    if not prop:
+        return jsonify({"error": "property not found"}), 404
+
+    target_person = db.execute("SELECT deceased FROM people WHERE id = ?", (person_id,)).fetchone()
+    if not target_person:
+        return jsonify({"error": "person not found"}), 404
+    if int(target_person["deceased"] or 0) == 1:
+        return jsonify({"error": "Mailer is not available for deceased individuals"}), 400
+
+    contact = _format_person_contact_for_mail(db, prop, person_id, person_address_id=person_address_id)
+    if not contact:
+        return jsonify({"error": "No mailing address available for this person at the selected address"}), 400
+
+    try:
+        result = place_openletterconnect_order(
+            db,
+            [contact],
+            prop,
+            template_id=template_id,
+            mode="mail-individual-address-override",
+        )
+        res = result["response"] if isinstance(result, dict) else {}
+        external_order_id = str(res.get("id") or res.get("orderId") or res.get("order_id") or "")
+        status = str(res.get("status") or "")
+        cost = res.get("totalCost") or res.get("cost")
+        db.execute(
+            """
+            INSERT INTO mail_orders (
+                property_id, person_id, mode, template_id, external_order_id, status, cost,
+                recipient_count, request_json, response_json, status_updated_at, last_event_type
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                property_id,
+                person_id,
+                "individual_address_override",
+                template_id,
+                external_order_id,
+                status,
+                cost,
+                1,
+                json.dumps(result.get("request")),
+                json.dumps(res),
+                format_db_time(datetime.utcnow()),
+                "order_submitted",
+            ),
+        )
+        add_person_note(
+            db,
+            person_id,
+            "OpenLetterConnect",
+            (
+                f"Mailer order submitted (template {template_id}) for property {property_id} "
+                f"using alternate address #{person_address_id}."
+            ),
+            {"response": res, "contact": contact},
+        )
+        db.execute(
+            """
+            INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                property_id,
+                person_id,
+                "Direct Mail",
+                f"Submitted address-override mailer order {external_order_id or '(no id)'}",
+                json.dumps({"response": res, "contact": contact}, default=str),
+            ),
+        )
+        db.commit()
+        return jsonify({"ok": True, "order": res}), 200
+    except Exception as exc:
+        db.rollback()
+        return jsonify({"error": str(exc)}), 400
+
+
 @app.route("/api/properties/<int:property_id>/mail/preview/relative/<int:person_id>", methods=["GET"])
 def mail_preview_single_relative_route(property_id, person_id):
     ensure_db()
@@ -33380,6 +33503,57 @@ def mail_preview_single_relative_route(property_id, person_id):
         {
             "ok": True,
             "mode": "individual",
+            "selected_template_id": template_id,
+            "available_templates": get_direct_mail_available_templates(template_id),
+            "recipient_count": 1,
+            "payload": built["payload"],
+            "proofs": proofs,
+            "template_meta": build_openletterconnect_template_meta(template_data),
+        }
+    )
+
+
+@app.route("/api/properties/<int:property_id>/mail/preview/relative/<int:person_id>/address/<int:person_address_id>", methods=["GET"])
+def mail_preview_single_relative_address_route(property_id, person_id, person_address_id):
+    ensure_db()
+    db = get_db()
+    template_id = direct_mail_template_id_from_request(db)
+    prop = db.execute(
+        """
+        SELECT p.id, p.owner_person_id, a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        """,
+        (property_id,),
+    ).fetchone()
+    if not prop:
+        return jsonify({"error": "property not found"}), 404
+
+    person = db.execute("SELECT deceased FROM people WHERE id = ?", (person_id,)).fetchone()
+    if not person:
+        return jsonify({"error": "person not found"}), 404
+    if int(person["deceased"] or 0) == 1:
+        return jsonify({"error": "Mailer is not available for deceased individuals"}), 400
+
+    contact = _format_person_contact_for_mail(db, prop, person_id, person_address_id=person_address_id)
+    if not contact:
+        return jsonify({"error": "No mailing address available for this person at the selected address"}), 400
+
+    built = build_openletterconnect_order_payload(
+        db,
+        [contact],
+        prop,
+        template_id=template_id,
+        mode="mail-individual-address-override",
+    )
+    template_data = built.get("template") or {}
+    include_proofs = request.args.get("include_proofs", "0").strip().lower() in ("1", "true", "yes")
+    proofs = view_openletterconnect_proofs(built["payload"]) if include_proofs else []
+    return jsonify(
+        {
+            "ok": True,
+            "mode": "individual_address_override",
             "selected_template_id": template_id,
             "available_templates": get_direct_mail_available_templates(template_id),
             "recipient_count": 1,

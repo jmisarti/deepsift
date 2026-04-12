@@ -148,7 +148,37 @@
                     <form method="post" action="{{ url_for('add_person_address', person_id=person.id) }}" class="grid-form compact"><label>Label <input name="label" value="Related Address"></label><label>Street <input name="street" required></label><label>City <input name="city" required></label><label>State <input name="state" required></label><label>ZIP <input name="postal_code" required></label><button type="submit">Add Address</button></form>
                 </details>
             </div>
-            <table class="crm-table contact-table"><thead><tr><th>Label</th><th>Address</th></tr></thead><tbody>{% for a in addresses %}<tr><td>{{ a.label }}</td><td>{{ a.street }}, {{ a.city }}, {{ a.state }} {{ a.postal_code }}</td></tr>{% endfor %}{% if not addresses %}<tr><td colspan="2">No addresses on file.</td></tr>{% endif %}</tbody></table>
+            <table class="crm-table contact-table">
+                <thead><tr><th>Label</th><th>Address</th><th>Mail</th></tr></thead>
+                <tbody>
+                    {% for a in addresses %}
+                    <tr>
+                        <td>{{ a.label }}</td>
+                        <td>{{ a.street }}, {{ a.city }}, {{ a.state }} {{ a.postal_code }}</td>
+                        <td>
+                            {% if default_property_id and not person.deceased and a.person_address_id != current_mail_person_address_id %}
+                            <button
+                                type="button"
+                                class="icon-btn address-mail-btn"
+                                data-person-address-id="{{ a.person_address_id }}"
+                                title="Mail this address"
+                                aria-label="Mail this address"
+                            >
+                                <img class="tiny-link-icon" src="{{ url_for('static', filename='openletterconnect-icon.svg') }}" alt="OpenLetterConnect">
+                            </button>
+                            {% elif a.person_address_id == current_mail_person_address_id %}
+                            <span class="pill" title="This is the default address used by Mail This Person">Default</span>
+                            {% else %}
+                            <span class="anon-muted">-</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                    {% if not addresses %}
+                    <tr><td colspan="3">No addresses on file.</td></tr>
+                    {% endif %}
+                </tbody>
+            </table>
         </section>
 
         <section class="contact-card">
@@ -633,6 +663,24 @@ if (personMailBtn) {
     );
   });
 }
+
+document.querySelectorAll('.address-mail-btn').forEach((button) => {
+  button.addEventListener('click', async () => {
+    if (!personCommPropertyId) {
+      alert('No property context available for this person.');
+      return;
+    }
+    const personAddressId = button.dataset.personAddressId;
+    if (!personAddressId) {
+      alert('No mailing address selected.');
+      return;
+    }
+    await openPersonMailPreview(
+      `/api/properties/${personCommPropertyId}/mail/preview/relative/${personId}/address/${personAddressId}`,
+      `/api/properties/${personCommPropertyId}/mail/relative/${personId}/address/${personAddressId}`
+    );
+  });
+});
 
 personMailPreviewModal.addEventListener('click', (e) => {
   if (e.target.dataset.closePersonMailPreview === '1') closePersonMailPreview();

@@ -13066,6 +13066,16 @@ def _untitled_should_notify_hot(existing_row, prepared_row, diff_map, change_typ
         return False
     if str(prepared_row.get("lead_category") or "").strip().lower() != "hot":
         return False
+    address = _untitled_source_address(prepared_row)
+    if not (
+        address.get("street")
+        and address.get("city")
+        and address.get("state") == "NJ"
+        and address.get("postal_code")
+    ):
+        return False
+    if _safe_float(prepared_row.get("last_session_est_duration")) <= 30:
+        return False
     if change_type in {"new", "reappeared"}:
         return True
     existing_category = str(existing_row["lead_category"] or "").strip().lower() if existing_row else ""

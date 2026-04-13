@@ -22859,7 +22859,7 @@ def refresh_reisift_followups_search_cache(db, lookback_days=7):
     }
 
 
-def enrich_reisift_followups_cache(db):
+def refresh_reisift_followups_cache(db):
     token = reisift_get_access_token()
     rows = db.execute(
         "SELECT property_uuid, added_at, payload_json FROM reisift_followups WHERE is_active = 1 ORDER BY id DESC"
@@ -22918,6 +22918,10 @@ def enrich_reisift_followups_cache(db):
         updated += 1
     commit_with_retry(db)
     return {"updated": updated, "errors": errors}
+
+
+def enrich_reisift_followups_cache(db):
+    return refresh_reisift_followups_cache(db)
 
 
 def get_cached_followups(db, sort_dir="desc"):
@@ -28666,7 +28670,7 @@ def follow_ups_page():
         error=error,
         lookback_days=lookback_days,
         sort_order=sort_order,
-        auto_enrich=(request.args.get("enrich") or "0") == "1",
+        auto_refresh=(request.args.get("refresh") or request.args.get("enrich") or "0") == "1",
         followup_summary={
             "lead_count": len(rows),
             "outbound_calls": outbound_calls_total,
@@ -28695,17 +28699,18 @@ def follow_ups_refresh():
         notice = f"Follow Ups refreshed. {data['synced']} rows cached from the last {lookback_days} days."
         if data["errors"]:
             notice += f" {len(data['errors'])} detail calls used fallback payload."
-        return redirect(url_for("follow_ups_page", notice=notice, days=lookback_days, sort=sort_order, enrich=1))
+        return redirect(url_for("follow_ups_page", notice=notice, days=lookback_days, sort=sort_order, refresh=1))
     except Exception as exc:
         return redirect(url_for("follow_ups_page", error=f"Refresh failed: {exc}", days=lookback_days, sort=sort_order))
 
 
+@app.route("/api/follow-ups/refresh-cache", methods=["POST"])
 @app.route("/api/follow-ups/enrich", methods=["POST"])
-def follow_ups_enrich_api():
+def follow_ups_refresh_cache_api():
     ensure_db()
     db = get_db()
     try:
-        result = enrich_reisift_followups_cache(db)
+        result = refresh_reisift_followups_cache(db)
         return jsonify({"ok": True, "updated": result["updated"], "errors": result["errors"]})
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500

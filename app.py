@@ -12732,12 +12732,22 @@ def _build_submitted_lead_activity_index(db, earliest_since=None):
         """,
         (cutoff, cutoff),
     ).fetchall()
+    mail_rows = db.execute(
+        """
+        SELECT id, property_id, external_order_id, recipient_count, created_at
+        FROM mail_orders
+        WHERE (? = '' OR created_at >= ?)
+        ORDER BY id DESC
+        """,
+        (cutoff, cutoff),
+    ).fetchall()
     index = {
         "sms_by_from": {},
         "sms_by_to": {},
         "calls_by_phone": {},
         "email_by_from": {},
         "email_by_to": {},
+        "mail_by_property": {},
     }
     for row in sms_rows:
         item = dict(row)
@@ -12764,6 +12774,11 @@ def _build_submitted_lead_activity_index(db, earliest_since=None):
             index["email_by_from"].setdefault(from_norm, []).append(item)
         if to_norm:
             index["email_by_to"].setdefault(to_norm, []).append(item)
+    for row in mail_rows:
+        item = dict(row)
+        property_id = int(row["property_id"] or 0)
+        if property_id > 0:
+            index["mail_by_property"].setdefault(property_id, []).append(item)
     return index
 
 
@@ -12785,6 +12800,7 @@ def _submitted_sms_message_key(item, direction):
 def _build_submitted_lead_activity_rollup(item, activity_index):
     phone_norms = set(item.get("phone_norms") or [])
     email_norms = set(item.get("email_norms") or [])
+    local_property_id = int(item.get("local_property_id") or 0)
     since_dt = _submitted_lead_timestamp_value(item.get("activity_since_at"), item.get("first_received_at"), item.get("date_added"))
     outbound_sms_keys = set()
     inbound_sms_keys = set()
@@ -12792,6 +12808,7 @@ def _build_submitted_lead_activity_rollup(item, activity_index):
     inbound_call_keys = set()
     outbound_email_keys = set()
     inbound_email_keys = set()
+    outbound_mail_count = 0
 
     def _is_after(value):
         if since_dt is None:
@@ -12844,10 +12861,20 @@ def _build_submitted_lead_activity_rollup(item, activity_index):
             if str(email_event.get("direction") or "").strip().lower() == "inbound":
                 inbound_email_keys.add(str(email_event.get("id") or ""))
 
+    if local_property_id > 0:
+        for mail_event in activity_index.get("mail_by_property", {}).get(local_property_id, []):
+            if not _is_after(mail_event.get("created_at")):
+                continue
+            try:
+                outbound_mail_count += max(1, int(mail_event.get("recipient_count") or 1))
+            except (TypeError, ValueError):
+                outbound_mail_count += 1
+
     return {
         "outbound_calls": len(outbound_call_keys),
         "outbound_sms": len(outbound_sms_keys),
         "outbound_email": len(outbound_email_keys),
+        "outbound_mail": outbound_mail_count,
         "inbound_responses": len(inbound_sms_keys) + len(inbound_call_keys) + len(inbound_email_keys),
         "inbound_calls": len(inbound_call_keys),
         "inbound_sms": len(inbound_sms_keys),
@@ -12948,7 +12975,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     source = normalize_whitespace(source).lower()
     sort_by = normalize_whitespace(sort_by).lower() or "date_added"
     sort_dir = normalize_whitespace(sort_dir).lower() or "desc"
-    allowed_sort_columns = {"date_added", "outbound_calls", "outbound_sms", "outbound_email", "inbound_responses"}
+    allowed_sort_columns = {"date_added", "outbound_calls", "outbound_sms", "outbound_email", "outbound_mail", "inbound_responses"}
     if sort_by not in allowed_sort_columns:
         sort_by = "date_added"
     if sort_dir not in {"asc", "desc"}:
@@ -13024,7 +13051,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
         reverse=True,
     )
     if not rows:
-        return [], {"lead_count": 0, "outbound_calls": 0, "outbound_sms": 0, "outbound_email": 0, "inbound_responses": 0}, {
+        return [], {"lead_count": 0, "outbound_calls": 0, "outbound_sms": 0, "outbound_email": 0, "outbound_mail": 0, "inbound_responses": 0}, {
             "page": 1,
             "per_page": per_page,
             "total_rows": 0,
@@ -13064,6 +13091,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
         "outbound_calls": sum(int(item.get("outbound_calls") or 0) for item in rows),
         "outbound_sms": sum(int(item.get("outbound_sms") or 0) for item in rows),
         "outbound_email": sum(int(item.get("outbound_email") or 0) for item in rows),
+        "outbound_mail": sum(int(item.get("outbound_mail") or 0) for item in rows),
         "inbound_responses": sum(int(item.get("inbound_responses") or 0) for item in rows),
     }
     total_rows = len(rows)

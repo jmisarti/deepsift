@@ -132,6 +132,15 @@
                     </th>
                     <th>
                         <div class="submitted-sort-head">
+                            <span>Outbound Mail</span>
+                            <span class="submitted-sort-links">
+                                {{ sort_link('outbound_mail', 'desc', 'High') }}
+                                {{ sort_link('outbound_mail', 'asc', 'Low') }}
+                            </span>
+                        </div>
+                    </th>
+                    <th>
+                        <div class="submitted-sort-head">
                             <span>Inbound Responses</span>
                             <span class="submitted-sort-links">
                                 {{ sort_link('inbound_responses', 'desc', 'High') }}
@@ -154,6 +163,7 @@
                     <td>{{ row.outbound_calls or 0 }}</td>
                     <td>{{ row.outbound_sms or 0 }}</td>
                     <td>{{ row.outbound_email or 0 }}</td>
+                    <td>{{ row.outbound_mail or 0 }}</td>
                     <td>{{ row.inbound_responses or 0 }}</td>
                     <td>
                         <span class="ad-leads-link-icons">
@@ -171,7 +181,7 @@
                     </td>
                 </tr>
                 <tr id="submitted-detail-{{ row.source }}-{{ row.id }}" class="followup-detail-row hidden">
-                    <td colspan="11">
+                    <td colspan="12">
                         <div class="inline-actions" style="justify-content:space-between; margin: 0.35rem 0 0.6rem;">
                             <p style="margin:0;"><strong>Lead Key:</strong> {{ row.lead_key or '-' }}</p>
                             <p style="margin:0;"><strong>Stage:</strong> {{ row.latest_stage or '-' }}</p>
@@ -257,7 +267,7 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="11">No submitted leads found yet.</td>
+                    <td colspan="12">No submitted leads found yet.</td>
                 </tr>
                 {% endfor %}
             </tbody>

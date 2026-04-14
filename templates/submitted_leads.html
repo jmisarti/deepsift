@@ -1,5 +1,9 @@
 {% extends "base.html" %}
 {% block content %}
+{% macro sort_link(column, direction, label) -%}
+    <a class="submitted-sort-link {% if sort_by == column and sort_dir == direction %}is-active{% endif %}"
+       href="{{ url_for('submitted_leads_page', q=q, source=source, sort_by=column, sort_dir=direction, page=1) }}">{{ label }}</a>
+{%- endmacro %}
 <section class="cards page-summary-cards">
     <article>
         <h3>Outbound Calls</h3>
@@ -25,6 +29,8 @@
     <div class="panel-actions">
         <form method="get" action="{{ url_for('submitted_leads_page') }}" class="inline-form">
             <input type="text" name="q" value="{{ q }}" placeholder="address, seller, phone, email">
+            <input type="hidden" name="sort_by" value="{{ sort_by }}">
+            <input type="hidden" name="sort_dir" value="{{ sort_dir }}">
             <label>Source
                 <select name="source">
                     <option value="">All</option>
@@ -48,11 +54,51 @@
                     <th>Status</th>
                     <th>Source</th>
                     <th>Owner(s)</th>
-                    <th>Date Added</th>
-                    <th>Outbound Calls</th>
-                    <th>Outbound SMS</th>
-                    <th>Outbound Email</th>
-                    <th>Inbound Responses</th>
+                    <th>
+                        <div class="submitted-sort-head">
+                            <span>Date Added</span>
+                            <span class="submitted-sort-links">
+                                {{ sort_link('date_added', 'desc', 'New') }}
+                                {{ sort_link('date_added', 'asc', 'Old') }}
+                            </span>
+                        </div>
+                    </th>
+                    <th>
+                        <div class="submitted-sort-head">
+                            <span>Outbound Calls</span>
+                            <span class="submitted-sort-links">
+                                {{ sort_link('outbound_calls', 'desc', 'High') }}
+                                {{ sort_link('outbound_calls', 'asc', 'Low') }}
+                            </span>
+                        </div>
+                    </th>
+                    <th>
+                        <div class="submitted-sort-head">
+                            <span>Outbound SMS</span>
+                            <span class="submitted-sort-links">
+                                {{ sort_link('outbound_sms', 'desc', 'High') }}
+                                {{ sort_link('outbound_sms', 'asc', 'Low') }}
+                            </span>
+                        </div>
+                    </th>
+                    <th>
+                        <div class="submitted-sort-head">
+                            <span>Outbound Email</span>
+                            <span class="submitted-sort-links">
+                                {{ sort_link('outbound_email', 'desc', 'High') }}
+                                {{ sort_link('outbound_email', 'asc', 'Low') }}
+                            </span>
+                        </div>
+                    </th>
+                    <th>
+                        <div class="submitted-sort-head">
+                            <span>Inbound Responses</span>
+                            <span class="submitted-sort-links">
+                                {{ sort_link('inbound_responses', 'desc', 'High') }}
+                                {{ sort_link('inbound_responses', 'asc', 'Low') }}
+                            </span>
+                        </div>
+                    </th>
                     <th>Open</th>
                 </tr>
             </thead>
@@ -72,7 +118,7 @@
                         <span class="ad-leads-link-icons">
                             {% if row.local_property_id %}
                             <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.local_property_id) }}" title="Open in Deep Dive" aria-label="Open in Deep Dive">
-                                <img class="tiny-link-icon" src="{{ url_for('static', filename='favicon.ico') }}" alt="Deep Dive">
+                                <img class="tiny-link-icon" src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/08/cropped-nj-logo-tiny-32x32.png" alt="DeepSift">
                             </a>
                             {% endif %}
                             {% if row.reisift_url %}
@@ -172,7 +218,7 @@
     {% if pagination.total_pages > 1 %}
     <nav class="anon-pagination ad-leads-pagination" aria-label="Submitted lead pages">
         {% if pagination.has_prev %}
-        <a href="{{ url_for('submitted_leads_page', q=q, source=source, page=pagination.prev_page) }}">Previous</a>
+        <a href="{{ url_for('submitted_leads_page', q=q, source=source, sort_by=sort_by, sort_dir=sort_dir, page=pagination.prev_page) }}">Previous</a>
         {% else %}
         <span class="is-disabled">Previous</span>
         {% endif %}
@@ -180,11 +226,11 @@
             {% if page_number == pagination.page %}
             <span class="is-current">{{ page_number }}</span>
             {% else %}
-            <a href="{{ url_for('submitted_leads_page', q=q, source=source, page=page_number) }}">{{ page_number }}</a>
+            <a href="{{ url_for('submitted_leads_page', q=q, source=source, sort_by=sort_by, sort_dir=sort_dir, page=page_number) }}">{{ page_number }}</a>
             {% endif %}
         {% endfor %}
         {% if pagination.has_next %}
-        <a href="{{ url_for('submitted_leads_page', q=q, source=source, page=pagination.next_page) }}">Next</a>
+        <a href="{{ url_for('submitted_leads_page', q=q, source=source, sort_by=sort_by, sort_dir=sort_dir, page=pagination.next_page) }}">Next</a>
         {% else %}
         <span class="is-disabled">Next</span>
         {% endif %}

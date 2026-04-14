@@ -12819,9 +12819,16 @@ def _build_submitted_lead_item(db, source, row):
     }
 
 
-def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50):
+def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sort_by="date_added", sort_dir="desc"):
     q = normalize_whitespace(q)
     source = normalize_whitespace(source).lower()
+    sort_by = normalize_whitespace(sort_by).lower() or "date_added"
+    sort_dir = normalize_whitespace(sort_dir).lower() or "desc"
+    allowed_sort_columns = {"date_added", "outbound_calls", "outbound_sms", "outbound_email", "inbound_responses"}
+    if sort_by not in allowed_sort_columns:
+        sort_by = "date_added"
+    if sort_dir not in {"asc", "desc"}:
+        sort_dir = "desc"
     try:
         page = max(1, int(page))
     except (TypeError, ValueError):
@@ -12906,6 +12913,19 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50):
     activity_index = _build_submitted_lead_activity_index(db, earliest_since=earliest_since)
     for item in rows:
         item.update(_build_submitted_lead_activity_rollup(item, activity_index))
+    if sort_by == "date_added":
+        rows.sort(
+            key=lambda item: _submitted_lead_timestamp_value(item.get("date_added"), item.get("last_received_at"), item.get("first_received_at")) or datetime.min,
+            reverse=(sort_dir == "desc"),
+        )
+    else:
+        rows.sort(
+            key=lambda item: (
+                int(item.get(sort_by) or 0),
+                _submitted_lead_timestamp_value(item.get("date_added"), item.get("last_received_at"), item.get("first_received_at")) or datetime.min,
+            ),
+            reverse=(sort_dir == "desc"),
+        )
     totals = {
         "lead_count": len(rows),
         "outbound_calls": sum(int(item.get("outbound_calls") or 0) for item in rows),
@@ -29270,16 +29290,28 @@ def submitted_leads_page():
     db = get_db()
     q = (request.args.get("q") or "").strip()
     source = (request.args.get("source") or "").strip().lower()
+    sort_by = (request.args.get("sort_by") or "date_added").strip().lower()
+    sort_dir = (request.args.get("sort_dir") or "desc").strip().lower()
     try:
         page = max(1, int(request.args.get("page") or 1))
     except (TypeError, ValueError):
         page = 1
-    rows, totals, pagination, source_options = build_submitted_leads_snapshot(db, q=q, source=source, page=page, per_page=50)
+    rows, totals, pagination, source_options = build_submitted_leads_snapshot(
+        db,
+        q=q,
+        source=source,
+        page=page,
+        per_page=50,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+    )
     return render_template(
         "submitted_leads.html",
         rows=rows,
         q=q,
         source=source,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
         source_options=source_options,
         pagination=pagination,
         followup_summary={

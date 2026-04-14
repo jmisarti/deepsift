@@ -195,6 +195,7 @@ CREATE TABLE IF NOT EXISTS propertyleads_lead_submissions (
     processing_result_json TEXT,
     reisift_status TEXT NOT NULL DEFAULT 'new lead',
     status TEXT NOT NULL DEFAULT 'captured',
+    local_property_id INTEGER,
     first_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     processed_at TEXT
@@ -215,6 +216,7 @@ CREATE TABLE IF NOT EXISTS manual_lead_submissions (
     processing_result_json TEXT,
     reisift_status TEXT NOT NULL DEFAULT 'new lead',
     status TEXT NOT NULL DEFAULT 'manual_added',
+    local_property_id INTEGER,
     activity_since_at TEXT,
     first_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

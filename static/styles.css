@@ -624,6 +624,18 @@ body {
     padding: 0.42rem 0.48rem;
 }
 
+.submitted-lead-address-cell {
+    min-width: 16rem;
+}
+
+.submitted-lead-address-line {
+    font-weight: 600;
+}
+
+.submitted-lead-status-line {
+    margin-top: 0.18rem;
+}
+
 .submitted-leads-table thead th {
     font-size: 0.66rem;
 }

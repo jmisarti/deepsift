@@ -1123,6 +1123,7 @@ def migrate_db(db):
     )
     ensure_column(db, "website_lead_submissions", "status", "status TEXT NOT NULL DEFAULT 'pending_step2'")
     ensure_column(db, "website_lead_submissions", "reisift_status", "reisift_status TEXT NOT NULL DEFAULT 'new lead'")
+    ensure_column(db, "website_lead_submissions", "local_property_id", "local_property_id INTEGER")
     ensure_column(db, "website_lead_submissions", "hold_expires_at", "hold_expires_at TEXT")
     ensure_column(db, "website_lead_submissions", "step1_payload_json", "step1_payload_json TEXT")
     ensure_column(db, "website_lead_submissions", "step2_payload_json", "step2_payload_json TEXT")
@@ -1165,6 +1166,7 @@ def migrate_db(db):
         """
     )
     ensure_column(db, "clever_lead_submissions", "reisift_status", "reisift_status TEXT NOT NULL DEFAULT 'new lead'")
+    ensure_column(db, "clever_lead_submissions", "local_property_id", "local_property_id INTEGER")
     db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_connection_id ON clever_lead_submissions(connection_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_record_id ON clever_lead_submissions(record_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_status ON clever_lead_submissions(status, last_received_at)")
@@ -1194,6 +1196,7 @@ def migrate_db(db):
         """
     )
     ensure_column(db, "propertyleads_lead_submissions", "reisift_status", "reisift_status TEXT NOT NULL DEFAULT 'new lead'")
+    ensure_column(db, "propertyleads_lead_submissions", "local_property_id", "local_property_id INTEGER")
     db.execute("CREATE INDEX IF NOT EXISTS idx_propertyleads_leads_id ON propertyleads_lead_submissions(lead_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_propertyleads_leads_status ON propertyleads_lead_submissions(status, last_received_at)")
     db.execute(
@@ -1221,6 +1224,7 @@ def migrate_db(db):
     )
     ensure_column(db, "manual_lead_submissions", "activity_since_at", "activity_since_at TEXT")
     ensure_column(db, "manual_lead_submissions", "reisift_status", "reisift_status TEXT NOT NULL DEFAULT 'new lead'")
+    ensure_column(db, "manual_lead_submissions", "local_property_id", "local_property_id INTEGER")
     db.execute("CREATE INDEX IF NOT EXISTS idx_manual_leads_reisift_uuid ON manual_lead_submissions(reisift_property_uuid)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_manual_leads_status ON manual_lead_submissions(status, last_received_at)")
     db.execute(
@@ -2938,6 +2942,7 @@ def upsert_propertyleads_submission(
     processing_result=None,
     reisift_property_uuid="",
     reisift_owner_uuid="",
+    local_property_id=0,
     processed_at="",
 ):
     fields = fields if isinstance(fields, dict) else {}
@@ -2963,6 +2968,7 @@ def upsert_propertyleads_submission(
         json.dumps(payload or {}),
         processing_blob,
         str(status or "captured").strip() or "captured",
+        int(local_property_id or 0),
         str(processed_at or "").strip() or None,
     )
     if existing:
@@ -2983,6 +2989,7 @@ def upsert_propertyleads_submission(
                 latest_payload_json = ?,
                 processing_result_json = COALESCE(?, processing_result_json),
                 status = ?,
+                local_property_id = COALESCE(NULLIF(?, 0), local_property_id),
                 processed_at = COALESCE(?, processed_at),
                 last_received_at = CURRENT_TIMESTAMP
             WHERE id = ?
@@ -2995,8 +3002,8 @@ def upsert_propertyleads_submission(
             INSERT INTO propertyleads_lead_submissions
                 (lead_key, lead_id, reisift_property_uuid, reisift_owner_uuid, latest_address, latest_phone, latest_email,
                  latest_name, latest_stage, county, lead_cost, source_label, latest_payload_json, processing_result_json,
-                 status, processed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 status, local_property_id, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (lead_key,) + params,
         )
@@ -3044,7 +3051,42 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
     if not isinstance(payload, dict):
         return {"ok": False, "error": "Invalid payload object.", "error_type": "validation", "slack_sent": False}
     fields = _extract_propertyleads_fields(payload)
-    lead_key = upsert_propertyleads_submission(db, fields, payload, status="received", source_label=source_label)
+    local_property_id = 0
+    local_ctx = {}
+    lead_key = _derive_propertyleads_lead_key(fields, payload)
+    try:
+        local_ctx = ensure_local_property_for_submitted_lead(
+            db,
+            source_label="PropertyLeads PPL",
+            address=fields.get("address") or "",
+            street=fields.get("street") or "",
+            city=fields.get("city") or "",
+            state=fields.get("state") or "",
+            postal_code=fields.get("postal_code") or "",
+            seller_name=fields.get("seller_name") or "",
+            phone=fields.get("phone") or "",
+            email=fields.get("email") or "",
+            lead_key=lead_key,
+            payload=payload,
+        )
+        local_property_id = int(local_ctx.get("property_id") or 0)
+    except Exception as exc:
+        log_app_error(
+            db,
+            source="propertyleads_local_property",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/webhooks/propertyleads/ppl",
+            status_code=500,
+        )
+    lead_key = upsert_propertyleads_submission(
+        db,
+        fields,
+        payload,
+        status="received",
+        source_label=source_label,
+        local_property_id=local_property_id,
+    )
     event_key = _derive_propertyleads_event_key(payload)
     if not event_key:
         payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
@@ -3059,6 +3101,7 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
             status="duplicate_event",
             source_label=source_label,
             processing_result={"ok": True, "duplicate": True, "event_key": event_key, "lead_key": lead_key},
+            local_property_id=local_property_id,
         )
         db.commit()
         return {"ok": True, "duplicate": True, "event_key": event_key, "lead_key": lead_key, "slack_sent": False}
@@ -3072,6 +3115,7 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
             status="failed_validation",
             source_label=source_label,
             processing_result={"ok": False, "event_key": event_key, "lead_key": lead_key, "error": err, "error_type": "validation"},
+            local_property_id=local_property_id,
         )
         log_app_error(
             db,
@@ -3170,6 +3214,9 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
             note_sync = reisift_append_property_note(token, created_uuid, notes)
         if token and created_uuid and not duplicate_existing:
             enrich_result = create_result.get("enrich")
+        if local_property_id > 0:
+            _set_local_property_uuid(db, local_property_id, created_uuid)
+            _set_local_owner_uuid(db, local_property_id, owner_uuid)
 
         sift_link = _sift_record_url(created_uuid)
         slack_lines = [
@@ -3205,6 +3252,7 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
             },
             reisift_property_uuid=created_uuid,
             reisift_owner_uuid=owner_uuid,
+            local_property_id=local_property_id,
             processed_at=format_db_time(datetime.utcnow()),
         )
         db.commit()
@@ -3249,6 +3297,7 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
             },
             reisift_property_uuid=created_uuid,
             reisift_owner_uuid=owner_uuid,
+            local_property_id=local_property_id,
             processed_at=format_db_time(datetime.utcnow()),
         )
         try:
@@ -11928,6 +11977,7 @@ def _upsert_clever_submission_row(
     processing_result=None,
     reisift_property_uuid="",
     reisift_owner_uuid="",
+    local_property_id=0,
     status="processed",
 ):
     fields = fields if isinstance(fields, dict) else {}
@@ -11960,6 +12010,7 @@ def _upsert_clever_submission_row(
                 assignment_fee = ?,
                 initial_offer_amount = ?,
                 final_purchase_price = ?,
+                local_property_id = COALESCE(NULLIF(?, 0), local_property_id),
                 latest_payload_json = ?,
                 processing_result_json = ?,
                 status = ?,
@@ -11987,6 +12038,7 @@ def _upsert_clever_submission_row(
                 fields.get("assignment_fee") or "",
                 fields.get("initial_offer_amount") or "",
                 fields.get("final_purchase_price") or "",
+                int(local_property_id or 0),
                 payload_json,
                 processing_json,
                 status,
@@ -12004,10 +12056,10 @@ def _upsert_clever_submission_row(
             latest_address, latest_phone, latest_email, latest_name,
             latest_stage, latest_event_type,
             investor_id, investor_name, deal_name, portal_connection_url,
-            source_created_at, assignment_fee, initial_offer_amount, final_purchase_price,
+            source_created_at, assignment_fee, initial_offer_amount, final_purchase_price, local_property_id,
             latest_payload_json, processing_result_json, status, processed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             lead_key,
@@ -12030,6 +12082,7 @@ def _upsert_clever_submission_row(
             fields.get("assignment_fee") or "",
             fields.get("initial_offer_amount") or "",
             fields.get("final_purchase_price") or "",
+            int(local_property_id or 0),
             payload_json,
             processing_json,
             status,
@@ -12702,6 +12755,259 @@ def _submitted_lead_reisift_status_options():
     ]
 
 
+def _find_local_property_by_reisift_uuid(db, property_uuid):
+    property_uuid = normalize_uuid(property_uuid or "")
+    if not property_uuid or not _table_has_column(db, "properties", "reisift_property_uuid"):
+        return 0
+    try:
+        row = db.execute(
+            "SELECT id FROM properties WHERE reisift_property_uuid = ? ORDER BY id DESC LIMIT 1",
+            (property_uuid,),
+        ).fetchone()
+    except Exception:
+        return 0
+    return int((row["id"] if row else 0) or 0)
+
+
+def ensure_local_property_for_submitted_lead(
+    db,
+    *,
+    source_label="Submitted Lead",
+    address="",
+    street="",
+    city="",
+    state="",
+    postal_code="",
+    seller_name="",
+    phone="",
+    email="",
+    property_uuid="",
+    owner_uuid="",
+    existing_property_id=0,
+    lead_key="",
+    payload=None,
+):
+    normalized = _normalize_address_components(
+        street=street,
+        city=city,
+        state=state,
+        postal_code=postal_code,
+        raw_address=address,
+    )
+    street_value = str(normalized.get("street") or "").strip()
+    city_value = str(normalized.get("city") or "").strip()
+    state_value = str(normalized.get("state") or "").strip()
+    postal_value = str(normalized.get("postal_code") or "").strip()
+    if not street_value or not city_value or not state_value:
+        return {
+            "property_id": int(existing_property_id or 0),
+            "owner_person_id": 0,
+            "property_created": False,
+            "owner_created": False,
+            "skipped": True,
+            "reason": "incomplete_address",
+            "address": normalized,
+        }
+
+    property_uuid = normalize_uuid(property_uuid or "")
+    owner_uuid = normalize_uuid(owner_uuid or "")
+    source_label = normalize_whitespace(source_label) or "Submitted Lead"
+    payload = payload if isinstance(payload, dict) else {}
+    property_id = int(existing_property_id or 0)
+    prop = None
+    address_id = 0
+
+    if property_id > 0:
+        prop = db.execute(
+            """
+            SELECT id, property_address_id, owner_person_id, notes
+            FROM properties
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (property_id,),
+        ).fetchone()
+        if not prop:
+            property_id = 0
+
+    if property_id <= 0 and property_uuid:
+        property_id = _find_local_property_by_reisift_uuid(db, property_uuid)
+        if property_id > 0:
+            prop = db.execute(
+                """
+                SELECT id, property_address_id, owner_person_id, notes
+                FROM properties
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (property_id,),
+            ).fetchone()
+
+    if property_id <= 0:
+        property_id = int(find_local_property_by_address(db, street_value, city_value, state_value, postal_value) or 0)
+        if property_id > 0:
+            prop = db.execute(
+                """
+                SELECT id, property_address_id, owner_person_id, notes
+                FROM properties
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (property_id,),
+            ).fetchone()
+
+    now_text = format_db_time(datetime.utcnow())
+    property_created = False
+    owner_created = False
+
+    if property_id > 0 and prop:
+        owner_person_id = int(prop["owner_person_id"] or 0)
+        address_id = int(prop["property_address_id"] or 0)
+    else:
+        address_id = int(create_address(db, street_value, city_value, state_value, postal_value) or 0)
+        property_note = f"Submitted lead created via {source_label} on {now_text}."
+        cur = db.execute(
+            """
+            INSERT INTO properties (property_address_id, owner_person_id, resident_person_id, status, notes)
+            VALUES (?, NULL, NULL, ?, ?)
+            """,
+            (
+                address_id,
+                "Untouched",
+                property_note,
+            ),
+        )
+        property_id = int(cur.lastrowid or 0)
+        owner_person_id = 0
+        property_created = True
+        db.execute(
+            """
+            INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+            VALUES (?, NULL, ?, ?, ?)
+            """,
+            (
+                property_id,
+                "Lead Intake",
+                f"Local property created from {source_label}",
+                json.dumps(
+                    {
+                        "lead_key": str(lead_key or "").strip(),
+                        "source": source_label,
+                        "address": normalized,
+                        "payload": payload,
+                    }
+                ),
+            ),
+        )
+
+    if property_uuid:
+        _set_local_property_uuid(db, property_id, property_uuid)
+    if owner_uuid:
+        _set_local_owner_uuid(db, property_id, owner_uuid)
+
+    seller_name = normalize_whitespace(seller_name)
+    phone_value = normalize_phone(phone or "")
+    email_value = normalize_email(email or "")
+    name_parts = _parse_seller_name_for_owner(seller_name)
+
+    if not owner_person_id and (name_parts.get("first_name") or name_parts.get("last_name") or phone_value or email_value):
+        person_notes = f"Created from {source_label} submitted lead."
+        if name_parts.get("first_name") or name_parts.get("last_name"):
+            owner_person_id = int(
+                find_or_create_person_by_name_parts(
+                    db,
+                    name_parts.get("first_name") or "Submitted",
+                    name_parts.get("last_name") or "Lead",
+                    notes=person_notes,
+                )
+            )
+        else:
+            owner_person_id = int(
+                create_person(
+                    db,
+                    "Submitted",
+                    "Lead",
+                    phone=phone_value,
+                    email=email_value,
+                    notes=person_notes,
+                )
+            )
+        owner_created = True
+        db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (owner_person_id, property_id))
+
+    if owner_person_id > 0:
+        person_row = db.execute(
+            "SELECT id, primary_phone, primary_email FROM people WHERE id = ? LIMIT 1",
+            (owner_person_id,),
+        ).fetchone()
+        if person_row:
+            assignments = []
+            params = []
+            if phone_value and not normalize_phone(person_row["primary_phone"] or ""):
+                assignments.append("primary_phone = ?")
+                params.append(phone_value)
+            if email_value and not normalize_email(person_row["primary_email"] or ""):
+                assignments.append("primary_email = ?")
+                params.append(email_value)
+            if assignments:
+                params.append(owner_person_id)
+                db.execute(f"UPDATE people SET {', '.join(assignments)} WHERE id = ?", tuple(params))
+
+        if phone_value and not touchpoint_exists(db, owner_person_id, "Phone", phone_value):
+            db.execute(
+                """
+                INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
+                VALUES (?, 'Phone', 'Mobile', ?, 'Unknown', ?, ?)
+                """,
+                (
+                    owner_person_id,
+                    phone_value,
+                    f"Imported from {source_label} submitted lead.",
+                    "",
+                ),
+            )
+
+        if email_value:
+            upsert_email_touchpoint_and_queue_validation(
+                db,
+                owner_person_id,
+                email_value,
+                note=f"Imported from {source_label} submitted lead.",
+                source="submitted_lead",
+            )
+
+        existing_addr = db.execute(
+            """
+            SELECT pa.id
+            FROM person_addresses pa
+            JOIN addresses a ON a.id = pa.address_id
+            WHERE pa.person_id = ?
+              AND lower(a.street) = lower(?)
+              AND lower(a.city) = lower(?)
+              AND lower(a.state) = lower(?)
+              AND lower(COALESCE(a.postal_code, '')) = lower(?)
+            LIMIT 1
+            """,
+            (owner_person_id, street_value, city_value, state_value, postal_value),
+        ).fetchone()
+        if not existing_addr:
+            if address_id <= 0:
+                address_id = int(create_address(db, street_value, city_value, state_value, postal_value) or 0)
+            db.execute(
+                "INSERT INTO person_addresses (person_id, address_id, label) VALUES (?, ?, ?)",
+                (owner_person_id, address_id, "Submitted Lead Address"),
+            )
+
+    return {
+        "property_id": property_id,
+        "owner_person_id": owner_person_id,
+        "property_created": property_created,
+        "owner_created": owner_created,
+        "skipped": False,
+        "address": normalized,
+    }
+
+
 def _build_submitted_lead_activity_index(db, earliest_since=None):
     cutoff = format_db_time(earliest_since) if isinstance(earliest_since, datetime) else str(earliest_since or "").strip()
     sms_rows = db.execute(
@@ -12920,13 +13226,48 @@ def _build_submitted_lead_item(db, source, row):
     city = str(fields.get("city") or "").strip()
     state = str(fields.get("state") or "").strip()
     postal_code = str(fields.get("postal_code") or "").strip()
-    local_property_id = find_local_property_by_address(db, street, city, state, postal_code)
     phone_value = normalize_phone(row["latest_phone"] or fields.get("phone") or "")
     email_value = normalize_email(row["latest_email"] or fields.get("email") or "")
     created_uuid = normalize_uuid(row["reisift_property_uuid"] or "")
     owner_uuid = normalize_uuid(row["reisift_owner_uuid"] or "") if "reisift_owner_uuid" in row.keys() else ""
     if source_low == "website":
         created_uuid, owner_uuid = _website_submission_reisift_ids(row)
+    stored_local_property_id = int((row["local_property_id"] if "local_property_id" in row.keys() else 0) or 0)
+    if stored_local_property_id <= 0 and created_uuid:
+        stored_local_property_id = _find_local_property_by_reisift_uuid(db, created_uuid)
+    if stored_local_property_id <= 0:
+        stored_local_property_id = int(find_local_property_by_address(db, street, city, state, postal_code) or 0)
+    if stored_local_property_id <= 0 and street and city and state:
+        try:
+            local_ctx = ensure_local_property_for_submitted_lead(
+                db,
+                source_label=_submitted_lead_source_label(source_low),
+                address=str(row["latest_address"] or fields.get("address") or "").strip(),
+                street=street,
+                city=city,
+                state=state,
+                postal_code=postal_code,
+                seller_name=str(row["latest_name"] or fields.get("seller_name") or "").strip(),
+                phone=phone_value,
+                email=email_value,
+                property_uuid=created_uuid,
+                owner_uuid=owner_uuid,
+                existing_property_id=0,
+                lead_key=str(row["lead_key"] or "").strip(),
+                payload=payload,
+            )
+            stored_local_property_id = int(local_ctx.get("property_id") or 0)
+            if stored_local_property_id > 0:
+                table_name = {
+                    "website": "website_lead_submissions",
+                    "clever": "clever_lead_submissions",
+                    "ppl": "propertyleads_lead_submissions",
+                    "manual": "manual_lead_submissions",
+                }.get(source_low)
+                if table_name:
+                    db.execute(f"UPDATE {table_name} SET local_property_id = ? WHERE id = ?", (stored_local_property_id, int(row["id"])))
+        except Exception:
+            stored_local_property_id = 0
     return {
         "id": int(row["id"]),
         "source": source_low,
@@ -12936,7 +13277,7 @@ def _build_submitted_lead_item(db, source, row):
         "reisift_property_uuid": created_uuid,
         "reisift_owner_uuid": owner_uuid,
         "reisift_url": _sift_record_url(created_uuid),
-        "local_property_id": local_property_id,
+        "local_property_id": stored_local_property_id,
         "address": str(row["latest_address"] or fields.get("address") or "").strip(),
         "owner_names": str(row["latest_name"] or fields.get("seller_name") or "").strip(),
         "status": str(row["status"] or "").strip(),
@@ -12992,7 +13333,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     website_rows = db.execute(
         """
         SELECT id, lead_key, reisift_property_uuid, reisift_owner_uuid, latest_address, latest_phone, latest_email, latest_name,
-               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, first_received_at, last_received_at,
+               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, local_property_id, first_received_at, last_received_at,
                step1_payload_json, step2_payload_json
         FROM website_lead_submissions
         ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
@@ -13002,7 +13343,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     clever_rows = db.execute(
         """
         SELECT id, lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name,
-               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, first_received_at, last_received_at,
+               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, local_property_id, first_received_at, last_received_at,
                source_created_at
         FROM clever_lead_submissions
         ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
@@ -13012,7 +13353,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     ppl_rows = db.execute(
         """
         SELECT id, lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name,
-               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, first_received_at, last_received_at
+               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, local_property_id, first_received_at, last_received_at
         FROM propertyleads_lead_submissions
         ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
         LIMIT 1000
@@ -13021,7 +13362,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     manual_rows = db.execute(
         """
         SELECT id, lead_key, reisift_property_uuid, reisift_owner_uuid, latest_address, latest_phone, latest_email, latest_name,
-               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, activity_since_at, first_received_at, last_received_at, entry_notes
+               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, local_property_id, activity_since_at, first_received_at, last_received_at, entry_notes
         FROM manual_lead_submissions
         ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
         LIMIT 1000
@@ -13195,6 +13536,38 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
         if current is not None:
             lead_key = str(current["lead_key"] or lead_key)
 
+    local_property_id = int((current["local_property_id"] if current and "local_property_id" in current.keys() else 0) or 0)
+    current_property_uuid = normalize_uuid((current["reisift_property_uuid"] if current else "") or "")
+    current_owner_uuid = normalize_uuid((current["reisift_owner_uuid"] if current else "") or "")
+    try:
+        local_ctx = ensure_local_property_for_submitted_lead(
+            db,
+            source_label="Website",
+            address=address,
+            street=fields.get("street") or "",
+            city=fields.get("city") or "",
+            state=fields.get("state") or "",
+            postal_code=fields.get("postal_code") or "",
+            seller_name=fields.get("seller_name") or "",
+            phone=phone,
+            email=email,
+            property_uuid=current_property_uuid,
+            owner_uuid=current_owner_uuid,
+            existing_property_id=local_property_id,
+            lead_key=lead_key,
+            payload=payload,
+        )
+        local_property_id = int(local_ctx.get("property_id") or local_property_id)
+    except Exception as exc:
+        log_app_error(
+            db,
+            source="website_local_property",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/api/integrations/website/lead",
+            status_code=500,
+        )
+
     if not is_step2:
         hold_expires_at = format_db_time(datetime.utcnow() + timedelta(seconds=WEBSITE_STEP2_WAIT_SECONDS))
         mode = "queued_waiting_for_step2"
@@ -13211,6 +13584,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                     step1_payload_json = ?,
                     step1_event_key = ?,
                     status = 'pending_step2',
+                    local_property_id = COALESCE(NULLIF(?, 0), local_property_id),
                     hold_expires_at = ?,
                     last_received_at = CURRENT_TIMESTAMP
                 WHERE lead_key = ?
@@ -13224,6 +13598,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                     json.dumps(payload),
                     json.dumps(payload),
                     event_key,
+                    local_property_id,
                     hold_expires_at,
                     lead_key,
                 ),
@@ -13233,8 +13608,8 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 """
                 INSERT INTO website_lead_submissions
                 (lead_key, latest_address, latest_phone, latest_email, latest_name, latest_stage, latest_payload_json,
-                 step1_payload_json, step1_event_key, status, hold_expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_step2', ?)
+                 step1_payload_json, step1_event_key, status, local_property_id, hold_expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_step2', ?, ?)
                 """,
                 (
                     lead_key,
@@ -13246,6 +13621,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                     json.dumps(payload),
                     json.dumps(payload),
                     event_key,
+                    local_property_id,
                     hold_expires_at,
                 ),
             )
@@ -13334,6 +13710,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
         mode = "process_step2_after_timeout"
     created_uuid = str(current["reisift_property_uuid"] or "").strip()
     owner_uuid = str(current["reisift_owner_uuid"] or "").strip()
+    local_property_id = int((current["local_property_id"] if "local_property_id" in current.keys() else 0) or 0)
     recovered_uuid, recovered_owner_uuid = _website_submission_reisift_ids(current)
     created_uuid = created_uuid or recovered_uuid
     owner_uuid = owner_uuid or recovered_owner_uuid
@@ -13414,6 +13791,34 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 enrich_result = reisift_enrich_property_uuid(token, created_uuid)
             except Exception as exc:
                 enrich_result = {"ok": False, "error": str(exc)}
+        try:
+            local_ctx = ensure_local_property_for_submitted_lead(
+                db,
+                source_label="Website",
+                address=merged_fields.get("address") or "",
+                street=merged_fields.get("street") or "",
+                city=merged_fields.get("city") or "",
+                state=merged_fields.get("state") or "",
+                postal_code=merged_fields.get("postal_code") or "",
+                seller_name=merged_fields.get("seller_name") or "",
+                phone=merged_fields.get("phone") or "",
+                email=merged_fields.get("email") or "",
+                property_uuid=created_uuid,
+                owner_uuid=owner_uuid,
+                existing_property_id=local_property_id,
+                lead_key=lead_key,
+                payload=merged_payload_for_notes,
+            )
+            local_property_id = int(local_ctx.get("property_id") or local_property_id)
+        except Exception as local_exc:
+            log_app_error(
+                db,
+                source="website_local_property",
+                error_message=str(local_exc),
+                details=traceback.format_exc(),
+                route="/api/integrations/website/lead",
+                status_code=500,
+            )
 
         sift_link = _sift_record_url(created_uuid)
         if duplicate_existing:
@@ -13459,6 +13864,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 step2_payload_json = ?,
                 step2_event_key = ?,
                 status = 'processed',
+                local_property_id = COALESCE(NULLIF(?, 0), local_property_id),
                 hold_expires_at = NULL,
                 processed_at = ?,
                 processing_result_json = ?,
@@ -13476,6 +13882,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 json.dumps(payload),
                 json.dumps(payload),
                 event_key,
+                local_property_id,
                 format_db_time(datetime.utcnow()),
                 json.dumps(result_payload),
                 lead_key,
@@ -13520,6 +13927,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             UPDATE website_lead_submissions
             SET step2_payload_json = ?,
                 step2_event_key = ?,
+                local_property_id = COALESCE(NULLIF(?, 0), local_property_id),
                 status = 'failed',
                 processed_at = ?,
                 processing_result_json = ?,
@@ -13529,6 +13937,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             (
                 json.dumps(payload),
                 event_key,
+                local_property_id,
                 format_db_time(datetime.utcnow()),
                 json.dumps({"error": err, "create_result": create_result}),
                 lead_key,
@@ -15648,6 +16057,8 @@ def process_clever_webhook_payload(db, payload, source_label="webhook"):
     seller_name = fields.get("seller_name") or ""
     phone = fields.get("phone") or ""
     email = fields.get("email") or ""
+    local_property_id = 0
+    local_ctx = {}
 
     existing = db.execute(
         "SELECT reisift_property_uuid FROM clever_lead_submissions WHERE lead_key = ? LIMIT 1",
@@ -15700,6 +16111,33 @@ def process_clever_webhook_payload(db, payload, source_label="webhook"):
             "processing_skipped": True,
         }
 
+    try:
+        local_ctx = ensure_local_property_for_submitted_lead(
+            db,
+            source_label="Clever",
+            address=address,
+            street=fields.get("street") or "",
+            city=fields.get("city") or "",
+            state=fields.get("state") or "",
+            postal_code=fields.get("postal_code") or "",
+            seller_name=seller_name,
+            phone=phone,
+            email=email,
+            property_uuid=existing_uuid,
+            lead_key=lead_key,
+            payload=payload,
+        )
+        local_property_id = int(local_ctx.get("property_id") or 0)
+    except Exception as exc:
+        log_app_error(
+            db,
+            source="clever_local_property",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/webhooks/clever/lead",
+            status_code=500,
+        )
+
     is_new_event = upsert_integration_event(db, CLEVER_LEADS_EVENT_SOURCE, event_key, payload)
     if source_label == "webhook" or is_new_event:
         add_clever_webhook_note(
@@ -15724,6 +16162,12 @@ def process_clever_webhook_payload(db, payload, source_label="webhook"):
         )
     db.commit()
     if not is_new_event:
+        if local_property_id > 0:
+            db.execute(
+                "UPDATE clever_lead_submissions SET local_property_id = COALESCE(NULLIF(?, 0), local_property_id) WHERE lead_key = ?",
+                (local_property_id, lead_key),
+            )
+            db.commit()
         return {
             "ok": True,
             "duplicate": True,
@@ -15849,8 +16293,12 @@ def process_clever_webhook_payload(db, payload, source_label="webhook"):
             processing_result=processing_result,
             reisift_property_uuid=created_uuid,
             reisift_owner_uuid=owner_uuid,
+            local_property_id=local_property_id,
             status="processed",
         )
+        if local_property_id > 0:
+            _set_local_property_uuid(db, local_property_id, created_uuid)
+            _set_local_owner_uuid(db, local_property_id, owner_uuid)
         should_slack = source_label == "webhook" and (current is None or previous_stage != (fields.get("stage") or ""))
         if should_slack:
             msg_lines = [
@@ -15917,6 +16365,7 @@ def process_clever_webhook_payload(db, payload, source_label="webhook"):
                 processing_result={"error": err_text},
                 reisift_property_uuid=created_uuid,
                 reisift_owner_uuid=owner_uuid,
+                local_property_id=local_property_id,
                 status="failed",
             )
             add_clever_webhook_note(
@@ -17322,7 +17771,7 @@ def run_website_step1_hold_once():
         rows = db.execute(
             """
             SELECT id, lead_key, latest_address, latest_phone, latest_email, latest_name, latest_stage,
-                   hold_expires_at, step1_payload_json, reisift_property_uuid, reisift_owner_uuid
+                   hold_expires_at, step1_payload_json, reisift_property_uuid, reisift_owner_uuid, local_property_id
             FROM website_lead_submissions
             WHERE status = 'pending_step2'
               AND hold_expires_at IS NOT NULL
@@ -17349,6 +17798,7 @@ def run_website_step1_hold_once():
             }
             created_uuid = str(row["reisift_property_uuid"] or "").strip()
             owner_uuid = str(row["reisift_owner_uuid"] or "").strip()
+            local_property_id = int((row["local_property_id"] if "local_property_id" in row.keys() else 0) or 0)
             create_result = None
             contact_sync = None
             note_sync = None
@@ -17472,6 +17922,35 @@ def run_website_step1_hold_once():
                     status_code=500,
                 )
 
+            try:
+                local_ctx = ensure_local_property_for_submitted_lead(
+                    db,
+                    source_label="Website",
+                    address=merged_fields.get("address") or "",
+                    street=merged_fields.get("street") or "",
+                    city=merged_fields.get("city") or "",
+                    state=merged_fields.get("state") or "",
+                    postal_code=merged_fields.get("postal_code") or "",
+                    seller_name=merged_fields.get("seller_name") or "",
+                    phone=merged_fields.get("phone") or "",
+                    email=merged_fields.get("email") or "",
+                    property_uuid=created_uuid,
+                    owner_uuid=owner_uuid,
+                    existing_property_id=local_property_id,
+                    lead_key=row["lead_key"],
+                    payload=step1_payload if isinstance(step1_payload, dict) else {},
+                )
+                local_property_id = int(local_ctx.get("property_id") or local_property_id)
+            except Exception as local_exc:
+                log_app_error(
+                    db,
+                    source="website_local_property",
+                    error_message=str(local_exc),
+                    details=traceback.format_exc(),
+                    route="run_website_step1_hold_once:local_property",
+                    status_code=500,
+                )
+
             if should_notify:
                 sift_link = _sift_record_url(created_uuid)
                 slack_lines = [
@@ -17524,6 +18003,7 @@ def run_website_step1_hold_once():
                 SET status = ?,
                     reisift_property_uuid = COALESCE(NULLIF(?, ''), reisift_property_uuid),
                     reisift_owner_uuid = COALESCE(NULLIF(?, ''), reisift_owner_uuid),
+                    local_property_id = COALESCE(NULLIF(?, 0), local_property_id),
                     processed_at = ?,
                     processing_result_json = ?,
                     hold_expires_at = NULL
@@ -17533,6 +18013,7 @@ def run_website_step1_hold_once():
                     status_value,
                     created_uuid,
                     owner_uuid,
+                    local_property_id,
                     now_utc,
                     json.dumps(processing_result),
                     int(row["id"]),
@@ -29515,6 +29996,7 @@ def submitted_leads_page():
         sort_by=sort_by,
         sort_dir=sort_dir,
     )
+    db.commit()
     return render_template(
         "submitted_leads.html",
         rows=rows,
@@ -29566,6 +30048,7 @@ def submitted_leads_add_route():
     )
     final_address = normalized_address.get("address") or address_raw
     activity_since_at = _manual_submitted_lead_activity_since(now_utc, hours=48)
+    local_property_id = 0
     payload = {
         "entry_type": "manual_submitted_lead",
         "reisift_record_input": reisift_input,
@@ -29589,6 +30072,33 @@ def submitted_leads_add_route():
         }
     )
     lead_key = f"manual:{reisift_uuid}"
+    try:
+        local_ctx = ensure_local_property_for_submitted_lead(
+            db,
+            source_label="Manual Submitted Lead",
+            address=final_address,
+            street=normalized_address.get("street") or "",
+            city=normalized_address.get("city") or "",
+            state=normalized_address.get("state") or "",
+            postal_code=normalized_address.get("postal_code") or "",
+            seller_name=seller_name,
+            phone=phone_value,
+            email=email_value,
+            property_uuid=reisift_uuid,
+            existing_property_id=0,
+            lead_key=lead_key,
+            payload=payload,
+        )
+        local_property_id = int(local_ctx.get("property_id") or 0)
+    except Exception as exc:
+        log_app_error(
+            db,
+            source="manual_submitted_local_property",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/submitted-leads/add",
+            status_code=500,
+        )
     existing = db.execute(
         """
         SELECT id
@@ -29612,6 +30122,7 @@ def submitted_leads_add_route():
                 latest_payload_json = ?,
                 processing_result_json = ?,
                 status = 'manual_added',
+                local_property_id = COALESCE(NULLIF(?, 0), local_property_id),
                 activity_since_at = ?,
                 last_received_at = CURRENT_TIMESTAMP,
                 processed_at = CURRENT_TIMESTAMP
@@ -29626,6 +30137,7 @@ def submitted_leads_add_route():
                 notes_value,
                 json.dumps(payload),
                 processing_result,
+                local_property_id,
                 activity_since_at,
                 int(existing["id"]),
             ),
@@ -29636,8 +30148,8 @@ def submitted_leads_add_route():
             """
             INSERT INTO manual_lead_submissions
             (lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name, latest_stage,
-             entry_notes, latest_payload_json, processing_result_json, status, activity_since_at, processed_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'Manual', ?, ?, ?, 'manual_added', ?, CURRENT_TIMESTAMP)
+             entry_notes, latest_payload_json, processing_result_json, status, local_property_id, activity_since_at, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'Manual', ?, ?, ?, 'manual_added', ?, ?, CURRENT_TIMESTAMP)
             """,
             (
                 lead_key,
@@ -29649,6 +30161,7 @@ def submitted_leads_add_route():
                 notes_value,
                 json.dumps(payload),
                 processing_result,
+                local_property_id,
                 activity_since_at,
             ),
         )
@@ -29680,7 +30193,13 @@ def submitted_leads_update_route(source, lead_id):
         return redirect(url_for("submitted_leads_page", error="Unknown submitted lead source.", **return_args))
 
     existing = db.execute(
-        f"SELECT id, lead_key, reisift_property_uuid, COALESCE(reisift_status, 'new lead') AS reisift_status FROM {table_name} WHERE id = ? LIMIT 1",
+        f"""
+        SELECT id, lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name, latest_payload_json,
+               COALESCE(reisift_status, 'new lead') AS reisift_status, COALESCE(local_property_id, 0) AS local_property_id
+        FROM {table_name}
+        WHERE id = ?
+        LIMIT 1
+        """,
         (int(lead_id),),
     ).fetchone()
     if not existing:
@@ -29713,6 +30232,32 @@ def submitted_leads_update_route(source, lead_id):
 
     params.append(int(lead_id))
     db.execute(f"UPDATE {table_name} SET {', '.join(update_fields)} WHERE id = ?", tuple(params))
+    final_reisift_uuid = extract_reisift_uuid_from_input(reisift_input) if reisift_input else normalize_uuid(existing["reisift_property_uuid"] or "")
+    try:
+        local_ctx = ensure_local_property_for_submitted_lead(
+            db,
+            source_label=f"{source_low.title()} Submitted Lead",
+            address=str(existing["latest_address"] or "").strip(),
+            seller_name=str(existing["latest_name"] or "").strip(),
+            phone=str(existing["latest_phone"] or "").strip(),
+            email=str(existing["latest_email"] or "").strip(),
+            property_uuid=final_reisift_uuid,
+            existing_property_id=int(existing["local_property_id"] or 0),
+            lead_key=str(existing["lead_key"] or "").strip(),
+            payload=parse_json_object(existing["latest_payload_json"] or "{}", default={}),
+        )
+        local_property_id = int(local_ctx.get("property_id") or 0)
+        if local_property_id > 0:
+            db.execute(f"UPDATE {table_name} SET local_property_id = ? WHERE id = ?", (local_property_id, int(lead_id)))
+    except Exception as exc:
+        log_app_error(
+            db,
+            source="submitted_leads_update_local_property",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route=f"/submitted-leads/{source_low}/{lead_id}/update",
+            status_code=500,
+        )
     db.commit()
     return redirect(url_for("submitted_leads_page", notice="Submitted lead updated.", **return_args))
 

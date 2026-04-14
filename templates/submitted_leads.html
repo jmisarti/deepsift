@@ -90,7 +90,6 @@
             <thead>
                 <tr>
                     <th>Address</th>
-                    <th>Status</th>
                     <th>REISift Status</th>
                     <th>Source</th>
                     <th>Owner(s)</th>
@@ -154,8 +153,10 @@
             <tbody>
                 {% for row in rows %}
                 <tr class="followup-main-row" data-target="submitted-detail-{{ row.source }}-{{ row.id }}">
-                    <td>{{ row.address or "-" }}</td>
-                    <td><span class="pill">{{ row.status or "-" }}</span></td>
+                    <td class="submitted-lead-address-cell">
+                        <div class="submitted-lead-address-line">{{ row.address or "-" }}</div>
+                        <div class="submitted-lead-status-line"><span class="pill">{{ row.status or "-" }}</span></div>
+                    </td>
                     <td><span class="pill">{{ row.reisift_status or "new lead" }}</span></td>
                     <td title="{{ row.source_label }}">{{ row.source_short }}</td>
                     <td>{{ row.owner_names or "-" }}</td>
@@ -181,7 +182,7 @@
                     </td>
                 </tr>
                 <tr id="submitted-detail-{{ row.source }}-{{ row.id }}" class="followup-detail-row hidden">
-                    <td colspan="12">
+                    <td colspan="11">
                         <div class="inline-actions" style="justify-content:space-between; margin: 0.35rem 0 0.6rem;">
                             <p style="margin:0;"><strong>Lead Key:</strong> {{ row.lead_key or '-' }}</p>
                             <p style="margin:0;"><strong>Stage:</strong> {{ row.latest_stage or '-' }}</p>

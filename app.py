@@ -12755,6 +12755,116 @@ def _submitted_lead_reisift_status_options():
     ]
 
 
+def recover_missing_propertyleads_submissions_from_events(db, limit=250):
+    try:
+        limit_value = max(1, min(int(limit or 250), 1000))
+    except Exception:
+        limit_value = 250
+    try:
+        event_rows = db.execute(
+            """
+            SELECT id, event_key, payload_json, created_at
+            FROM integration_events
+            WHERE source = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (PROPERTYLEADS_PPL_EVENT_SOURCE, limit_value),
+        ).fetchall()
+    except Exception:
+        return 0
+
+    repaired = 0
+    for event_row in event_rows:
+        payload = parse_json_object(event_row["payload_json"] or "{}", default={})
+        if not isinstance(payload, dict) or not payload:
+            continue
+        fields = _extract_propertyleads_fields(payload)
+        lead_key = _derive_propertyleads_lead_key(fields, payload)
+        if not lead_key:
+            continue
+        try:
+            existing = db.execute(
+                """
+                SELECT id, reisift_property_uuid, reisift_owner_uuid, local_property_id
+                FROM propertyleads_lead_submissions
+                WHERE lead_key = ?
+                LIMIT 1
+                """,
+                (lead_key,),
+            ).fetchone()
+        except Exception:
+            existing = None
+        if existing:
+            continue
+
+        local_property_id = int(find_local_property_by_address(
+            db,
+            fields.get("street") or "",
+            fields.get("city") or "",
+            fields.get("state") or "",
+            fields.get("postal_code") or "",
+        ) or 0)
+        if local_property_id <= 0:
+            try:
+                local_ctx = ensure_local_property_for_submitted_lead(
+                    db,
+                    source_label="PropertyLeads PPL",
+                    address=fields.get("address") or "",
+                    street=fields.get("street") or "",
+                    city=fields.get("city") or "",
+                    state=fields.get("state") or "",
+                    postal_code=fields.get("postal_code") or "",
+                    seller_name=fields.get("seller_name") or "",
+                    phone=fields.get("phone") or "",
+                    email=fields.get("email") or "",
+                    lead_key=lead_key,
+                    payload=payload,
+                )
+                local_property_id = int(local_ctx.get("property_id") or 0)
+            except Exception:
+                local_property_id = 0
+
+        property_uuid = ""
+        owner_uuid = ""
+        if local_property_id > 0:
+            prop = db.execute(
+                """
+                SELECT reisift_property_uuid, reisift_owner_uuid
+                FROM properties
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (local_property_id,),
+            ).fetchone()
+            if prop:
+                property_uuid = normalize_uuid((prop["reisift_property_uuid"] or "").strip())
+                owner_uuid = normalize_uuid((prop["reisift_owner_uuid"] or "").strip())
+
+        upsert_propertyleads_submission(
+            db,
+            fields,
+            payload,
+            status="processed" if property_uuid else "received",
+            source_label="recovered_event",
+            processing_result={
+                "ok": True,
+                "recovered_from_event": True,
+                "event_key": str(event_row["event_key"] or "").strip(),
+                "integration_event_id": int(event_row["id"] or 0),
+                "created_uuid": property_uuid,
+                "owner_uuid": owner_uuid,
+            },
+            reisift_property_uuid=property_uuid,
+            reisift_owner_uuid=owner_uuid,
+            local_property_id=local_property_id,
+            processed_at=str(event_row["created_at"] or "").strip(),
+        )
+        repaired += 1
+
+    return repaired
+
+
 def _find_local_property_by_reisift_uuid(db, property_uuid):
     property_uuid = normalize_uuid(property_uuid or "")
     if not property_uuid or not _table_has_column(db, "properties", "reisift_property_uuid"):
@@ -29979,6 +30089,20 @@ def submitted_leads_page():
     db = get_db()
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()
+    try:
+        repaired = recover_missing_propertyleads_submissions_from_events(db, limit=250)
+        if repaired > 0 and not notice:
+            noun = "submission" if repaired == 1 else "submissions"
+            notice = f"Recovered {repaired} PropertyLeads {noun} from webhook history."
+    except Exception as exc:
+        log_app_error(
+            db,
+            source="submitted_leads_recovery",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route=request.path,
+            status_code=500,
+        )
     q = (request.args.get("q") or "").strip()
     source = (request.args.get("source") or "").strip().lower()
     sort_by = (request.args.get("sort_by") or "date_added").strip().lower()

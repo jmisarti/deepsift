@@ -642,6 +642,41 @@ body {
     padding: 0.36rem 0.44rem;
 }
 
+.submitted-leads-manual-entry {
+    margin: 0.75rem 0 0.9rem;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: #f8fbfe;
+    padding: 0.7rem 0.9rem;
+}
+
+.submitted-leads-manual-entry > summary {
+    cursor: pointer;
+}
+
+.submitted-manual-form {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0.7rem 0.85rem;
+    margin-top: 0.75rem;
+}
+
+.submitted-manual-form label {
+    display: grid;
+    gap: 0.28rem;
+    margin: 0;
+}
+
+.submitted-manual-form label span {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: #40516b;
+}
+
+.submitted-manual-form-note {
+    grid-column: 1 / -1;
+}
+
 .ad-lead-note-item {
     border: 1px solid var(--line);
     border-radius: 12px;

@@ -25,7 +25,46 @@
 
 <section class="panel">
     <h2>Submitted Leads</h2>
-    <p>Local submissions only: website, Clever, and PPL. Activity counts are matched by captured seller phone/email and updated from local webhook/email data.</p>
+    <p>Local submissions only: website, Clever, PPL, and manual REISift-linked adds. Activity counts are matched by captured seller phone/email and updated from local webhook/email data.</p>
+    {% if notice %}
+    <p class="ok-line">{{ notice }}</p>
+    {% endif %}
+    {% if error %}
+    <p class="warn-line">{{ error }}</p>
+    {% endif %}
+    <details class="submitted-leads-manual-entry">
+        <summary><strong>Add Manual Lead</strong></summary>
+        <p>Add a REISift-linked lead when it did not come in through a webhook. Required fields are the REISift record, the address, and at least one seller phone or email so the attempt counters can attach correctly.</p>
+        <form method="post" action="{{ url_for('submitted_leads_add_route') }}" class="submitted-manual-form">
+            <label>
+                <span>REISift URL or UUID</span>
+                <input type="text" name="reisift_record" placeholder="https://app.reisift.io/... or UUID" required>
+            </label>
+            <label>
+                <span>Property Address</span>
+                <input type="text" name="address" placeholder="123 Main St, City, ST 00000" required>
+            </label>
+            <label>
+                <span>Seller Name</span>
+                <input type="text" name="seller_name" placeholder="Optional but recommended">
+            </label>
+            <label>
+                <span>Seller Phone</span>
+                <input type="text" name="phone" placeholder="At least phone or email">
+            </label>
+            <label>
+                <span>Seller Email</span>
+                <input type="email" name="email" placeholder="At least phone or email">
+            </label>
+            <label class="submitted-manual-form-note">
+                <span>Notes</span>
+                <textarea name="notes" rows="2" placeholder="Optional context for the team"></textarea>
+            </label>
+            <div class="inline-actions">
+                <button type="submit">Add Lead</button>
+            </div>
+        </form>
+    </details>
     <div class="panel-actions">
         <form method="get" action="{{ url_for('submitted_leads_page') }}" class="inline-form">
             <input type="text" name="q" value="{{ q }}" placeholder="address, seller, phone, email">
@@ -137,6 +176,9 @@
                         </div>
                         <p><strong>Address:</strong> {{ row.address or '-' }}</p>
                         <p><strong>City/State/Zip:</strong> {{ row.city or '-' }}, {{ row.state or '-' }} {{ row.postal_code or '' }}</p>
+                        {% if row.entry_notes %}
+                        <p><strong>Entry Notes:</strong> {{ row.entry_notes }}</p>
+                        {% endif %}
                         <div class="table-wrap">
                             <table class="compact-table submitted-leads-detail-table">
                                 <thead>

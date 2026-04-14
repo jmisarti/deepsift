@@ -199,6 +199,25 @@ CREATE TABLE IF NOT EXISTS propertyleads_lead_submissions (
     processed_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS manual_lead_submissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_key TEXT NOT NULL UNIQUE,
+    reisift_property_uuid TEXT NOT NULL,
+    reisift_owner_uuid TEXT,
+    latest_address TEXT NOT NULL,
+    latest_phone TEXT,
+    latest_email TEXT,
+    latest_name TEXT,
+    latest_stage TEXT,
+    entry_notes TEXT,
+    latest_payload_json TEXT,
+    processing_result_json TEXT,
+    status TEXT NOT NULL DEFAULT 'manual_added',
+    first_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS skiptrace_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider TEXT NOT NULL DEFAULT 'SkipSherpa',

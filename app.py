@@ -1195,6 +1195,30 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_propertyleads_leads_status ON propertyleads_lead_submissions(status, last_received_at)")
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS manual_lead_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_key TEXT NOT NULL UNIQUE,
+            reisift_property_uuid TEXT NOT NULL,
+            reisift_owner_uuid TEXT,
+            latest_address TEXT NOT NULL,
+            latest_phone TEXT,
+            latest_email TEXT,
+            latest_name TEXT,
+            latest_stage TEXT,
+            entry_notes TEXT,
+            latest_payload_json TEXT,
+            processing_result_json TEXT,
+            status TEXT NOT NULL DEFAULT 'manual_added',
+            first_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TEXT
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_manual_leads_reisift_uuid ON manual_lead_submissions(reisift_property_uuid)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_manual_leads_status ON manual_lead_submissions(status, last_received_at)")
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS lead_monitor_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source TEXT NOT NULL DEFAULT 'manual',
@@ -2559,6 +2583,17 @@ def normalize_uuid(value):
         return ""
     if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", text):
         return text
+    return ""
+
+
+def extract_reisift_uuid_from_input(value):
+    raw = str(value or "").strip()
+    direct = normalize_uuid(raw)
+    if direct:
+        return direct
+    match = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", raw.lower())
+    if match:
+        return normalize_uuid(match.group(0))
     return ""
 
 
@@ -12624,7 +12659,7 @@ def build_website_ad_lead_snapshot(db, q="", source="", page=1, per_page=50):
 
 def _submitted_lead_source_short(source):
     source_low = str(source or "").strip().lower()
-    return {"website": "W", "clever": "C", "ppl": "P"}.get(source_low, "?")
+    return {"website": "W", "clever": "C", "ppl": "P", "manual": "M"}.get(source_low, "?")
 
 
 def _submitted_lead_source_label(source):
@@ -12633,6 +12668,7 @@ def _submitted_lead_source_label(source):
         "website": "Website",
         "clever": "Clever",
         "ppl": "PPL",
+        "manual": "Manual",
     }.get(source_low, str(source or "").strip().title() or "Unknown")
 
 
@@ -12809,6 +12845,25 @@ def _build_submitted_lead_item(db, source, row):
     elif source_low == "clever":
         fields = _extract_clever_lead_fields(payload)
         latest_stage = str(fields.get("stage") or row["latest_stage"] or "").strip()
+    elif source_low == "manual":
+        normalized = _normalize_address_components(
+            raw_address=str(row["latest_address"] or "").strip(),
+            street="",
+            city="",
+            state="",
+            postal_code="",
+        )
+        fields = {
+            "address": normalized.get("address") or str(row["latest_address"] or "").strip(),
+            "street": normalized.get("street") or "",
+            "city": normalized.get("city") or "",
+            "state": normalized.get("state") or "",
+            "postal_code": normalized.get("postal_code") or "",
+            "phone": str(row["latest_phone"] or "").strip(),
+            "email": str(row["latest_email"] or "").strip(),
+            "seller_name": str(row["latest_name"] or "").strip(),
+        }
+        latest_stage = str(row["latest_stage"] or "Manual").strip()
     else:
         fields = _extract_propertyleads_fields(payload)
         latest_stage = "PPL"
@@ -12857,6 +12912,7 @@ def _build_submitted_lead_item(db, source, row):
         "processing_result_json_pretty": json.dumps(parse_json_object(row["processing_result_json"] or "{}", default={}), indent=2, sort_keys=True),
         "step1_yes": bool(str(row["step1_payload_json"] or "").strip()) if "step1_payload_json" in row.keys() else False,
         "step2_yes": bool(str(row["step2_payload_json"] or "").strip()) if "step2_payload_json" in row.keys() else False,
+        "entry_notes": str(row["entry_notes"] or "").strip() if "entry_notes" in row.keys() else "",
     }
 
 
@@ -12908,7 +12964,16 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
         LIMIT 1000
         """
     ).fetchall()
-    for source_name, source_rows in (("website", website_rows), ("clever", clever_rows), ("ppl", ppl_rows)):
+    manual_rows = db.execute(
+        """
+        SELECT id, lead_key, reisift_property_uuid, reisift_owner_uuid, latest_address, latest_phone, latest_email, latest_name,
+               latest_stage, latest_payload_json, processing_result_json, status, first_received_at, last_received_at, entry_notes
+        FROM manual_lead_submissions
+        ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
+        LIMIT 1000
+        """
+    ).fetchall()
+    for source_name, source_rows in (("website", website_rows), ("clever", clever_rows), ("ppl", ppl_rows), ("manual", manual_rows)):
         if source and source != source_name:
             continue
         for row in source_rows:
@@ -12944,7 +13009,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
             "start_index": 0,
             "end_index": 0,
             "page_numbers": [1],
-        }, ["website", "clever", "ppl"]
+        }, ["website", "clever", "manual", "ppl"]
     earliest_since = None
     for item in rows:
         candidate = _submitted_lead_timestamp_value(item.get("first_received_at"), item.get("date_added"))
@@ -12993,7 +13058,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
         "end_index": min(end, total_rows) if total_rows else 0,
         "page_numbers": list(range(max(1, page - 2), min(total_pages, page + 2) + 1)),
     }
-    return page_rows, totals, pagination, ["website", "clever", "ppl"]
+    return page_rows, totals, pagination, ["website", "clever", "manual", "ppl"]
 
 
 def process_website_lead_payload(db, payload, source_label="webhook"):
@@ -29376,6 +29441,8 @@ def follow_ups_page():
 def submitted_leads_page():
     ensure_db()
     db = get_db()
+    notice = (request.args.get("notice") or "").strip()
+    error = (request.args.get("error") or "").strip()
     q = (request.args.get("q") or "").strip()
     source = (request.args.get("source") or "").strip().lower()
     sort_by = (request.args.get("sort_by") or "date_added").strip().lower()
@@ -29396,6 +29463,8 @@ def submitted_leads_page():
     return render_template(
         "submitted_leads.html",
         rows=rows,
+        notice=notice,
+        error=error,
         q=q,
         source=source,
         sort_by=sort_by,
@@ -29410,6 +29479,110 @@ def submitted_leads_page():
             "inbound_responses": totals["inbound_responses"],
         },
     )
+
+
+@app.route("/submitted-leads/add", methods=["POST"])
+def submitted_leads_add_route():
+    ensure_db()
+    db = get_db()
+    reisift_input = (request.form.get("reisift_record") or "").strip()
+    reisift_uuid = extract_reisift_uuid_from_input(reisift_input)
+    address_raw = normalize_whitespace(request.form.get("address") or "")
+    seller_name = normalize_whitespace(request.form.get("seller_name") or "")
+    phone_value = normalize_phone(request.form.get("phone") or "")
+    email_value = normalize_email(request.form.get("email") or "")
+    notes_value = normalize_whitespace(request.form.get("notes") or "")
+
+    if not reisift_uuid:
+        return redirect(url_for("submitted_leads_page", error="A valid REISift record URL or UUID is required."))
+    if not address_raw:
+        return redirect(url_for("submitted_leads_page", error="Address is required for manual submitted leads."))
+    if not (phone_value or email_value):
+        return redirect(url_for("submitted_leads_page", error="Add at least one seller phone or email so attempt tracking can attach to the lead."))
+
+    normalized_address = _normalize_address_components(
+        raw_address=address_raw,
+        street="",
+        city="",
+        state="",
+        postal_code="",
+    )
+    final_address = normalized_address.get("address") or address_raw
+    payload = {
+        "entry_type": "manual_submitted_lead",
+        "reisift_record_input": reisift_input,
+        "reisift_property_uuid": reisift_uuid,
+        "address": final_address,
+        "seller_name": seller_name,
+        "phone": phone_value,
+        "email": email_value,
+        "notes": notes_value,
+        "created_at": format_db_time(datetime.utcnow()),
+    }
+    lead_key = f"manual:{reisift_uuid}"
+    existing = db.execute(
+        """
+        SELECT id
+        FROM manual_lead_submissions
+        WHERE lead_key = ?
+        LIMIT 1
+        """,
+        (lead_key,),
+    ).fetchone()
+    if existing:
+        db.execute(
+            """
+            UPDATE manual_lead_submissions
+            SET reisift_property_uuid = ?,
+                latest_address = ?,
+                latest_phone = ?,
+                latest_email = ?,
+                latest_name = ?,
+                latest_stage = 'Manual',
+                entry_notes = ?,
+                latest_payload_json = ?,
+                processing_result_json = ?,
+                status = 'manual_added',
+                last_received_at = CURRENT_TIMESTAMP,
+                processed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                reisift_uuid,
+                final_address,
+                phone_value,
+                email_value,
+                seller_name,
+                notes_value,
+                json.dumps(payload),
+                json.dumps({"mode": "manual_add", "created_uuid": reisift_uuid, "notes": notes_value}),
+                int(existing["id"]),
+            ),
+        )
+        message = "Manual submitted lead updated."
+    else:
+        db.execute(
+            """
+            INSERT INTO manual_lead_submissions
+            (lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name, latest_stage,
+             entry_notes, latest_payload_json, processing_result_json, status, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'Manual', ?, ?, ?, 'manual_added', CURRENT_TIMESTAMP)
+            """,
+            (
+                lead_key,
+                reisift_uuid,
+                final_address,
+                phone_value,
+                email_value,
+                seller_name,
+                notes_value,
+                json.dumps(payload),
+                json.dumps({"mode": "manual_add", "created_uuid": reisift_uuid, "notes": notes_value}),
+            ),
+        )
+        message = "Manual submitted lead added."
+    db.commit()
+    return redirect(url_for("submitted_leads_page", notice=message))
 
 
 @app.route("/follow-ups/refresh", methods=["POST"])

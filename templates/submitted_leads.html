@@ -47,7 +47,7 @@
     <p class="ad-leads-pagination-summary">Showing {{ pagination.start_index }}-{{ pagination.end_index }} of {{ pagination.total_rows }} submitted leads.</p>
     {% endif %}
     <div class="table-wrap">
-        <table>
+        <table class="submitted-leads-table">
             <thead>
                 <tr>
                     <th>Address</th>
@@ -138,7 +138,7 @@
                         <p><strong>Address:</strong> {{ row.address or '-' }}</p>
                         <p><strong>City/State/Zip:</strong> {{ row.city or '-' }}, {{ row.state or '-' }} {{ row.postal_code or '' }}</p>
                         <div class="table-wrap">
-                            <table class="compact-table">
+                            <table class="compact-table submitted-leads-detail-table">
                                 <thead>
                                     <tr>
                                         <th>Phone</th>
@@ -160,7 +160,7 @@
                             </table>
                         </div>
                         <div class="table-wrap" style="margin-top:0.6rem;">
-                            <table class="compact-table">
+                            <table class="compact-table submitted-leads-detail-table">
                                 <thead>
                                     <tr>
                                         <th>Email</th>
@@ -180,7 +180,7 @@
                             </table>
                         </div>
                         <div class="table-wrap" style="margin-top:0.6rem;">
-                            <table class="compact-table">
+                            <table class="compact-table submitted-leads-detail-table">
                                 <thead>
                                     <tr>
                                         <th>Inbound SMS</th>

@@ -614,6 +614,34 @@ body {
     text-decoration: underline;
 }
 
+.submitted-leads-table {
+    font-size: 0.82rem;
+    table-layout: auto;
+}
+
+.submitted-leads-table th,
+.submitted-leads-table td {
+    padding: 0.42rem 0.48rem;
+}
+
+.submitted-leads-table thead th {
+    font-size: 0.66rem;
+}
+
+.submitted-leads-table .pill {
+    font-size: 0.7rem;
+    padding: 0.1rem 0.45rem;
+}
+
+.submitted-leads-detail-table {
+    font-size: 0.8rem;
+}
+
+.submitted-leads-detail-table th,
+.submitted-leads-detail-table td {
+    padding: 0.36rem 0.44rem;
+}
+
 .ad-lead-note-item {
     border: 1px solid var(--line);
     border-radius: 12px;

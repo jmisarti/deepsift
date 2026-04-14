@@ -12412,6 +12412,39 @@ def build_website_reisift_tags(step_tag="", step1_payload=None):
     return ",".join(ordered)
 
 
+def _website_submission_reisift_ids(row_or_result):
+    created_uuid = ""
+    owner_uuid = ""
+    if isinstance(row_or_result, sqlite3.Row):
+        row_keys = set(row_or_result.keys())
+        created_uuid = normalize_uuid((row_or_result["reisift_property_uuid"] or "") if "reisift_property_uuid" in row_keys else "")
+        owner_uuid = normalize_uuid((row_or_result["reisift_owner_uuid"] or "") if "reisift_owner_uuid" in row_keys else "")
+        result = parse_json_object((row_or_result["processing_result_json"] or "{}") if "processing_result_json" in row_keys else "{}", default={})
+    elif isinstance(row_or_result, dict):
+        created_uuid = normalize_uuid(row_or_result.get("reisift_property_uuid") or row_or_result.get("created_uuid") or "")
+        owner_uuid = normalize_uuid(row_or_result.get("reisift_owner_uuid") or row_or_result.get("owner_uuid") or "")
+        result = row_or_result
+    else:
+        result = {}
+    if not created_uuid and isinstance(result, dict):
+        created_uuid = normalize_uuid(
+            result.get("created_uuid")
+            or ((result.get("create_result") or {}) if isinstance(result.get("create_result"), dict) else {}).get("created_uuid")
+            or ""
+        )
+    if not owner_uuid and isinstance(result, dict):
+        owner_uuid = normalize_uuid(
+            result.get("owner_uuid")
+            or ((result.get("create_result") or {}) if isinstance(result.get("create_result"), dict) else {}).get("owner_uuid")
+            or ""
+        )
+    return created_uuid, owner_uuid
+
+
+def _website_reisift_tags_list(step_tag="", step1_payload=None):
+    return [tag for tag in build_website_reisift_tags(step_tag=step_tag, step1_payload=step1_payload).split(",") if tag]
+
+
 def _compact_source_label(source_value):
     source_value = str(source_value or "").strip().lower()
     if not source_value:
@@ -12454,6 +12487,7 @@ def build_website_ad_lead_snapshot(db, q="", source="", page=1, per_page=50):
         SELECT id,
                lead_key,
                reisift_property_uuid,
+               reisift_owner_uuid,
                latest_address,
                latest_phone,
                latest_email,
@@ -12462,6 +12496,7 @@ def build_website_ad_lead_snapshot(db, q="", source="", page=1, per_page=50):
                status,
                first_received_at,
                last_received_at,
+               processing_result_json,
                step1_payload_json,
                step2_payload_json
         FROM website_lead_submissions
@@ -12472,6 +12507,7 @@ def build_website_ad_lead_snapshot(db, q="", source="", page=1, per_page=50):
     lead_rows = []
     campaign_buckets = {}
     for row in rows:
+        created_uuid, _owner_uuid = _website_submission_reisift_ids(row)
         step1_payload = parse_json_object(row["step1_payload_json"] or "{}")
         step1_attribution = extract_website_campaign_attribution(step1_payload)
         attribution = {
@@ -12509,8 +12545,8 @@ def build_website_ad_lead_snapshot(db, q="", source="", page=1, per_page=50):
         item = {
             "id": int(row["id"]),
             "lead_key": str(row["lead_key"] or ""),
-            "reisift_property_uuid": str(row["reisift_property_uuid"] or ""),
-            "reisift_url": _sift_record_url(row["reisift_property_uuid"]),
+            "reisift_property_uuid": created_uuid,
+            "reisift_url": _sift_record_url(created_uuid),
             "address": str(row["latest_address"] or "").strip(),
             "name": str(row["latest_name"] or "").strip(),
             "phone": str(row["latest_phone"] or "").strip(),
@@ -12783,14 +12819,19 @@ def _build_submitted_lead_item(db, source, row):
     local_property_id = find_local_property_by_address(db, street, city, state, postal_code)
     phone_value = normalize_phone(row["latest_phone"] or fields.get("phone") or "")
     email_value = normalize_email(row["latest_email"] or fields.get("email") or "")
+    created_uuid = normalize_uuid(row["reisift_property_uuid"] or "")
+    owner_uuid = normalize_uuid(row["reisift_owner_uuid"] or "") if "reisift_owner_uuid" in row.keys() else ""
+    if source_low == "website":
+        created_uuid, owner_uuid = _website_submission_reisift_ids(row)
     return {
         "id": int(row["id"]),
         "source": source_low,
         "source_label": _submitted_lead_source_label(source_low),
         "source_short": _submitted_lead_source_short(source_low),
         "lead_key": str(row["lead_key"] or ""),
-        "reisift_property_uuid": str(row["reisift_property_uuid"] or "").strip(),
-        "reisift_url": _sift_record_url(row["reisift_property_uuid"]),
+        "reisift_property_uuid": created_uuid,
+        "reisift_owner_uuid": owner_uuid,
+        "reisift_url": _sift_record_url(created_uuid),
         "local_property_id": local_property_id,
         "address": str(row["latest_address"] or fields.get("address") or "").strip(),
         "owner_names": str(row["latest_name"] or fields.get("seller_name") or "").strip(),
@@ -12840,7 +12881,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     rows = []
     website_rows = db.execute(
         """
-        SELECT id, lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name,
+        SELECT id, lead_key, reisift_property_uuid, reisift_owner_uuid, latest_address, latest_phone, latest_email, latest_name,
                latest_stage, latest_payload_json, processing_result_json, status, first_received_at, last_received_at,
                step1_payload_json, step2_payload_json
         FROM website_lead_submissions
@@ -13000,9 +13041,17 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
     db.commit()
     if not is_new:
         existing_uuid = ""
-        existing = db.execute("SELECT reisift_property_uuid FROM website_lead_submissions WHERE lead_key = ? LIMIT 1", (lead_key,)).fetchone()
+        existing = db.execute(
+            """
+            SELECT reisift_property_uuid, reisift_owner_uuid, processing_result_json
+            FROM website_lead_submissions
+            WHERE lead_key = ?
+            LIMIT 1
+            """,
+            (lead_key,),
+        ).fetchone()
         if existing:
-            existing_uuid = str(existing["reisift_property_uuid"] or "").strip()
+            existing_uuid, _existing_owner_uuid = _website_submission_reisift_ids(existing)
         return {
             "ok": True,
             "duplicate": True,
@@ -13165,12 +13214,26 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
         mode = "process_step2_after_timeout"
     created_uuid = str(current["reisift_property_uuid"] or "").strip()
     owner_uuid = str(current["reisift_owner_uuid"] or "").strip()
+    recovered_uuid, recovered_owner_uuid = _website_submission_reisift_ids(current)
+    created_uuid = created_uuid or recovered_uuid
+    owner_uuid = owner_uuid or recovered_owner_uuid
     contact_sync = None
     note_sync = None
+    tag_sync = None
     enrich_result = None
     create_result = None
     duplicate_reason = ""
     duplicate_existing = False
+    if recovered_uuid or recovered_owner_uuid:
+        db.execute(
+            """
+            UPDATE website_lead_submissions
+            SET reisift_property_uuid = COALESCE(NULLIF(?, ''), reisift_property_uuid),
+                reisift_owner_uuid = COALESCE(NULLIF(?, ''), reisift_owner_uuid)
+            WHERE lead_key = ?
+            """,
+            (recovered_uuid, recovered_owner_uuid, lead_key),
+        )
 
     try:
         if not merged_fields.get("address"):
@@ -13208,10 +13271,29 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 [{"number": merged_fields.get("phone"), "type": "UNKNOWN"}] if merged_fields.get("phone") else [],
                 [merged_fields.get("email")] if merged_fields.get("email") else [],
             )
-        if token and created_uuid and additional_note:
-            note_sync = reisift_append_property_note(token, created_uuid, additional_note)
-        if token and created_uuid and not duplicate_existing:
-            enrich_result = reisift_enrich_property_uuid(token, created_uuid)
+        if token and created_uuid:
+            try:
+                tag_sync = reisift_append_property_tags(
+                    token,
+                    created_uuid,
+                    _website_reisift_tags_list("Stage2", step1_payload),
+                )
+            except Exception as exc:
+                tag_sync = {"ok": False, "property_uuid": created_uuid, "error": str(exc)}
+        if token and created_uuid:
+            step2_note_parts = ["Website Step-2 Update", notes]
+            if additional_note:
+                step2_note_parts.append(additional_note)
+            note_sync = reisift_append_property_note(
+                token,
+                created_uuid,
+                "\n\n".join(part for part in step2_note_parts if str(part or "").strip()),
+            )
+        if token and created_uuid:
+            try:
+                enrich_result = reisift_enrich_property_uuid(token, created_uuid)
+            except Exception as exc:
+                enrich_result = {"ok": False, "error": str(exc)}
 
         sift_link = _sift_record_url(created_uuid)
         if duplicate_existing:
@@ -13237,6 +13319,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             "owner_uuid": owner_uuid,
             "contact_sync": contact_sync,
             "note_sync": note_sync,
+            "tag_sync": tag_sync,
             "enrich": enrich_result,
             "create_result": create_result,
             "duplicate_existing": duplicate_existing,
@@ -17201,7 +17284,7 @@ def run_website_step1_hold_once():
                         "tags": build_website_reisift_tags("Stage1", step1_payload),
                         "notes": f"{notes}\n\n{additional_note}".strip() if additional_note else notes,
                         "owner": owner_payload,
-                        "skip_map_lookup": True,
+                        "force_map_lookup": True,
                     }
                     create_result = create_reisift_property_from_search(create_payload)
                     created_uuid = str(create_result.get("created_uuid") or "").strip()
@@ -22033,7 +22116,9 @@ def create_reisift_property_from_search(input_payload):
         raise ValueError("search is required.")
     token = reisift_get_access_token()
 
-    use_map_lookup = not REISIFT_DISABLE_MAP_LOOKUP and not bool(input_payload.get("skip_map_lookup"))
+    use_map_lookup = bool(input_payload.get("force_map_lookup")) or (
+        not REISIFT_DISABLE_MAP_LOOKUP and not bool(input_payload.get("skip_map_lookup"))
+    )
     map_id = None
     autocomplete_payload = {}
     address_info_payload = {}
@@ -22122,7 +22207,10 @@ def create_reisift_property_from_search(input_payload):
     enrich_wait_seconds = random.randint(2, 5)
     if created_uuid:
         time.sleep(enrich_wait_seconds)
-        enrich_result = reisift_enrich_property_uuid(token, created_uuid)
+        try:
+            enrich_result = reisift_enrich_property_uuid(token, created_uuid)
+        except Exception as exc:
+            enrich_result = {"ok": False, "error": str(exc)}
 
     return {
         "search": search,
@@ -30113,6 +30201,7 @@ def ads_lead_detail_page(lead_id):
     step1_payload = parse_json_object(row["step1_payload_json"] or "{}")
     step2_payload = parse_json_object(row["step2_payload_json"] or "{}")
     processing_result = parse_json_object(row["processing_result_json"] or "{}")
+    created_uuid, owner_uuid = _website_submission_reisift_ids(row)
     attribution = extract_website_campaign_attribution(step1_payload if isinstance(step1_payload, dict) else {})
     source_value = str(attribution.get("utm_source") or "").strip().lower()
     if not source_value and str(attribution.get("gclid") or "").strip():
@@ -30153,9 +30242,9 @@ def ads_lead_detail_page(lead_id):
     lead = {
         "id": int(row["id"]),
         "lead_key": str(row["lead_key"] or "").strip(),
-        "reisift_property_uuid": str(row["reisift_property_uuid"] or "").strip(),
-        "reisift_owner_uuid": str(row["reisift_owner_uuid"] or "").strip(),
-        "reisift_url": _sift_record_url(row["reisift_property_uuid"]),
+        "reisift_property_uuid": created_uuid,
+        "reisift_owner_uuid": owner_uuid,
+        "reisift_url": _sift_record_url(created_uuid),
         "local_property_id": local_property_id,
         "address": str(row["latest_address"] or "").strip(),
         "phone": str(row["latest_phone"] or "").strip(),

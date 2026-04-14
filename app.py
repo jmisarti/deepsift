@@ -22848,33 +22848,43 @@ def create_reisift_property_from_search(input_payload):
     map_id = None
     autocomplete_payload = {}
     address_info_payload = {}
+    map_lookup_fallback_used = False
+    map_lookup_fallback_reason = ""
+    create_payload = None
     if use_map_lookup:
-        autocomplete_body = {
-            "search": search,
-            "entity_types": input_payload.get("entity_types")
-            or ["state", "county", "municipality", "address", "zip"],
-        }
-        autocomplete = requests.post(
-            f"{REISIFT_MAP_BASE_URL}/properties/search-autocomplete/",
-            headers=reisift_auth_headers(token),
-            json=autocomplete_body,
-            timeout=30,
-        )
-        autocomplete.raise_for_status()
-        autocomplete_payload = autocomplete.json()
-        map_id = _reisift_find_first_map_id(autocomplete_payload)
-        if not map_id:
-            raise ValueError("Could not resolve map_id from ReiSift map autocomplete response.")
+        try:
+            autocomplete_body = {
+                "search": search,
+                "entity_types": input_payload.get("entity_types")
+                or ["state", "county", "municipality", "address", "zip"],
+            }
+            autocomplete = requests.post(
+                f"{REISIFT_MAP_BASE_URL}/properties/search-autocomplete/",
+                headers=reisift_auth_headers(token),
+                json=autocomplete_body,
+                timeout=30,
+            )
+            autocomplete.raise_for_status()
+            autocomplete_payload = autocomplete.json()
+            map_id = _reisift_find_first_map_id(autocomplete_payload)
+            if map_id:
+                address_info_res = requests.post(
+                    f"{REISIFT_BASE_URL}/api/internal/property/address-info-from-map-id/",
+                    headers=reisift_auth_headers(token),
+                    json={"map_id": map_id},
+                    timeout=30,
+                )
+                address_info_res.raise_for_status()
+                address_info_payload = address_info_res.json()
+                create_payload = _reisift_build_property_create_payload(address_info_payload, input_payload)
+            else:
+                map_lookup_fallback_reason = "Could not resolve map_id from ReiSift map autocomplete response."
+        except Exception as exc:
+            map_lookup_fallback_reason = str(exc) or "ReiSift map lookup failed."
 
-        address_info_res = requests.post(
-            f"{REISIFT_BASE_URL}/api/internal/property/address-info-from-map-id/",
-            headers=reisift_auth_headers(token),
-            json={"map_id": map_id},
-            timeout=30,
-        )
-        address_info_res.raise_for_status()
-        address_info_payload = address_info_res.json()
-        create_payload = _reisift_build_property_create_payload(address_info_payload, input_payload)
+        if create_payload is None:
+            create_payload = _reisift_build_property_create_payload_from_input(input_payload)
+            map_lookup_fallback_used = True
     else:
         create_payload = _reisift_build_property_create_payload_from_input(input_payload)
     create_res = requests.post(
@@ -22902,6 +22912,8 @@ def create_reisift_property_from_search(input_payload):
                 return {
                     "search": search,
                     "map_id": map_id,
+                    "map_lookup_fallback_used": map_lookup_fallback_used,
+                    "map_lookup_fallback_reason": map_lookup_fallback_reason,
                     "create_payload": create_payload,
                     "created": create_body,
                     "created_uuid": existing_uuid,
@@ -22941,6 +22953,8 @@ def create_reisift_property_from_search(input_payload):
     return {
         "search": search,
         "map_id": map_id,
+        "map_lookup_fallback_used": map_lookup_fallback_used,
+        "map_lookup_fallback_reason": map_lookup_fallback_reason,
         "create_payload": create_payload,
         "created": create_body,
         "created_uuid": created_uuid,

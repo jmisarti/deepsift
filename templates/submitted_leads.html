@@ -34,7 +34,7 @@
     {% endif %}
     <details class="submitted-leads-manual-entry">
         <summary><strong>Add Manual Lead</strong></summary>
-        <p>Add a REISift-linked lead when it did not come in through a webhook. Required fields are the REISift record, the address, and at least one seller phone or email so the attempt counters can attach correctly.</p>
+        <p>Add a REISift-linked lead when it did not come in through a webhook. Required fields are the REISift record, the address, and at least one seller phone or email so the attempt counters can attach correctly. Manual leads now backfill matching call and SMS activity from the prior 48 hours as soon as they are added.</p>
         <form method="post" action="{{ url_for('submitted_leads_add_route') }}" class="submitted-manual-form">
             <label>
                 <span>REISift URL or UUID</span>

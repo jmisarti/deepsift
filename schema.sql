@@ -213,6 +213,7 @@ CREATE TABLE IF NOT EXISTS manual_lead_submissions (
     latest_payload_json TEXT,
     processing_result_json TEXT,
     status TEXT NOT NULL DEFAULT 'manual_added',
+    activity_since_at TEXT,
     first_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     processed_at TEXT

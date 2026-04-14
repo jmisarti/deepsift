@@ -1209,12 +1209,14 @@ def migrate_db(db):
             latest_payload_json TEXT,
             processing_result_json TEXT,
             status TEXT NOT NULL DEFAULT 'manual_added',
+            activity_since_at TEXT,
             first_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             last_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             processed_at TEXT
         )
         """
     )
+    ensure_column(db, "manual_lead_submissions", "activity_since_at", "activity_since_at TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS idx_manual_leads_reisift_uuid ON manual_lead_submissions(reisift_property_uuid)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_manual_leads_status ON manual_lead_submissions(status, last_received_at)")
     db.execute(
@@ -12680,6 +12682,11 @@ def _submitted_lead_timestamp_value(*values):
     return None
 
 
+def _manual_submitted_lead_activity_since(now_dt=None, hours=48):
+    anchor = now_dt or datetime.utcnow()
+    return format_db_time(anchor - timedelta(hours=max(1, int(hours or 48))))
+
+
 def _build_submitted_lead_activity_index(db, earliest_since=None):
     cutoff = format_db_time(earliest_since) if isinstance(earliest_since, datetime) else str(earliest_since or "").strip()
     sms_rows = db.execute(
@@ -12763,7 +12770,7 @@ def _submitted_sms_message_key(item, direction):
 def _build_submitted_lead_activity_rollup(item, activity_index):
     phone_norms = set(item.get("phone_norms") or [])
     email_norms = set(item.get("email_norms") or [])
-    since_dt = _submitted_lead_timestamp_value(item.get("first_received_at"), item.get("date_added"))
+    since_dt = _submitted_lead_timestamp_value(item.get("activity_since_at"), item.get("first_received_at"), item.get("date_added"))
     outbound_sms_keys = set()
     inbound_sms_keys = set()
     outbound_call_keys = set()
@@ -12898,6 +12905,10 @@ def _build_submitted_lead_item(db, source, row):
             or row["last_received_at"]
             or ""
         ).strip(),
+        "activity_since_at": str(
+            (row["activity_since_at"] if "activity_since_at" in row.keys() else "")
+            or (_manual_submitted_lead_activity_since(parse_flexible_datetime(row["first_received_at"])) if source_low == "manual" else "")
+        ).strip(),
         "first_received_at": str(row["first_received_at"] or "").strip(),
         "last_received_at": str(row["last_received_at"] or "").strip(),
         "phones": [{"value": phone_value, "type": "Seller", "status": "Captured"}] if phone_value else [],
@@ -12967,7 +12978,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     manual_rows = db.execute(
         """
         SELECT id, lead_key, reisift_property_uuid, reisift_owner_uuid, latest_address, latest_phone, latest_email, latest_name,
-               latest_stage, latest_payload_json, processing_result_json, status, first_received_at, last_received_at, entry_notes
+               latest_stage, latest_payload_json, processing_result_json, status, activity_since_at, first_received_at, last_received_at, entry_notes
         FROM manual_lead_submissions
         ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
         LIMIT 1000
@@ -13012,7 +13023,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
         }, ["website", "clever", "manual", "ppl"]
     earliest_since = None
     for item in rows:
-        candidate = _submitted_lead_timestamp_value(item.get("first_received_at"), item.get("date_added"))
+        candidate = _submitted_lead_timestamp_value(item.get("activity_since_at"), item.get("first_received_at"), item.get("date_added"))
         if candidate is None:
             continue
         earliest_since = candidate if earliest_since is None else min(earliest_since, candidate)
@@ -29485,6 +29496,7 @@ def submitted_leads_page():
 def submitted_leads_add_route():
     ensure_db()
     db = get_db()
+    now_utc = datetime.utcnow()
     reisift_input = (request.form.get("reisift_record") or "").strip()
     reisift_uuid = extract_reisift_uuid_from_input(reisift_input)
     address_raw = normalize_whitespace(request.form.get("address") or "")
@@ -29508,6 +29520,7 @@ def submitted_leads_add_route():
         postal_code="",
     )
     final_address = normalized_address.get("address") or address_raw
+    activity_since_at = _manual_submitted_lead_activity_since(now_utc, hours=48)
     payload = {
         "entry_type": "manual_submitted_lead",
         "reisift_record_input": reisift_input,
@@ -29517,8 +29530,19 @@ def submitted_leads_add_route():
         "phone": phone_value,
         "email": email_value,
         "notes": notes_value,
-        "created_at": format_db_time(datetime.utcnow()),
+        "activity_lookback_hours": 48,
+        "activity_since_at": activity_since_at,
+        "created_at": format_db_time(now_utc),
     }
+    processing_result = json.dumps(
+        {
+            "mode": "manual_add",
+            "created_uuid": reisift_uuid,
+            "notes": notes_value,
+            "activity_lookback_hours": 48,
+            "activity_since_at": activity_since_at,
+        }
+    )
     lead_key = f"manual:{reisift_uuid}"
     existing = db.execute(
         """
@@ -29543,6 +29567,7 @@ def submitted_leads_add_route():
                 latest_payload_json = ?,
                 processing_result_json = ?,
                 status = 'manual_added',
+                activity_since_at = ?,
                 last_received_at = CURRENT_TIMESTAMP,
                 processed_at = CURRENT_TIMESTAMP
             WHERE id = ?
@@ -29555,7 +29580,8 @@ def submitted_leads_add_route():
                 seller_name,
                 notes_value,
                 json.dumps(payload),
-                json.dumps({"mode": "manual_add", "created_uuid": reisift_uuid, "notes": notes_value}),
+                processing_result,
+                activity_since_at,
                 int(existing["id"]),
             ),
         )
@@ -29565,8 +29591,8 @@ def submitted_leads_add_route():
             """
             INSERT INTO manual_lead_submissions
             (lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name, latest_stage,
-             entry_notes, latest_payload_json, processing_result_json, status, processed_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'Manual', ?, ?, ?, 'manual_added', CURRENT_TIMESTAMP)
+             entry_notes, latest_payload_json, processing_result_json, status, activity_since_at, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'Manual', ?, ?, ?, 'manual_added', ?, CURRENT_TIMESTAMP)
             """,
             (
                 lead_key,
@@ -29577,7 +29603,8 @@ def submitted_leads_add_route():
                 seller_name,
                 notes_value,
                 json.dumps(payload),
-                json.dumps({"mode": "manual_add", "created_uuid": reisift_uuid, "notes": notes_value}),
+                processing_result,
+                activity_since_at,
             ),
         )
         message = "Manual submitted lead added."

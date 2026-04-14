@@ -1122,6 +1122,7 @@ def migrate_db(db):
         """
     )
     ensure_column(db, "website_lead_submissions", "status", "status TEXT NOT NULL DEFAULT 'pending_step2'")
+    ensure_column(db, "website_lead_submissions", "reisift_status", "reisift_status TEXT NOT NULL DEFAULT 'new lead'")
     ensure_column(db, "website_lead_submissions", "hold_expires_at", "hold_expires_at TEXT")
     ensure_column(db, "website_lead_submissions", "step1_payload_json", "step1_payload_json TEXT")
     ensure_column(db, "website_lead_submissions", "step2_payload_json", "step2_payload_json TEXT")
@@ -1163,6 +1164,7 @@ def migrate_db(db):
         )
         """
     )
+    ensure_column(db, "clever_lead_submissions", "reisift_status", "reisift_status TEXT NOT NULL DEFAULT 'new lead'")
     db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_connection_id ON clever_lead_submissions(connection_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_record_id ON clever_lead_submissions(record_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_status ON clever_lead_submissions(status, last_received_at)")
@@ -1191,6 +1193,7 @@ def migrate_db(db):
         )
         """
     )
+    ensure_column(db, "propertyleads_lead_submissions", "reisift_status", "reisift_status TEXT NOT NULL DEFAULT 'new lead'")
     db.execute("CREATE INDEX IF NOT EXISTS idx_propertyleads_leads_id ON propertyleads_lead_submissions(lead_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_propertyleads_leads_status ON propertyleads_lead_submissions(status, last_received_at)")
     db.execute(
@@ -1217,6 +1220,7 @@ def migrate_db(db):
         """
     )
     ensure_column(db, "manual_lead_submissions", "activity_since_at", "activity_since_at TEXT")
+    ensure_column(db, "manual_lead_submissions", "reisift_status", "reisift_status TEXT NOT NULL DEFAULT 'new lead'")
     db.execute("CREATE INDEX IF NOT EXISTS idx_manual_leads_reisift_uuid ON manual_lead_submissions(reisift_property_uuid)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_manual_leads_status ON manual_lead_submissions(status, last_received_at)")
     db.execute(
@@ -12687,6 +12691,17 @@ def _manual_submitted_lead_activity_since(now_dt=None, hours=48):
     return format_db_time(anchor - timedelta(hours=max(1, int(hours or 48))))
 
 
+def _submitted_lead_reisift_status_options():
+    return [
+        "new lead",
+        "attempting contact",
+        "contacted",
+        "follow up",
+        "qualified",
+        "dead",
+    ]
+
+
 def _build_submitted_lead_activity_index(db, earliest_since=None):
     cutoff = format_db_time(earliest_since) if isinstance(earliest_since, datetime) else str(earliest_since or "").strip()
     sms_rows = db.execute(
@@ -12898,6 +12913,7 @@ def _build_submitted_lead_item(db, source, row):
         "address": str(row["latest_address"] or fields.get("address") or "").strip(),
         "owner_names": str(row["latest_name"] or fields.get("seller_name") or "").strip(),
         "status": str(row["status"] or "").strip(),
+        "reisift_status": normalize_whitespace((row["reisift_status"] if "reisift_status" in row.keys() else "") or "new lead").lower(),
         "latest_stage": latest_stage,
         "date_added": str(
             row["first_received_at"]
@@ -12949,7 +12965,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     website_rows = db.execute(
         """
         SELECT id, lead_key, reisift_property_uuid, reisift_owner_uuid, latest_address, latest_phone, latest_email, latest_name,
-               latest_stage, latest_payload_json, processing_result_json, status, first_received_at, last_received_at,
+               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, first_received_at, last_received_at,
                step1_payload_json, step2_payload_json
         FROM website_lead_submissions
         ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
@@ -12959,7 +12975,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     clever_rows = db.execute(
         """
         SELECT id, lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name,
-               latest_stage, latest_payload_json, processing_result_json, status, first_received_at, last_received_at,
+               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, first_received_at, last_received_at,
                source_created_at
         FROM clever_lead_submissions
         ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
@@ -12969,7 +12985,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     ppl_rows = db.execute(
         """
         SELECT id, lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name,
-               latest_stage, latest_payload_json, processing_result_json, status, first_received_at, last_received_at
+               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, first_received_at, last_received_at
         FROM propertyleads_lead_submissions
         ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
         LIMIT 1000
@@ -12978,7 +12994,7 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     manual_rows = db.execute(
         """
         SELECT id, lead_key, reisift_property_uuid, reisift_owner_uuid, latest_address, latest_phone, latest_email, latest_name,
-               latest_stage, latest_payload_json, processing_result_json, status, activity_since_at, first_received_at, last_received_at, entry_notes
+               latest_stage, latest_payload_json, processing_result_json, status, reisift_status, activity_since_at, first_received_at, last_received_at, entry_notes
         FROM manual_lead_submissions
         ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
         LIMIT 1000
@@ -29481,6 +29497,7 @@ def submitted_leads_page():
         sort_by=sort_by,
         sort_dir=sort_dir,
         source_options=source_options,
+        reisift_status_options=_submitted_lead_reisift_status_options(),
         pagination=pagination,
         followup_summary={
             "lead_count": totals["lead_count"],
@@ -29610,6 +29627,66 @@ def submitted_leads_add_route():
         message = "Manual submitted lead added."
     db.commit()
     return redirect(url_for("submitted_leads_page", notice=message))
+
+
+@app.route("/submitted-leads/<source>/<int:lead_id>/update", methods=["POST"])
+def submitted_leads_update_route(source, lead_id):
+    ensure_db()
+    db = get_db()
+    source_low = normalize_whitespace(source).lower()
+    table_map = {
+        "website": "website_lead_submissions",
+        "clever": "clever_lead_submissions",
+        "ppl": "propertyleads_lead_submissions",
+        "manual": "manual_lead_submissions",
+    }
+    table_name = table_map.get(source_low)
+    return_args = {
+        "q": (request.form.get("return_q") or "").strip(),
+        "source": (request.form.get("return_source") or "").strip().lower(),
+        "sort_by": (request.form.get("return_sort_by") or "date_added").strip().lower(),
+        "sort_dir": (request.form.get("return_sort_dir") or "desc").strip().lower(),
+        "page": (request.form.get("return_page") or "1").strip(),
+    }
+    if not table_name:
+        return redirect(url_for("submitted_leads_page", error="Unknown submitted lead source.", **return_args))
+
+    existing = db.execute(
+        f"SELECT id, lead_key, reisift_property_uuid, COALESCE(reisift_status, 'new lead') AS reisift_status FROM {table_name} WHERE id = ? LIMIT 1",
+        (int(lead_id),),
+    ).fetchone()
+    if not existing:
+        return redirect(url_for("submitted_leads_page", error="Submitted lead not found.", **return_args))
+
+    reisift_input = (request.form.get("reisift_record") or "").strip()
+    reisift_status = normalize_whitespace(request.form.get("reisift_status") or "new lead").lower()
+    if reisift_status not in _submitted_lead_reisift_status_options():
+        reisift_status = "new lead"
+
+    update_fields = ["reisift_status = ?"]
+    params = [reisift_status]
+
+    if reisift_input:
+        reisift_uuid = extract_reisift_uuid_from_input(reisift_input)
+        if not reisift_uuid:
+            return redirect(url_for("submitted_leads_page", error="Enter a valid REISift URL or UUID.", **return_args))
+        update_fields.append("reisift_property_uuid = ?")
+        params.append(reisift_uuid)
+        if source_low == "manual":
+            new_lead_key = f"manual:{reisift_uuid}"
+            conflict = db.execute(
+                "SELECT id FROM manual_lead_submissions WHERE lead_key = ? AND id <> ? LIMIT 1",
+                (new_lead_key, int(lead_id)),
+            ).fetchone()
+            if conflict:
+                return redirect(url_for("submitted_leads_page", error="That REISift record is already linked to another manual lead entry.", **return_args))
+            update_fields.append("lead_key = ?")
+            params.append(new_lead_key)
+
+    params.append(int(lead_id))
+    db.execute(f"UPDATE {table_name} SET {', '.join(update_fields)} WHERE id = ?", tuple(params))
+    db.commit()
+    return redirect(url_for("submitted_leads_page", notice="Submitted lead updated.", **return_args))
 
 
 @app.route("/follow-ups/refresh", methods=["POST"])

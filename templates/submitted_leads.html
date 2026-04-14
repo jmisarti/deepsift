@@ -91,6 +91,7 @@
                 <tr>
                     <th>Address</th>
                     <th>Status</th>
+                    <th>REISift Status</th>
                     <th>Source</th>
                     <th>Owner(s)</th>
                     <th>
@@ -146,6 +147,7 @@
                 <tr class="followup-main-row" data-target="submitted-detail-{{ row.source }}-{{ row.id }}">
                     <td>{{ row.address or "-" }}</td>
                     <td><span class="pill">{{ row.status or "-" }}</span></td>
+                    <td><span class="pill">{{ row.reisift_status or "new lead" }}</span></td>
                     <td title="{{ row.source_label }}">{{ row.source_short }}</td>
                     <td>{{ row.owner_names or "-" }}</td>
                     <td>{{ row.date_added|fmt_long_date }}</td>
@@ -169,13 +171,35 @@
                     </td>
                 </tr>
                 <tr id="submitted-detail-{{ row.source }}-{{ row.id }}" class="followup-detail-row hidden">
-                    <td colspan="10">
+                    <td colspan="11">
                         <div class="inline-actions" style="justify-content:space-between; margin: 0.35rem 0 0.6rem;">
                             <p style="margin:0;"><strong>Lead Key:</strong> {{ row.lead_key or '-' }}</p>
                             <p style="margin:0;"><strong>Stage:</strong> {{ row.latest_stage or '-' }}</p>
                         </div>
                         <p><strong>Address:</strong> {{ row.address or '-' }}</p>
                         <p><strong>City/State/Zip:</strong> {{ row.city or '-' }}, {{ row.state or '-' }} {{ row.postal_code or '' }}</p>
+                        <form method="post" action="{{ url_for('submitted_leads_update_route', source=row.source, lead_id=row.id) }}" class="submitted-manual-form" style="margin-top:0.75rem;">
+                            <input type="hidden" name="return_q" value="{{ q }}">
+                            <input type="hidden" name="return_source" value="{{ source }}">
+                            <input type="hidden" name="return_sort_by" value="{{ sort_by }}">
+                            <input type="hidden" name="return_sort_dir" value="{{ sort_dir }}">
+                            <input type="hidden" name="return_page" value="{{ pagination.page }}">
+                            <label>
+                                <span>REISift URL or UUID</span>
+                                <input type="text" name="reisift_record" value="{{ row.reisift_url or row.reisift_property_uuid or '' }}" placeholder="https://app.reisift.io/... or UUID">
+                            </label>
+                            <label>
+                                <span>REISift Status</span>
+                                <select name="reisift_status">
+                                    {% for option in reisift_status_options %}
+                                    <option value="{{ option }}" {% if (row.reisift_status or 'new lead') == option %}selected{% endif %}>{{ option|title }}</option>
+                                    {% endfor %}
+                                </select>
+                            </label>
+                            <div class="inline-actions">
+                                <button type="submit">Update REISift Details</button>
+                            </div>
+                        </form>
                         {% if row.entry_notes %}
                         <p><strong>Entry Notes:</strong> {{ row.entry_notes }}</p>
                         {% endif %}
@@ -221,24 +245,6 @@
                                 </tbody>
                             </table>
                         </div>
-                        <div class="table-wrap" style="margin-top:0.6rem;">
-                            <table class="compact-table submitted-leads-detail-table">
-                                <thead>
-                                    <tr>
-                                        <th>Inbound SMS</th>
-                                        <th>Inbound Calls</th>
-                                        <th>Inbound Email</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <tr>
-                                        <td>{{ row.inbound_sms or 0 }}</td>
-                                        <td>{{ row.inbound_calls or 0 }}</td>
-                                        <td>{{ row.inbound_email or 0 }}</td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
                         <details style="margin-top:0.8rem;">
                             <summary><strong>Processing Result</strong></summary>
                             <pre class="json-block">{{ row.processing_result_json_pretty }}</pre>
@@ -251,7 +257,7 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="10">No submitted leads found yet.</td>
+                    <td colspan="11">No submitted leads found yet.</td>
                 </tr>
                 {% endfor %}
             </tbody>

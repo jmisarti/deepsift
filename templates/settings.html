@@ -216,6 +216,12 @@
             <label class="span2">Integration API Key (for external POST endpoints)
                 <input name="integration_api_key" value="{{ integration_api_key }}">
             </label>
+            <label class="span2">SmrtPhone API Key
+                <input name="smrtphone_api_key" value="{{ smrtphone_api_key }}">
+            </label>
+            <label class="span2">SmrtPhone Webhook Token (optional)
+                <input name="smrtphone_webhook_token" value="{{ smrtphone_webhook_token }}" placeholder="Used to verify the unified SmrtPhone webhook">
+            </label>
             <label class="span2">Slack Incoming Webhook URL
                 <input name="slack_webhook_url" value="{{ slack_settings.webhook_url }}">
             </label>
@@ -277,6 +283,8 @@
                 <button type="submit" name="integration_action" value="test_slack_agent_ops">Save + Test Agent Ops Slack</button>
             </div>
         </form>
+        <p class="muted-text">SmrtPhone unified webhook URL: <code>{{ smrtphone_events_webhook_url or 'Set Public App Base URL to generate the SmrtPhone webhook URL.' }}</code></p>
+        <p class="muted-text">Use the SmrtPhone API key above for API calls from DeepSift. The optional webhook token can be appended to the webhook URL and checked on inbound webhook posts.</p>
         <p class="muted-text">Sequence <code>MAIL</code> steps use the OpenLetterConnect API key above plus the sender/template values from Direct Mail Settings.</p>
         <p class="muted-text">OpenLetterConnect events webhook URL: <code>{{ openletterconnect_events_webhook_url or 'Set Public App Base URL to generate the OpenLetterConnect events webhook URL.' }}</code></p>
         <p class="muted-text">The webhook secret key above should match the secret/token configured in OpenLetterConnect for the new events webhook.</p>

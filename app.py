@@ -103,8 +103,10 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = env_flag("SESSION_COOKIE_SECURE", False)
 
 SMRTPHONE_SEND_URL = os.getenv("SMRTPHONE_SEND_URL", "https://phone.smrt.studio/sms/send").strip()
+SMRTPHONE_API_KEY = os.getenv("SMRTPHONE_API_KEY", "").strip()
 SMRTPHONE_FROM_NUMBER = os.getenv("SMRTPHONE_FROM_NUMBER", "19088679098").strip() or "19088679098"
 SMRTPHONE_OWNED_NUMBERS = os.getenv("SMRTPHONE_OWNED_NUMBERS", "").strip()
+SMRTPHONE_WEBHOOK_TOKEN = os.getenv("SMRTPHONE_WEBHOOK_TOKEN", "").strip()
 SMRTPHONE_OWNED_DEFAULT_NUMBERS = [
     "6829002099",
     "9088679098",
@@ -1164,6 +1166,33 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_connection_id ON clever_lead_submissions(connection_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_record_id ON clever_lead_submissions(record_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_clever_leads_status ON clever_lead_submissions(status, last_received_at)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS propertyleads_lead_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_key TEXT NOT NULL UNIQUE,
+            lead_id TEXT,
+            reisift_property_uuid TEXT,
+            reisift_owner_uuid TEXT,
+            latest_address TEXT,
+            latest_phone TEXT,
+            latest_email TEXT,
+            latest_name TEXT,
+            latest_stage TEXT,
+            county TEXT,
+            lead_cost TEXT,
+            source_label TEXT,
+            latest_payload_json TEXT,
+            processing_result_json TEXT,
+            status TEXT NOT NULL DEFAULT 'captured',
+            first_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TEXT
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_propertyleads_leads_id ON propertyleads_lead_submissions(lead_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_propertyleads_leads_status ON propertyleads_lead_submissions(status, last_received_at)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS lead_monitor_runs (
@@ -2840,6 +2869,99 @@ def _extract_propertyleads_fields(payload):
     }
 
 
+def _derive_propertyleads_lead_key(fields, payload):
+    fields = fields if isinstance(fields, dict) else {}
+    lead_id = str(fields.get("lead_id") or "").strip()
+    if lead_id:
+        return f"propertyleads:{lead_id}"
+    email = normalize_email(fields.get("email") or "")
+    if email:
+        return f"propertyleads_email:{email}"
+    phone = normalize_phone(fields.get("phone") or "")
+    if phone:
+        return f"propertyleads_phone:{phone}"
+    address = _normalize_address_key(fields.get("address") or "")
+    if address:
+        return f"propertyleads_address:{address}"
+    payload_hash = hashlib.sha256(json.dumps(payload or {}, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
+    return f"propertyleads_payload:{payload_hash}"
+
+
+def upsert_propertyleads_submission(
+    db,
+    fields,
+    payload,
+    *,
+    status="captured",
+    source_label="webhook",
+    processing_result=None,
+    reisift_property_uuid="",
+    reisift_owner_uuid="",
+    processed_at="",
+):
+    fields = fields if isinstance(fields, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    lead_key = _derive_propertyleads_lead_key(fields, payload)
+    processing_blob = json.dumps(processing_result or {}) if processing_result is not None else None
+    existing = db.execute(
+        "SELECT id FROM propertyleads_lead_submissions WHERE lead_key = ? LIMIT 1",
+        (lead_key,),
+    ).fetchone()
+    params = (
+        str(fields.get("lead_id") or "").strip(),
+        str(reisift_property_uuid or "").strip(),
+        str(reisift_owner_uuid or "").strip(),
+        str(fields.get("address") or "").strip(),
+        normalize_phone(fields.get("phone") or "") or str(fields.get("phone") or "").strip(),
+        normalize_email(fields.get("email") or "") or str(fields.get("email") or "").strip(),
+        str(fields.get("seller_name") or "").strip(),
+        "ppl_submission",
+        str(fields.get("county") or "").strip(),
+        str(fields.get("lead_cost") or "").strip(),
+        str(source_label or "").strip(),
+        json.dumps(payload or {}),
+        processing_blob,
+        str(status or "captured").strip() or "captured",
+        str(processed_at or "").strip() or None,
+    )
+    if existing:
+        db.execute(
+            """
+            UPDATE propertyleads_lead_submissions
+            SET lead_id = ?,
+                reisift_property_uuid = ?,
+                reisift_owner_uuid = ?,
+                latest_address = ?,
+                latest_phone = ?,
+                latest_email = ?,
+                latest_name = ?,
+                latest_stage = ?,
+                county = ?,
+                lead_cost = ?,
+                source_label = ?,
+                latest_payload_json = ?,
+                processing_result_json = COALESCE(?, processing_result_json),
+                status = ?,
+                processed_at = COALESCE(?, processed_at),
+                last_received_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            params + (existing["id"],),
+        )
+    else:
+        db.execute(
+            """
+            INSERT INTO propertyleads_lead_submissions
+                (lead_key, lead_id, reisift_property_uuid, reisift_owner_uuid, latest_address, latest_phone, latest_email,
+                 latest_name, latest_stage, county, lead_cost, source_label, latest_payload_json, processing_result_json,
+                 status, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (lead_key,) + params,
+        )
+    return lead_key
+
+
 def _build_propertyleads_notes(payload, fields, source_label="webhook"):
     lines = [
         "Source: PropertyLeads.com PPL",
@@ -2881,6 +3003,7 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
     if not isinstance(payload, dict):
         return {"ok": False, "error": "Invalid payload object.", "error_type": "validation", "slack_sent": False}
     fields = _extract_propertyleads_fields(payload)
+    lead_key = upsert_propertyleads_submission(db, fields, payload, status="received", source_label=source_label)
     event_key = _derive_propertyleads_event_key(payload)
     if not event_key:
         payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
@@ -2888,10 +3011,27 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
     is_new = upsert_integration_event(db, PROPERTYLEADS_PPL_EVENT_SOURCE, event_key, payload)
     db.commit()
     if not is_new:
-        return {"ok": True, "duplicate": True, "event_key": event_key, "slack_sent": False}
+        upsert_propertyleads_submission(
+            db,
+            fields,
+            payload,
+            status="duplicate_event",
+            source_label=source_label,
+            processing_result={"ok": True, "duplicate": True, "event_key": event_key, "lead_key": lead_key},
+        )
+        db.commit()
+        return {"ok": True, "duplicate": True, "event_key": event_key, "lead_key": lead_key, "slack_sent": False}
 
     if not fields.get("address"):
         err = "PropertyLeads payload missing property address."
+        upsert_propertyleads_submission(
+            db,
+            fields,
+            payload,
+            status="failed_validation",
+            source_label=source_label,
+            processing_result={"ok": False, "event_key": event_key, "lead_key": lead_key, "error": err, "error_type": "validation"},
+        )
         log_app_error(
             db,
             source="propertyleads_ppl_ingest",
@@ -2923,6 +3063,7 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
         return {
             "ok": False,
             "event_key": event_key,
+            "lead_key": lead_key,
             "error": err,
             "error_type": "validation",
             "slack_sent": True,
@@ -3004,10 +3145,32 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
         if duplicate_reason:
             slack_lines.append(f"Reason: {duplicate_reason}")
         send_slack_notification(db, "\n".join(slack_lines), channel="#acquisitions")
+        upsert_propertyleads_submission(
+            db,
+            fields,
+            payload,
+            status="processed",
+            source_label=source_label,
+            processing_result={
+                "ok": True,
+                "event_key": event_key,
+                "lead_key": lead_key,
+                "created_uuid": created_uuid,
+                "owner_uuid": owner_uuid,
+                "duplicate_existing": duplicate_existing,
+                "duplicate_reason": duplicate_reason,
+                "contact_sync": contact_sync,
+                "note_sync": note_sync,
+            },
+            reisift_property_uuid=created_uuid,
+            reisift_owner_uuid=owner_uuid,
+            processed_at=format_db_time(datetime.utcnow()),
+        )
         db.commit()
         return {
             "ok": True,
             "event_key": event_key,
+            "lead_key": lead_key,
             "created_uuid": created_uuid,
             "owner_uuid": owner_uuid,
             "duplicate_existing": duplicate_existing,
@@ -3029,6 +3192,24 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
             status_code=500,
         )
         sift_link = _sift_record_url(created_uuid)
+        upsert_propertyleads_submission(
+            db,
+            fields,
+            payload,
+            status="failed",
+            source_label=source_label,
+            processing_result={
+                "ok": False,
+                "event_key": event_key,
+                "lead_key": lead_key,
+                "created_uuid": created_uuid,
+                "error": err,
+                "error_type": "server",
+            },
+            reisift_property_uuid=created_uuid,
+            reisift_owner_uuid=owner_uuid,
+            processed_at=format_db_time(datetime.utcnow()),
+        )
         try:
             send_slack_notification(
                 db,
@@ -3054,6 +3235,7 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
         return {
             "ok": False,
             "event_key": event_key,
+            "lead_key": lead_key,
             "created_uuid": created_uuid,
             "error": err,
             "error_type": "server",
@@ -3062,9 +3244,9 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
 
 
 def send_smrtphone_sms(to_number, message_body, from_number=None):
-    api_key = os.getenv("SMRTPHONE_API_KEY", "").strip()
+    api_key = get_smrtphone_api_key()
     if not api_key:
-        raise ValueError("SMRTPHONE_API_KEY is not set")
+        raise ValueError("SmrtPhone API key is not set")
 
     headers = {
         "X-Auth-smrtPhone": api_key,
@@ -3101,9 +3283,9 @@ def send_smrtphone_sms(to_number, message_body, from_number=None):
 
 
 def fetch_smrtphone_recording_url(call_sid):
-    api_key = os.getenv("SMRTPHONE_API_KEY", "").strip()
+    api_key = get_smrtphone_api_key()
     if not api_key:
-        raise ValueError("SMRTPHONE_API_KEY is not set")
+        raise ValueError("SmrtPhone API key is not set")
     clean_sid = (call_sid or "").strip()
     if not clean_sid:
         raise ValueError("call_sid is required")
@@ -10095,6 +10277,57 @@ def get_public_app_base_url(db=None):
     return ""
 
 
+def get_smrtphone_api_key(db=None):
+    temp_db = None
+    if db is None:
+        try:
+            db = get_db()
+        except Exception:
+            try:
+                temp_db = open_sqlite_connection()
+                db = temp_db
+            except Exception:
+                db = None
+    try:
+        if db is not None:
+            return (get_setting(db, "smrtphone_api_key", "") or SMRTPHONE_API_KEY).strip()
+        return SMRTPHONE_API_KEY
+    finally:
+        if temp_db is not None:
+            temp_db.close()
+
+
+def get_smrtphone_webhook_token(db=None):
+    temp_db = None
+    if db is None:
+        try:
+            db = get_db()
+        except Exception:
+            try:
+                temp_db = open_sqlite_connection()
+                db = temp_db
+            except Exception:
+                db = None
+    try:
+        if db is not None:
+            return (get_setting(db, "smrtphone_webhook_token", "") or SMRTPHONE_WEBHOOK_TOKEN).strip()
+        return SMRTPHONE_WEBHOOK_TOKEN
+    finally:
+        if temp_db is not None:
+            temp_db.close()
+
+
+def get_smrtphone_events_webhook_url(db=None):
+    base_url = get_public_app_base_url(db)
+    if not base_url:
+        return ""
+    url = f"{base_url.rstrip('/')}/webhooks/smrtphone/events"
+    token = get_smrtphone_webhook_token(db)
+    if token:
+        return f"{url}?token={quote(token)}"
+    return url
+
+
 def get_openletterconnect_api_key(db=None):
     if db is None:
         try:
@@ -12351,6 +12584,355 @@ def build_website_ad_lead_snapshot(db, q="", source="", page=1, per_page=50):
         "page_numbers": list(range(max(1, page - 2), min(total_pages, page + 2) + 1)),
     }
     return paged_rows, campaign_rows, totals, source_options, pagination
+
+
+def _submitted_lead_source_short(source):
+    source_low = str(source or "").strip().lower()
+    return {"website": "W", "clever": "C", "ppl": "P"}.get(source_low, "?")
+
+
+def _submitted_lead_source_label(source):
+    source_low = str(source or "").strip().lower()
+    return {
+        "website": "Website",
+        "clever": "Clever",
+        "ppl": "PPL",
+    }.get(source_low, str(source or "").strip().title() or "Unknown")
+
+
+def _submitted_lead_timestamp_value(*values):
+    for value in values:
+        parsed = parse_flexible_datetime(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _build_submitted_lead_activity_index(db, earliest_since=None):
+    cutoff = format_db_time(earliest_since) if isinstance(earliest_since, datetime) else str(earliest_since or "").strip()
+    sms_rows = db.execute(
+        """
+        SELECT id, event_type, processing_status, sms_id, from_number, to_number, payload_json, received_at, error_text
+        FROM smrtphone_webhook_events
+        WHERE (? = '' OR received_at >= ?)
+        ORDER BY id DESC
+        """,
+        (cutoff, cutoff),
+    ).fetchall()
+    call_rows = db.execute(
+        """
+        SELECT id, call_sid, from_number, to_number, created_at
+        FROM call_recording_jobs
+        WHERE (? = '' OR created_at >= ?)
+        ORDER BY id DESC
+        """,
+        (cutoff, cutoff),
+    ).fetchall()
+    email_rows = db.execute(
+        """
+        SELECT id, direction, from_number, to_number, sent_at, created_at
+        FROM communications
+        WHERE upper(channel) = 'EMAIL'
+          AND (? = '' OR COALESCE(sent_at, created_at) >= ?)
+        ORDER BY id DESC
+        """,
+        (cutoff, cutoff),
+    ).fetchall()
+    index = {
+        "sms_by_from": {},
+        "sms_by_to": {},
+        "calls_by_phone": {},
+        "email_by_from": {},
+        "email_by_to": {},
+    }
+    for row in sms_rows:
+        item = dict(row)
+        item["payload"] = parse_json_object(row["payload_json"] or "{}", default={})
+        from_norm = normalize_phone(row["from_number"] or "")
+        to_norm = normalize_phone(row["to_number"] or "")
+        if from_norm:
+            index["sms_by_from"].setdefault(from_norm, []).append(item)
+        if to_norm:
+            index["sms_by_to"].setdefault(to_norm, []).append(item)
+    for row in call_rows:
+        item = dict(row)
+        from_norm = normalize_phone(row["from_number"] or "")
+        to_norm = normalize_phone(row["to_number"] or "")
+        if from_norm:
+            index["calls_by_phone"].setdefault(from_norm, []).append(item)
+        if to_norm:
+            index["calls_by_phone"].setdefault(to_norm, []).append(item)
+    for row in email_rows:
+        item = dict(row)
+        from_norm = normalize_email(row["from_number"] or "")
+        to_norm = normalize_email(row["to_number"] or "")
+        if from_norm:
+            index["email_by_from"].setdefault(from_norm, []).append(item)
+        if to_norm:
+            index["email_by_to"].setdefault(to_norm, []).append(item)
+    return index
+
+
+def _submitted_sms_message_key(item, direction):
+    sms_id = str(item.get("sms_id") or "").strip()
+    if sms_id:
+        return sms_id
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    message = (
+        str(payload.get("message") or payload.get("body") or payload.get("text") or "").strip()
+        or str(item.get("error_text") or "").strip()
+    )
+    from_norm = normalize_phone(item.get("from_number") or "")
+    to_norm = normalize_phone(item.get("to_number") or "")
+    received_bucket = str(item.get("received_at") or "").strip()[:16]
+    return hashlib.sha1(f"{direction}|{from_norm}|{to_norm}|{message}|{received_bucket}".encode("utf-8")).hexdigest()
+
+
+def _build_submitted_lead_activity_rollup(item, activity_index):
+    phone_norms = set(item.get("phone_norms") or [])
+    email_norms = set(item.get("email_norms") or [])
+    since_dt = _submitted_lead_timestamp_value(item.get("first_received_at"), item.get("date_added"))
+    outbound_sms_keys = set()
+    inbound_sms_keys = set()
+    outbound_call_keys = set()
+    inbound_call_keys = set()
+    outbound_email_keys = set()
+    inbound_email_keys = set()
+
+    def _is_after(value):
+        if since_dt is None:
+            return True
+        event_dt = parse_flexible_datetime(value)
+        if event_dt is None:
+            return True
+        return event_dt >= since_dt
+
+    for phone_norm in phone_norms:
+        for sms_event in activity_index.get("sms_by_to", {}).get(phone_norm, []):
+            if not _is_after(sms_event.get("received_at")):
+                continue
+            if str(sms_event.get("processing_status") or "").strip().lower() in {"error", "orphan"}:
+                continue
+            if str(sms_event.get("event_type") or "").strip().lower() not in {"outbound", "status"}:
+                continue
+            outbound_sms_keys.add(_submitted_sms_message_key(sms_event, "outbound"))
+        for sms_event in activity_index.get("sms_by_from", {}).get(phone_norm, []):
+            if not _is_after(sms_event.get("received_at")):
+                continue
+            if str(sms_event.get("processing_status") or "").strip().lower() in {"ignored", "error"}:
+                continue
+            if str(sms_event.get("event_type") or "").strip().lower() != "inbound":
+                continue
+            inbound_sms_keys.add(_submitted_sms_message_key(sms_event, "inbound"))
+        for call_event in activity_index.get("calls_by_phone", {}).get(phone_norm, []):
+            if not _is_after(call_event.get("created_at")):
+                continue
+            key = str(call_event.get("call_sid") or call_event.get("id") or "").strip()
+            if not key:
+                continue
+            direction = _infer_call_direction_without_db(call_event)
+            from_norm = normalize_phone(call_event.get("from_number") or "")
+            to_norm = normalize_phone(call_event.get("to_number") or "")
+            if direction == "Outbound" or (direction == "Unknown" and to_norm in phone_norms and from_norm not in phone_norms):
+                outbound_call_keys.add(key)
+            elif direction == "Inbound" or (direction == "Unknown" and from_norm in phone_norms and to_norm not in phone_norms):
+                inbound_call_keys.add(key)
+
+    for email_norm in email_norms:
+        for email_event in activity_index.get("email_by_to", {}).get(email_norm, []):
+            if not _is_after(email_event.get("sent_at") or email_event.get("created_at")):
+                continue
+            if str(email_event.get("direction") or "").strip().lower() == "outbound":
+                outbound_email_keys.add(str(email_event.get("id") or ""))
+        for email_event in activity_index.get("email_by_from", {}).get(email_norm, []):
+            if not _is_after(email_event.get("sent_at") or email_event.get("created_at")):
+                continue
+            if str(email_event.get("direction") or "").strip().lower() == "inbound":
+                inbound_email_keys.add(str(email_event.get("id") or ""))
+
+    return {
+        "outbound_calls": len(outbound_call_keys),
+        "outbound_sms": len(outbound_sms_keys),
+        "outbound_email": len(outbound_email_keys),
+        "inbound_responses": len(inbound_sms_keys) + len(inbound_call_keys) + len(inbound_email_keys),
+        "inbound_calls": len(inbound_call_keys),
+        "inbound_sms": len(inbound_sms_keys),
+        "inbound_email": len(inbound_email_keys),
+    }
+
+
+def _build_submitted_lead_item(db, source, row):
+    source_low = str(source or "").strip().lower()
+    payload = parse_json_object(row["latest_payload_json"] or "{}", default={})
+    payload_pretty = json.dumps(payload, indent=2, sort_keys=True) if payload else "{}"
+    if source_low == "website":
+        step1_payload = parse_json_object(row["step1_payload_json"] or "{}", default={})
+        step2_payload = parse_json_object(row["step2_payload_json"] or "{}", default={})
+        fields = _website_merge_fields(_extract_website_lead_fields(step1_payload), _extract_website_lead_fields(step2_payload))
+        latest_stage = "Stage2" if str(row["step2_payload_json"] or "").strip() else "Stage1"
+    elif source_low == "clever":
+        fields = _extract_clever_lead_fields(payload)
+        latest_stage = str(fields.get("stage") or row["latest_stage"] or "").strip()
+    else:
+        fields = _extract_propertyleads_fields(payload)
+        latest_stage = "PPL"
+    street = str(fields.get("street") or "").strip()
+    city = str(fields.get("city") or "").strip()
+    state = str(fields.get("state") or "").strip()
+    postal_code = str(fields.get("postal_code") or "").strip()
+    local_property_id = find_local_property_by_address(db, street, city, state, postal_code)
+    phone_value = normalize_phone(row["latest_phone"] or fields.get("phone") or "")
+    email_value = normalize_email(row["latest_email"] or fields.get("email") or "")
+    return {
+        "id": int(row["id"]),
+        "source": source_low,
+        "source_label": _submitted_lead_source_label(source_low),
+        "source_short": _submitted_lead_source_short(source_low),
+        "lead_key": str(row["lead_key"] or ""),
+        "reisift_property_uuid": str(row["reisift_property_uuid"] or "").strip(),
+        "reisift_url": _sift_record_url(row["reisift_property_uuid"]),
+        "local_property_id": local_property_id,
+        "address": str(row["latest_address"] or fields.get("address") or "").strip(),
+        "owner_names": str(row["latest_name"] or fields.get("seller_name") or "").strip(),
+        "status": str(row["status"] or "").strip(),
+        "latest_stage": latest_stage,
+        "date_added": str(
+            row["first_received_at"]
+            or (row["source_created_at"] if "source_created_at" in row.keys() else "")
+            or row["last_received_at"]
+            or ""
+        ).strip(),
+        "first_received_at": str(row["first_received_at"] or "").strip(),
+        "last_received_at": str(row["last_received_at"] or "").strip(),
+        "phones": [{"value": phone_value, "type": "Seller", "status": "Captured"}] if phone_value else [],
+        "emails": [{"value": email_value, "status": "Captured"}] if email_value else [],
+        "phone_norms": [phone_value] if phone_value else [],
+        "email_norms": [email_value] if email_value else [],
+        "street": street,
+        "city": city,
+        "state": state,
+        "postal_code": postal_code,
+        "payload_json_pretty": payload_pretty,
+        "processing_result_json_pretty": json.dumps(parse_json_object(row["processing_result_json"] or "{}", default={}), indent=2, sort_keys=True),
+        "step1_yes": bool(str(row["step1_payload_json"] or "").strip()) if "step1_payload_json" in row.keys() else False,
+        "step2_yes": bool(str(row["step2_payload_json"] or "").strip()) if "step2_payload_json" in row.keys() else False,
+    }
+
+
+def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50):
+    q = normalize_whitespace(q)
+    source = normalize_whitespace(source).lower()
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        per_page = max(1, min(200, int(per_page)))
+    except (TypeError, ValueError):
+        per_page = 50
+    rows = []
+    website_rows = db.execute(
+        """
+        SELECT id, lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name,
+               latest_stage, latest_payload_json, processing_result_json, status, first_received_at, last_received_at,
+               step1_payload_json, step2_payload_json
+        FROM website_lead_submissions
+        ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
+        LIMIT 1000
+        """
+    ).fetchall()
+    clever_rows = db.execute(
+        """
+        SELECT id, lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name,
+               latest_stage, latest_payload_json, processing_result_json, status, first_received_at, last_received_at,
+               source_created_at
+        FROM clever_lead_submissions
+        ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
+        LIMIT 1000
+        """
+    ).fetchall()
+    ppl_rows = db.execute(
+        """
+        SELECT id, lead_key, reisift_property_uuid, latest_address, latest_phone, latest_email, latest_name,
+               latest_stage, latest_payload_json, processing_result_json, status, first_received_at, last_received_at
+        FROM propertyleads_lead_submissions
+        ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
+        LIMIT 1000
+        """
+    ).fetchall()
+    for source_name, source_rows in (("website", website_rows), ("clever", clever_rows), ("ppl", ppl_rows)):
+        if source and source != source_name:
+            continue
+        for row in source_rows:
+            item = _build_submitted_lead_item(db, source_name, row)
+            search_blob = " ".join(
+                [
+                    item.get("address") or "",
+                    item.get("owner_names") or "",
+                    " ".join(item.get("phone_norms") or []),
+                    " ".join(item.get("email_norms") or []),
+                    item.get("lead_key") or "",
+                    item.get("source_label") or "",
+                    item.get("reisift_property_uuid") or "",
+                ]
+            ).lower()
+            if q and q.lower() not in search_blob:
+                continue
+            rows.append(item)
+    rows.sort(
+        key=lambda item: _submitted_lead_timestamp_value(item.get("last_received_at"), item.get("date_added")) or datetime.min,
+        reverse=True,
+    )
+    if not rows:
+        return [], {"lead_count": 0, "outbound_calls": 0, "outbound_sms": 0, "outbound_email": 0, "inbound_responses": 0}, {
+            "page": 1,
+            "per_page": per_page,
+            "total_rows": 0,
+            "total_pages": 1,
+            "has_prev": False,
+            "has_next": False,
+            "prev_page": 1,
+            "next_page": 1,
+            "start_index": 0,
+            "end_index": 0,
+            "page_numbers": [1],
+        }, ["website", "clever", "ppl"]
+    earliest_since = None
+    for item in rows:
+        candidate = _submitted_lead_timestamp_value(item.get("first_received_at"), item.get("date_added"))
+        if candidate is None:
+            continue
+        earliest_since = candidate if earliest_since is None else min(earliest_since, candidate)
+    activity_index = _build_submitted_lead_activity_index(db, earliest_since=earliest_since)
+    for item in rows:
+        item.update(_build_submitted_lead_activity_rollup(item, activity_index))
+    totals = {
+        "lead_count": len(rows),
+        "outbound_calls": sum(int(item.get("outbound_calls") or 0) for item in rows),
+        "outbound_sms": sum(int(item.get("outbound_sms") or 0) for item in rows),
+        "outbound_email": sum(int(item.get("outbound_email") or 0) for item in rows),
+        "inbound_responses": sum(int(item.get("inbound_responses") or 0) for item in rows),
+    }
+    total_rows = len(rows)
+    total_pages = max(1, math.ceil(total_rows / per_page)) if total_rows else 1
+    page = min(page, total_pages)
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_rows = rows[start:end]
+    pagination = {
+        "page": page,
+        "per_page": per_page,
+        "total_rows": total_rows,
+        "total_pages": total_pages,
+        "has_prev": page > 1,
+        "has_next": page < total_pages,
+        "prev_page": page - 1,
+        "next_page": page + 1,
+        "start_index": start + 1 if total_rows else 0,
+        "end_index": min(end, total_rows) if total_rows else 0,
+        "page_numbers": list(range(max(1, page - 2), min(total_pages, page + 2) + 1)),
+    }
+    return page_rows, totals, pagination, ["website", "clever", "ppl"]
 
 
 def process_website_lead_payload(db, payload, source_label="webhook"):
@@ -28682,6 +29264,34 @@ def follow_ups_page():
     )
 
 
+@app.route("/submitted-leads")
+def submitted_leads_page():
+    ensure_db()
+    db = get_db()
+    q = (request.args.get("q") or "").strip()
+    source = (request.args.get("source") or "").strip().lower()
+    try:
+        page = max(1, int(request.args.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    rows, totals, pagination, source_options = build_submitted_leads_snapshot(db, q=q, source=source, page=page, per_page=50)
+    return render_template(
+        "submitted_leads.html",
+        rows=rows,
+        q=q,
+        source=source,
+        source_options=source_options,
+        pagination=pagination,
+        followup_summary={
+            "lead_count": totals["lead_count"],
+            "outbound_calls": totals["outbound_calls"],
+            "outbound_sms": totals["outbound_sms"],
+            "outbound_email": totals["outbound_email"],
+            "inbound_responses": totals["inbound_responses"],
+        },
+    )
+
+
 @app.route("/follow-ups/refresh", methods=["POST"])
 def follow_ups_refresh():
     ensure_db()
@@ -30350,6 +30960,8 @@ def settings_page():
                 fields = {
                     "public_app_base_url": request.form.get("public_app_base_url", ""),
                     "integration_api_key": request.form.get("integration_api_key", ""),
+                    "smrtphone_api_key": request.form.get("smrtphone_api_key", ""),
+                    "smrtphone_webhook_token": request.form.get("smrtphone_webhook_token", ""),
                     "slack_webhook_url": request.form.get("slack_webhook_url", ""),
                     "slack_signing_secret": request.form.get("slack_signing_secret", ""),
                     "slack_default_channel": request.form.get("slack_default_channel", ""),
@@ -30500,6 +31112,9 @@ def settings_page():
     ad_platform_settings = get_ads_dashboard_settings(db)
     integration_api_key = get_integration_api_key(db)
     public_app_base_url = get_public_app_base_url(db)
+    smrtphone_api_key = get_smrtphone_api_key(db)
+    smrtphone_webhook_token = get_smrtphone_webhook_token(db)
+    smrtphone_events_webhook_url = get_smrtphone_events_webhook_url(db)
     openletterconnect_api_key = get_openletterconnect_api_key(db)
     openletterconnect_webhook_secret = get_openletterconnect_webhook_secret(db)
     openletterconnect_events_webhook_url = get_openletterconnect_events_webhook_url(db)
@@ -30595,6 +31210,9 @@ def settings_page():
         ad_platform_settings=ad_platform_settings,
         public_app_base_url=public_app_base_url,
         integration_api_key=integration_api_key,
+        smrtphone_api_key=smrtphone_api_key,
+        smrtphone_webhook_token=smrtphone_webhook_token,
+        smrtphone_events_webhook_url=smrtphone_events_webhook_url,
         openletterconnect_api_key=openletterconnect_api_key,
         openletterconnect_webhook_secret=openletterconnect_webhook_secret,
         openletterconnect_events_webhook_url=openletterconnect_events_webhook_url,
@@ -34363,12 +34981,93 @@ def slack_events_webhook():
     return jsonify({"ok": True})
 
 
-@app.route("/webhooks/smrtphone/inbound", methods=["POST"])
-def smrtphone_inbound_webhook():
+def _smrtphone_request_payload(payload=None):
+    if isinstance(payload, dict):
+        return payload
+    return request.get_json(silent=True) or request.form.to_dict() or {}
+
+
+def _verify_smrtphone_webhook_request(db):
+    expected = get_smrtphone_webhook_token(db)
+    if not expected:
+        return True, ""
+    provided = (
+        (request.args.get("token") or "").strip()
+        or (request.headers.get("X-SmrtPhone-Token") or "").strip()
+        or (request.headers.get("X-Webhook-Token") or "").strip()
+        or str((request.get_json(silent=True) or {}).get("token") or "").strip()
+        or (request.form.get("token") or "").strip()
+    )
+    if not provided or not hmac.compare_digest(provided, expected):
+        return False, "Invalid SmrtPhone webhook token."
+    return True, ""
+
+
+def _dispatch_smrtphone_events_webhook(db, payload):
+    payload = payload if isinstance(payload, dict) else {}
+    webhook = payload.get("webhook") if isinstance(payload.get("webhook"), dict) else {}
+    event_name = (
+        extract_first_string_by_keys(payload, ["event", "eventType", "type", "name"])
+        or extract_first_string_by_keys(webhook, ["event", "eventType", "type", "name"])
+    ).strip().lower()
+    has_sms_content = any(
+        str(payload.get(key) or "").strip()
+        for key in ("message", "body", "text")
+    )
+    has_call_sid = bool(
+        extract_first_string_by_keys(
+            payload,
+            ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "callID"],
+        )
+        or extract_first_string_by_keys(
+            webhook,
+            ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "callID"],
+        )
+    )
+    if any(
+        str(payload.get(key) or webhook.get(key) or "").strip()
+        for key in ("phone_number_agent", "phone_number_caller")
+    ) or "agent" in event_name:
+        return smrtphone_agent_call_ended_webhook(payload=payload, db=db)
+    if "delivery" in event_name or "callback" in event_name or (
+        str(payload.get("smsId") or payload.get("sms_id") or payload.get("id") or "").strip()
+        and str(payload.get("status") or "").strip()
+        and not has_sms_content
+        and not has_call_sid
+    ):
+        return smrtphone_status_webhook(payload=payload, db=db)
+    if has_call_sid or "call" in event_name:
+        return smrtphone_call_completed_webhook(payload=payload, db=db)
+    if has_sms_content or str(payload.get("smsId") or payload.get("sms_id") or "").strip():
+        return smrtphone_inbound_webhook(payload=payload, db=db)
+    log_smrtphone_webhook_event(
+        db,
+        "events_unknown",
+        payload,
+        processing_status="ignored",
+        error_text=f"Unrecognized unified SmrtPhone payload (event={event_name or 'unknown'})",
+    )
+    db.commit()
+    return jsonify({"ok": True, "ignored": True, "reason": "unrecognized event"}), 200
+
+
+@app.route("/webhooks/smrtphone/events", methods=["POST"])
+def smrtphone_events_webhook():
     ensure_db()
     db = get_db()
+    ok, reason = _verify_smrtphone_webhook_request(db)
+    if not ok:
+        return jsonify({"ok": False, "error": reason}), 401
+    payload = _smrtphone_request_payload()
+    return _dispatch_smrtphone_events_webhook(db, payload)
 
-    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+
+@app.route("/webhooks/smrtphone/inbound", methods=["POST"])
+def smrtphone_inbound_webhook(payload=None, db=None):
+    ensure_db()
+    db = db or get_db()
+
+    payload = _smrtphone_request_payload(payload)
     sms_id = str(payload.get("smsId") or payload.get("sms_id") or payload.get("id") or "").strip()
     from_number = str(payload.get("from") or payload.get("from_number") or "").strip()
     to_number = str(payload.get("to") or payload.get("to_number") or "").strip()
@@ -34584,11 +35283,11 @@ def smrtphone_inbound_webhook():
 
 
 @app.route("/webhooks/smrtphone/status", methods=["POST"])
-def smrtphone_status_webhook():
+def smrtphone_status_webhook(payload=None, db=None):
     ensure_db()
-    db = get_db()
+    db = db or get_db()
 
-    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    payload = _smrtphone_request_payload(payload)
     sms_id = str(payload.get("smsId") or payload.get("sms_id") or payload.get("id") or "").strip()
     status = str(payload.get("status") or "").strip().title()
     to_number = str(payload.get("to") or payload.get("to_number") or "").strip()
@@ -34765,10 +35464,10 @@ def smrtphone_status_webhook():
 
 
 @app.route("/webhooks/smrtphone/call-completed", methods=["POST"])
-def smrtphone_call_completed_webhook():
+def smrtphone_call_completed_webhook(payload=None, db=None):
     ensure_db()
-    db = get_db()
-    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    db = db or get_db()
+    payload = _smrtphone_request_payload(payload)
     call_sid = extract_first_string_by_keys(
         payload,
         ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "callID", "id"],
@@ -34934,11 +35633,11 @@ def smrtphone_call_completed_webhook():
 
 
 @app.route("/webhooks/smrtphone/agent-call-ended", methods=["POST"])
-def smrtphone_agent_call_ended_webhook():
+def smrtphone_agent_call_ended_webhook(payload=None, db=None):
     ensure_db()
-    db = get_db()
+    db = db or get_db()
 
-    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    payload = _smrtphone_request_payload(payload)
     webhook = payload.get("webhook") if isinstance(payload.get("webhook"), dict) else {}
     event_name = (
         extract_first_string_by_keys(payload, ["event", "eventType", "type", "name"])

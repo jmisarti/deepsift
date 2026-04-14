@@ -52,3 +52,18 @@ Follow-up questions for later:
 - Whether there is a separate event type or subscription toggle for ongoing updates
 - Whether payload shape changes between `replay` and live update events
 - Whether Clever can include richer seller/property fields comparable to the old worksheet data
+
+## RentCast valuation placeholder
+
+Needed integration placeholder:
+- Add a future call to RentCast property valuation for valuation assistance.
+- Endpoint to revisit: `https://developers.rentcast.io/reference/property-valuation`
+
+Important note:
+- This is only a placeholder for now; we have not designed how the valuation should be used in lead scoring, underwriting, offer guidance, or UI display yet.
+
+Questions for later:
+- When valuation should be triggered: on intake, on demand, or on a scheduled refresh
+- Which address normalization rules we want before calling the valuation endpoint
+- Whether we should store the raw valuation payload, normalized summary fields, or both
+- Which workflows should consume the valuation once it is available

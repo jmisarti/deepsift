@@ -1,0 +1,209 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="cards page-summary-cards">
+    <article>
+        <h3>Outbound Calls</h3>
+        <p>{{ followup_summary.outbound_calls }}</p>
+    </article>
+    <article>
+        <h3>Outbound SMS</h3>
+        <p>{{ followup_summary.outbound_sms }}</p>
+    </article>
+    <article>
+        <h3>Outbound Email</h3>
+        <p>{{ followup_summary.outbound_email }}</p>
+    </article>
+    <article>
+        <h3>Inbound Responses</h3>
+        <p>{{ followup_summary.inbound_responses }}</p>
+    </article>
+</section>
+
+<section class="panel">
+    <h2>Submitted Leads</h2>
+    <p>Local submissions only: website, Clever, and PPL. Activity counts are matched by captured seller phone/email and updated from local webhook/email data.</p>
+    <div class="panel-actions">
+        <form method="get" action="{{ url_for('submitted_leads_page') }}" class="inline-form">
+            <input type="text" name="q" value="{{ q }}" placeholder="address, seller, phone, email">
+            <label>Source
+                <select name="source">
+                    <option value="">All</option>
+                    {% for item in source_options %}
+                    <option value="{{ item }}" {% if source == item %}selected{% endif %}>{{ item|title }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <button type="submit">Apply</button>
+            <a href="{{ url_for('submitted_leads_page') }}">Clear</a>
+        </form>
+    </div>
+    {% if pagination.total_rows %}
+    <p class="ad-leads-pagination-summary">Showing {{ pagination.start_index }}-{{ pagination.end_index }} of {{ pagination.total_rows }} submitted leads.</p>
+    {% endif %}
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Address</th>
+                    <th>Status</th>
+                    <th>Source</th>
+                    <th>Owner(s)</th>
+                    <th>Date Added</th>
+                    <th>Outbound Calls</th>
+                    <th>Outbound SMS</th>
+                    <th>Outbound Email</th>
+                    <th>Inbound Responses</th>
+                    <th>Open</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr class="followup-main-row" data-target="submitted-detail-{{ row.source }}-{{ row.id }}">
+                    <td>{{ row.address or "-" }}</td>
+                    <td><span class="pill">{{ row.status or "-" }}</span></td>
+                    <td title="{{ row.source_label }}">{{ row.source_short }}</td>
+                    <td>{{ row.owner_names or "-" }}</td>
+                    <td>{{ row.date_added|fmt_long_date }}</td>
+                    <td>{{ row.outbound_calls or 0 }}</td>
+                    <td>{{ row.outbound_sms or 0 }}</td>
+                    <td>{{ row.outbound_email or 0 }}</td>
+                    <td>{{ row.inbound_responses or 0 }}</td>
+                    <td>
+                        <span class="ad-leads-link-icons">
+                            {% if row.local_property_id %}
+                            <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.local_property_id) }}" title="Open in Deep Dive" aria-label="Open in Deep Dive">
+                                <img class="tiny-link-icon" src="{{ url_for('static', filename='favicon.ico') }}" alt="Deep Dive">
+                            </a>
+                            {% endif %}
+                            {% if row.reisift_url %}
+                            <a class="action-icon-link" href="{{ row.reisift_url }}" target="_blank" rel="noopener" title="Open in REISift" aria-label="Open in REISift">
+                                <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+                            </a>
+                            {% endif %}
+                        </span>
+                    </td>
+                </tr>
+                <tr id="submitted-detail-{{ row.source }}-{{ row.id }}" class="followup-detail-row hidden">
+                    <td colspan="10">
+                        <div class="inline-actions" style="justify-content:space-between; margin: 0.35rem 0 0.6rem;">
+                            <p style="margin:0;"><strong>Lead Key:</strong> {{ row.lead_key or '-' }}</p>
+                            <p style="margin:0;"><strong>Stage:</strong> {{ row.latest_stage or '-' }}</p>
+                        </div>
+                        <p><strong>Address:</strong> {{ row.address or '-' }}</p>
+                        <p><strong>City/State/Zip:</strong> {{ row.city or '-' }}, {{ row.state or '-' }} {{ row.postal_code or '' }}</p>
+                        <div class="table-wrap">
+                            <table class="compact-table">
+                                <thead>
+                                    <tr>
+                                        <th>Phone</th>
+                                        <th>Type</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for phone in row.phones %}
+                                    <tr>
+                                        <td>{{ phone.value|fmt_phone }}</td>
+                                        <td>{{ phone.type }}</td>
+                                        <td>{{ phone.status }}</td>
+                                    </tr>
+                                    {% else %}
+                                    <tr><td colspan="3">No phone captured yet.</td></tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="table-wrap" style="margin-top:0.6rem;">
+                            <table class="compact-table">
+                                <thead>
+                                    <tr>
+                                        <th>Email</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for email in row.emails %}
+                                    <tr>
+                                        <td>{{ email.value }}</td>
+                                        <td>{{ email.status }}</td>
+                                    </tr>
+                                    {% else %}
+                                    <tr><td colspan="2">No email captured yet.</td></tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="table-wrap" style="margin-top:0.6rem;">
+                            <table class="compact-table">
+                                <thead>
+                                    <tr>
+                                        <th>Inbound SMS</th>
+                                        <th>Inbound Calls</th>
+                                        <th>Inbound Email</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td>{{ row.inbound_sms or 0 }}</td>
+                                        <td>{{ row.inbound_calls or 0 }}</td>
+                                        <td>{{ row.inbound_email or 0 }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <details style="margin-top:0.8rem;">
+                            <summary><strong>Processing Result</strong></summary>
+                            <pre class="json-block">{{ row.processing_result_json_pretty }}</pre>
+                        </details>
+                        <details style="margin-top:0.6rem;">
+                            <summary><strong>Latest Payload</strong></summary>
+                            <pre class="json-block">{{ row.payload_json_pretty }}</pre>
+                        </details>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="10">No submitted leads found yet.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% if pagination.total_pages > 1 %}
+    <nav class="anon-pagination ad-leads-pagination" aria-label="Submitted lead pages">
+        {% if pagination.has_prev %}
+        <a href="{{ url_for('submitted_leads_page', q=q, source=source, page=pagination.prev_page) }}">Previous</a>
+        {% else %}
+        <span class="is-disabled">Previous</span>
+        {% endif %}
+        {% for page_number in pagination.page_numbers %}
+            {% if page_number == pagination.page %}
+            <span class="is-current">{{ page_number }}</span>
+            {% else %}
+            <a href="{{ url_for('submitted_leads_page', q=q, source=source, page=page_number) }}">{{ page_number }}</a>
+            {% endif %}
+        {% endfor %}
+        {% if pagination.has_next %}
+        <a href="{{ url_for('submitted_leads_page', q=q, source=source, page=pagination.next_page) }}">Next</a>
+        {% else %}
+        <span class="is-disabled">Next</span>
+        {% endif %}
+    </nav>
+    {% endif %}
+</section>
+<script>
+(() => {
+  const rows = document.querySelectorAll('.followup-main-row');
+  rows.forEach((row) => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('a') || e.target.closest('button') || e.target.closest('select') || e.target.closest('input') || e.target.closest('summary')) return;
+      const id = row.getAttribute('data-target');
+      if (!id) return;
+      const detail = document.getElementById(id);
+      if (!detail) return;
+      detail.classList.toggle('hidden');
+    });
+  });
+})();
+</script>
+{% endblock %}

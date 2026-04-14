@@ -177,6 +177,28 @@ CREATE TABLE IF NOT EXISTS smrtphone_webhook_events (
     received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS propertyleads_lead_submissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_key TEXT NOT NULL UNIQUE,
+    lead_id TEXT,
+    reisift_property_uuid TEXT,
+    reisift_owner_uuid TEXT,
+    latest_address TEXT,
+    latest_phone TEXT,
+    latest_email TEXT,
+    latest_name TEXT,
+    latest_stage TEXT,
+    county TEXT,
+    lead_cost TEXT,
+    source_label TEXT,
+    latest_payload_json TEXT,
+    processing_result_json TEXT,
+    status TEXT NOT NULL DEFAULT 'captured',
+    first_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS skiptrace_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider TEXT NOT NULL DEFAULT 'SkipSherpa',

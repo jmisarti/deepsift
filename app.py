@@ -13140,7 +13140,7 @@ def _build_submitted_lead_activity_index(db, earliest_since=None):
     ).fetchall()
     email_rows = db.execute(
         """
-        SELECT id, direction, from_number, to_number, sent_at, created_at
+        SELECT id, property_id, person_id, direction, from_number, to_number, sent_at, created_at
         FROM communications
         WHERE upper(channel) = 'EMAIL'
           AND (? = '' OR COALESCE(sent_at, created_at) >= ?)
@@ -13163,6 +13163,7 @@ def _build_submitted_lead_activity_index(db, earliest_since=None):
         "calls_by_phone": {},
         "email_by_from": {},
         "email_by_to": {},
+        "email_by_property": {},
         "mail_by_property": {},
     }
     for row in sms_rows:
@@ -13186,10 +13187,13 @@ def _build_submitted_lead_activity_index(db, earliest_since=None):
         item = dict(row)
         from_norm = normalize_email(row["from_number"] or "")
         to_norm = normalize_email(row["to_number"] or "")
+        property_id = int(row["property_id"] or 0)
         if from_norm:
             index["email_by_from"].setdefault(from_norm, []).append(item)
         if to_norm:
             index["email_by_to"].setdefault(to_norm, []).append(item)
+        if property_id > 0:
+            index["email_by_property"].setdefault(property_id, []).append(item)
     for row in mail_rows:
         item = dict(row)
         property_id = int(row["property_id"] or 0)
@@ -13278,6 +13282,17 @@ def _build_submitted_lead_activity_rollup(item, activity_index):
                 inbound_email_keys.add(str(email_event.get("id") or ""))
 
     if local_property_id > 0:
+        for email_event in activity_index.get("email_by_property", {}).get(local_property_id, []):
+            if not _is_after(email_event.get("sent_at") or email_event.get("created_at")):
+                continue
+            direction = str(email_event.get("direction") or "").strip().lower()
+            event_id = str(email_event.get("id") or "").strip()
+            if not event_id:
+                continue
+            if direction == "outbound":
+                outbound_email_keys.add(event_id)
+            elif direction == "inbound":
+                inbound_email_keys.add(event_id)
         for mail_event in activity_index.get("mail_by_property", {}).get(local_property_id, []):
             if not _is_after(mail_event.get("created_at")):
                 continue

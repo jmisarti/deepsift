@@ -3835,8 +3835,8 @@ def analyze_call_transcript_with_openai(transcript_text, property_id=None, perso
     raise ValueError("No JSON output returned by call analyzer")
 
 
-def call_skipsherpa_person_lookup(first_name, last_name, street, city="", state="", zipcode="", middle_name=""):
-    api_key = get_skipsherpa_api_key()
+def call_skipsherpa_person_lookup(first_name, last_name, street, city="", state="", zipcode="", middle_name="", db=None):
+    api_key = get_skipsherpa_api_key(db)
     if not api_key:
         raise ValueError("SKIPSHERPA_API_KEY is not set")
     first_name, middle_name, last_name = normalize_first_middle_last(first_name, middle_name, last_name)
@@ -3882,8 +3882,8 @@ def call_skipsherpa_person_lookup(first_name, last_name, street, city="", state=
     return {"request": payload, "response": data}
 
 
-def call_skipsherpa_property_lookup(street, city="", state="", zipcode=""):
-    api_key = get_skipsherpa_api_key()
+def call_skipsherpa_property_lookup(street, city="", state="", zipcode="", db=None):
+    api_key = get_skipsherpa_api_key(db)
     if not api_key:
         raise ValueError("SKIPSHERPA_API_KEY is not set")
 
@@ -24875,6 +24875,7 @@ def run_property_skip_trace_lookup(db, property_id):
         city=prop["city"],
         state=prop["state"],
         zipcode=prop["postal_code"],
+        db=db,
     )
     summary = import_skipsherpa_property_result(db, property_id, lookup_pkg)
     return {
@@ -24913,6 +24914,7 @@ def run_reisift_uuid_skiptrace_sync(db, property_uuid, added_by="System", source
         city=intake["address"]["city"],
         state=intake["address"]["state"],
         zipcode=intake["address"]["postal_code"],
+        db=db,
     )
     summary = import_skipsherpa_property_result(db, property_id, lookup_pkg)
     if owner_uuid:
@@ -35009,6 +35011,7 @@ def skip_trace_person_route(property_id, person_id):
             city=prop["city"],
             state=prop["state"],
             zipcode=prop["postal_code"],
+            db=db,
         )
         lookup = lookup_pkg.get("response") if isinstance(lookup_pkg, dict) else {}
         req_payload = lookup_pkg.get("request") if isinstance(lookup_pkg, dict) else {}
@@ -35066,6 +35069,7 @@ def skip_trace_property_route(property_id):
             city=prop["city"],
             state=prop["state"],
             zipcode=prop["postal_code"],
+            db=db,
         )
         summary = import_skipsherpa_property_result(db, property_id, lookup_pkg)
         db.commit()

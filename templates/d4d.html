@@ -26,7 +26,7 @@
     </form>
 
     <table>
-        <thead><tr><th>Property</th><th>Owner</th><th>Status</th><th>Added</th><th>Source</th><th>SIFT Record</th></tr></thead>
+        <thead><tr><th>Property</th><th>Owner</th><th>Status</th><th>Added</th><th>Source</th><th>Open</th></tr></thead>
         <tbody>
             {% for p in properties %}
             <tr>
@@ -42,10 +42,13 @@
                 <td>{{ p.d4d_added_at or p.created_at }}</td>
                 <td>{{ p.d4d_source or '-' }}{% if p.d4d_added_by %}<br><small>{{ p.d4d_added_by }}</small>{% endif %}</td>
                 <td>
+                    <a class="action-icon-link" href="{{ url_for('property_detail', property_id=p.id) }}" title="Open in Deep Dive" aria-label="Open in Deep Dive">
+                        <img class="tiny-link-icon" src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/08/cropped-nj-logo-tiny-32x32.png" alt="DeepSift">
+                    </a>
                     {% if p.reisift_property_uuid %}
-                    <a href="{{ sift_record_url(p.reisift_property_uuid) }}" target="_blank" rel="noopener noreferrer">Open ReiSift record</a>
-                    {% else %}
-                    <span>-</span>
+                    <a class="action-icon-link" href="{{ sift_record_url(p.reisift_property_uuid) }}" target="_blank" rel="noopener noreferrer" title="Open in REISift" aria-label="Open in REISift">
+                        <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+                    </a>
                     {% endif %}
                 </td>
             </tr>

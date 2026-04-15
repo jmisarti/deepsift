@@ -18846,7 +18846,10 @@ def _reisift_status_label(status_value, default="New Lead"):
 
 def _reisift_create_status_value(status_value, default="new_lead"):
     raw = str(status_value or "").strip()
-    return raw or default
+    normalized_default = _reisift_status_slug(default or "new_lead", default="new_lead")
+    if not raw:
+        return normalized_default
+    return _reisift_status_slug(raw, default=normalized_default)
 
 
 def _playbook_priority_for_action(property_status, action_type, fallback_priority):
@@ -25039,7 +25042,7 @@ def sync_d4d_property_to_reisift(db, property_id, added_by="", source="Slack D4D
             "city": prop["city"],
             "state": prop["state"],
             "postal_code": prop["postal_code"],
-            "status": "New Lead",
+            "status": "new_lead",
             "lists": "Driving For Dollars",
             "tags": "Driving For Dollars,D4D",
             "notes": notes,

@@ -33644,8 +33644,74 @@ def property_detail(property_id):
         sequence_targets=sequence_targets,
         sequence_enrollments=sequence_enrollments,
         agent_trace=agent_trace,
-        seq_notice=(request.args.get("seq_notice") or "").strip(),
+        page_notice=(request.args.get("notice") or request.args.get("seq_notice") or "").strip(),
+        page_error=(request.args.get("error") or "").strip(),
     )
+
+
+@app.route("/property/<int:property_id>/reisift-note", methods=["POST"])
+def add_property_reisift_note(property_id):
+    ensure_db()
+    db = get_db()
+
+    property_row = db.execute(
+        """
+        SELECT id, owner_person_id, reisift_property_uuid
+        FROM properties
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if property_row is None:
+        return "Property not found", 404
+
+    property_uuid = normalize_uuid(property_row["reisift_property_uuid"] or "")
+    note_text = (request.form.get("note_text") or "").strip()
+    if not note_text:
+        return redirect(url_for("property_detail", property_id=property_id, error="Enter a note before sending it to REISift."))
+    if not property_uuid:
+        return redirect(url_for("property_detail", property_id=property_id, error="No REISift record is linked to this property yet."))
+
+    try:
+        token = reisift_get_access_token()
+        note_result = reisift_append_property_note(token, property_uuid, note_text)
+    except Exception as exc:
+        log_app_error(
+            db,
+            source=f"{PROVIDER_ALERT_SOURCE_PREFIX}reisift",
+            route=f"/property/{property_id}/reisift-note",
+            status_code=500,
+            error_message=f"ReiSift note sync failed: {exc}",
+            details=json.dumps({"property_id": property_id, "property_uuid": property_uuid, "note_text": note_text[:1000]}),
+        )
+        db.commit()
+        return redirect(url_for("property_detail", property_id=property_id, error=f"REISift note failed: {exc}"))
+
+    outcome = "Skipped"
+    notice = "REISift note already present."
+    if note_result.get("ok") and not note_result.get("skipped"):
+        outcome = "Appended"
+        notice = "REISift note added."
+    elif not note_result.get("ok"):
+        outcome = "Failed"
+        notice = "REISift note could not be added."
+
+    db.execute(
+        """
+        INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            property_id,
+            property_row["owner_person_id"],
+            "ReiSift Note",
+            outcome,
+            note_text,
+        ),
+    )
+    db.commit()
+    return redirect(url_for("property_detail", property_id=property_id, notice=notice))
 
 @app.route("/people", methods=["POST"])
 def create_person_route():

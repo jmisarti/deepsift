@@ -20,6 +20,12 @@
             </div>
         </details>
     </div>
+    {% if page_notice %}
+    <div class="notice-banner">{{ page_notice }}</div>
+    {% endif %}
+    {% if page_error %}
+    <div class="error-banner">{{ page_error }}</div>
+    {% endif %}
     {% if prop.is_d4d %}
     <p><span class="pill">D4D Lead</span>
         {% if prop.d4d_added_at %} Added {{ prop.d4d_added_at }}{% endif %}
@@ -42,6 +48,19 @@
         <span>No ReiSift record linked yet.</span>
         {% endif %}
     </p>
+    <details>
+        <summary><strong>Add REISift Note</strong></summary>
+        {% if prop.reisift_property_uuid %}
+        <form method="post" action="{{ url_for('add_property_reisift_note', property_id=prop.id) }}" class="grid-form compact">
+            <label class="span2">Note
+                <textarea name="note_text" placeholder="Add a note to the linked REISift property..." required></textarea>
+            </label>
+            <button type="submit">Send to REISift</button>
+        </form>
+        {% else %}
+        <p class="muted-text">Link a REISift record to this property first, then you can append notes here.</p>
+        {% endif %}
+    </details>
     <p><strong>Last Sold Date:</strong> {{ prop.attom_last_sold_date or '-' }}</p>
     <p><strong>Last Sale Price:</strong> {% if prop.attom_last_sold_price is not none %}${{ "{:,.0f}".format(prop.attom_last_sold_price) }}{% else %}-{% endif %}</p>
     <h4>Confirmed / Verified Contacts</h4>

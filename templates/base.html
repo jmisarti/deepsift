@@ -81,6 +81,7 @@
                     <span class="top-notify-count hidden" id="providerAlertCount">0</span>
                 </button>
                 <div class="provider-banner-summary" id="providerAlertSummary"></div>
+                <button type="button" id="providerAlertDismiss" class="provider-banner-dismiss hidden">Dismiss</button>
                 <div class="top-notify-panel provider-banner-panel hidden" id="providerAlertPanel">
                     <h4>Recent Provider Alerts</h4>
                     <div class="top-notify-list" id="providerAlertList"></div>
@@ -106,6 +107,7 @@
       const providerCount = document.getElementById('providerAlertCount');
       const providerList = document.getElementById('providerAlertList');
       const providerSummary = document.getElementById('providerAlertSummary');
+      const providerDismiss = document.getElementById('providerAlertDismiss');
       const userWrap = document.getElementById('userMenuWrap');
       const userToggle = document.getElementById('userMenuToggle');
       const userPanel = document.getElementById('userMenuPanel');
@@ -165,9 +167,11 @@
         if (!providerList || !providerWrap) return;
         setCount(providerCount, items.length);
         providerWrap.classList.toggle('hidden', !items.length);
+        if (providerDismiss) providerDismiss.classList.toggle('hidden', !items.length);
         if (!items.length) {
           providerList.innerHTML = '<p class="top-notify-empty">No recent provider alerts</p>';
           if (providerSummary) providerSummary.textContent = '';
+          if (providerPanel) providerPanel.classList.add('hidden');
           return;
         }
         const first = items[0] || {};
@@ -204,11 +208,26 @@
         } catch (_err) {}
       }
 
+      async function dismissProviderAlerts() {
+        try {
+          const r = await fetch('/api/provider-alerts/dismiss-all', { method: 'POST' });
+          if (!r.ok) return;
+          renderProvider([]);
+        } catch (_err) {}
+      }
+
       if (toggle && panel) {
         toggle.addEventListener('click', () => panel.classList.toggle('hidden'));
       }
       if (providerToggle && providerPanel) {
         providerToggle.addEventListener('click', () => providerPanel.classList.toggle('hidden'));
+      }
+      if (providerDismiss) {
+        providerDismiss.addEventListener('click', async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          await dismissProviderAlerts();
+        });
       }
       if (userWrap && userToggle && userPanel) {
         userToggle.addEventListener('click', () => userPanel.classList.toggle('hidden'));

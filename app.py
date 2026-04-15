@@ -894,10 +894,12 @@ def migrate_db(db):
             status_code INTEGER,
             error_message TEXT NOT NULL,
             details TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            dismissed_at TEXT
         )
         """
     )
+    ensure_column(db, "app_errors", "dismissed_at", "dismissed_at TEXT")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS buyers (
@@ -38927,6 +38929,7 @@ def api_recent_provider_alerts():
         SELECT id, source, route, status_code, error_message, created_at
         FROM app_errors
         WHERE source LIKE ?
+          AND COALESCE(dismissed_at, '') = ''
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -38946,6 +38949,23 @@ def api_recent_provider_alerts():
             }
         )
     return jsonify({"ok": True, "items": items, "count": len(items)})
+
+
+@app.route("/api/provider-alerts/dismiss-all", methods=["POST"])
+def dismiss_all_provider_alerts():
+    ensure_db()
+    db = get_db()
+    cur = db.execute(
+        """
+        UPDATE app_errors
+        SET dismissed_at = CURRENT_TIMESTAMP
+        WHERE source LIKE ?
+          AND COALESCE(dismissed_at, '') = ''
+        """,
+        (f"{PROVIDER_ALERT_SOURCE_PREFIX}%",),
+    )
+    db.commit()
+    return jsonify({"ok": True, "dismissed": int(cur.rowcount or 0)})
 
 
 @app.errorhandler(Exception)

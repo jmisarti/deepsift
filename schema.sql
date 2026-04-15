@@ -314,7 +314,8 @@ CREATE TABLE IF NOT EXISTS app_errors (
     status_code INTEGER,
     error_message TEXT NOT NULL,
     details TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    dismissed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS referral_realtors (

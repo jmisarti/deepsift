@@ -379,11 +379,30 @@ body {
 
 .provider-banner-summary {
     color: #7c5a16;
+    flex: 1 1 auto;
     font-size: 0.9rem;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.provider-banner-dismiss {
+    background: none;
+    border: 0;
+    color: #8a4b08;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 600;
+    margin-left: auto;
+    padding: 0;
+    text-decoration: underline;
+    white-space: nowrap;
+}
+
+.provider-banner-dismiss:hover {
+    color: #7c2d12;
 }
 
 .provider-banner-panel {

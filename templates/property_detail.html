@@ -227,12 +227,13 @@
 <section class="panel">
     <h3>Communication Summary (By Individual)</h3>
     <table class="crm-table">
-        <thead><tr><th>Individual</th><th>Relationship</th><th>SMS Out</th><th>SMS In</th><th>Email Out</th><th>Email In</th><th>Emails Opened</th></tr></thead>
+        <thead><tr><th>Individual</th><th>Relationship</th><th>Mail Out</th><th>SMS Out</th><th>SMS In</th><th>Email Out</th><th>Email In</th><th>Emails Opened</th></tr></thead>
         <tbody>
             {% for row in property_comm_summary_rows %}
             <tr>
                 <td><a href="{{ url_for('person_detail', person_id=row.person_id, property_id=prop.id) }}">{{ row.full_name }}</a></td>
                 <td>{{ row.relationship_type }}</td>
+                <td>{{ row.mail_outbound }}</td>
                 <td>{{ row.sms_outbound }}</td>
                 <td>{{ row.sms_inbound }}</td>
                 <td>{{ row.email_outbound }}</td>
@@ -240,7 +241,7 @@
                 <td>{{ row.email_opened }}</td>
             </tr>
             {% else %}
-            <tr><td colspan="7">No communication activity yet.</td></tr>
+            <tr><td colspan="8">No communication activity yet.</td></tr>
             {% endfor %}
         </tbody>
     </table>

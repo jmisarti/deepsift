@@ -26627,6 +26627,21 @@ def communication_counts_for_people(db, person_ids, property_id=None):
         """,
         tuple(params),
     ).fetchall()
+    mail_where = [f"person_id IN ({placeholders})"]
+    mail_params = list(clean_ids)
+    if property_id is not None:
+        mail_where.append("property_id = ?")
+        mail_params.append(int(property_id))
+    mail_rows = db.execute(
+        f"""
+        SELECT person_id,
+               COUNT(*) AS mail_outbound
+        FROM mail_orders
+        WHERE {' AND '.join(mail_where)}
+        GROUP BY person_id
+        """,
+        tuple(mail_params),
+    ).fetchall()
     out = {}
     for r in rows:
         out[int(r["person_id"])] = {
@@ -26635,7 +26650,22 @@ def communication_counts_for_people(db, person_ids, property_id=None):
             "email_outbound": int(r["email_outbound"] or 0),
             "email_inbound": int(r["email_inbound"] or 0),
             "email_opened": int(r["email_opened"] or 0),
+            "mail_outbound": 0,
         }
+    for r in mail_rows:
+        person_id = int(r["person_id"])
+        bucket = out.setdefault(
+            person_id,
+            {
+                "sms_outbound": 0,
+                "sms_inbound": 0,
+                "email_outbound": 0,
+                "email_inbound": 0,
+                "email_opened": 0,
+                "mail_outbound": 0,
+            },
+        )
+        bucket["mail_outbound"] = int(r["mail_outbound"] or 0)
     return out
 
 
@@ -33840,6 +33870,7 @@ def property_detail(property_id):
         property_comm_summary_rows.append(
             {
                 **row,
+                "mail_outbound": int(c.get("mail_outbound", 0)),
                 "sms_outbound": int(c.get("sms_outbound", 0)),
                 "sms_inbound": int(c.get("sms_inbound", 0)),
                 "email_outbound": int(c.get("email_outbound", 0)),
@@ -34245,6 +34276,7 @@ def person_detail(person_id):
         person_comm_summary_rows.append(
             {
                 **row,
+                "mail_outbound": int(c.get("mail_outbound", 0)),
                 "sms_outbound": int(c.get("sms_outbound", 0)),
                 "sms_inbound": int(c.get("sms_inbound", 0)),
                 "email_outbound": int(c.get("email_outbound", 0)),

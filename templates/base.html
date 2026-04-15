@@ -53,7 +53,10 @@
                             <span class="top-notify-count hidden" id="smsNotifyCount">0</span>
                         </button>
                         <div class="top-notify-panel hidden" id="smsNotifyPanel">
-                            <h4>Unread Notifications</h4>
+                            <div class="top-notify-panel-header">
+                                <h4>Unread Notifications</h4>
+                                <button type="button" id="smsNotifyClear" class="top-notify-panel-clear hidden">Clear</button>
+                            </div>
                             <div class="top-notify-list" id="smsNotifyList"></div>
                         </div>
                     </div>
@@ -101,6 +104,7 @@
       const panel = document.getElementById('smsNotifyPanel');
       const count = document.getElementById('smsNotifyCount');
       const list = document.getElementById('smsNotifyList');
+      const clearBtn = document.getElementById('smsNotifyClear');
       const providerWrap = document.getElementById('providerAlertBannerWrap');
       const providerToggle = document.getElementById('providerAlertToggle');
       const providerPanel = document.getElementById('providerAlertPanel');
@@ -138,6 +142,7 @@
       function render(items) {
         if (!list) return;
         setCount(count, items.length);
+        if (clearBtn) clearBtn.classList.toggle('hidden', items.length <= 0);
         if (!items.length) {
           list.innerHTML = '<p class="top-notify-empty">No unread notifications</p>';
           return;
@@ -198,6 +203,14 @@
         } catch (_err) {}
       }
 
+      async function clearNotifications() {
+        try {
+          const r = await fetch('/api/notifications/unread/clear', { method: 'POST' });
+          if (!r.ok) return;
+          render([]);
+        } catch (_err) {}
+      }
+
       async function refreshProviderAlerts() {
         if (!providerList) return;
         try {
@@ -218,6 +231,13 @@
 
       if (toggle && panel) {
         toggle.addEventListener('click', () => panel.classList.toggle('hidden'));
+      }
+      if (clearBtn) {
+        clearBtn.addEventListener('click', async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          await clearNotifications();
+        });
       }
       if (providerToggle && providerPanel) {
         providerToggle.addEventListener('click', () => providerPanel.classList.toggle('hidden'));

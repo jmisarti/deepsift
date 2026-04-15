@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS person_addresses (
     person_id INTEGER NOT NULL,
     address_id INTEGER NOT NULL,
     label TEXT NOT NULL DEFAULT 'Related Address',
+    is_default_mailing INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(person_id) REFERENCES people(id),
     FOREIGN KEY(address_id) REFERENCES addresses(id)

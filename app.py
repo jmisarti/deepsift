@@ -862,6 +862,7 @@ def migrate_db(db):
     ensure_column(db, "people", "bankruptcy", "bankruptcy INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "people", "employer", "employer TEXT")
     ensure_column(db, "person_relationships", "relationship_order", "relationship_order INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "person_addresses", "is_default_mailing", "is_default_mailing INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "properties", "attom_last_sold_date", "attom_last_sold_date TEXT")
     ensure_column(db, "properties", "attom_last_sold_price", "attom_last_sold_price REAL")
     ensure_column(db, "properties", "reisift_property_uuid", "reisift_property_uuid TEXT")
@@ -1837,6 +1838,76 @@ def create_person(db, first_name, last_name, middle_name="", phone="", email="",
         ),
     )
     return cur.lastrowid
+
+
+def _find_person_address_row(db, person_id, street, city, state, postal_code):
+    return db.execute(
+        """
+        SELECT pa.id AS person_address_id, pa.person_id, pa.address_id, pa.label, pa.is_default_mailing,
+               a.street, a.city, a.state, a.postal_code
+        FROM person_addresses pa
+        JOIN addresses a ON a.id = pa.address_id
+        WHERE pa.person_id = ?
+          AND lower(a.street) = lower(?)
+          AND lower(a.city) = lower(?)
+          AND lower(a.state) = lower(?)
+          AND lower(COALESCE(a.postal_code, '')) = lower(?)
+        LIMIT 1
+        """,
+        (person_id, street, city, state, postal_code),
+    ).fetchone()
+
+
+def set_default_person_address(db, person_id, person_address_id):
+    db.execute("UPDATE person_addresses SET is_default_mailing = 0 WHERE person_id = ?", (person_id,))
+    db.execute(
+        "UPDATE person_addresses SET is_default_mailing = 1 WHERE person_id = ? AND id = ?",
+        (person_id, person_address_id),
+    )
+
+
+def ensure_person_address_link(db, person_id, street, city, state, postal_code, label="Related Address", set_default=False):
+    clean_street = (street or "").strip()
+    clean_city = (city or "").strip()
+    clean_state = (state or "").strip()
+    clean_postal = (postal_code or "").strip()
+    if not (person_id and clean_street and clean_city and clean_state and clean_postal):
+        return None
+
+    existing = _find_person_address_row(db, person_id, clean_street, clean_city, clean_state, clean_postal)
+    if existing:
+        if label and (existing["label"] or "") != label:
+            db.execute(
+                "UPDATE person_addresses SET label = ? WHERE id = ?",
+                (label, existing["person_address_id"]),
+            )
+        if set_default:
+            set_default_person_address(db, person_id, existing["person_address_id"])
+        return int(existing["person_address_id"])
+
+    addr_id = create_address(db, clean_street, clean_city, clean_state, clean_postal)
+    cur = db.execute(
+        "INSERT INTO person_addresses (person_id, address_id, label, is_default_mailing) VALUES (?, ?, ?, ?)",
+        (person_id, addr_id, label or "Related Address", 1 if set_default else 0),
+    )
+    person_address_id = int(cur.lastrowid)
+    if set_default:
+        set_default_person_address(db, person_id, person_address_id)
+    return person_address_id
+
+
+def get_default_person_address_row(db, person_id):
+    return db.execute(
+        """
+        SELECT pa.id AS person_address_id, pa.label, pa.is_default_mailing, a.id AS address_id, a.street, a.city, a.state, a.postal_code
+        FROM person_addresses pa
+        JOIN addresses a ON a.id = pa.address_id
+        WHERE pa.person_id = ?
+        ORDER BY COALESCE(pa.is_default_mailing, 0) DESC, pa.id DESC
+        LIMIT 1
+        """,
+        (person_id,),
+    ).fetchone()
 
 
 def normalize_whitespace(value):
@@ -4455,7 +4526,7 @@ def _format_person_contact_for_mail(db, property_row, person_id, person_address_
     if person_address_id:
         addr = db.execute(
             """
-            SELECT pa.id AS person_address_id, pa.label, a.id AS address_id, a.street, a.city, a.state, a.postal_code
+            SELECT pa.id AS person_address_id, pa.label, pa.is_default_mailing, a.id AS address_id, a.street, a.city, a.state, a.postal_code
             FROM person_addresses pa
             JOIN addresses a ON a.id = pa.address_id
             WHERE pa.person_id = ? AND pa.id = ?
@@ -4464,17 +4535,7 @@ def _format_person_contact_for_mail(db, property_row, person_id, person_address_
             (person_id, int(person_address_id)),
         ).fetchone()
     else:
-        addr = db.execute(
-            """
-            SELECT pa.id AS person_address_id, pa.label, a.id AS address_id, a.street, a.city, a.state, a.postal_code
-            FROM person_addresses pa
-            JOIN addresses a ON a.id = pa.address_id
-            WHERE pa.person_id = ?
-            ORDER BY pa.id DESC
-            LIMIT 1
-            """,
-            (person_id,),
-        ).fetchone()
+        addr = get_default_person_address_row(db, person_id)
 
     # Fallback for the primary owner if a dedicated mailing address is unavailable.
     if not addr and not person_address_id and person_id == property_row["owner_person_id"]:
@@ -4705,6 +4766,17 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
     attom = ((property_payload.get("address") or {}).get("attom") or {})
     last_sold_date = (attom.get("attom_last_sold_date") or "").strip() if isinstance(attom, dict) else ""
     last_sold_price = attom.get("attom_last_sold_price") if isinstance(attom, dict) else None
+    tax_addr_payload = property_payload.get("tax_mailing_address") or {}
+    tax_us = tax_addr_payload.get("us_address") or {}
+    has_golden_tax_mailing = bool(property_payload.get("has_golden_tax_mailing_address"))
+    golden_tax_address = {
+        "street": (tax_us.get("street") or "").strip(),
+        "city": (tax_us.get("city") or "").strip(),
+        "state": (tax_us.get("state") or "").strip(),
+        "zipcode": (tax_us.get("zipcode") or "").strip(),
+    }
+    if not all(golden_tax_address.values()):
+        golden_tax_address = None
 
     db.execute(
         """
@@ -4780,26 +4852,29 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
             zipcode = (us.get("zipcode") or "").strip()
             if not (street and city and state and zipcode):
                 continue
-            exists_addr = db.execute(
-                """
-                SELECT pa.id
-                FROM person_addresses pa
-                JOIN addresses a ON a.id = pa.address_id
-                WHERE pa.person_id = ?
-                  AND lower(a.street)=lower(?)
-                  AND lower(a.city)=lower(?)
-                  AND lower(a.state)=lower(?)
-                  AND a.postal_code=?
-                LIMIT 1
-                """,
-                (owner_person_id, street, city, state, zipcode),
-            ).fetchone()
-            if exists_addr:
-                continue
-            addr_id = create_address(db, street, city, state, zipcode)
-            db.execute(
-                "INSERT INTO person_addresses (person_id, address_id, label) VALUES (?, ?, ?)",
-                (owner_person_id, addr_id, "SkipSherpa Owner Address"),
+            ensure_person_address_link(
+                db,
+                owner_person_id,
+                street,
+                city,
+                state,
+                zipcode,
+                label="SkipSherpa Owner Address",
+                set_default=False,
+            )
+
+        # Rule: when the property lookup returns a golden tax mailing address, use that as the default
+        # mailing address for every returned owner and co-owner on the property.
+        if has_golden_tax_mailing and golden_tax_address:
+            ensure_person_address_link(
+                db,
+                owner_person_id,
+                golden_tax_address["street"],
+                golden_tax_address["city"],
+                golden_tax_address["state"],
+                golden_tax_address["zipcode"],
+                label="Golden Tax Mailing Address",
+                set_default=True,
             )
 
         # Persist owner emails/phones into touchpoints so mail/SMS workflows can use person data directly.
@@ -34140,25 +34215,16 @@ def person_detail(person_id):
 
     addresses = db.execute(
         """
-        SELECT pa.id AS person_address_id, pa.address_id, pa.label, pa.created_at,
+        SELECT pa.id AS person_address_id, pa.address_id, pa.label, pa.created_at, pa.is_default_mailing,
                a.street, a.city, a.state, a.postal_code
         FROM person_addresses pa
         JOIN addresses a ON a.id = pa.address_id
         WHERE pa.person_id = ?
-        ORDER BY pa.created_at DESC, pa.id DESC
+        ORDER BY COALESCE(pa.is_default_mailing, 0) DESC, pa.created_at DESC, pa.id DESC
         """,
         (person_id,),
     ).fetchall()
-    current_mail_address_row = db.execute(
-        """
-        SELECT pa.id AS person_address_id
-        FROM person_addresses pa
-        WHERE pa.person_id = ?
-        ORDER BY pa.id DESC
-        LIMIT 1
-        """,
-        (person_id,),
-    ).fetchone()
+    current_mail_address_row = get_default_person_address_row(db, person_id)
     current_mail_person_address_id = int(current_mail_address_row["person_address_id"] or 0) if current_mail_address_row else 0
 
 

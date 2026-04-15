@@ -49,6 +49,20 @@
         {% endif %}
     </p>
     <details>
+        <summary><strong>Link / Update REISift UUID</strong></summary>
+        <form method="post" action="{{ url_for('update_property_reisift_link', property_id=prop.id) }}" class="grid-form compact">
+            <label class="span2">REISift URL or UUID
+                <input
+                    name="reisift_record"
+                    value="{{ prop.reisift_property_uuid or '' }}"
+                    placeholder="https://app.reisift.io/records/properties/... or UUID"
+                    required
+                >
+            </label>
+            <button type="submit">{{ 'Update REISift Link' if prop.reisift_property_uuid else 'Link REISift Record' }}</button>
+        </form>
+    </details>
+    <details>
         <summary><strong>Add REISift Note</strong></summary>
         {% if prop.reisift_property_uuid %}
         <form method="post" action="{{ url_for('add_property_reisift_note', property_id=prop.id) }}" class="grid-form compact">

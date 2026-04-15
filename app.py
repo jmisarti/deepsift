@@ -12267,6 +12267,72 @@ def _extract_reisift_property_tags(property_payload):
     return tags
 
 
+def _extract_reisift_property_list_names(property_payload):
+    payload = property_payload if isinstance(property_payload, dict) else {}
+    raw = payload.get("lists")
+    names = []
+    seen = set()
+
+    def add_name(value):
+        text = str(value or "").strip()
+        key = text.lower()
+        if not text or key in seen:
+            return
+        seen.add(key)
+        names.append(text)
+
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                add_name(item.get("title") or item.get("name") or item.get("label"))
+            else:
+                add_name(item)
+    elif isinstance(raw, dict):
+        for key, value in raw.items():
+            if value in (True, "true", "True", 1, "1"):
+                add_name(key)
+    elif isinstance(raw, str):
+        for part in parse_csv_list(raw):
+            add_name(part)
+    return names
+
+
+def reisift_sync_property_lists(token, property_uuid, lists_to_add=None):
+    property_uuid = str(property_uuid or "").strip()
+    desired_lists = [str(item or "").strip() for item in parse_csv_list(lists_to_add) if str(item or "").strip()]
+    if not property_uuid or not desired_lists:
+        return {"ok": False, "skipped": True, "reason": "missing_property_uuid_or_lists"}
+
+    current_payload = fetch_reisift_property_payload(token, property_uuid)
+    existing_lists = _extract_reisift_property_list_names(current_payload)
+    merged_lists = []
+    seen = set()
+    for item in list(existing_lists) + list(desired_lists):
+        text = str(item or "").strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        merged_lists.append(text)
+
+    if [item.lower() for item in merged_lists] == [item.lower() for item in existing_lists]:
+        return {"ok": True, "skipped": True, "reason": "lists_already_present", "lists": existing_lists}
+
+    response = requests.patch(
+        f"{REISIFT_BASE_URL}/api/internal/property/{property_uuid}/",
+        headers=reisift_auth_headers(token),
+        json={"lists": merged_lists},
+        timeout=30,
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"raw_text": response.text}
+    if not response.ok:
+        raise ValueError(f"ReiSift list update failed for {property_uuid} ({response.status_code}): {payload}")
+    return {"ok": True, "request": {"lists": merged_lists}, "response": payload}
+
+
 def reisift_sync_property_tags(token, property_uuid, tags_to_add=None, tags_to_remove=None, remove_prefixes=None):
     property_uuid = str(property_uuid or "").strip()
     desired_tags = [str(tag or "").strip() for tag in (tags_to_add or []) if str(tag or "").strip()]
@@ -23525,6 +23591,123 @@ def _rentcast_response_headers_map(response):
     return out
 
 
+def reisift_search_properties_by_text(token, search_text, limit=10):
+    text = normalize_whitespace(search_text)
+    if not text:
+        return []
+    body = {
+        "limit": max(1, min(50, int(limit or 10))),
+        "offset": 0,
+        "ordering": "-owner_updated",
+        "query": {"must": {"search": text}},
+    }
+    response = requests.post(
+        f"{REISIFT_BASE_URL}/api/internal/property/",
+        headers=reisift_auth_headers(token, {"x-http-method-override": "GET"}),
+        json=body,
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json() if response.headers.get("content-type", "").lower().startswith("application/json") else {}
+    rows = payload.get("results") if isinstance(payload, dict) else []
+    out = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        address = row.get("address") if isinstance(row.get("address"), dict) else {}
+        street = str(address.get("street") or "").strip()
+        city = str(address.get("city") or "").strip()
+        state = str(address.get("state") or "").strip()
+        postal_code = str(address.get("zip") or address.get("postal_code") or "").strip()
+        full_address = (
+            str(address.get("full_address") or "").strip()
+            or ", ".join([x for x in [street, city, state, postal_code] if x]).strip()
+        )
+        owners = row.get("owners") if isinstance(row.get("owners"), list) else []
+        owner_names = []
+        for owner in owners:
+            if not isinstance(owner, dict):
+                continue
+            full_name = (owner.get("full_name") or "").strip()
+            if full_name:
+                owner_names.append(full_name)
+                continue
+            candidate = " ".join([x for x in [(owner.get("first_name") or "").strip(), (owner.get("last_name") or "").strip()] if x]).strip()
+            if candidate:
+                owner_names.append(candidate)
+        out.append(
+            {
+                "uuid": normalize_uuid(row.get("uuid") or ""),
+                "status": str(row.get("status") or "").strip(),
+                "full_address": full_address,
+                "street": street,
+                "city": city,
+                "state": state,
+                "postal_code": postal_code,
+                "created_at": str(row.get("created") or "").strip(),
+                "updated_at": str(row.get("updated") or row.get("owner_updated") or "").strip(),
+                "owner_names": owner_names,
+            }
+        )
+    return out
+
+
+def reisift_find_existing_property_by_address(token, street="", city="", state="", postal_code="", search_text=""):
+    normalized_target = _normalize_address_components(street=street, city=city, state=state, postal_code=postal_code)
+    target_street = normalize_address_match_text(normalized_target.get("street") or "")
+    target_city = normalize_address_match_text(normalized_target.get("city") or "")
+    target_state = normalize_state_code(normalized_target.get("state") or "")
+    target_postal = normalize_postal_code(normalized_target.get("postal_code") or "")
+    target_full = normalize_address_match_text(normalized_target.get("address") or format_property_address_line(street, city, state, postal_code))
+
+    search_candidates = []
+    for candidate in [
+        search_text,
+        normalized_target.get("address") or "",
+        " ".join([x for x in [normalized_target.get("street"), normalized_target.get("city"), normalized_target.get("state"), normalized_target.get("postal_code")] if x]),
+        ", ".join([x for x in [normalized_target.get("street"), normalized_target.get("city"), normalized_target.get("state")] if x]),
+        normalized_target.get("street") or "",
+    ]:
+        clean = normalize_whitespace(candidate)
+        if clean and clean.lower() not in [item.lower() for item in search_candidates]:
+            search_candidates.append(clean)
+
+    seen = set()
+    best = None
+    best_score = -1
+    for query in search_candidates:
+        for row in reisift_search_properties_by_text(token, query, limit=20):
+            uuid = normalize_uuid(row.get("uuid") or "")
+            if not uuid or uuid in seen:
+                continue
+            seen.add(uuid)
+            row_street = normalize_address_match_text(row.get("street") or "")
+            row_city = normalize_address_match_text(row.get("city") or "")
+            row_state = normalize_state_code(row.get("state") or "")
+            row_postal = normalize_postal_code(row.get("postal_code") or "")
+            row_full = normalize_address_match_text(row.get("full_address") or "")
+
+            score = 0
+            if target_street and row_street == target_street:
+                score += 60
+            if target_city and row_city == target_city:
+                score += 20
+            if target_state and row_state == target_state:
+                score += 10
+            if target_postal and row_postal == target_postal:
+                score += 15
+            if target_full and row_full == target_full:
+                score += 15
+            if target_street and target_city and row_street == target_street and row_city == target_city and score >= best_score:
+                if score > best_score:
+                    best = row
+                    best_score = score
+
+    if best_score < 70:
+        return {}
+    return dict(best or {})
+
+
 def call_rentcast_address_tool(db, action, full_address):
     action_key = normalize_whitespace(action).lower().replace("-", "_")
     address = normalize_whitespace(full_address)
@@ -25014,6 +25197,7 @@ def sync_d4d_property_to_reisift(db, property_id, added_by="", source="Slack D4D
 
     property_uuid = normalize_uuid(prop["reisift_property_uuid"] or "")
     owner_uuid = normalize_uuid(prop["reisift_owner_uuid"] or "")
+    had_local_uuid_before = bool(property_uuid)
     actor = normalize_whitespace(added_by) or "Slack"
     now_text = format_db_time(datetime.utcnow())
     address_line = format_property_address_line(prop["street"], prop["city"], prop["state"], prop["postal_code"])
@@ -25031,6 +25215,11 @@ def sync_d4d_property_to_reisift(db, property_id, added_by="", source="Slack D4D
         "owner_person_ids": owner_person_ids,
         "sift_record_url": _sift_record_url(property_uuid),
         "create_result": None,
+        "status_result": None,
+        "list_sync": None,
+        "tag_sync": None,
+        "note_sync": None,
+        "task_result": None,
         "warnings": [],
     }
 
@@ -25038,47 +25227,99 @@ def sync_d4d_property_to_reisift(db, property_id, added_by="", source="Slack D4D
     create_result = None
 
     if not property_uuid:
-        create_payload = {
-            "search": address_line,
-            "street": prop["street"],
-            "city": prop["city"],
-            "state": prop["state"],
-            "postal_code": prop["postal_code"],
-            "status": "new_lead",
-            "lists": "Driving For Dollars",
-            "tags": "Driving For Dollars,D4D",
-            "notes": notes,
-            "owner": {
-                "first_name": owner_first,
-                "last_name": owner_last,
-                "address_street": prop["street"],
-                "address_city": prop["city"],
-                "address_state": prop["state"],
-                "address_postal_code": prop["postal_code"],
-                "emails": email_items,
-                "phones": phone_items,
-            },
-        }
-        create_result = create_reisift_property_from_search(create_payload)
-        property_uuid = normalize_uuid(create_result.get("created_uuid") or "")
-        owner_uuid = normalize_uuid(create_result.get("owner_uuid") or "")
-        out["created"] = bool(property_uuid) and not bool(create_result.get("duplicate_existing"))
-        out["duplicate_existing"] = bool(create_result.get("duplicate_existing"))
-        out["create_result"] = create_result
-        out["property_uuid"] = property_uuid
-        out["owner_uuid"] = owner_uuid
-        if property_uuid:
-            _set_local_property_uuid(db, property_id, property_uuid)
+        token = reisift_get_access_token()
+        existing_match = reisift_find_existing_property_by_address(
+            token,
+            street=prop["street"],
+            city=prop["city"],
+            state=prop["state"],
+            postal_code=prop["postal_code"],
+            search_text=address_line,
+        )
+        if existing_match:
+            property_uuid = normalize_uuid(existing_match.get("uuid") or "")
+            out["duplicate_existing"] = bool(property_uuid)
+            out["property_uuid"] = property_uuid
             out["sift_record_url"] = _sift_record_url(property_uuid)
+        if not property_uuid:
+            create_payload = {
+                "search": address_line,
+                "street": prop["street"],
+                "city": prop["city"],
+                "state": prop["state"],
+                "postal_code": prop["postal_code"],
+                "status": "new_lead",
+                "lists": "Driving For Dollars",
+                "tags": "Driving For Dollars,D4D",
+                "notes": notes,
+                "owner": {
+                    "first_name": owner_first,
+                    "last_name": owner_last,
+                    "address_street": prop["street"],
+                    "address_city": prop["city"],
+                    "address_state": prop["state"],
+                    "address_postal_code": prop["postal_code"],
+                    "emails": email_items,
+                    "phones": phone_items,
+                },
+            }
+            try:
+                create_result = create_reisift_property_from_search(create_payload)
+                property_uuid = normalize_uuid(create_result.get("created_uuid") or "")
+                owner_uuid = normalize_uuid(create_result.get("owner_uuid") or "")
+                out["created"] = bool(property_uuid) and not bool(create_result.get("duplicate_existing"))
+                out["duplicate_existing"] = bool(create_result.get("duplicate_existing"))
+                out["create_result"] = create_result
+            except Exception as exc:
+                out["warnings"].append(f"ReiSift create failed: {exc}")
+                existing_match = reisift_find_existing_property_by_address(
+                    token,
+                    street=prop["street"],
+                    city=prop["city"],
+                    state=prop["state"],
+                    postal_code=prop["postal_code"],
+                    search_text=address_line,
+                )
+                if not existing_match:
+                    raise
+                property_uuid = normalize_uuid(existing_match.get("uuid") or "")
+                out["duplicate_existing"] = bool(property_uuid)
+                out["warnings"].append("Recovered by linking to an existing ReiSift property.")
+
+            out["property_uuid"] = property_uuid
+            out["owner_uuid"] = owner_uuid
+            if property_uuid:
+                _set_local_property_uuid(db, property_id, property_uuid)
+                out["sift_record_url"] = _sift_record_url(property_uuid)
 
     if property_uuid:
-        token = reisift_get_access_token()
+        token = token or reisift_get_access_token()
+        _set_local_property_uuid(db, property_id, property_uuid)
         if not owner_uuid:
             details = fetch_reisift_property_payload(token, property_uuid)
             owner_uuid = normalize_uuid(_reisift_find_owner_uuid(details) or "")
             out["owner_uuid"] = owner_uuid
         if owner_uuid:
             _set_local_owner_uuid(db, property_id, owner_uuid)
+        try:
+            out["status_result"] = reisift_update_property_status(token, property_uuid, "new_lead")
+        except Exception as exc:
+            out["warnings"].append(f"ReiSift status update failed: {exc}")
+        try:
+            out["list_sync"] = reisift_sync_property_lists(token, property_uuid, ["Driving For Dollars"])
+        except Exception as exc:
+            out["warnings"].append(f"ReiSift list sync failed: {exc}")
+        try:
+            d4d_tags = ["D4D", "Driving For Dollars"]
+            if phone_items or email_items:
+                d4d_tags.extend(build_reisift_skiptrace_tags())
+            out["tag_sync"] = reisift_append_property_tags(token, property_uuid, d4d_tags)
+        except Exception as exc:
+            out["warnings"].append(f"ReiSift tag sync failed: {exc}")
+        try:
+            out["note_sync"] = reisift_append_property_note(token, property_uuid, notes)
+        except Exception as exc:
+            out["warnings"].append(f"ReiSift note sync failed: {exc}")
         if owner_uuid and (phone_items or email_items):
             out["contact_sync"] = sync_skiptrace_contacts_to_reisift_owner(
                 db,
@@ -25086,6 +25327,20 @@ def sync_d4d_property_to_reisift(db, property_id, added_by="", source="Slack D4D
                 phone_items=phone_items,
                 email_items=email_items,
             )
+        if not had_local_uuid_before and reisift_task_writes_enabled():
+            try:
+                out["task_result"] = reisift_create_task(
+                    token,
+                    title="Call New D4D Lead",
+                    address=address_line,
+                    assigned_to_property=property_uuid,
+                    assigned_to_user=REISIFT_UNTITLED_TASK_ASSIGNED_TO_USER,
+                    due_date=_reisift_due_tomorrow_noon_utc_text(),
+                    all_day=True,
+                    notes=f"D4D lead synced from {source}. Review local property #{property_id}.",
+                )
+            except Exception as exc:
+                out["warnings"].append(f"ReiSift task create failed: {exc}")
     out["ok"] = bool(property_uuid)
 
     activity_note = {
@@ -33647,6 +33902,63 @@ def property_detail(property_id):
         page_notice=(request.args.get("notice") or request.args.get("seq_notice") or "").strip(),
         page_error=(request.args.get("error") or "").strip(),
     )
+
+
+@app.route("/property/<int:property_id>/reisift-link", methods=["POST"])
+def update_property_reisift_link(property_id):
+    ensure_db()
+    db = get_db()
+
+    property_row = db.execute(
+        """
+        SELECT id, owner_person_id, reisift_property_uuid, reisift_owner_uuid
+        FROM properties
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if property_row is None:
+        return "Property not found", 404
+
+    raw_input = (request.form.get("reisift_record") or "").strip()
+    property_uuid = extract_reisift_uuid_from_input(raw_input)
+    if not property_uuid:
+        return redirect(url_for("property_detail", property_id=property_id, error="Enter a valid REISift record URL or UUID."))
+
+    owner_uuid = normalize_uuid(property_row["reisift_owner_uuid"] or "")
+    notice = "REISift link updated."
+    try:
+        token = reisift_get_access_token()
+        details = fetch_reisift_property_payload(token, property_uuid)
+        owner_uuid = normalize_uuid(_reisift_find_owner_uuid(details) or owner_uuid)
+    except Exception as exc:
+        notice = f"REISift UUID saved. Owner details could not be verified: {exc}"
+
+    db.execute(
+        """
+        UPDATE properties
+        SET reisift_property_uuid = ?,
+            reisift_owner_uuid = ?
+        WHERE id = ?
+        """,
+        (property_uuid, owner_uuid, property_id),
+    )
+    db.execute(
+        """
+        INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            property_id,
+            property_row["owner_person_id"],
+            "ReiSift Link",
+            "Updated",
+            json.dumps({"property_uuid": property_uuid, "owner_uuid": owner_uuid, "raw_input": raw_input}),
+        ),
+    )
+    db.commit()
+    return redirect(url_for("property_detail", property_id=property_id, notice=notice))
 
 
 @app.route("/property/<int:property_id>/reisift-note", methods=["POST"])

@@ -7648,6 +7648,46 @@ def add_person_note(db, person_id, source, note_body, payload=None):
     )
 
 
+def log_email_validation_result(db, person_id, email_value, touch_status, validation_result, property_id=None):
+    try:
+        person_id = int(person_id or 0)
+    except Exception:
+        person_id = 0
+    email_value = normalize_email(email_value)
+    if not person_id or not email_value:
+        return
+    provider_status = str((validation_result or {}).get("provider_status") or "").strip() or str(touch_status or "").strip()
+    touch_status = str(touch_status or "").strip() or "Unknown"
+    status_low = touch_status.lower()
+    if status_low == "valid":
+        note_body = f"EmailListVerify marked {email_value} as valid ({provider_status})."
+    elif status_low == "unknown":
+        note_body = f"EmailListVerify marked {email_value} as unknown ({provider_status})."
+    else:
+        note_body = f"EmailListVerify marked {email_value} as undeliverable ({provider_status})."
+    payload = {
+        "email": email_value,
+        "touchpoint_status": touch_status,
+        "provider_status": provider_status,
+        "validation_result": validation_result or {},
+    }
+    add_person_note(db, person_id, "EmailListVerify", note_body, payload)
+    if property_id is None:
+        property_id = find_property_id_for_person(db, person_id)
+    try:
+        property_id = int(property_id or 0)
+    except Exception:
+        property_id = 0
+    if property_id > 0:
+        db.execute(
+            """
+            INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (property_id, person_id, "Email Validation", touch_status, note_body),
+        )
+
+
 def get_setting(db, key, default=""):
     row = db.execute("SELECT value FROM app_settings WHERE key = ?", ((key or "").strip(),)).fetchone()
     if not row:
@@ -11021,6 +11061,13 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                 WHERE id = ?
                 """,
                 (new_touch_status, merged_note, email_value, touchpoint_id),
+            )
+            log_email_validation_result(
+                db,
+                row["person_id"],
+                email_value,
+                new_touch_status,
+                validation_result,
             )
             db.execute(
                 """

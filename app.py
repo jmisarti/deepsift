@@ -1134,6 +1134,10 @@ def migrate_db(db):
     ensure_column(db, "website_lead_submissions", "step2_event_key", "step2_event_key TEXT")
     ensure_column(db, "website_lead_submissions", "processed_at", "processed_at TEXT")
     ensure_column(db, "website_lead_submissions", "processing_result_json", "processing_result_json TEXT")
+    ensure_column(db, "website_lead_submissions", "google_ads_qualified_at", "google_ads_qualified_at TEXT")
+    ensure_column(db, "website_lead_submissions", "google_ads_qualified_result_json", "google_ads_qualified_result_json TEXT")
+    ensure_column(db, "website_lead_submissions", "google_ads_converted_at", "google_ads_converted_at TEXT")
+    ensure_column(db, "website_lead_submissions", "google_ads_converted_result_json", "google_ads_converted_result_json TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS idx_website_lead_status_expiry ON website_lead_submissions(status, hold_expires_at)")
     db.execute(
         """
@@ -8138,6 +8142,10 @@ def _normalize_google_ads_customer_id(value):
     return re.sub(r"\D", "", str(value or ""))
 
 
+def _normalize_google_ads_conversion_action_id(value):
+    return re.sub(r"\D", "", str(value or ""))
+
+
 def _normalize_meta_account_id(value):
     cleaned = normalize_whitespace(value).lower().replace("act_", "")
     return re.sub(r"\D", "", cleaned)
@@ -8282,6 +8290,260 @@ def _google_ads_post(settings, customer_id, service_method, body):
         if response.status_code != 403 or "USER_PERMISSION_DENIED" not in current_error.upper():
             break
     raise RuntimeError(f"Google Ads {service_method} failed ({response.status_code}): {last_error}")
+
+
+def _google_ads_post_rest_method(settings, customer_id, rest_method, body):
+    customer_id = _normalize_google_ads_customer_id(customer_id)
+    if not customer_id:
+        raise RuntimeError("Google Ads customer ID is missing.")
+    access_token = _google_ads_exchange_refresh_token(settings)
+    base_headers = _google_ads_headers(settings, access_token)
+    login_customer_id = _normalize_google_ads_customer_id(settings.get("google_login_customer_id"))
+    attempts = [dict(base_headers)]
+    if login_customer_id:
+        attempts.append({k: v for k, v in base_headers.items() if k.lower() != "login-customer-id"})
+        if login_customer_id != customer_id:
+            child_headers = dict(base_headers)
+            child_headers["login-customer-id"] = customer_id
+            attempts.append(child_headers)
+    last_error = ""
+    for headers in attempts:
+        response = requests.post(
+            f"https://googleads.googleapis.com/{GOOGLE_ADS_API_VERSION}/customers/{customer_id}:{rest_method}",
+            headers=headers,
+            json=body,
+            timeout=90,
+        )
+        if response.ok:
+            try:
+                return response.json()
+            except Exception as exc:
+                raise RuntimeError(f"Google Ads {rest_method} returned invalid JSON: {exc}") from exc
+        current_error = _google_ads_extract_error(response)
+        last_error = current_error
+        if response.status_code != 403 or "USER_PERMISSION_DENIED" not in current_error.upper():
+            break
+    raise RuntimeError(f"Google Ads {rest_method} failed ({response.status_code}): {last_error}")
+
+
+def _google_ads_lead_feedback_customer_id(settings):
+    explicit = _normalize_google_ads_customer_id(settings.get("google_conversion_customer_id"))
+    if explicit:
+        return explicit
+    customer_ids = settings.get("google_customer_ids") or []
+    return _normalize_google_ads_customer_id(customer_ids[0]) if customer_ids else ""
+
+
+def _google_ads_normalize_phone_for_upload(value):
+    digits = re.sub(r"\D", "", str(value or ""))
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return ""
+
+
+def _google_ads_sha256(value):
+    clean = str(value or "").strip()
+    if not clean:
+        return ""
+    return hashlib.sha256(clean.encode("utf-8")).hexdigest()
+
+
+def _google_ads_lead_user_identifiers(email="", phone=""):
+    identifiers = []
+    clean_email = normalize_email(email)
+    if clean_email:
+        identifiers.append({"hashedEmail": _google_ads_sha256(clean_email)})
+    clean_phone = _google_ads_normalize_phone_for_upload(phone)
+    if clean_phone:
+        identifiers.append({"hashedPhoneNumber": _google_ads_sha256(clean_phone)})
+    return identifiers
+
+
+def _google_ads_conversion_action_resource_name(customer_id, action_id):
+    customer_id = _normalize_google_ads_customer_id(customer_id)
+    action_id = _normalize_google_ads_conversion_action_id(action_id)
+    if not customer_id or not action_id:
+        return ""
+    return f"customers/{customer_id}/conversionActions/{action_id}"
+
+
+def _google_ads_conversion_datetime_text(dt_obj=None, tz_name="America/New_York"):
+    tz = get_zoneinfo_safe(tz_name)
+    if dt_obj is None:
+        dt_obj = datetime.now(tz)
+    elif dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=tz)
+    else:
+        dt_obj = dt_obj.astimezone(tz)
+    return dt_obj.isoformat(sep=" ", timespec="seconds")
+
+
+def _google_ads_partial_failure_text(payload):
+    error_obj = payload.get("partialFailureError") if isinstance(payload, dict) else None
+    if not isinstance(error_obj, dict) or not error_obj:
+        return ""
+    message = normalize_whitespace(error_obj.get("message"))
+    details = error_obj.get("details")
+    detail_text = normalize_whitespace(json.dumps(details, ensure_ascii=True, default=str)) if details else ""
+    return " | ".join(part for part in [message, detail_text] if part).strip()
+
+
+def _google_ads_search_stream_results(settings, customer_id, query):
+    payload = _google_ads_post(
+        settings,
+        customer_id,
+        "searchStream",
+        {
+            "query": "\n".join(line.strip() for line in str(query or "").strip().splitlines()),
+        },
+    )
+    batches = payload if isinstance(payload, list) else [payload]
+    rows = []
+    for batch in batches:
+        if not isinstance(batch, dict):
+            continue
+        results = batch.get("results")
+        if not isinstance(results, list):
+            continue
+        for item in results:
+            if isinstance(item, dict):
+                rows.append(item)
+    return rows
+
+
+def _google_ads_resolve_lead_feedback_action(settings, stage_key):
+    customer_id = _google_ads_lead_feedback_customer_id(settings)
+    if not customer_id:
+        raise RuntimeError("Google Ads conversion customer ID is missing.")
+    stage_value = normalize_whitespace(stage_key).lower()
+    if stage_value not in {"qualified", "converted"}:
+        raise RuntimeError(f"Unsupported Google Ads lead feedback stage: {stage_key}")
+    category = "QUALIFIED_LEAD" if stage_value == "qualified" else "CONVERTED_LEAD"
+    query = f"""
+        SELECT
+          conversion_action.id,
+          conversion_action.resource_name,
+          conversion_action.name,
+          conversion_action.category,
+          conversion_action.status,
+          conversion_action.type,
+          conversion_action.primary_for_goal,
+          conversion_action.include_in_conversions_metric
+        FROM conversion_action
+        WHERE conversion_action.status = 'ENABLED'
+          AND conversion_action.type = 'UPLOAD_CLICKS'
+          AND conversion_action.category = '{category}'
+    """
+    rows = _google_ads_search_stream_results(settings, customer_id, query)
+    candidates = []
+    for item in rows:
+        action = item.get("conversionAction") or {}
+        action_id = _normalize_google_ads_conversion_action_id(action.get("id"))
+        if not action_id:
+            continue
+        candidates.append(
+            {
+                "id": action_id,
+                "resource_name": normalize_whitespace(action.get("resourceName")),
+                "name": normalize_whitespace(action.get("name")) or f"{stage_value.title()} Lead",
+                "category": normalize_whitespace(action.get("category")).upper(),
+                "status": normalize_whitespace(action.get("status")).upper(),
+                "type": normalize_whitespace(action.get("type")).upper(),
+                "primary_for_goal": bool(action.get("primaryForGoal")),
+                "include_in_conversions_metric": bool(action.get("includeInConversionsMetric")),
+            }
+        )
+    if not candidates:
+        raise RuntimeError(
+            f"No enabled Google Ads conversion action was found for {stage_value.title()} Lead. "
+            f"Create an Import from clicks conversion action with goal type {stage_value.title()} lead."
+        )
+    candidates.sort(
+        key=lambda item: (
+            1 if item.get("include_in_conversions_metric") else 0,
+            1 if item.get("primary_for_goal") else 0,
+            int(item.get("id") or 0),
+        ),
+        reverse=True,
+    )
+    chosen = candidates[0]
+    return {
+        "customer_id": customer_id,
+        "stage_key": stage_value,
+        "category": category,
+        "action_id": chosen["id"],
+        "resource_name": chosen["resource_name"] or _google_ads_conversion_action_resource_name(customer_id, chosen["id"]),
+        "action_name": chosen["name"],
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+    }
+
+
+def upload_google_ads_lead_funnel_conversion(
+    settings,
+    *,
+    conversion_action_id="",
+    gclid,
+    email="",
+    phone="",
+    lead_id=0,
+    stage_key="qualified",
+    conversion_at=None,
+):
+    customer_id = _google_ads_lead_feedback_customer_id(settings)
+    if not customer_id:
+        raise RuntimeError("Google Ads conversion customer ID is missing.")
+    resolved_action = None
+    action_id = _normalize_google_ads_conversion_action_id(conversion_action_id)
+    if not action_id:
+        resolved_action = _google_ads_resolve_lead_feedback_action(settings, stage_key)
+        action_id = _normalize_google_ads_conversion_action_id(resolved_action.get("action_id"))
+    if not action_id:
+        raise RuntimeError("Google Ads conversion action could not be resolved.")
+    gclid = str(gclid or "").strip()
+    if not gclid:
+        raise RuntimeError("This lead does not have a GCLID, so it cannot be uploaded back to Google Ads.")
+
+    conversion = {
+        "gclid": gclid,
+        "conversionAction": _google_ads_conversion_action_resource_name(customer_id, action_id),
+        "conversionDateTime": _google_ads_conversion_datetime_text(conversion_at),
+        "conversionValue": 1.0,
+        "currencyCode": "USD",
+        "orderId": f"deepsift-website-lead-{int(lead_id or 0)}-{str(stage_key or 'lead').strip().lower()}",
+        "conversionEnvironment": "WEB",
+    }
+    user_identifiers = _google_ads_lead_user_identifiers(email=email, phone=phone)
+    if user_identifiers:
+        conversion["userIdentifiers"] = user_identifiers
+
+    response = _google_ads_post_rest_method(
+        settings,
+        customer_id,
+        "uploadClickConversions",
+        {
+            "conversions": [conversion],
+            "partialFailure": True,
+        },
+    )
+    partial_failure_text = _google_ads_partial_failure_text(response)
+    if partial_failure_text:
+        raise RuntimeError(f"Google Ads partial failure: {partial_failure_text}")
+    results = response.get("results") if isinstance(response, dict) else None
+    if not isinstance(results, list) or not results:
+        raise RuntimeError("Google Ads upload returned no successful conversion results.")
+    return {
+        "ok": True,
+        "customer_id": customer_id,
+        "conversion_action_id": action_id,
+        "conversion_action": conversion.get("conversionAction"),
+        "resolved_action": resolved_action,
+        "conversion_date_time": conversion.get("conversionDateTime"),
+        "response": response,
+        "result": results[0],
+    }
 
 
 def _google_ads_display_status(campaign_status, primary_status):
@@ -9500,6 +9762,9 @@ def get_ads_dashboard_settings(db):
         "google_refresh_token": (get_setting(db, "ads_google_refresh_token", "") or os.getenv("ADS_GOOGLE_REFRESH_TOKEN", "")).strip(),
         "google_customer_ids_raw": (get_setting(db, "ads_google_customer_ids", "") or os.getenv("ADS_GOOGLE_CUSTOMER_IDS", "")).strip(),
         "google_login_customer_id": (get_setting(db, "ads_google_login_customer_id", "") or os.getenv("ADS_GOOGLE_LOGIN_CUSTOMER_ID", "")).strip(),
+        "google_conversion_customer_id": (get_setting(db, "ads_google_conversion_customer_id", "") or os.getenv("ADS_GOOGLE_CONVERSION_CUSTOMER_ID", "")).strip(),
+        "google_qualified_conversion_action_id": (get_setting(db, "ads_google_qualified_conversion_action_id", "") or os.getenv("ADS_GOOGLE_QUALIFIED_CONVERSION_ACTION_ID", "")).strip(),
+        "google_converted_conversion_action_id": (get_setting(db, "ads_google_converted_conversion_action_id", "") or os.getenv("ADS_GOOGLE_CONVERTED_CONVERSION_ACTION_ID", "")).strip(),
         "meta_app_id": (get_setting(db, "ads_meta_app_id", "") or os.getenv("ADS_META_APP_ID", "")).strip(),
         "meta_app_secret": (get_setting(db, "ads_meta_app_secret", "") or os.getenv("ADS_META_APP_SECRET", "")).strip(),
         "meta_access_token": (get_setting(db, "ads_meta_access_token", "") or os.getenv("ADS_META_ACCESS_TOKEN", "")).strip(),
@@ -9518,16 +9783,24 @@ def get_ads_dashboard_settings(db):
     }
     settings["google_customer_ids"] = [value for value in (_normalize_google_ads_customer_id(item) for item in _split_csv_values(settings["google_customer_ids_raw"])) if value]
     settings["google_login_customer_id"] = _normalize_google_ads_customer_id(settings.get("google_login_customer_id"))
+    settings["google_conversion_customer_id"] = _normalize_google_ads_customer_id(settings.get("google_conversion_customer_id"))
+    settings["google_qualified_conversion_action_id"] = _normalize_google_ads_conversion_action_id(settings.get("google_qualified_conversion_action_id"))
+    settings["google_converted_conversion_action_id"] = _normalize_google_ads_conversion_action_id(settings.get("google_converted_conversion_action_id"))
     settings["meta_account_ids"] = [value for value in (_normalize_meta_account_id(item) for item in _split_csv_values(settings["meta_account_ids_raw"])) if value]
     settings["amazon_account_id"] = normalize_whitespace(settings.get("amazon_account_id"))
     settings["amazon_profile_ids"] = _split_csv_values(settings["amazon_profile_ids_raw"])
     settings["roku_account_ids"] = [value for value in (_normalize_roku_account_id(item) for item in _split_csv_values(settings["roku_account_ids_raw"])) if value]
-    settings["google_ready"] = bool(
+    settings["google_auth_ready"] = bool(
         settings["google_developer_token"]
         and settings["google_client_id"]
         and settings["google_client_secret"]
         and settings["google_refresh_token"]
-        and settings["google_customer_ids"]
+        and (settings["google_customer_ids"] or settings["google_conversion_customer_id"])
+    )
+    settings["google_ready"] = bool(settings["google_auth_ready"] and settings["google_customer_ids"])
+    settings["google_lead_feedback_ready"] = bool(
+        settings["google_auth_ready"]
+        and _google_ads_lead_feedback_customer_id(settings)
     )
     settings["meta_ready"] = bool(settings["meta_access_token"] and settings["meta_account_ids"])
     settings["amazon_ready"] = bool(
@@ -31583,10 +31856,185 @@ def ads_lead_attribution_page():
     )
 
 
+def _website_lead_feedback_state(row, gclid, settings):
+    row_keys = set(row.keys()) if isinstance(row, sqlite3.Row) else set()
+    qualified_at = str((row["google_ads_qualified_at"] if "google_ads_qualified_at" in row_keys else "") or "").strip()
+    converted_at = str((row["google_ads_converted_at"] if "google_ads_converted_at" in row_keys else "") or "").strip()
+    qualified_result = parse_json_object((row["google_ads_qualified_result_json"] if "google_ads_qualified_result_json" in row_keys else "") or "{}", default={})
+    converted_result = parse_json_object((row["google_ads_converted_result_json"] if "google_ads_converted_result_json" in row_keys else "") or "{}", default={})
+    missing = []
+    if not settings.get("google_auth_ready"):
+        missing.append("Google Ads credentials")
+    if not _google_ads_lead_feedback_customer_id(settings):
+        missing.append("conversion customer ID")
+    if not str(gclid or "").strip():
+        missing.append("GCLID")
+    missing_text = ", ".join(missing)
+    return {
+        "qualified_sent_at": qualified_at,
+        "converted_sent_at": converted_at,
+        "qualified_result": qualified_result,
+        "converted_result": converted_result,
+        "qualified_can_send": bool(not qualified_at and not missing_text),
+        "converted_can_send": bool(not converted_at and not missing_text),
+        "missing_text": missing_text,
+    }
+
+
+def _ensure_local_property_for_website_lead_submission(
+    db,
+    row,
+    *,
+    step1_payload=None,
+    step2_payload=None,
+    created_uuid="",
+    owner_uuid="",
+):
+    row_keys = set(row.keys()) if isinstance(row, sqlite3.Row) else set()
+    existing_property_id = int((row["local_property_id"] if "local_property_id" in row_keys else 0) or 0)
+    if existing_property_id > 0:
+        existing = db.execute("SELECT id FROM properties WHERE id = ? LIMIT 1", (existing_property_id,)).fetchone()
+        if existing:
+            return existing_property_id
+        existing_property_id = 0
+
+    step1_payload = step1_payload if isinstance(step1_payload, dict) else {}
+    step2_payload = step2_payload if isinstance(step2_payload, dict) else {}
+    step1_fields = _extract_website_lead_fields(step1_payload)
+    step2_fields = _extract_website_lead_fields(step2_payload)
+    merged_fields = _website_merge_fields(step1_fields, step2_fields)
+    merged_payload = dict(step1_payload)
+    merged_payload.update(step2_payload)
+    if not merged_fields.get("address"):
+        merged_fields["address"] = str((row["latest_address"] if "latest_address" in row_keys else "") or "").strip()
+    if not merged_fields.get("phone"):
+        merged_fields["phone"] = str((row["latest_phone"] if "latest_phone" in row_keys else "") or "").strip()
+    if not merged_fields.get("email"):
+        merged_fields["email"] = str((row["latest_email"] if "latest_email" in row_keys else "") or "").strip()
+    if not merged_fields.get("seller_name"):
+        merged_fields["seller_name"] = str((row["latest_name"] if "latest_name" in row_keys else "") or "").strip()
+
+    local_ctx = ensure_local_property_for_submitted_lead(
+        db,
+        source_label="Website",
+        address=merged_fields.get("address") or "",
+        street=merged_fields.get("street") or "",
+        city=merged_fields.get("city") or "",
+        state=merged_fields.get("state") or "",
+        postal_code=merged_fields.get("postal_code") or "",
+        seller_name=merged_fields.get("seller_name") or "",
+        phone=merged_fields.get("phone") or "",
+        email=merged_fields.get("email") or "",
+        property_uuid=created_uuid,
+        owner_uuid=owner_uuid,
+        existing_property_id=existing_property_id,
+        lead_key=str((row["lead_key"] if "lead_key" in row_keys else "") or "").strip(),
+        payload=merged_payload,
+    )
+    property_id = int(local_ctx.get("property_id") or 0)
+    if property_id > 0 and property_id != existing_property_id and "id" in row_keys:
+        db.execute("UPDATE website_lead_submissions SET local_property_id = ? WHERE id = ?", (property_id, int(row["id"])))
+    return property_id
+
+
+def _build_ads_website_lead_detail(db, row, *, settings=None, include_notes=True, backfill_local=True):
+    settings = settings or get_ads_dashboard_settings(db)
+    row_keys = set(row.keys()) if isinstance(row, sqlite3.Row) else set()
+    step1_payload = parse_json_object((row["step1_payload_json"] if "step1_payload_json" in row_keys else "") or "{}", default={})
+    step2_payload = parse_json_object((row["step2_payload_json"] if "step2_payload_json" in row_keys else "") or "{}", default={})
+    processing_result = parse_json_object((row["processing_result_json"] if "processing_result_json" in row_keys else "") or "{}", default={})
+    created_uuid, owner_uuid = _website_submission_reisift_ids(row)
+    attribution = extract_website_campaign_attribution(step1_payload if isinstance(step1_payload, dict) else {})
+    source_value = str(attribution.get("utm_source") or "").strip().lower()
+    if not source_value and str(attribution.get("gclid") or "").strip():
+        source_value = "google"
+    local_property_id = int((row["local_property_id"] if "local_property_id" in row_keys else 0) or 0)
+    if backfill_local:
+        try:
+            local_property_id = _ensure_local_property_for_website_lead_submission(
+                db,
+                row,
+                step1_payload=step1_payload,
+                step2_payload=step2_payload,
+                created_uuid=created_uuid,
+                owner_uuid=owner_uuid,
+            )
+        except Exception:
+            parsed_backfill = _parse_search_address_simple(str((row["latest_address"] if "latest_address" in row_keys else "") or "").strip())
+            if parsed_backfill.get("street") and parsed_backfill.get("city"):
+                local_property_id = int(
+                    find_local_property_by_address(
+                        db,
+                        parsed_backfill.get("street"),
+                        parsed_backfill.get("city"),
+                        parsed_backfill.get("state"),
+                        parsed_backfill.get("postal_code"),
+                    )
+                    or 0
+                )
+    parsed_address = _parse_search_address_simple(str((row["latest_address"] if "latest_address" in row_keys else "") or "").strip())
+    note_rows = []
+    if include_notes:
+        notes = db.execute(
+            """
+            SELECT id, note_body, payload_json, created_at
+            FROM website_lead_webhook_notes
+            WHERE lead_key = ?
+            ORDER BY id DESC
+            LIMIT 50
+            """,
+            (str((row["lead_key"] if "lead_key" in row_keys else "") or ""),),
+        ).fetchall()
+        for note in notes:
+            note_rows.append(
+                {
+                    "id": int(note["id"]),
+                    "created_at": str(note["created_at"] or ""),
+                    "note_body": str(note["note_body"] or "").strip(),
+                    "payload": parse_json_object(note["payload_json"] or "{}", default={}),
+                }
+            )
+    lead = {
+        "id": int((row["id"] if "id" in row_keys else 0) or 0),
+        "lead_key": str((row["lead_key"] if "lead_key" in row_keys else "") or "").strip(),
+        "reisift_property_uuid": created_uuid,
+        "reisift_owner_uuid": owner_uuid,
+        "reisift_url": _sift_record_url(created_uuid),
+        "local_property_id": local_property_id,
+        "address": str((row["latest_address"] if "latest_address" in row_keys else "") or "").strip(),
+        "phone": str((row["latest_phone"] if "latest_phone" in row_keys else "") or "").strip(),
+        "email": str((row["latest_email"] if "latest_email" in row_keys else "") or "").strip(),
+        "name": str((row["latest_name"] if "latest_name" in row_keys else "") or "").strip(),
+        "stage": str((row["latest_stage"] if "latest_stage" in row_keys else "") or "").strip(),
+        "status": str((row["status"] if "status" in row_keys else "") or "").strip(),
+        "first_received_at": str((row["first_received_at"] if "first_received_at" in row_keys else "") or ""),
+        "last_received_at": str((row["last_received_at"] if "last_received_at" in row_keys else "") or ""),
+        "hold_expires_at": str((row["hold_expires_at"] if "hold_expires_at" in row_keys else "") or ""),
+        "processed_at": str((row["processed_at"] if "processed_at" in row_keys else "") or ""),
+        "step1_yes": bool(str((row["step1_payload_json"] if "step1_payload_json" in row_keys else "") or "").strip()),
+        "step2_yes": bool(str((row["step2_payload_json"] if "step2_payload_json" in row_keys else "") or "").strip()),
+        "source": source_value or "unknown",
+        "source_short": _compact_source_label(source_value),
+        "campaign_label": _website_campaign_group_label(attribution),
+        "utm_campaign": str(attribution.get("utm_campaign") or "").strip(),
+        "gad_campaignid": str(attribution.get("gad_campaignid") or "").strip(),
+        "gclid": str(attribution.get("gclid") or "").strip(),
+        "page_url": str(attribution.get("page_url") or "").strip(),
+        "parsed_address": parsed_address,
+        "step1_payload": step1_payload,
+        "step2_payload": step2_payload,
+        "processing_result": processing_result,
+        "notes": note_rows,
+    }
+    lead["feedback"] = _website_lead_feedback_state(row, lead.get("gclid"), settings)
+    return lead
+
+
 @app.route("/ads/leads/<int:lead_id>", methods=["GET"])
 def ads_lead_detail_page(lead_id):
     ensure_db()
     db = get_db()
+    settings = get_ads_dashboard_settings(db)
     row = db.execute(
         """
         SELECT id,
@@ -31604,8 +32052,66 @@ def ads_lead_detail_page(lead_id):
                hold_expires_at,
                processed_at,
                processing_result_json,
+               local_property_id,
                step1_payload_json,
-               step2_payload_json
+               step2_payload_json,
+               google_ads_qualified_at,
+               google_ads_qualified_result_json,
+               google_ads_converted_at,
+               google_ads_converted_result_json
+        FROM website_lead_submissions
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (lead_id,),
+    ).fetchone()
+    if not row:
+        return redirect(url_for("ads_lead_attribution_page", notice=f"Tracked website lead #{lead_id} was not found."))
+    lead = _build_ads_website_lead_detail(db, row, settings=settings, include_notes=True, backfill_local=True)
+    db.commit()
+    return render_template(
+        "ads_lead_detail.html",
+        lead=lead,
+        page_notice=(request.args.get("notice") or "").strip(),
+        page_error=(request.args.get("error") or "").strip(),
+    )
+
+
+@app.route("/ads/leads/<int:lead_id>/feedback/<goal_key>", methods=["POST"])
+def ads_lead_feedback_route(lead_id, goal_key):
+    ensure_db()
+    db = get_db()
+    goal_value = normalize_whitespace(goal_key).lower()
+    if goal_value not in {"qualified", "converted"}:
+        return redirect(url_for("ads_lead_detail_page", lead_id=lead_id))
+    next_url = (request.form.get("next_url") or "").strip()
+    if not is_safe_next_path(next_url):
+        next_url = url_for("ads_lead_detail_page", lead_id=lead_id)
+
+    row = db.execute(
+        """
+        SELECT id,
+               lead_key,
+               reisift_property_uuid,
+               reisift_owner_uuid,
+               latest_address,
+               latest_phone,
+               latest_email,
+               latest_name,
+               latest_stage,
+               status,
+               first_received_at,
+               last_received_at,
+               hold_expires_at,
+               processed_at,
+               processing_result_json,
+               local_property_id,
+               step1_payload_json,
+               step2_payload_json,
+               google_ads_qualified_at,
+               google_ads_qualified_result_json,
+               google_ads_converted_at,
+               google_ads_converted_result_json
         FROM website_lead_submissions
         WHERE id = ?
         LIMIT 1
@@ -31615,80 +32121,96 @@ def ads_lead_detail_page(lead_id):
     if not row:
         return redirect(url_for("ads_lead_attribution_page", notice=f"Tracked website lead #{lead_id} was not found."))
 
-    step1_payload = parse_json_object(row["step1_payload_json"] or "{}")
-    step2_payload = parse_json_object(row["step2_payload_json"] or "{}")
-    processing_result = parse_json_object(row["processing_result_json"] or "{}")
-    created_uuid, owner_uuid = _website_submission_reisift_ids(row)
-    attribution = extract_website_campaign_attribution(step1_payload if isinstance(step1_payload, dict) else {})
-    source_value = str(attribution.get("utm_source") or "").strip().lower()
-    if not source_value and str(attribution.get("gclid") or "").strip():
-        source_value = "google"
-    parsed_address = _parse_search_address_simple(str(row["latest_address"] or "").strip())
-    local_property_id = 0
-    if parsed_address.get("street") and parsed_address.get("city"):
-        local_property_id = int(
-            find_local_property_by_address(
-                db,
-                parsed_address.get("street"),
-                parsed_address.get("city"),
-                parsed_address.get("state"),
-                parsed_address.get("postal_code"),
+    settings = get_ads_dashboard_settings(db)
+    lead = _build_ads_website_lead_detail(db, row, settings=settings, include_notes=False, backfill_local=True)
+    feedback = lead.get("feedback") or {}
+    already_sent_at = feedback.get(f"{goal_value}_sent_at")
+    if already_sent_at:
+        db.commit()
+        return redirect(f"{next_url}{'&' if '?' in next_url else '?'}notice={quote_plus(f'{goal_value.title()} Lead was already uploaded on {already_sent_at}.')}")
+
+    can_send = bool(feedback.get(f"{goal_value}_can_send"))
+    if not can_send:
+        db.commit()
+        message = feedback.get("missing_text") or f"{goal_value.title()} Lead is not ready to upload."
+        return redirect(f"{next_url}{'&' if '?' in next_url else '?'}error={quote_plus(message)}")
+
+    now_text = format_db_time(datetime.utcnow())
+    try:
+        upload_result = upload_google_ads_lead_funnel_conversion(
+            settings,
+            gclid=lead.get("gclid") or "",
+            email=lead.get("email") or "",
+            phone=lead.get("phone") or "",
+            lead_id=lead_id,
+            stage_key=goal_value,
+        )
+        result_json = json.dumps(upload_result)
+        if goal_value == "qualified":
+            db.execute(
+                """
+                UPDATE website_lead_submissions
+                SET google_ads_qualified_at = ?,
+                    google_ads_qualified_result_json = ?
+                WHERE id = ?
+                """,
+                (now_text, result_json, lead_id),
             )
-            or 0
-        )
-    notes = db.execute(
-        """
-        SELECT id, note_body, payload_json, created_at
-        FROM website_lead_webhook_notes
-        WHERE lead_key = ?
-        ORDER BY id DESC
-        LIMIT 50
-        """,
-        (str(row["lead_key"] or ""),),
-    ).fetchall()
-    note_rows = []
-    for note in notes:
-        note_rows.append(
+        else:
+            db.execute(
+                """
+                UPDATE website_lead_submissions
+                SET google_ads_converted_at = ?,
+                    google_ads_converted_result_json = ?
+                WHERE id = ?
+                """,
+                (now_text, result_json, lead_id),
+            )
+        add_website_webhook_note(
+            db,
+            f"google_ads_{goal_value}:{lead_id}:{now_text}",
+            lead.get("lead_key") or "",
+            f"Google Ads offline conversion uploaded\nStage: {goal_value.title()} Lead\nGCLID: {lead.get('gclid') or '-'}",
             {
-                "id": int(note["id"]),
-                "created_at": str(note["created_at"] or ""),
-                "note_body": str(note["note_body"] or "").strip(),
-                "payload": parse_json_object(note["payload_json"] or "{}"),
-            }
+                "stage": goal_value,
+                "uploaded_at": now_text,
+                "google_ads": upload_result,
+            },
         )
-    lead = {
-        "id": int(row["id"]),
-        "lead_key": str(row["lead_key"] or "").strip(),
-        "reisift_property_uuid": created_uuid,
-        "reisift_owner_uuid": owner_uuid,
-        "reisift_url": _sift_record_url(created_uuid),
-        "local_property_id": local_property_id,
-        "address": str(row["latest_address"] or "").strip(),
-        "phone": str(row["latest_phone"] or "").strip(),
-        "email": str(row["latest_email"] or "").strip(),
-        "name": str(row["latest_name"] or "").strip(),
-        "stage": str(row["latest_stage"] or "").strip(),
-        "status": str(row["status"] or "").strip(),
-        "first_received_at": str(row["first_received_at"] or ""),
-        "last_received_at": str(row["last_received_at"] or ""),
-        "hold_expires_at": str(row["hold_expires_at"] or ""),
-        "processed_at": str(row["processed_at"] or ""),
-        "step1_yes": bool(str(row["step1_payload_json"] or "").strip()),
-        "step2_yes": bool(str(row["step2_payload_json"] or "").strip()),
-        "source": source_value or "unknown",
-        "source_short": _compact_source_label(source_value),
-        "campaign_label": _website_campaign_group_label(attribution),
-        "utm_campaign": str(attribution.get("utm_campaign") or "").strip(),
-        "gad_campaignid": str(attribution.get("gad_campaignid") or "").strip(),
-        "gclid": str(attribution.get("gclid") or "").strip(),
-        "page_url": str(attribution.get("page_url") or "").strip(),
-        "parsed_address": parsed_address,
-        "step1_payload": step1_payload,
-        "step2_payload": step2_payload,
-        "processing_result": processing_result,
-        "notes": note_rows,
-    }
-    return render_template("ads_lead_detail.html", lead=lead)
+        if int(lead.get("local_property_id") or 0) > 0:
+            db.execute(
+                """
+                INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+                VALUES (?, NULL, ?, ?, ?)
+                """,
+                (
+                    int(lead.get("local_property_id") or 0),
+                    "Google Ads Lead Feedback",
+                    f"{goal_value.title()} Lead Uploaded",
+                    json.dumps(
+                        {
+                            "lead_id": int(lead_id),
+                            "lead_key": lead.get("lead_key") or "",
+                            "gclid": lead.get("gclid") or "",
+                            "google_ads": upload_result,
+                        }
+                    ),
+                ),
+            )
+        db.commit()
+        return redirect(f"{next_url}{'&' if '?' in next_url else '?'}notice={quote_plus(f'{goal_value.title()} Lead uploaded to Google Ads.')}")
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="google_ads_lead_feedback",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route=f"/ads/leads/{lead_id}/feedback/{goal_value}",
+            status_code=500,
+        )
+        db.commit()
+        return redirect(f"{next_url}{'&' if '?' in next_url else '?'}error={quote_plus(f'Google Ads {goal_value} lead upload failed: {exc}')}")
 
 
 @app.route("/ads/refresh", methods=["POST"])
@@ -32442,6 +32964,9 @@ def settings_page():
                 "ads_google_refresh_token": request.form.get("ads_google_refresh_token", ""),
                 "ads_google_customer_ids": request.form.get("ads_google_customer_ids", ""),
                 "ads_google_login_customer_id": request.form.get("ads_google_login_customer_id", ""),
+                "ads_google_conversion_customer_id": request.form.get("ads_google_conversion_customer_id", ""),
+                "ads_google_qualified_conversion_action_id": request.form.get("ads_google_qualified_conversion_action_id", ""),
+                "ads_google_converted_conversion_action_id": request.form.get("ads_google_converted_conversion_action_id", ""),
                 "ads_meta_app_id": request.form.get("ads_meta_app_id", ""),
                 "ads_meta_app_secret": request.form.get("ads_meta_app_secret", ""),
                 "ads_meta_access_token": request.form.get("ads_meta_access_token", ""),
@@ -33778,6 +34303,7 @@ def upload_owner_contacts(property_id):
 def property_detail(property_id):
     ensure_db()
     db = get_db()
+    ads_settings = get_ads_dashboard_settings(db)
 
     prop = db.execute(
         """
@@ -33961,6 +34487,56 @@ def property_detail(property_id):
                 )
     property_mail_summary = _summarize_property_mail_orders(db, property_id)
     property_skiptrace_summary = _summarize_property_skiptrace_runs(db, property_id)
+    related_website_lead = None
+    related_website_lead_updated = False
+    property_address_text = f"{prop['street']}, {prop['city']}, {prop['state']} {prop['postal_code']}".strip()
+    prop_reisift_uuid = normalize_uuid((prop["reisift_property_uuid"] if "reisift_property_uuid" in prop.keys() else "") or "")
+    candidate_lead_rows = db.execute(
+        """
+        SELECT id,
+               lead_key,
+               reisift_property_uuid,
+               reisift_owner_uuid,
+               latest_address,
+               latest_phone,
+               latest_email,
+               latest_name,
+               latest_stage,
+               status,
+               first_received_at,
+               last_received_at,
+               hold_expires_at,
+               processed_at,
+               processing_result_json,
+               local_property_id,
+               step1_payload_json,
+               step2_payload_json,
+               google_ads_qualified_at,
+               google_ads_qualified_result_json,
+               google_ads_converted_at,
+               google_ads_converted_result_json
+        FROM website_lead_submissions
+        WHERE COALESCE(local_property_id, 0) = ?
+           OR (? <> '' AND lower(COALESCE(reisift_property_uuid, '')) = lower(?))
+           OR lower(COALESCE(latest_address, '')) = lower(?)
+        ORDER BY COALESCE(last_received_at, first_received_at) DESC, id DESC
+        LIMIT 10
+        """,
+        (property_id, prop_reisift_uuid, prop_reisift_uuid, property_address_text),
+    ).fetchall()
+    for candidate in candidate_lead_rows:
+        candidate_lead = _build_ads_website_lead_detail(db, candidate, settings=ads_settings, include_notes=False, backfill_local=False)
+        candidate_property_id = int(candidate_lead.get("local_property_id") or 0)
+        if candidate_property_id not in {0, property_id}:
+            continue
+        if candidate_property_id == 0:
+            db.execute("UPDATE website_lead_submissions SET local_property_id = ? WHERE id = ?", (property_id, int(candidate["id"])))
+            candidate_lead["local_property_id"] = property_id
+            related_website_lead_updated = True
+        related_website_lead = candidate_lead
+        break
+    if related_website_lead_updated:
+        db.commit()
     summary_people = []
     if owner:
         summary_people.append(
@@ -34052,6 +34628,7 @@ def property_detail(property_id):
         sequence_targets=sequence_targets,
         sequence_enrollments=sequence_enrollments,
         agent_trace=agent_trace,
+        related_website_lead=related_website_lead,
         page_notice=(request.args.get("notice") or request.args.get("seq_notice") or "").strip(),
         page_error=(request.args.get("error") or "").strip(),
     )

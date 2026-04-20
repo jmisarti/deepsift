@@ -75,6 +75,57 @@
         <p class="muted-text">Link a REISift record to this property first, then you can append notes here.</p>
         {% endif %}
     </details>
+    {% if related_website_lead %}
+    <details>
+        <summary><strong>Tracked Website Lead</strong></summary>
+        <p class="muted-text">This property is tied to tracked website lead #{{ related_website_lead.id }}. You can open the full ad lead detail page or send deeper-funnel feedback to Google Ads here. DeepSift resolves the standard Qualified Lead and Converted Lead actions automatically.</p>
+        <div class="inline-actions" style="margin-bottom:0.5rem;">
+            <a href="{{ url_for('ads_lead_detail_page', lead_id=related_website_lead.id) }}">Open Tracked Lead</a>
+            {% if related_website_lead.reisift_url %}
+            <a href="{{ related_website_lead.reisift_url }}" target="_blank" rel="noopener noreferrer">Open REISift Record</a>
+            {% endif %}
+        </div>
+        <table class="compact-table home-trend-table">
+            <tbody>
+                <tr><th>Campaign</th><td>{{ related_website_lead.campaign_label or '-' }}</td></tr>
+                <tr><th>GCLID</th><td>{{ related_website_lead.gclid or '-' }}</td></tr>
+                <tr><th>Lead Status</th><td>{{ related_website_lead.status or '-' }}</td></tr>
+                <tr>
+                    <th>Qualified Lead</th>
+                    <td>
+                        {% if related_website_lead.feedback.qualified_sent_at %}
+                        <span class="pill">Sent</span> {{ related_website_lead.feedback.qualified_sent_at|fmt_est_datetime }}
+                        {% else %}
+                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=related_website_lead.id, goal_key='qualified') }}" class="inline-form">
+                            <input type="hidden" name="next_url" value="{{ url_for('property_detail', property_id=prop.id) }}">
+                            <button type="submit" {% if not related_website_lead.feedback.qualified_can_send %}disabled{% endif %}>Send Qualified Lead</button>
+                        </form>
+                        {% if not related_website_lead.feedback.qualified_can_send %}
+                        <span class="muted-text">{% if related_website_lead.feedback.missing_text %}Needs {{ related_website_lead.feedback.missing_text }}{% else %}Already sent{% endif %}</span>
+                        {% endif %}
+                        {% endif %}
+                    </td>
+                </tr>
+                <tr>
+                    <th>Converted Lead</th>
+                    <td>
+                        {% if related_website_lead.feedback.converted_sent_at %}
+                        <span class="pill">Sent</span> {{ related_website_lead.feedback.converted_sent_at|fmt_est_datetime }}
+                        {% else %}
+                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=related_website_lead.id, goal_key='converted') }}" class="inline-form">
+                            <input type="hidden" name="next_url" value="{{ url_for('property_detail', property_id=prop.id) }}">
+                            <button type="submit" {% if not related_website_lead.feedback.converted_can_send %}disabled{% endif %}>Send Converted Lead</button>
+                        </form>
+                        {% if not related_website_lead.feedback.converted_can_send %}
+                        <span class="muted-text">{% if related_website_lead.feedback.missing_text %}Needs {{ related_website_lead.feedback.missing_text }}{% else %}Already sent{% endif %}</span>
+                        {% endif %}
+                        {% endif %}
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </details>
+    {% endif %}
     <p><strong>Last Sold Date:</strong> {{ prop.attom_last_sold_date or '-' }}</p>
     <p><strong>Last Sale Price:</strong> {% if prop.attom_last_sold_price is not none %}${{ "{:,.0f}".format(prop.attom_last_sold_price) }}{% else %}-{% endif %}</p>
     <h4>Confirmed / Verified Contacts</h4>

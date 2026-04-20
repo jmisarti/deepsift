@@ -3,6 +3,12 @@
 <section class="panel">
     <h2>Tracked Website Lead #{{ lead.id }}</h2>
     <p class="anon-muted">Stored website submission record with attribution, processing details, and raw step payloads.</p>
+    {% if page_notice %}
+    <div class="notice-banner">{{ page_notice }}</div>
+    {% endif %}
+    {% if page_error %}
+    <div class="error-banner">{{ page_error }}</div>
+    {% endif %}
     <div class="inline-actions ads-toolbar">
         <a href="{{ url_for('ads_lead_attribution_page') }}">Back to Tracked Leads</a>
         {% if lead.reisift_url %}
@@ -33,6 +39,62 @@
             </tbody>
         </table>
     </div>
+</section>
+
+<section class="panel">
+    <h3>Lead Feedback</h3>
+    <p class="anon-muted">Send deeper-funnel lead quality back to Google Ads from this tracked website lead. DeepSift resolves the standard Qualified Lead and Converted Lead conversion actions automatically, and each stage can only be sent once.</p>
+    <div class="table-wrap">
+        <table class="compact-table home-trend-table">
+            <tbody>
+                <tr>
+                    <th>Qualified Lead</th>
+                    <td>
+                        {% if lead.feedback.qualified_sent_at %}
+                        <span class="pill">Sent</span> {{ lead.feedback.qualified_sent_at|fmt_est_datetime }}
+                        {% else %}
+                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=lead.id, goal_key='qualified') }}" class="inline-form">
+                            <input type="hidden" name="next_url" value="{{ url_for('ads_lead_detail_page', lead_id=lead.id) }}">
+                            <button type="submit" {% if not lead.feedback.qualified_can_send %}disabled{% endif %}>Send Qualified Lead</button>
+                        </form>
+                        {% if not lead.feedback.qualified_can_send %}
+                        <span class="anon-muted">{% if lead.feedback.missing_text %}Needs {{ lead.feedback.missing_text }}{% else %}Already sent{% endif %}</span>
+                        {% endif %}
+                        {% endif %}
+                    </td>
+                </tr>
+                <tr>
+                    <th>Converted Lead</th>
+                    <td>
+                        {% if lead.feedback.converted_sent_at %}
+                        <span class="pill">Sent</span> {{ lead.feedback.converted_sent_at|fmt_est_datetime }}
+                        {% else %}
+                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=lead.id, goal_key='converted') }}" class="inline-form">
+                            <input type="hidden" name="next_url" value="{{ url_for('ads_lead_detail_page', lead_id=lead.id) }}">
+                            <button type="submit" {% if not lead.feedback.converted_can_send %}disabled{% endif %}>Send Converted Lead</button>
+                        </form>
+                        {% if not lead.feedback.converted_can_send %}
+                        <span class="anon-muted">{% if lead.feedback.missing_text %}Needs {{ lead.feedback.missing_text }}{% else %}Already sent{% endif %}</span>
+                        {% endif %}
+                        {% endif %}
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+    {% if lead.feedback.qualified_result or lead.feedback.converted_result %}
+    <details class="collapsed-section" style="margin-top:0.75rem;">
+        <summary>Last Google Ads Upload Details</summary>
+        {% if lead.feedback.qualified_result %}
+        <p><strong>Qualified Lead Upload</strong></p>
+        <pre class="payload-output">{{ lead.feedback.qualified_result | tojson(indent=2) }}</pre>
+        {% endif %}
+        {% if lead.feedback.converted_result %}
+        <p><strong>Converted Lead Upload</strong></p>
+        <pre class="payload-output">{{ lead.feedback.converted_result | tojson(indent=2) }}</pre>
+        {% endif %}
+    </details>
+    {% endif %}
 </section>
 
 <section class="panel">

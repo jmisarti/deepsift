@@ -121,6 +121,10 @@
             <label>Google Login Customer ID (optional)
                 <input name="ads_google_login_customer_id" value="{{ ad_platform_settings.google_login_customer_id }}">
             </label>
+            <label>Google Conversion Customer ID (optional)
+                <input name="ads_google_conversion_customer_id" value="{{ ad_platform_settings.google_conversion_customer_id }}" placeholder="defaults to first customer ID">
+            </label>
+            <p class="muted-text span2">The one-click lead feedback buttons on tracked website leads and linked Deep Dive properties now auto-discover the enabled Google Ads conversion actions for the standard <code>Qualified lead</code> and <code>Converted lead</code> goal categories on this customer. DeepSift uploads them as offline click conversions using the stored GCLID.</p>
 
             <label>Meta App ID
                 <input name="ads_meta_app_id" value="{{ ad_platform_settings.meta_app_id }}">

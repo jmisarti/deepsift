@@ -8406,6 +8406,21 @@ def _google_ads_conversion_datetime_text(dt_obj=None, tz_name="America/New_York"
     return dt_obj.isoformat(sep=" ", timespec="seconds")
 
 
+def _google_ads_lead_feedback_conversion_at(lead, stage_key):
+    stage_value = normalize_whitespace(stage_key).lower()
+    day_offset = 1 if stage_value == "qualified" else 2 if stage_value == "converted" else 0
+    base_value = ""
+    if isinstance(lead, dict):
+        base_value = (
+            str(lead.get("first_received_at") or "").strip()
+            or str(lead.get("last_received_at") or "").strip()
+        )
+    base_dt = parse_iso_datetime(base_value) or parse_db_time(base_value) or datetime.utcnow()
+    if base_dt.tzinfo is None:
+        base_dt = base_dt.replace(tzinfo=timezone.utc)
+    return base_dt + timedelta(days=day_offset)
+
+
 def _google_ads_partial_failure_text(payload):
     error_obj = payload.get("partialFailureError") if isinstance(payload, dict) else None
     if not isinstance(error_obj, dict) or not error_obj:
@@ -32231,6 +32246,7 @@ def ads_lead_feedback_route(lead_id, goal_key):
             lead_id=lead_id,
             stage_key=goal_value,
             campaign_id=lead.get("gad_campaignid") or "",
+            conversion_at=_google_ads_lead_feedback_conversion_at(lead, goal_value),
         )
         result_json = json.dumps(upload_result)
         if goal_value == "qualified":

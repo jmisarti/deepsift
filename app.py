@@ -8431,6 +8431,18 @@ def _google_ads_partial_failure_text(payload):
     return " | ".join(part for part in [message, detail_text] if part).strip()
 
 
+def _google_ads_friendly_partial_failure_message(raw_text):
+    text = normalize_whitespace(raw_text)
+    upper = text.upper()
+    if "TOO_RECENT_CONVERSION_ACTION" in upper or "TRY IMPORTING AGAIN IN 6 HOURS" in upper:
+        return (
+            "Google Ads found the correct conversion action, but it was created too recently. "
+            "Google requires about 6 hours before the first offline lead import can be accepted. "
+            "Please try again later."
+        )
+    return text
+
+
 def _google_ads_search_stream_results(settings, customer_id, query):
     payload = _google_ads_post(
         settings,
@@ -8631,7 +8643,7 @@ def upload_google_ads_lead_funnel_conversion(
     )
     partial_failure_text = _google_ads_partial_failure_text(response)
     if partial_failure_text:
-        raise RuntimeError(f"Google Ads partial failure: {partial_failure_text}")
+        raise RuntimeError(f"Google Ads partial failure: {_google_ads_friendly_partial_failure_message(partial_failure_text)}")
     results = response.get("results") if isinstance(response, dict) else None
     if not isinstance(results, list) or not results:
         raise RuntimeError("Google Ads upload returned no successful conversion results.")

@@ -65,11 +65,11 @@
     <details>
         <summary><strong>Add REISift Note</strong></summary>
         {% if prop.reisift_property_uuid %}
-        <form method="post" action="{{ url_for('add_property_reisift_note', property_id=prop.id) }}" class="grid-form compact">
+        <form method="post" action="{{ url_for('add_property_reisift_note', property_id=prop.id) }}" class="grid-form compact loading-submit-form" data-loading-form>
             <label class="span2">Note
                 <textarea name="note_text" placeholder="Add a note to the linked REISift property..." required></textarea>
             </label>
-            <button type="submit">Send to REISift</button>
+            <button type="submit" data-loading-label="Sending...">Send to REISift</button>
         </form>
         {% else %}
         <p class="muted-text">Link a REISift record to this property first, then you can append notes here.</p>
@@ -891,8 +891,7 @@ document.getElementById('propertyStatusSelect').addEventListener('change', async
 document.getElementById('propertySkipTraceBtn').addEventListener('click', async () => {
   if (!window.confirm('Run property skip trace now? This will refresh owners, co-owner links, and sale data.')) return;
   const btn = document.getElementById('propertySkipTraceBtn');
-  btn.disabled = true;
-  btn.textContent = 'Running...';
+  if (window.startBusyButton) window.startBusyButton(btn, 'Running...');
   try {
     const res = await postJson(`/api/properties/${propertyId}/skip-trace-property`, {});
     if (!res.ok) {
@@ -901,19 +900,23 @@ document.getElementById('propertySkipTraceBtn').addEventListener('click', async 
       window.location.reload();
     }
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Skip Trace Property (Owners)';
+    if (window.stopBusyButton) window.stopBusyButton(btn);
   }
 });
 
 const mailAllRelativesBtn = document.getElementById('mailAllRelativesBtn');
 if (mailAllRelativesBtn) {
   mailAllRelativesBtn.addEventListener('click', async () => {
-    await openMailPreview(
-      `/api/properties/${propertyId}/mail/preview/relatives`,
-      `/api/properties/${propertyId}/mail/relatives`,
-      'Mail All Relatives'
-    );
+    if (window.startBusyButton) window.startBusyButton(mailAllRelativesBtn, 'Loading...');
+    try {
+      await openMailPreview(
+        `/api/properties/${propertyId}/mail/preview/relatives`,
+        `/api/properties/${propertyId}/mail/relatives`,
+        'Mail All Relatives'
+      );
+    } finally {
+      if (window.stopBusyButton) window.stopBusyButton(mailAllRelativesBtn);
+    }
   });
 }
 
@@ -942,12 +945,10 @@ mailProofModal.addEventListener('click', (e) => {
 
 mailProofSendBtn.addEventListener('click', async () => {
   if (!mailPreviewSendPath) return;
-  mailProofSendBtn.disabled = true;
-  mailProofSendBtn.textContent = 'Sending...';
+  if (window.startBusyButton) window.startBusyButton(mailProofSendBtn, 'Sending...');
   const res = await postJson(mailPreviewSendPath, selectedMailTemplateId ? {template_id: selectedMailTemplateId} : {});
   if (!res.ok) {
-    mailProofSendBtn.disabled = false;
-    mailProofSendBtn.textContent = 'Approve and Pay';
+    if (window.stopBusyButton) window.stopBusyButton(mailProofSendBtn);
     alert((res.data && res.data.error) ? res.data.error : 'Failed to submit mail order.');
     return;
   }

@@ -623,9 +623,7 @@ document.getElementById('skipTraceBtn').addEventListener('click', async () => {
     return;
   }
   if (!window.confirm('Run skip trace for this person using the property address?')) return;
-  btn.disabled = true;
-  const oldText = btn.textContent;
-  btn.textContent = 'Running Skip Trace...';
+  if (window.startBusyButton) window.startBusyButton(btn, 'Running Skip Trace...');
   if (busy) busy.classList.remove('hidden');
   try {
     const firstName = (document.getElementById('personFirstName')?.value || '{{ person.first_name }}').trim();
@@ -644,8 +642,7 @@ document.getElementById('skipTraceBtn').addEventListener('click', async () => {
     alert(`Skip trace complete. Matches: ${s.matched_people || 0}, Phones +${s.phones_added || 0}, Emails +${s.emails_added || 0}, Addresses +${s.addresses_added || 0}, Relatives +${s.relatives_added || 0}.`);
     window.location.reload();
   } finally {
-    btn.disabled = false;
-    btn.textContent = oldText;
+    if (window.stopBusyButton) window.stopBusyButton(btn);
     if (busy) busy.classList.add('hidden');
   }
 });
@@ -657,10 +654,15 @@ if (personMailBtn) {
       alert('No property context available for this person.');
       return;
     }
-    await openPersonMailPreview(
-      `/api/properties/${personCommPropertyId}/mail/preview/relative/${personId}`,
-      `/api/properties/${personCommPropertyId}/mail/relative/${personId}`
-    );
+    if (window.startBusyButton) window.startBusyButton(personMailBtn, 'Loading...');
+    try {
+      await openPersonMailPreview(
+        `/api/properties/${personCommPropertyId}/mail/preview/relative/${personId}`,
+        `/api/properties/${personCommPropertyId}/mail/relative/${personId}`
+      );
+    } finally {
+      if (window.stopBusyButton) window.stopBusyButton(personMailBtn);
+    }
   });
 }
 
@@ -675,10 +677,15 @@ document.querySelectorAll('.address-mail-btn').forEach((button) => {
       alert('No mailing address selected.');
       return;
     }
-    await openPersonMailPreview(
-      `/api/properties/${personCommPropertyId}/mail/preview/relative/${personId}/address/${personAddressId}`,
-      `/api/properties/${personCommPropertyId}/mail/relative/${personId}/address/${personAddressId}`
-    );
+    if (window.startBusyButton) window.startBusyButton(button, 'Loading...');
+    try {
+      await openPersonMailPreview(
+        `/api/properties/${personCommPropertyId}/mail/preview/relative/${personId}/address/${personAddressId}`,
+        `/api/properties/${personCommPropertyId}/mail/relative/${personId}/address/${personAddressId}`
+      );
+    } finally {
+      if (window.stopBusyButton) window.stopBusyButton(button);
+    }
   });
 });
 
@@ -696,12 +703,10 @@ personMailProofModal.addEventListener('click', (e) => {
 
 personMailProofSendBtn.addEventListener('click', async () => {
   if (!personMailSendPath) return;
-  personMailProofSendBtn.disabled = true;
-  personMailProofSendBtn.textContent = 'Sending...';
+  if (window.startBusyButton) window.startBusyButton(personMailProofSendBtn, 'Sending...');
   const res = await postJson(personMailSendPath, selectedPersonMailTemplateId ? {template_id: selectedPersonMailTemplateId} : {});
   if (!res.ok) {
-    personMailProofSendBtn.disabled = false;
-    personMailProofSendBtn.textContent = 'Approve and Pay';
+    if (window.stopBusyButton) window.stopBusyButton(personMailProofSendBtn);
     alert((res.data && res.data.error) ? res.data.error : 'Failed to submit mail order.');
     return;
   }

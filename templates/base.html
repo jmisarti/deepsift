@@ -280,6 +280,37 @@
     })();
 
     (function() {
+      function startBusyButton(button, label) {
+        if (!button || button.dataset.loading === '1') return;
+        const nextLabel = label || button.dataset.loadingLabel || 'Working...';
+        button.dataset.loading = '1';
+        button.dataset.wasDisabled = button.disabled ? '1' : '0';
+        if (button.tagName === 'BUTTON') {
+          if (!button.dataset.originalHtml) button.dataset.originalHtml = button.innerHTML;
+          button.innerHTML = '<span class="busy-spinner anon-inline-spinner" aria-hidden="true"></span><span>' + nextLabel + '</span>';
+          button.classList.add('anon-loading-button');
+        } else if (button.tagName === 'INPUT') {
+          if (!button.dataset.originalValue) button.dataset.originalValue = button.value;
+          button.value = nextLabel;
+        }
+        button.disabled = true;
+      }
+
+      function stopBusyButton(button) {
+        if (!button) return;
+        if (button.tagName === 'BUTTON' && button.dataset.originalHtml) {
+          button.innerHTML = button.dataset.originalHtml;
+          button.classList.remove('anon-loading-button');
+        } else if (button.tagName === 'INPUT' && button.dataset.originalValue) {
+          button.value = button.dataset.originalValue;
+        }
+        button.disabled = button.dataset.wasDisabled === '1';
+        button.dataset.loading = '0';
+      }
+
+      window.startBusyButton = startBusyButton;
+      window.stopBusyButton = stopBusyButton;
+
       function setLoadingState(form, submitter) {
         if (!form || !submitter) return;
         if (form.dataset.loading === '1') return;
@@ -290,15 +321,7 @@
         submitButtons.forEach((btn) => {
           if (btn !== submitter) btn.disabled = true;
         });
-        if (submitter.tagName === 'BUTTON') {
-          if (!submitter.dataset.originalHtml) submitter.dataset.originalHtml = submitter.innerHTML;
-          submitter.innerHTML = '<span class="busy-spinner anon-inline-spinner" aria-hidden="true"></span><span>' + label + '</span>';
-          submitter.classList.add('anon-loading-button');
-        } else if (submitter.tagName === 'INPUT') {
-          if (!submitter.dataset.originalValue) submitter.dataset.originalValue = submitter.value;
-          submitter.value = label;
-        }
-        submitter.disabled = true;
+        startBusyButton(submitter, label);
       }
 
       document.querySelectorAll('form[data-loading-form]').forEach((form) => {

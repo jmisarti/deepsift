@@ -53,9 +53,9 @@
                         {% if lead.feedback.qualified_sent_at %}
                         <span class="pill">Sent</span> {{ lead.feedback.qualified_sent_at|fmt_est_datetime }}
                         {% else %}
-                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=lead.id, goal_key='qualified') }}" class="inline-form">
+                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=lead.id, goal_key='qualified') }}" class="inline-form loading-submit-form" data-loading-form>
                             <input type="hidden" name="next_url" value="{{ url_for('ads_lead_detail_page', lead_id=lead.id) }}">
-                            <button type="submit" {% if not lead.feedback.qualified_can_send %}disabled{% endif %}>Send Qualified Lead</button>
+                            <button type="submit" data-loading-label="Sending..." {% if not lead.feedback.qualified_can_send %}disabled{% endif %}>Send Qualified Lead</button>
                         </form>
                         {% if not lead.feedback.qualified_can_send %}
                         <span class="anon-muted">{% if lead.feedback.missing_text %}Needs {{ lead.feedback.missing_text }}{% else %}Already sent{% endif %}</span>
@@ -69,9 +69,9 @@
                         {% if lead.feedback.converted_sent_at %}
                         <span class="pill">Sent</span> {{ lead.feedback.converted_sent_at|fmt_est_datetime }}
                         {% else %}
-                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=lead.id, goal_key='converted') }}" class="inline-form">
+                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=lead.id, goal_key='converted') }}" class="inline-form loading-submit-form" data-loading-form>
                             <input type="hidden" name="next_url" value="{{ url_for('ads_lead_detail_page', lead_id=lead.id) }}">
-                            <button type="submit" {% if not lead.feedback.converted_can_send %}disabled{% endif %}>Send Converted Lead</button>
+                            <button type="submit" data-loading-label="Sending..." {% if not lead.feedback.converted_can_send %}disabled{% endif %}>Send Converted Lead</button>
                         </form>
                         {% if not lead.feedback.converted_can_send %}
                         <span class="anon-muted">{% if lead.feedback.missing_text %}Needs {{ lead.feedback.missing_text }}{% else %}Already sent{% endif %}</span>

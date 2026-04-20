@@ -278,6 +278,40 @@
         if (userWrap && !userWrap.contains(e.target)) userPanel.classList.add('hidden');
       });
     })();
+
+    (function() {
+      function setLoadingState(form, submitter) {
+        if (!form || !submitter) return;
+        if (form.dataset.loading === '1') return;
+        form.dataset.loading = '1';
+        form.classList.add('is-submitting');
+        const label = submitter.dataset.loadingLabel || form.dataset.loadingLabel || 'Working...';
+        const submitButtons = form.querySelectorAll('button[type="submit"], input[type="submit"]');
+        submitButtons.forEach((btn) => {
+          if (btn !== submitter) btn.disabled = true;
+        });
+        if (submitter.tagName === 'BUTTON') {
+          if (!submitter.dataset.originalHtml) submitter.dataset.originalHtml = submitter.innerHTML;
+          submitter.innerHTML = '<span class="busy-spinner anon-inline-spinner" aria-hidden="true"></span><span>' + label + '</span>';
+          submitter.classList.add('anon-loading-button');
+        } else if (submitter.tagName === 'INPUT') {
+          if (!submitter.dataset.originalValue) submitter.dataset.originalValue = submitter.value;
+          submitter.value = label;
+        }
+        submitter.disabled = true;
+      }
+
+      document.querySelectorAll('form[data-loading-form]').forEach((form) => {
+        form.addEventListener('submit', (event) => {
+          if (form.dataset.loading === '1') {
+            event.preventDefault();
+            return;
+          }
+          const submitter = event.submitter || form.querySelector('button[type="submit"], input[type="submit"]');
+          setLoadingState(form, submitter);
+        });
+      });
+    })();
     </script>
 </body>
 </html>

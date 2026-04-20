@@ -96,9 +96,9 @@
                         {% if related_website_lead.feedback.qualified_sent_at %}
                         <span class="pill">Sent</span> {{ related_website_lead.feedback.qualified_sent_at|fmt_est_datetime }}
                         {% else %}
-                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=related_website_lead.id, goal_key='qualified') }}" class="inline-form">
+                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=related_website_lead.id, goal_key='qualified') }}" class="inline-form loading-submit-form" data-loading-form>
                             <input type="hidden" name="next_url" value="{{ url_for('property_detail', property_id=prop.id) }}">
-                            <button type="submit" {% if not related_website_lead.feedback.qualified_can_send %}disabled{% endif %}>Send Qualified Lead</button>
+                            <button type="submit" data-loading-label="Sending..." {% if not related_website_lead.feedback.qualified_can_send %}disabled{% endif %}>Send Qualified Lead</button>
                         </form>
                         {% if not related_website_lead.feedback.qualified_can_send %}
                         <span class="muted-text">{% if related_website_lead.feedback.missing_text %}Needs {{ related_website_lead.feedback.missing_text }}{% else %}Already sent{% endif %}</span>
@@ -112,9 +112,9 @@
                         {% if related_website_lead.feedback.converted_sent_at %}
                         <span class="pill">Sent</span> {{ related_website_lead.feedback.converted_sent_at|fmt_est_datetime }}
                         {% else %}
-                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=related_website_lead.id, goal_key='converted') }}" class="inline-form">
+                        <form method="post" action="{{ url_for('ads_lead_feedback_route', lead_id=related_website_lead.id, goal_key='converted') }}" class="inline-form loading-submit-form" data-loading-form>
                             <input type="hidden" name="next_url" value="{{ url_for('property_detail', property_id=prop.id) }}">
-                            <button type="submit" {% if not related_website_lead.feedback.converted_can_send %}disabled{% endif %}>Send Converted Lead</button>
+                            <button type="submit" data-loading-label="Sending..." {% if not related_website_lead.feedback.converted_can_send %}disabled{% endif %}>Send Converted Lead</button>
                         </form>
                         {% if not related_website_lead.feedback.converted_can_send %}
                         <span class="muted-text">{% if related_website_lead.feedback.missing_text %}Needs {{ related_website_lead.feedback.missing_text }}{% else %}Already sent{% endif %}</span>

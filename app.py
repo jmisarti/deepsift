@@ -8334,6 +8334,32 @@ def _google_ads_lead_feedback_customer_id(settings):
     return _normalize_google_ads_customer_id(customer_ids[0]) if customer_ids else ""
 
 
+def _google_ads_customer_resource_id(value):
+    text = normalize_whitespace(value)
+    if not text:
+        return ""
+    match = re.search(r"customers/(\d+)", text)
+    if match:
+        return _normalize_google_ads_customer_id(match.group(1))
+    return _normalize_google_ads_customer_id(text)
+
+
+def _google_ads_lead_feedback_customer_candidates(settings, preferred_customer_id=""):
+    seen = set()
+    ordered = []
+    for raw in [
+        preferred_customer_id,
+        settings.get("google_conversion_customer_id"),
+        *list(settings.get("google_customer_ids") or []),
+    ]:
+        customer_id = _normalize_google_ads_customer_id(raw)
+        if not customer_id or customer_id in seen:
+            continue
+        ordered.append(customer_id)
+        seen.add(customer_id)
+    return ordered
+
+
 def _google_ads_normalize_phone_for_upload(value):
     digits = re.sub(r"\D", "", str(value or ""))
     if len(digits) == 10:
@@ -8413,16 +8439,43 @@ def _google_ads_search_stream_results(settings, customer_id, query):
     return rows
 
 
-def _google_ads_resolve_lead_feedback_action(settings, stage_key):
-    customer_id = _google_ads_lead_feedback_customer_id(settings)
-    if not customer_id:
-        raise RuntimeError("Google Ads conversion customer ID is missing.")
+def _google_ads_find_customer_for_campaign(settings, campaign_id):
+    campaign_id = re.sub(r"\D", "", str(campaign_id or ""))
+    if not campaign_id:
+        return ""
+    query = f"""
+        SELECT
+          customer.id,
+          campaign.id
+        FROM campaign
+        WHERE campaign.id = {campaign_id}
+          AND campaign.status != 'REMOVED'
+    """
+    for customer_id in _google_ads_lead_feedback_customer_candidates(settings):
+        try:
+            rows = _google_ads_search_stream_results(settings, customer_id, query)
+        except Exception:
+            continue
+        for item in rows:
+            customer = item.get("customer") or {}
+            resolved_customer_id = _normalize_google_ads_customer_id(customer.get("id")) or customer_id
+            if resolved_customer_id:
+                return resolved_customer_id
+    return ""
+
+
+def _google_ads_resolve_lead_feedback_action(settings, stage_key, campaign_id=""):
     stage_value = normalize_whitespace(stage_key).lower()
     if stage_value not in {"qualified", "converted"}:
         raise RuntimeError(f"Unsupported Google Ads lead feedback stage: {stage_key}")
     category = "QUALIFIED_LEAD" if stage_value == "qualified" else "CONVERTED_LEAD"
+    preferred_customer_id = _google_ads_find_customer_for_campaign(settings, campaign_id)
+    customer_candidates = _google_ads_lead_feedback_customer_candidates(settings, preferred_customer_id=preferred_customer_id)
+    if not customer_candidates:
+        raise RuntimeError("Google Ads conversion customer ID is missing.")
     query = f"""
         SELECT
+          customer.id,
           conversion_action.id,
           conversion_action.resource_name,
           conversion_action.name,
@@ -8430,38 +8483,64 @@ def _google_ads_resolve_lead_feedback_action(settings, stage_key):
           conversion_action.status,
           conversion_action.type,
           conversion_action.primary_for_goal,
-          conversion_action.include_in_conversions_metric
+          conversion_action.include_in_conversions_metric,
+          conversion_action.owner_customer
         FROM conversion_action
         WHERE conversion_action.status = 'ENABLED'
           AND conversion_action.type = 'UPLOAD_CLICKS'
           AND conversion_action.category = '{category}'
     """
-    rows = _google_ads_search_stream_results(settings, customer_id, query)
     candidates = []
-    for item in rows:
-        action = item.get("conversionAction") or {}
-        action_id = _normalize_google_ads_conversion_action_id(action.get("id"))
-        if not action_id:
+    for customer_id in customer_candidates:
+        try:
+            rows = _google_ads_search_stream_results(settings, customer_id, query)
+        except Exception:
             continue
-        candidates.append(
-            {
-                "id": action_id,
-                "resource_name": normalize_whitespace(action.get("resourceName")),
-                "name": normalize_whitespace(action.get("name")) or f"{stage_value.title()} Lead",
-                "category": normalize_whitespace(action.get("category")).upper(),
-                "status": normalize_whitespace(action.get("status")).upper(),
-                "type": normalize_whitespace(action.get("type")).upper(),
-                "primary_for_goal": bool(action.get("primaryForGoal")),
-                "include_in_conversions_metric": bool(action.get("includeInConversionsMetric")),
-            }
-        )
+        for item in rows:
+            action = item.get("conversionAction") or {}
+            action_id = _normalize_google_ads_conversion_action_id(action.get("id"))
+            if not action_id:
+                continue
+            owner_customer_id = _google_ads_customer_resource_id(action.get("ownerCustomer"))
+            candidates.append(
+                {
+                    "id": action_id,
+                    "resource_name": normalize_whitespace(action.get("resourceName")),
+                    "name": normalize_whitespace(action.get("name")) or f"{stage_value.title()} Lead",
+                    "category": normalize_whitespace(action.get("category")).upper(),
+                    "status": normalize_whitespace(action.get("status")).upper(),
+                    "type": normalize_whitespace(action.get("type")).upper(),
+                    "primary_for_goal": bool(action.get("primaryForGoal")),
+                    "include_in_conversions_metric": bool(action.get("includeInConversionsMetric")),
+                    "search_customer_id": customer_id,
+                    "upload_customer_id": owner_customer_id or customer_id,
+                    "owner_customer_id": owner_customer_id,
+                }
+            )
     if not candidates:
         raise RuntimeError(
             f"No enabled Google Ads conversion action was found for {stage_value.title()} Lead. "
             f"Create an Import from clicks conversion action with goal type {stage_value.title()} lead."
         )
+    if preferred_customer_id:
+        matching_customer_candidates = [
+            item
+            for item in candidates
+            if item.get("upload_customer_id") == preferred_customer_id or item.get("search_customer_id") == preferred_customer_id
+        ]
+        if matching_customer_candidates:
+            candidates = matching_customer_candidates
+    distinct_upload_customers = {item.get("upload_customer_id") for item in candidates if item.get("upload_customer_id")}
+    explicit_customer = _normalize_google_ads_customer_id(settings.get("google_conversion_customer_id"))
+    if len(distinct_upload_customers) > 1 and not preferred_customer_id and not explicit_customer:
+        raise RuntimeError(
+            "Multiple Google Ads accounts have lead-stage conversion actions configured. "
+            "Set Google Conversion Customer ID in Ads settings so DeepSift knows which account to upload into."
+        )
     candidates.sort(
         key=lambda item: (
+            1 if preferred_customer_id and item.get("upload_customer_id") == preferred_customer_id else 0,
+            1 if explicit_customer and item.get("upload_customer_id") == explicit_customer else 0,
             1 if item.get("include_in_conversions_metric") else 0,
             1 if item.get("primary_for_goal") else 0,
             int(item.get("id") or 0),
@@ -8470,11 +8549,13 @@ def _google_ads_resolve_lead_feedback_action(settings, stage_key):
     )
     chosen = candidates[0]
     return {
-        "customer_id": customer_id,
+        "customer_id": chosen.get("search_customer_id") or chosen.get("upload_customer_id") or customer_candidates[0],
+        "upload_customer_id": chosen.get("upload_customer_id") or chosen.get("search_customer_id") or customer_candidates[0],
+        "preferred_customer_id": preferred_customer_id,
         "stage_key": stage_value,
         "category": category,
         "action_id": chosen["id"],
-        "resource_name": chosen["resource_name"] or _google_ads_conversion_action_resource_name(customer_id, chosen["id"]),
+        "resource_name": chosen["resource_name"] or _google_ads_conversion_action_resource_name(chosen.get("upload_customer_id") or chosen.get("search_customer_id") or customer_candidates[0], chosen["id"]),
         "action_name": chosen["name"],
         "candidate_count": len(candidates),
         "candidates": candidates,
@@ -8491,15 +8572,17 @@ def upload_google_ads_lead_funnel_conversion(
     lead_id=0,
     stage_key="qualified",
     conversion_at=None,
+    campaign_id="",
 ):
-    customer_id = _google_ads_lead_feedback_customer_id(settings)
-    if not customer_id:
+    request_customer_id = _google_ads_lead_feedback_customer_id(settings)
+    if not request_customer_id:
         raise RuntimeError("Google Ads conversion customer ID is missing.")
     resolved_action = None
     action_id = _normalize_google_ads_conversion_action_id(conversion_action_id)
     if not action_id:
-        resolved_action = _google_ads_resolve_lead_feedback_action(settings, stage_key)
+        resolved_action = _google_ads_resolve_lead_feedback_action(settings, stage_key, campaign_id=campaign_id)
         action_id = _normalize_google_ads_conversion_action_id(resolved_action.get("action_id"))
+        request_customer_id = _normalize_google_ads_customer_id(resolved_action.get("upload_customer_id")) or request_customer_id
     if not action_id:
         raise RuntimeError("Google Ads conversion action could not be resolved.")
     gclid = str(gclid or "").strip()
@@ -8508,7 +8591,10 @@ def upload_google_ads_lead_funnel_conversion(
 
     conversion = {
         "gclid": gclid,
-        "conversionAction": _google_ads_conversion_action_resource_name(customer_id, action_id),
+        "conversionAction": (
+            normalize_whitespace((resolved_action or {}).get("resource_name"))
+            or _google_ads_conversion_action_resource_name(request_customer_id, action_id)
+        ),
         "conversionDateTime": _google_ads_conversion_datetime_text(conversion_at),
         "conversionValue": 1.0,
         "currencyCode": "USD",
@@ -8521,7 +8607,7 @@ def upload_google_ads_lead_funnel_conversion(
 
     response = _google_ads_post_rest_method(
         settings,
-        customer_id,
+        request_customer_id,
         "uploadClickConversions",
         {
             "conversions": [conversion],
@@ -8536,7 +8622,7 @@ def upload_google_ads_lead_funnel_conversion(
         raise RuntimeError("Google Ads upload returned no successful conversion results.")
     return {
         "ok": True,
-        "customer_id": customer_id,
+        "customer_id": request_customer_id,
         "conversion_action_id": action_id,
         "conversion_action": conversion.get("conversionAction"),
         "resolved_action": resolved_action,
@@ -32144,6 +32230,7 @@ def ads_lead_feedback_route(lead_id, goal_key):
             phone=lead.get("phone") or "",
             lead_id=lead_id,
             stage_key=goal_value,
+            campaign_id=lead.get("gad_campaignid") or "",
         )
         result_json = json.dumps(upload_result)
         if goal_value == "qualified":

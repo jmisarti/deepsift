@@ -886,6 +886,7 @@ def migrate_db(db):
     ensure_column(db, "mail_orders", "delivered_at", "delivered_at TEXT")
     ensure_column(db, "mail_orders", "bad_address_at", "bad_address_at TEXT")
     ensure_column(db, "mail_orders", "qr_scanned_at", "qr_scanned_at TEXT")
+    ensure_column(db, "sequence_steps", "mail_template_id", "mail_template_id INTEGER")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS app_errors (
@@ -6878,14 +6879,16 @@ def extract_steps_from_form(form, prefix):
     delays = form.getlist(f"{prefix}delay[]")
     channels = form.getlist(f"{prefix}channel[]")
     subjects = form.getlist(f"{prefix}subject[]")
+    mail_templates = form.getlist(f"{prefix}mail_template[]")
     bodies = form.getlist(f"{prefix}body[]")
     steps = []
-    max_len = max(len(orders), len(delays), len(channels), len(subjects), len(bodies), 0)
+    max_len = max(len(orders), len(delays), len(channels), len(subjects), len(mail_templates), len(bodies), 0)
     for i in range(max_len):
         order_val = orders[i] if i < len(orders) else str(i + 1)
         delay_val = delays[i] if i < len(delays) else "0"
         channel_val = channels[i] if i < len(channels) else "SMS"
         subject_val = subjects[i] if i < len(subjects) else ""
+        mail_template_val = mail_templates[i] if i < len(mail_templates) else ""
         body_val = bodies[i] if i < len(bodies) else ""
         body_text = (body_val or "").strip()
         if not body_text:
@@ -6902,12 +6905,14 @@ def extract_steps_from_form(form, prefix):
         channel = (channel_val or "SMS").strip().upper()
         if channel not in SEQUENCE_SUPPORTED_CHANNELS:
             channel = "SMS"
+        mail_template_id = normalize_direct_mail_template_id(mail_template_val) if channel == "MAIL" else None
         steps.append(
             {
                 "order": order_int,
                 "delay_minutes": delay_int,
                 "channel": channel,
                 "subject_template": (subject_val or "").strip(),
+                "mail_template_id": mail_template_id,
                 "body_template": body_text,
             }
         )
@@ -6922,6 +6927,7 @@ def extract_steps_from_form(form, prefix):
                 "delay_hours": round((s["delay_minutes"] or 0) / 60.0, 4),
                 "channel": s["channel"],
                 "subject_template": s["subject_template"],
+                "mail_template_id": s.get("mail_template_id"),
                 "body_template": s["body_template"],
             }
         )
@@ -7284,7 +7290,7 @@ def run_sequence_tick():
                     mail_target, mail_skipped = get_sequence_mail_target(db, prop, enr["person_id"])
                     if not mail_target:
                         raise ValueError("No mailing address available for sequence step")
-                    template_id = get_direct_mail_template_id(db)
+                    template_id = resolve_direct_mail_template_id(db, next_step["mail_template_id"])
                     result = place_openletterconnect_order(
                         db,
                         [mail_target],
@@ -8065,6 +8071,40 @@ def get_direct_mail_available_templates(selected_template_id=None):
             },
         )
     return options
+
+
+def ensure_template_option(options, template_id):
+    template_id = normalize_direct_mail_template_id(template_id)
+    rows = options if isinstance(options, list) else []
+    if not template_id:
+        return rows
+    if any(int(opt.get("id") or 0) == template_id for opt in rows if isinstance(opt, dict)):
+        return rows
+    rows.append(
+        {
+            "id": template_id,
+            "title": f"Template {template_id}",
+            "label": f"Template {template_id}",
+            "productType": None,
+            "paperType": None,
+            "paperSize": None,
+            "deliveryType": None,
+            "postageType": None,
+            "envelopeType": None,
+            "thumbnailUrl": None,
+            "backThumbnailUrl": None,
+        }
+    )
+    rows.sort(key=lambda item: ((item.get("title") or "").lower(), item.get("id") or 0))
+    return rows
+
+
+def describe_sequence_mail_template(db, template_id):
+    normalized = normalize_direct_mail_template_id(template_id)
+    if not normalized:
+        default_id = get_direct_mail_template_id(db)
+        return f"Global Default (Template {default_id})"
+    return f"Template {normalized}"
 
 
 def direct_mail_template_id_from_request(db):
@@ -33866,8 +33906,8 @@ def sequences_page():
             for step in parsed:
                 db.execute(
                     """
-                    INSERT INTO sequence_steps (campaign_id, step_order, delay_minutes, channel, subject_template, body_template, is_active)
-                    VALUES (?, ?, ?, ?, ?, ?, 1)
+                    INSERT INTO sequence_steps (campaign_id, step_order, delay_minutes, channel, subject_template, mail_template_id, body_template, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                     """,
                     (
                         campaign_id,
@@ -33875,6 +33915,7 @@ def sequences_page():
                         step["delay_minutes"],
                         step["channel"],
                         step["subject_template"],
+                        step.get("mail_template_id"),
                         step["body_template"],
                     ),
                 )
@@ -33898,6 +33939,18 @@ def sequences_page():
             (c["id"],),
         ).fetchone()["c"]
         campaign_rows.append({"campaign": c, "steps": steps_view, "active_count": active_count})
+    global_direct_mail_template_id = get_direct_mail_template_id(db)
+    global_direct_mail_template_label = describe_sequence_mail_template(db, None)
+    mail_template_options = []
+    mail_template_error = ""
+    try:
+        mail_template_options = get_direct_mail_available_templates(global_direct_mail_template_id)
+    except Exception as exc:
+        mail_template_options = []
+        mail_template_error = str(exc)
+    for row in campaign_rows:
+        for step in row["steps"]:
+            ensure_template_option(mail_template_options, step.get("mail_template_id"))
     property_options = db.execute(
         """
         SELECT p.id, a.street, a.city, a.state, a.postal_code
@@ -33915,6 +33968,10 @@ def sequences_page():
         campaign_rows=campaign_rows,
         property_options=property_options,
         person_options=person_options,
+        mail_template_options=mail_template_options,
+        mail_template_error=mail_template_error,
+        global_direct_mail_template_id=global_direct_mail_template_id,
+        global_direct_mail_template_label=global_direct_mail_template_label,
         notice=notice,
         error_notice=error_notice,
     )
@@ -33951,8 +34008,8 @@ def update_sequence_campaign(campaign_id):
         for step in parsed:
             db.execute(
                 """
-                INSERT INTO sequence_steps (campaign_id, step_order, delay_minutes, channel, subject_template, body_template, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, 1)
+                INSERT INTO sequence_steps (campaign_id, step_order, delay_minutes, channel, subject_template, mail_template_id, body_template, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
                     campaign_id,
@@ -33960,6 +34017,7 @@ def update_sequence_campaign(campaign_id):
                     step["delay_minutes"],
                     step["channel"],
                     step["subject_template"],
+                    step.get("mail_template_id"),
                     step["body_template"],
                 ),
             )
@@ -34022,6 +34080,8 @@ def preview_sequence_campaign(campaign_id):
                 "delay_hours": round((int(s["delay_minutes"] or 0)) / 60.0, 4),
                 "channel": (s["channel"] or "").upper(),
                 "subject": render_sequence_template(s["subject_template"] or "", person, prop, owner),
+                "mail_template_id": normalize_direct_mail_template_id(s["mail_template_id"]) if "mail_template_id" in s.keys() else None,
+                "mail_template_label": describe_sequence_mail_template(db, s["mail_template_id"] if "mail_template_id" in s.keys() else None),
                 "body": render_sequence_template(s["body_template"] or "", person, prop, owner),
             }
         )

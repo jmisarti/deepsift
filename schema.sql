@@ -376,6 +376,7 @@ CREATE TABLE IF NOT EXISTS sequence_steps (
     delay_minutes INTEGER NOT NULL DEFAULT 0,
     channel TEXT NOT NULL DEFAULT 'SMS',
     subject_template TEXT,
+    mail_template_id INTEGER,
     body_template TEXT NOT NULL,
     is_active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

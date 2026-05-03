@@ -16,6 +16,7 @@
                 <button type="button" id="propertySkipTraceBtn">Skip Trace Property (Owners)</button>
                 <button type="button" id="bulkSmsBtn">Bulk Text This Property</button>
                 <button type="button" id="mailAllRelativesBtn" {% if not prop.owner_person_id %}disabled{% endif %}>Mail All Relatives</button>
+                <a href="{{ url_for('rentcast_tools_page', property_id=prop.id) }}">RentCast Valuation</a>
                 <a href="{{ url_for('sequences_page') }}">Sequence Automation</a>
             </div>
         </details>

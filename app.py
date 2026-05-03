@@ -24275,6 +24275,212 @@ def call_rentcast_address_tool(db, action, full_address):
     return payload
 
 
+def _rentcast_nested_value(data, *paths):
+    if not isinstance(data, dict):
+        return None
+    for path in paths:
+        current = data
+        ok = True
+        for part in str(path or "").split("."):
+            if isinstance(current, dict) and part in current:
+                current = current.get(part)
+            else:
+                ok = False
+                break
+        if ok and current not in (None, ""):
+            return current
+    return None
+
+
+def _rentcast_number_value(data, *paths):
+    value = _rentcast_nested_value(data, *paths)
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _rentcast_money_text(value):
+    if value in (None, ""):
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(number):
+        return ""
+    return f"${number:,.0f}"
+
+
+def _rentcast_count_text(value):
+    if value in (None, ""):
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(number):
+        return ""
+    if abs(number - round(number)) < 0.05:
+        return f"{int(round(number))}"
+    return f"{number:,.1f}"
+
+
+def _rentcast_property_display_address(property_row):
+    if not property_row:
+        return ""
+    return ", ".join(
+        [
+            part
+            for part in [
+                normalize_whitespace(property_row.get("street") or ""),
+                normalize_whitespace(property_row.get("city") or ""),
+                " ".join(
+                    [
+                        normalize_whitespace(property_row.get("state") or ""),
+                        normalize_whitespace(property_row.get("postal_code") or ""),
+                    ]
+                ).strip(),
+            ]
+            if part
+        ]
+    ).strip()
+
+
+def _summarize_rentcast_comparables(comparables):
+    rows = comparables if isinstance(comparables, list) else []
+    prices = []
+    total_price = 0.0
+    total_sqft_price = 0.0
+    total_sqft = 0.0
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        price = _rentcast_number_value(item, "price", "listPrice", "value")
+        sqft = _rentcast_number_value(item, "squareFootage", "square_feet", "livingArea", "sqft")
+        if price is not None:
+            prices.append(price)
+            total_price += price
+        if price is not None and sqft is not None and sqft > 0:
+            total_sqft_price += price
+            total_sqft += sqft
+    prices.sort()
+    if not prices:
+        return {"count": len(rows), "median_price": None, "average_price": None, "price_per_sqft": None}
+    middle = len(prices) // 2
+    if len(prices) % 2:
+        median_price = prices[middle]
+    else:
+        median_price = (prices[middle - 1] + prices[middle]) / 2.0
+    average_price = total_price / len(prices) if prices else None
+    price_per_sqft = (total_sqft_price / total_sqft) if total_sqft > 0 else None
+    return {
+        "count": len(rows),
+        "median_price": median_price,
+        "average_price": average_price,
+        "price_per_sqft": price_per_sqft,
+    }
+
+
+def build_rentcast_valuation_note(payload, fallback_address="", saved_at=None):
+    payload = payload if isinstance(payload, dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    action = normalize_whitespace(payload.get("action") or "")
+    if action.lower().replace("-", "_") != "valuation":
+        raise ValueError("Only RentCast valuation results can be saved to property notes.")
+    if not payload.get("ok"):
+        raise ValueError("RentCast valuation did not succeed, so there is nothing to save.")
+
+    saved_dt = saved_at or datetime.utcnow()
+    saved_label = format_est_datetime(format_db_time(saved_dt))
+    address = normalize_whitespace(payload.get("address") or fallback_address or "")
+    if not address:
+        address = normalize_whitespace(
+            ", ".join(
+                [
+                    part
+                    for part in [
+                        _rentcast_nested_value(data, "formattedAddress", "fullAddress", "addressLine1", "address"),
+                        _rentcast_nested_value(data, "city"),
+                        " ".join(
+                            [
+                                str(_rentcast_nested_value(data, "state") or "").strip(),
+                                str(_rentcast_nested_value(data, "zipCode", "postalCode") or "").strip(),
+                            ]
+                        ).strip(),
+                    ]
+                    if part
+                ]
+            )
+        )
+
+    estimate = _rentcast_number_value(
+        data,
+        "price",
+        "value",
+        "valuation",
+        "estimatedValue",
+        "estimate",
+        "avm",
+    )
+    estimate_low = _rentcast_number_value(
+        data,
+        "priceRangeLow",
+        "valueRangeLow",
+        "estimatedValueRangeLow",
+        "low",
+        "range.low",
+    )
+    estimate_high = _rentcast_number_value(
+        data,
+        "priceRangeHigh",
+        "valueRangeHigh",
+        "estimatedValueRangeHigh",
+        "high",
+        "range.high",
+    )
+    rent_estimate = _rentcast_number_value(
+        data,
+        "rent",
+        "rentEstimate",
+        "estimatedRent",
+        "estimated_rent",
+    )
+    confidence = _rentcast_nested_value(data, "confidenceScore", "confidence", "score")
+    comparables = data.get("comparables") if isinstance(data.get("comparables"), list) else []
+    comp_summary = _summarize_rentcast_comparables(comparables)
+
+    lines = [f"RentCast Valuation | Saved {saved_label}"]
+    if address:
+        lines.append(f"Address: {address}")
+    if estimate is not None:
+        lines.append(f"Estimated Value: {_rentcast_money_text(estimate)}")
+    if estimate_low is not None or estimate_high is not None:
+        low_text = _rentcast_money_text(estimate_low) or "?"
+        high_text = _rentcast_money_text(estimate_high) or "?"
+        lines.append(f"Estimated Range: {low_text} - {high_text}")
+    if rent_estimate is not None:
+        lines.append(f"Estimated Rent: {_rentcast_money_text(rent_estimate)}/mo")
+    confidence_text = _rentcast_count_text(confidence)
+    if confidence_text:
+        lines.append(f"Confidence: {confidence_text}")
+    if comp_summary["count"]:
+        lines.append(f"Comparable Count: {comp_summary['count']}")
+    if comp_summary["median_price"] is not None:
+        lines.append(f"Median Comp Price: {_rentcast_money_text(comp_summary['median_price'])}")
+    if comp_summary["average_price"] is not None:
+        lines.append(f"Average Comp Price: {_rentcast_money_text(comp_summary['average_price'])}")
+    if comp_summary["price_per_sqft"] is not None:
+        lines.append(f"Comp $/Sqft: {_rentcast_money_text(comp_summary['price_per_sqft'])}")
+    lines.append("Source: RentCast AVM")
+    return "\n".join([line for line in lines if line]).strip()
+
+
 def _normalize_listing_address_variants(full_address):
     address = re.sub(r"\s+", " ", str(full_address or "").strip())
     if not address:
@@ -28813,7 +29019,55 @@ def dashboard():
 
 @app.route("/tools/rentcast")
 def rentcast_tools_page():
-    return render_template("rentcast_tools.html")
+    ensure_db()
+    db = get_db()
+    selected_property_id = _safe_int(request.args.get("property_id") or 0, 0)
+    property_options = [
+        {
+            "id": int(row["id"]),
+            "full_address": _rentcast_property_display_address(dict(row)),
+        }
+        for row in db.execute(
+            """
+            SELECT p.id, a.street, a.city, a.state, a.postal_code
+            FROM properties p
+            JOIN addresses a ON a.id = p.property_address_id
+            ORDER BY p.created_at DESC, p.id DESC
+            LIMIT 500
+            """
+        ).fetchall()
+    ]
+    selected_property = None
+    if selected_property_id > 0:
+        selected_row = db.execute(
+            """
+            SELECT p.id, a.street, a.city, a.state, a.postal_code
+            FROM properties p
+            JOIN addresses a ON a.id = p.property_address_id
+            WHERE p.id = ?
+            LIMIT 1
+            """,
+            (selected_property_id,),
+        ).fetchone()
+        if selected_row:
+            selected_property = {
+                "id": int(selected_row["id"]),
+                "full_address": _rentcast_property_display_address(dict(selected_row)),
+            }
+            if not any(int(option["id"]) == selected_property["id"] for option in property_options):
+                property_options.insert(0, selected_property)
+    initial_address = normalize_whitespace(
+        request.args.get("address")
+        or ((selected_property or {}).get("full_address") if selected_property else "")
+    )
+    return render_template(
+        "rentcast_tools.html",
+        property_options=property_options,
+        selected_property_id=selected_property_id,
+        initial_address=initial_address,
+        page_notice=(request.args.get("notice") or "").strip(),
+        page_error=(request.args.get("error") or "").strip(),
+    )
 
 
 @app.route("/api/tools/rentcast", methods=["POST"])
@@ -28848,6 +29102,68 @@ def rentcast_tools_api():
         ), 400
     finally:
         db.close()
+
+
+@app.route("/api/properties/<int:property_id>/rentcast-valuation-note", methods=["POST"])
+def save_property_rentcast_valuation_note(property_id):
+    ensure_db()
+    db = get_db()
+    property_row = db.execute(
+        """
+        SELECT p.id,
+               p.owner_person_id,
+               p.notes,
+               a.street,
+               a.city,
+               a.state,
+               a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if property_row is None:
+        return jsonify({"ok": False, "error": "Property not found."}), 404
+
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    property_dict = dict(property_row)
+    fallback_address = _rentcast_property_display_address(property_dict)
+    try:
+        note_text = build_rentcast_valuation_note(payload, fallback_address=fallback_address, saved_at=datetime.utcnow())
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    combined_notes = append_note_line(property_dict.get("notes") or "", note_text)
+    db.execute("UPDATE properties SET notes = ? WHERE id = ?", (combined_notes, property_id))
+    db.execute(
+        """
+        INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            property_id,
+            property_row["owner_person_id"],
+            "RentCast Valuation",
+            "Saved to property notes",
+            note_text,
+        ),
+    )
+    db.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "notice": "RentCast valuation saved to property notes.",
+            "note_text": note_text,
+        }
+    )
 
 
 def _anon_return_target():

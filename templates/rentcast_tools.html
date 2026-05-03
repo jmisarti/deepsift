@@ -8,6 +8,12 @@
 </section>
 
 <section class="panel rentcast-tool-panel">
+    {% if page_notice %}
+    <div class="notice-banner">{{ page_notice }}</div>
+    {% endif %}
+    {% if page_error %}
+    <div class="error-banner">{{ page_error }}</div>
+    {% endif %}
     <div class="home-section-header">
         <div>
             <h2>Address Lookup</h2>
@@ -17,21 +23,42 @@
 
     <div class="grid-form compact rentcast-form-grid">
         <label class="span2">
+            <span>DeepSift property (optional)</span>
+            <select id="rentcastPropertySelect">
+                <option value="">Select a property to link this lookup</option>
+                {% for option in property_options %}
+                <option
+                    value="{{ option.id }}"
+                    data-address="{{ option.full_address }}"
+                    {% if option.id == selected_property_id %}selected{% endif %}
+                >
+                    #{{ option.id }} · {{ option.full_address }}
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+        <label class="span2">
             <span>Property address</span>
             <input
                 type="text"
                 id="rentcastAddress"
                 placeholder="123 Main St, Anytown, NJ 07000"
+                value="{{ initial_address or '' }}"
                 autocomplete="street-address"
                 spellcheck="false"
             >
         </label>
     </div>
 
+    <div class="notice-banner hidden" id="rentcastSaveNotice"></div>
+    <div class="error-banner hidden" id="rentcastSaveError"></div>
+
     <div class="rentcast-action-row">
         <button type="button" id="saleListingBtn">Run Sale Listing Check</button>
         <button type="button" id="valuationBtn">Run Valuation</button>
+        <button type="button" id="saveValuationBtn" class="hidden" disabled>Save Valuation to Property Notes</button>
     </div>
+    <p class="muted-text" id="rentcastSaveHint">Run a valuation, then save the result into a linked DeepSift property note.</p>
 
     <div class="busy-inline hidden" id="rentcastBusy">
         <span class="busy-spinner" aria-hidden="true"></span>
@@ -99,8 +126,13 @@
 <script>
 (function () {
     const addressInput = document.getElementById('rentcastAddress');
+    const propertySelect = document.getElementById('rentcastPropertySelect');
     const saleButton = document.getElementById('saleListingBtn');
     const valuationButton = document.getElementById('valuationBtn');
+    const saveValuationButton = document.getElementById('saveValuationBtn');
+    const saveHint = document.getElementById('rentcastSaveHint');
+    const saveNotice = document.getElementById('rentcastSaveNotice');
+    const saveError = document.getElementById('rentcastSaveError');
     const busyWrap = document.getElementById('rentcastBusy');
     const busyText = document.getElementById('rentcastBusyText');
     const output = document.getElementById('rentcastOutput');
@@ -109,13 +141,16 @@
     const medianPriceEl = document.getElementById('rentcastMedianPrice');
     const averagePriceEl = document.getElementById('rentcastAveragePrice');
     const pricePerSqftEl = document.getElementById('rentcastPricePerSqft');
+    let lastPayload = null;
 
     function setBusy(isBusy, label) {
         if (busyWrap) busyWrap.classList.toggle('hidden', !isBusy);
         if (busyText) busyText.textContent = label || 'Running request...';
         if (saleButton) saleButton.disabled = isBusy;
         if (valuationButton) valuationButton.disabled = isBusy;
+        if (saveValuationButton) saveValuationButton.disabled = isBusy || !canSaveCurrentValuation();
         if (addressInput) addressInput.disabled = isBusy;
+        if (propertySelect) propertySelect.disabled = isBusy;
     }
 
     function renderJson(payload) {
@@ -174,6 +209,48 @@
         const address1 = String(item.addressLine1 || '').trim();
         const address2 = String(item.addressLine2 || '').trim();
         return [address1, address2].filter(Boolean).join(' ');
+    }
+
+    function clearSaveMessages() {
+        if (saveNotice) {
+            saveNotice.textContent = '';
+            saveNotice.classList.add('hidden');
+        }
+        if (saveError) {
+            saveError.textContent = '';
+            saveError.classList.add('hidden');
+        }
+    }
+
+    function selectedPropertyId() {
+        return propertySelect && propertySelect.value ? propertySelect.value : '';
+    }
+
+    function canSaveCurrentValuation() {
+        return Boolean(
+            lastPayload &&
+            lastPayload.ok &&
+            String(lastPayload.action || '').toLowerCase() === 'valuation' &&
+            selectedPropertyId()
+        );
+    }
+
+    function syncSaveUi() {
+        const hasValuation = Boolean(lastPayload && String(lastPayload.action || '').toLowerCase() === 'valuation');
+        if (saveValuationButton) {
+            saveValuationButton.classList.toggle('hidden', !hasValuation);
+            saveValuationButton.disabled = !canSaveCurrentValuation();
+        }
+        if (!saveHint) return;
+        if (!hasValuation) {
+            saveHint.textContent = 'Run a valuation, then save the result into a linked DeepSift property note.';
+            return;
+        }
+        if (!selectedPropertyId()) {
+            saveHint.textContent = 'Select a DeepSift property first, then you can save this valuation into its notes.';
+            return;
+        }
+        saveHint.textContent = 'This valuation is ready to save into the selected DeepSift property notes.';
     }
 
     function updateSummaryCards(comparables) {
@@ -244,6 +321,7 @@
             return;
         }
 
+        clearSaveMessages();
         setBusy(true, label);
         if (comparablesWrap) comparablesWrap.classList.add('hidden');
         renderJson({ ok: false, status: 'running', action, address });
@@ -270,13 +348,65 @@
             if (!response.ok && (typeof payload !== 'object' || payload === null)) {
                 payload = { ok: false, status_code: response.status, error: 'Request failed.' };
             }
+            lastPayload = payload;
             renderJson(payload);
             renderComparables(payload);
         } catch (error) {
+            lastPayload = { ok: false, action, error: String(error) };
             renderJson({ ok: false, error: String(error) });
             renderComparables({});
         } finally {
+            syncSaveUi();
             setBusy(false);
+        }
+    }
+
+    async function saveValuationToProperty() {
+        if (!canSaveCurrentValuation()) {
+            syncSaveUi();
+            return;
+        }
+        clearSaveMessages();
+        const propertyId = selectedPropertyId();
+        const priorLabel = saveValuationButton ? saveValuationButton.textContent : '';
+        if (saveValuationButton) {
+            saveValuationButton.disabled = true;
+            saveValuationButton.textContent = 'Saving...';
+        }
+        setBusy(true, 'Saving valuation note...');
+        try {
+            const response = await fetch(`/api/properties/${propertyId}/rentcast-valuation-note`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                body: JSON.stringify(lastPayload || {})
+            });
+            let payload;
+            try {
+                payload = await response.json();
+            } catch (_err) {
+                payload = { ok: response.ok, error: 'Response was not valid JSON.' };
+            }
+            if (!response.ok || !payload.ok) {
+                throw new Error(payload.error || 'Could not save valuation to property notes.');
+            }
+            if (saveNotice) {
+                saveNotice.textContent = payload.notice || 'RentCast valuation saved to property notes.';
+                saveNotice.classList.remove('hidden');
+            }
+        } catch (error) {
+            if (saveError) {
+                saveError.textContent = String(error);
+                saveError.classList.remove('hidden');
+            }
+        } finally {
+            if (saveValuationButton) {
+                saveValuationButton.textContent = priorLabel || 'Save Valuation to Property Notes';
+            }
+            setBusy(false);
+            syncSaveUi();
         }
     }
 
@@ -290,6 +420,22 @@
             runTool('valuation', 'Running valuation call...');
         });
     }
+    if (saveValuationButton) {
+        saveValuationButton.addEventListener('click', function () {
+            saveValuationToProperty();
+        });
+    }
+    if (propertySelect) {
+        propertySelect.addEventListener('change', function () {
+            const option = propertySelect.options[propertySelect.selectedIndex];
+            const selectedAddress = option ? String(option.dataset.address || '').trim() : '';
+            if (selectedAddress) {
+                addressInput.value = selectedAddress;
+            }
+            clearSaveMessages();
+            syncSaveUi();
+        });
+    }
     if (addressInput) {
         addressInput.addEventListener('keydown', function (event) {
             if (event.key === 'Enter') {
@@ -298,6 +444,7 @@
             }
         });
     }
+    syncSaveUi();
 })();
 </script>
 {% endblock %}

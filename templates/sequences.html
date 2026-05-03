@@ -3,7 +3,7 @@
 <section class="panel">
     <h2>Sequence Campaigns</h2>
     <p>Create reusable campaigns, then enroll people from property/person pages.</p>
-    <p class="muted-text">Step behavior: <code>EMAIL</code> uses subject + body, <code>SMS</code> uses body, <code>VM_DROP</code> uses the body field as the Slybroadcast recording name, and <code>MAIL</code> uses the global direct mail template while keeping the body as an internal note.</p>
+    <p class="muted-text">Step behavior: <code>EMAIL</code> uses subject + body, <code>SMS</code> uses body, <code>VM_DROP</code> uses the body field as the Slybroadcast recording name, and <code>MAIL</code> uses the global direct mail template while keeping the body as an internal note. Campaigns made of only <code>MAIL</code> steps can now be launched manually from property and person pages.</p>
     {% if notice %}<div class="notice-banner">{{ notice }}</div>{% endif %}
     {% if error_notice %}<div class="error-banner">{{ error_notice }}</div>{% endif %}
 </section>

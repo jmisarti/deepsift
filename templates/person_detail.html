@@ -54,6 +54,59 @@
 </section>
 
 <section class="panel">
+    <details>
+        <summary><strong>Mail Campaigns</strong></summary>
+        <p class="muted-text">Start a mail-only sequence manually for this person. The campaign will stop itself if this person is marked deceased, the local status moves to DNC / opt-out / not interested, the linked property becomes on-market / sold, or the latest mail result is a bad address.</p>
+        {% if default_property_id %}
+            {% if mail_sequence_campaigns %}
+            <form method="post" action="{{ url_for('enroll_person_sequence_route', person_id=person.id) }}" class="grid-form compact loading-submit-form" data-loading-form>
+                <input type="hidden" name="property_id" value="{{ default_property_id }}">
+                <label>Mail Campaign
+                    <select name="campaign_id" required>
+                        {% for campaign in mail_sequence_campaigns %}
+                        <option value="{{ campaign.id }}">{{ campaign.name }}{% if campaign.description %} - {{ campaign.description }}{% endif %}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <button type="submit" data-loading-label="Starting..." {% if person.deceased %}disabled{% endif %}>Start Mail Campaign</button>
+            </form>
+            {% if mail_person_enrollments %}
+            <table class="compact-table home-trend-table">
+                <thead><tr><th>Campaign</th><th>Property</th><th>Status</th><th>Next Run</th><th></th></tr></thead>
+                <tbody>
+                    {% for enrollment in mail_person_enrollments %}
+                    <tr>
+                        <td>{{ enrollment.campaign_name }}</td>
+                        <td><a href="{{ url_for('property_detail', property_id=enrollment.property_id) }}">{{ enrollment.street }}, {{ enrollment.city }}, {{ enrollment.state }} {{ enrollment.postal_code }}</a></td>
+                        <td>{{ enrollment.status }}{% if enrollment.stopped_reason %} - {{ enrollment.stopped_reason }}{% endif %}</td>
+                        <td>{{ enrollment.next_run_at|fmt_est_datetime if enrollment.next_run_at else '-' }}</td>
+                        <td>
+                            {% if enrollment.status == 'Active' %}
+                            <form method="post" action="{{ url_for('stop_sequence_enrollment', enrollment_id=enrollment.id) }}" class="inline-form">
+                                <input type="hidden" name="redirect_to" value="person">
+                                <input type="hidden" name="person_id" value="{{ person.id }}">
+                                <input type="hidden" name="property_id" value="{{ enrollment.property_id }}">
+                                <button type="submit">Stop</button>
+                            </form>
+                            {% else %}
+                            <span class="muted-text">-</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% endif %}
+            {% else %}
+            <p class="muted-text">No mail-only campaigns exist yet. Build one on the Sequence Automation page with only <code>MAIL</code> steps, then come back here to launch it.</p>
+            {% endif %}
+        {% else %}
+        <p class="muted-text">This person needs a default property context before we can launch a mail campaign.</p>
+        {% endif %}
+    </details>
+</section>
+
+<section class="panel">
     <h3>Communication Summary (By Individual)</h3>
     <table class="crm-table">
         <thead><tr><th>Individual</th><th>Relationship</th><th>SMS Out</th><th>SMS In</th><th>Email Out</th><th>Email In</th><th>Emails Opened</th></tr></thead>

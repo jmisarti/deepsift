@@ -6411,6 +6411,76 @@ def get_sequence_steps(db, campaign_id):
     ).fetchall()
 
 
+def get_sequence_campaign_channels(db, campaign_id):
+    channels = set()
+    for step in get_sequence_steps(db, campaign_id):
+        channel = (step["channel"] or "SMS").strip().upper()
+        if channel:
+            channels.add(channel)
+    return channels
+
+
+def is_mail_only_sequence_campaign(db, campaign_id):
+    channels = get_sequence_campaign_channels(db, campaign_id)
+    return bool(channels) and channels == {"MAIL"}
+
+
+def get_mail_only_sequence_campaigns(db, only_active=False):
+    campaigns = get_sequence_campaigns(db, only_active=only_active)
+    return [campaign for campaign in campaigns if is_mail_only_sequence_campaign(db, campaign["id"])]
+
+
+def get_latest_mail_order_status_label(db, property_id, person_id):
+    if not property_id or not person_id:
+        return ""
+    row = db.execute(
+        """
+        SELECT status, response_json
+        FROM mail_orders
+        WHERE property_id = ? AND person_id = ?
+        ORDER BY COALESCE(status_updated_at, created_at) DESC, id DESC
+        LIMIT 1
+        """,
+        (property_id, person_id),
+    ).fetchone()
+    if not row:
+        return ""
+    response_payload = {}
+    raw_response = str(row["response_json"] or "").strip()
+    if raw_response:
+        try:
+            response_payload = json.loads(raw_response)
+        except Exception:
+            response_payload = {}
+    order_fields = extract_openletterconnect_order_fields(response_payload if isinstance(response_payload, dict) else {})
+    return _normalize_openletterconnect_status((row["status"] or order_fields["status"] or "").strip())
+
+
+def get_mail_sequence_suppression_reason(db, property_row, person_row):
+    if not property_row or not person_row:
+        return "Missing person or property context"
+    if int(person_row["deceased"] or 0) == 1:
+        return "Mail is blocked because this person is marked deceased."
+
+    person_status = str(person_row["outreach_status"] or "").strip()
+    person_status_key = person_status.lower()
+    if person_status_key in LEAD_STOP_STATUSES:
+        return f"Mail is blocked because the person's status is '{person_status or person_status_key}'."
+
+    property_status = str(property_row["status"] or "").strip()
+    property_status_key = property_status.lower()
+    if property_status_key in LEAD_STOP_STATUSES:
+        return f"Mail is blocked because the property status is '{property_status or property_status_key}'."
+    if property_status_key in ON_MARKET_STATUSES or property_status_key == "sold":
+        return f"Mail is blocked because the property status is '{property_status or property_status_key}'."
+
+    latest_mail_status = get_latest_mail_order_status_label(db, property_row["id"], person_row["id"])
+    if latest_mail_status == "Bad Address":
+        return "Mail is blocked because the latest OpenLetterConnect result was Bad Address."
+
+    return ""
+
+
 def parse_hhmm(value, default_hour, default_minute):
     text = (value or "").strip()
     m = re.match(r"^(\d{1,2}):(\d{2})$", text)
@@ -6865,7 +6935,7 @@ def enroll_person_in_sequence(db, campaign_id, property_id, person_id):
     campaign_id = int(campaign_id)
     property_id = int(property_id)
     person_id = int(person_id)
-    person = db.execute("SELECT id, deceased FROM people WHERE id = ?", (person_id,)).fetchone()
+    person = db.execute("SELECT id, deceased, outreach_status FROM people WHERE id = ?", (person_id,)).fetchone()
     if not person:
         raise ValueError("Person not found")
     if int(person["deceased"] or 0) == 1:
@@ -6878,7 +6948,7 @@ def enroll_person_in_sequence(db, campaign_id, property_id, person_id):
         raise ValueError("Campaign has no active steps")
     prop = db.execute(
         """
-        SELECT p.id, p.owner_person_id, a.street, a.city, a.state, a.postal_code
+        SELECT p.id, p.owner_person_id, p.property_address_id, p.status, a.street, a.city, a.state, a.postal_code
         FROM properties p
         JOIN addresses a ON a.id = p.property_address_id
         WHERE p.id = ?
@@ -6898,6 +6968,10 @@ def enroll_person_in_sequence(db, campaign_id, property_id, person_id):
         "MAIL": bool(mail_target),
     }
     needed_channels = {str(s["channel"] or "SMS").upper() for s in steps}
+    if "MAIL" in needed_channels:
+        suppression_reason = get_mail_sequence_suppression_reason(db, prop, person)
+        if suppression_reason:
+            raise ValueError(suppression_reason)
     if not any(availability.get(channel, False) for channel in needed_channels):
         raise ValueError("No usable contact info is available for the channels in this campaign")
     if "SMS" in needed_channels and not availability["SMS"]:
@@ -6967,7 +7041,7 @@ def run_sequence_tick():
             person = db.execute("SELECT * FROM people WHERE id = ?", (enr["person_id"],)).fetchone()
             prop = db.execute(
                 """
-                SELECT p.id, p.owner_person_id, a.street, a.city, a.state, a.postal_code
+                SELECT p.id, p.owner_person_id, p.property_address_id, p.status, a.street, a.city, a.state, a.postal_code
                 FROM properties p
                 JOIN addresses a ON a.id = p.property_address_id
                 WHERE p.id = ?
@@ -7019,6 +7093,29 @@ def run_sequence_tick():
             status = "Sent"
             comm_id = None
             error_text = ""
+            if channel == "MAIL":
+                suppression_reason = get_mail_sequence_suppression_reason(db, prop, person)
+                if suppression_reason:
+                    db.execute(
+                        """
+                        INSERT INTO sequence_events (enrollment_id, step_id, step_order, channel, status, communication_id, error_text)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            enr["id"],
+                            next_step["id"] if next_step else None,
+                            next_step["step_order"] if next_step else None,
+                            channel,
+                            "Stopped",
+                            None,
+                            suppression_reason,
+                        ),
+                    )
+                    db.execute(
+                        "UPDATE sequence_enrollments SET status = 'Stopped', stopped_reason = ?, completed_at = ?, next_run_at = NULL WHERE id = ?",
+                        (suppression_reason, format_db_time(now), enr["id"]),
+                    )
+                    continue
             try:
                 body = render_sequence_template(next_step["body_template"], person, prop, owner)
                 if channel == "EMAIL":
@@ -35008,6 +35105,7 @@ def property_detail(property_id):
             }
         )
     sequence_campaigns = get_sequence_campaigns(db, only_active=True)
+    mail_sequence_campaigns = get_mail_only_sequence_campaigns(db, only_active=True)
     target_ids = _property_sequence_targets(db, property_id)
     sequence_targets = []
     if target_ids:
@@ -35028,6 +35126,10 @@ def property_detail(property_id):
         """,
         (property_id,),
     ).fetchall()
+    mail_sequence_campaign_ids = {int(c["id"]) for c in mail_sequence_campaigns}
+    mail_sequence_enrollments = [
+        row for row in sequence_enrollments if int(row["campaign_id"] or 0) in mail_sequence_campaign_ids
+    ]
     agent_trace = _agent_trace_for_property(db, property_id, limit=25) or {}
 
     return render_template(
@@ -35056,8 +35158,10 @@ def property_detail(property_id):
         social_url=normalize_social_profile_url,
         person_name=person_name,
         sequence_campaigns=sequence_campaigns,
+        mail_sequence_campaigns=mail_sequence_campaigns,
         sequence_targets=sequence_targets,
         sequence_enrollments=sequence_enrollments,
+        mail_sequence_enrollments=mail_sequence_enrollments,
         agent_trace=agent_trace,
         related_website_lead=related_website_lead,
         page_notice=(request.args.get("notice") or request.args.get("seq_notice") or "").strip(),
@@ -35350,6 +35454,7 @@ def person_detail(person_id):
         (person_id,),
     ).fetchall()
     sequence_campaigns = get_sequence_campaigns(db, only_active=True)
+    mail_sequence_campaigns = get_mail_only_sequence_campaigns(db, only_active=True)
     person_enrollments = db.execute(
         """
         SELECT e.*, c.name AS campaign_name, a.street, a.city, a.state, a.postal_code
@@ -35363,6 +35468,10 @@ def person_detail(person_id):
         """,
         (person_id,),
     ).fetchall()
+    mail_sequence_campaign_ids = {int(c["id"]) for c in mail_sequence_campaigns}
+    mail_person_enrollments = [
+        row for row in person_enrollments if int(row["campaign_id"] or 0) in mail_sequence_campaign_ids
+    ]
     skiptrace_origin = db.execute(
         """
         SELECT r.subject_person_id,
@@ -35427,7 +35536,9 @@ def person_detail(person_id):
         smrt_from_number=get_deep_dive_sms_number(db),
         social_url=normalize_social_profile_url,
         sequence_campaigns=sequence_campaigns,
+        mail_sequence_campaigns=mail_sequence_campaigns,
         person_enrollments=person_enrollments,
+        mail_person_enrollments=mail_person_enrollments,
         person_comm_summary_rows=person_comm_summary_rows,
         seq_notice=(request.args.get("seq_notice") or "").strip(),
     )

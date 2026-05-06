@@ -67,3 +67,20 @@ Questions for later:
 - Which address normalization rules we want before calling the valuation endpoint
 - Whether we should store the raw valuation payload, normalized summary fields, or both
 - Which workflows should consume the valuation once it is available
+
+## REISift-only SMS / phone-context attachment
+
+Future consideration:
+- When SmrtPhone or similar inbound communication resolves only to REISift context, try to attach the new phone number to an existing local DeepSift property before treating it as unresolved.
+
+Suggested resolution order:
+- Match by existing local phone touchpoint first
+- Then by REISift property UUID already linked on a local property
+- Then by normalized address match
+- Then by a single clear owner/person match
+- Only create a brand-new local property if no existing local match exists
+
+Important caution:
+- A new phone number does not necessarily mean a new property.
+- Existing leads may text or call from alternate numbers, and REISift may also contain owner numbers that DeepSift has not learned yet.
+- We should prefer attaching those numbers to the existing lead/property record instead of creating duplicates.

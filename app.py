@@ -2897,14 +2897,29 @@ def _derive_propertyleads_event_key(payload):
 
 def _extract_propertyleads_fields(payload):
     first_name = (
-        extract_first_string_by_keys(payload, ["first_name", "firstName", "firstname", "First_Name"])
+        extract_first_string_by_keys(
+            payload,
+            ["first_name", "firstName", "firstname", "First_Name", "First Name", "owner_first_name"],
+        )
         or ""
     ).strip()
     last_name = (
-        extract_first_string_by_keys(payload, ["last_name", "lastName", "lastname", "Last_Name"])
+        extract_first_string_by_keys(
+            payload,
+            ["last_name", "lastName", "lastname", "Last_Name", "Last Name", "owner_last_name"],
+        )
         or ""
     ).strip()
     seller_name = " ".join([part for part in [first_name, last_name] if part]).strip()
+    if not seller_name:
+        seller_name = (
+            extract_first_string_by_keys(payload, ["seller_name", "name", "full_name", "owner_name", "customer_name"])
+            or ""
+        ).strip()
+        if seller_name and (not first_name or not last_name):
+            parsed_name = _parse_seller_name_for_owner(seller_name)
+            first_name = first_name or parsed_name.get("first_name") or ""
+            last_name = last_name or parsed_name.get("last_name") or ""
     street = (
         extract_first_string_by_keys(
             payload,
@@ -3145,6 +3160,8 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
             state=fields.get("state") or "",
             postal_code=fields.get("postal_code") or "",
             seller_name=fields.get("seller_name") or "",
+            first_name=fields.get("first_name") or "",
+            last_name=fields.get("last_name") or "",
             phone=fields.get("phone") or "",
             email=fields.get("email") or "",
             lead_key=lead_key,
@@ -12198,6 +12215,14 @@ def _parse_seller_name_for_owner(name):
     return {"first_name": bits[0], "last_name": bits[-1]}
 
 
+def _is_placeholder_submitted_person_name(first_name, last_name):
+    first_norm = str(first_name or "").strip().lower()
+    last_norm = str(last_name or "").strip().lower()
+    placeholder_first = {"", "submitted", "unknown"}
+    placeholder_last = {"", "lead", "person", "unknown"}
+    return first_norm in placeholder_first and last_norm in placeholder_last
+
+
 def _build_clever_lead_notes(row_data):
     owner_name = _row_value_by_keys(row_data, ["Seller Name"])
     owner_split = _parse_seller_name_for_owner(owner_name)
@@ -12320,9 +12345,15 @@ def _extract_website_lead_fields(payload):
         # Step-2 schema currently uses: 2=email, 3=phone
         phone = _payload_value_by_keys(payload, ["phone", "phone_number", "mobile"]) or raw_phone_3
         email = _payload_value_by_keys(payload, ["email", "email_address"]) or raw_phone_2
-    seller_name = _payload_value_by_keys(payload, ["seller_name", "name", "full_name", "owner_name"])
-    first_name = _payload_value_by_keys(payload, ["first_name", "firstname", "1.3"])
-    last_name = _payload_value_by_keys(payload, ["last_name", "lastname", "1.6"])
+    seller_name = _payload_value_by_keys(payload, ["seller_name", "name", "full_name", "owner_name", "customer_name"])
+    first_name = _payload_value_by_keys(
+        payload,
+        ["first_name", "firstname", "owner_first_name", "customer_first_name", "first name", "1.3"],
+    )
+    last_name = _payload_value_by_keys(
+        payload,
+        ["last_name", "lastname", "owner_last_name", "customer_last_name", "last name", "1.6"],
+    )
     stage = (
         _payload_value_by_keys(payload, ["stage", "page", "form_step", "submission_type", "form_name", "form_id"])
         or "website_submission"
@@ -13532,6 +13563,8 @@ def recover_missing_propertyleads_submissions_from_events(db, limit=250):
                     state=fields.get("state") or "",
                     postal_code=fields.get("postal_code") or "",
                     seller_name=fields.get("seller_name") or "",
+                    first_name=fields.get("first_name") or "",
+                    last_name=fields.get("last_name") or "",
                     phone=fields.get("phone") or "",
                     email=fields.get("email") or "",
                     lead_key=lead_key,
@@ -13605,6 +13638,8 @@ def ensure_local_property_for_submitted_lead(
     state="",
     postal_code="",
     seller_name="",
+    first_name="",
+    last_name="",
     phone="",
     email="",
     property_uuid="",
@@ -13732,9 +13767,19 @@ def ensure_local_property_for_submitted_lead(
         _set_local_owner_uuid(db, property_id, owner_uuid)
 
     seller_name = normalize_whitespace(seller_name)
+    first_name = normalize_whitespace(first_name)
+    last_name = normalize_whitespace(last_name)
+    if not seller_name and (first_name or last_name):
+        seller_name = normalize_whitespace(" ".join([x for x in [first_name, last_name] if x]))
     phone_value = normalize_phone(phone or "")
     email_value = normalize_email(email or "")
     name_parts = _parse_seller_name_for_owner(seller_name)
+    if not name_parts.get("first_name") and first_name:
+        name_parts["first_name"] = first_name
+    if not name_parts.get("last_name") and last_name:
+        name_parts["last_name"] = last_name
+    norm_first_name = name_parts.get("first_name") or ""
+    norm_last_name = name_parts.get("last_name") or ""
 
     if not owner_person_id and (name_parts.get("first_name") or name_parts.get("last_name") or phone_value or email_value):
         person_notes = f"Created from {source_label} submitted lead."
@@ -13763,12 +13808,22 @@ def ensure_local_property_for_submitted_lead(
 
     if owner_person_id > 0:
         person_row = db.execute(
-            "SELECT id, primary_phone, primary_email FROM people WHERE id = ? LIMIT 1",
+            "SELECT id, first_name, last_name, primary_phone, primary_email FROM people WHERE id = ? LIMIT 1",
             (owner_person_id,),
         ).fetchone()
         if person_row:
             assignments = []
             params = []
+            current_first = str(person_row["first_name"] or "").strip()
+            current_last = str(person_row["last_name"] or "").strip()
+            if (norm_first_name or norm_last_name) and _is_placeholder_submitted_person_name(current_first, current_last):
+                next_first, next_last = normalize_first_last(norm_first_name, norm_last_name)
+                if next_first:
+                    assignments.append("first_name = ?")
+                    params.append(next_first)
+                if next_last:
+                    assignments.append("last_name = ?")
+                    params.append(next_last)
             if phone_value and not normalize_phone(person_row["primary_phone"] or ""):
                 assignments.append("primary_phone = ?")
                 params.append(phone_value)
@@ -14089,6 +14144,8 @@ def _build_submitted_lead_item(db, source, row):
                 state=state,
                 postal_code=postal_code,
                 seller_name=str(row["latest_name"] or fields.get("seller_name") or "").strip(),
+                first_name=fields.get("first_name") or "",
+                last_name=fields.get("last_name") or "",
                 phone=phone_value,
                 email=email_value,
                 property_uuid=created_uuid,
@@ -14390,6 +14447,8 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             state=fields.get("state") or "",
             postal_code=fields.get("postal_code") or "",
             seller_name=fields.get("seller_name") or "",
+            first_name=fields.get("first_name") or "",
+            last_name=fields.get("last_name") or "",
             phone=phone,
             email=email,
             property_uuid=current_property_uuid,
@@ -14642,6 +14701,8 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 state=merged_fields.get("state") or "",
                 postal_code=merged_fields.get("postal_code") or "",
                 seller_name=merged_fields.get("seller_name") or "",
+                first_name=merged_fields.get("first_name") or "",
+                last_name=merged_fields.get("last_name") or "",
                 phone=merged_fields.get("phone") or "",
                 email=merged_fields.get("email") or "",
                 property_uuid=created_uuid,
@@ -16962,6 +17023,8 @@ def process_clever_webhook_payload(db, payload, source_label="webhook"):
             state=fields.get("state") or "",
             postal_code=fields.get("postal_code") or "",
             seller_name=seller_name,
+            first_name=fields.get("first_name") or "",
+            last_name=fields.get("last_name") or "",
             phone=phone,
             email=email,
             property_uuid=existing_uuid,
@@ -18773,6 +18836,8 @@ def run_website_step1_hold_once():
                     state=merged_fields.get("state") or "",
                     postal_code=merged_fields.get("postal_code") or "",
                     seller_name=merged_fields.get("seller_name") or "",
+                    first_name=merged_fields.get("first_name") or "",
+                    last_name=merged_fields.get("last_name") or "",
                     phone=merged_fields.get("phone") or "",
                     email=merged_fields.get("email") or "",
                     property_uuid=created_uuid,
@@ -32492,6 +32557,8 @@ def _ensure_local_property_for_website_lead_submission(
         state=merged_fields.get("state") or "",
         postal_code=merged_fields.get("postal_code") or "",
         seller_name=merged_fields.get("seller_name") or "",
+        first_name=merged_fields.get("first_name") or "",
+        last_name=merged_fields.get("last_name") or "",
         phone=merged_fields.get("phone") or "",
         email=merged_fields.get("email") or "",
         property_uuid=created_uuid,

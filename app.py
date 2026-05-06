@@ -37951,40 +37951,66 @@ def smrtphone_inbound_webhook(payload=None, db=None):
             if not person_id and int(reisift_context.get("person_id") or 0):
                 person_id = int(reisift_context.get("person_id") or 0)
     resolved_reisift_uuid = normalize_uuid(reisift_context.get("reisift_property_uuid") or "")
-    has_resolved_context = bool(int(property_id or 0)) or bool(resolved_reisift_uuid)
-    if not has_resolved_context:
+    has_local_property = bool(int(property_id or 0))
+    if not has_local_property:
         signal = classify_unknown_contact_text(message)
         source_key_basis = sms_id or hashlib.sha1(
             f"{event_type}|{from_number}|{to_number}|{message}|{event_name}".encode("utf-8", errors="ignore")
         ).hexdigest()[:20]
         source_key = f"sms-unresolved:{source_key_basis}"
+        reisift_only_context = bool(resolved_reisift_uuid)
+        unresolved_classification = "potential_seller" if reisift_only_context else signal["classification"]
+        unresolved_source = "smrtphone_webhook_reisift_only" if reisift_only_context else "smrtphone_webhook_unresolved"
+        unresolved_confidence = 0.78 if reisift_only_context else 0.55
+        unresolved_note = f"direction={direction}; event={event_name or event_type}"
+        if reisift_only_context:
+            unresolved_note += "; no_local_property=1"
         upsert_cached_contact_context(
             db,
             counterparty_number,
             property_id=None,
-            person_id=None,
-            classification=signal["classification"],
-            source="smrtphone_webhook_unresolved",
-            confidence=0.55,
-            notes=f"direction={direction}; event={event_name or event_type}",
+            person_id=person_id,
+            classification=unresolved_classification,
+            source=unresolved_source,
+            confidence=unresolved_confidence,
+            notes=unresolved_note,
+            reisift_property_uuid=resolved_reisift_uuid,
+            reisift_full_address=str(reisift_context.get("reisift_full_address") or "").strip(),
+            reisift_owner_name=str(reisift_context.get("reisift_owner_name") or "").strip(),
+            reisift_property_status=str(reisift_context.get("reisift_property_status") or "").strip(),
+            last_reisift_lookup_at=format_db_time(datetime.utcnow()) if reisift_only_context else None,
         )
+        summary_prefix = "REISift-only" if reisift_only_context else "Unresolved"
         upsert_agent_signal(
             db,
             source_type="sms",
             source_key=source_key,
             property_id=None,
-            person_id=None,
+            person_id=person_id,
             channel="SMS",
             intent=signal["intent"],
             sentiment="Unknown",
-            confidence=0.55,
+            confidence=unresolved_confidence,
             recommended_next_step=signal["recommended"],
-            summary_text=f"Unresolved {direction.lower()} SMS: {message[:240]}",
+            summary_text=f"{summary_prefix} {direction.lower()} SMS: {message[:240]}",
             is_spam=(signal["classification"] in {"spam", "solicitor"}),
             do_not_contact=(signal["classification"] in {"spam", "solicitor"}),
-            payload={"event": event_name, "from": from_number, "to": to_number, "message": message, "classification": signal["classification"]},
+            payload={
+                "event": event_name,
+                "from": from_number,
+                "to": to_number,
+                "message": message,
+                "classification": signal["classification"],
+                "reisift_property_uuid": resolved_reisift_uuid,
+                "reisift_full_address": str(reisift_context.get("reisift_full_address") or "").strip(),
+            },
         )
         route_new_agent_signals_once(db, limit=10)
+        unresolved_error = (
+            f"REISift context found without local property for {direction.lower()} message (event={event_name or 'unknown'}); uuid={resolved_reisift_uuid or '-'}"
+            if reisift_only_context
+            else f"Context unresolved for {direction.lower()} message (event={event_name or 'unknown'}); classified={signal['classification']}"
+        )
         log_smrtphone_webhook_event(
             db,
             event_type,
@@ -37993,10 +38019,17 @@ def smrtphone_inbound_webhook(payload=None, db=None):
             sms_id=sms_id,
             from_number=from_number,
             to_number=to_number,
-            error_text=f"Context unresolved for {direction.lower()} message (event={event_name or 'unknown'}); classified={signal['classification']}",
+            error_text=unresolved_error,
         )
         db.commit()
-        return jsonify({"ok": True, "stored_unresolved": True, "classification": signal["classification"]}), 200
+        return jsonify(
+            {
+                "ok": True,
+                "stored_unresolved": True,
+                "classification": signal["classification"],
+                "reisift_only_context": reisift_only_context,
+            }
+        ), 200
     if not person_id:
         if property_id:
             person_id = find_person_id_by_recent_outbound_to_number(db, property_id, counterparty_number)

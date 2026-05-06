@@ -1719,9 +1719,10 @@ def _is_emaillistverify_accept_all_status(*parts):
     )
 
 
-def emit_provider_alert(source, error_message, details="", route="", status_code=500):
+def emit_provider_alert(source, error_message, details="", route="", status_code=500, db=None):
     ensure_db()
-    alert_db = open_sqlite_connection()
+    owns_db = db is None
+    alert_db = db if db is not None else open_sqlite_connection()
     slack_result = {"ok": False, "error": ""}
     try:
         source_text = str(source or f"{PROVIDER_ALERT_SOURCE_PREFIX}unknown").strip()[:80] or f"{PROVIDER_ALERT_SOURCE_PREFIX}unknown"
@@ -1755,7 +1756,8 @@ def emit_provider_alert(source, error_message, details="", route="", status_code
             status_code=status_code,
         )
         alert_id = int(alert_db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-        alert_db.commit()
+        if owns_db:
+            alert_db.commit()
         provider_label = _provider_alert_label(source_text)
         slack_lines = [
             "Provider alert in Deep Prospect CRM",
@@ -1786,7 +1788,8 @@ def emit_provider_alert(source, error_message, details="", route="", status_code
                 slack_result = {"ok": False, "error": str(exc)}
         return {"ok": True, "duplicate": False, "alert_id": alert_id, "slack": slack_result}
     finally:
-        alert_db.close()
+        if owns_db:
+            alert_db.close()
 
 
 def init_db():
@@ -38792,6 +38795,107 @@ def _openletterconnect_build_note_text(record):
     return "\n".join(lines)
 
 
+def _openletterconnect_property_link(db, property_id):
+    try:
+        property_id_int = int(property_id or 0)
+    except (TypeError, ValueError):
+        property_id_int = 0
+    if property_id_int <= 0:
+        return ""
+    base_url = get_public_app_base_url(db)
+    if not base_url:
+        return ""
+    return f"{base_url.rstrip('/')}/property/{property_id_int}"
+
+
+def _openletterconnect_row_property_address(db, mail_order_row, record):
+    property_id = int(mail_order_row["property_id"] or 0) if mail_order_row and mail_order_row["property_id"] else 0
+    if property_id:
+        from_property = _property_address_string(db, property_id)
+        if from_property:
+            return from_property
+    if isinstance(record.get("utm_details"), dict):
+        from_utm = str(record["utm_details"].get("utm_property_address") or "").strip()
+        if from_utm:
+            return from_utm
+    request_payload = {}
+    try:
+        request_payload = json.loads(mail_order_row["request_json"] or "{}") if mail_order_row else {}
+    except Exception:
+        request_payload = {}
+    property_block = request_payload.get("property") if isinstance(request_payload, dict) and isinstance(request_payload.get("property"), dict) else {}
+    if property_block:
+        formatted = format_property_address_line(
+            property_block.get("street"),
+            property_block.get("city"),
+            property_block.get("state"),
+            property_block.get("postal_code") or property_block.get("zip"),
+        )
+        if formatted:
+            return formatted
+    return ""
+
+
+def _notify_openletterconnect_bad_address(db, rows, record, route):
+    display_status = str(record.get("display_status") or "").strip().lower()
+    if display_status != "bad address":
+        return []
+    emitted = []
+    seen = set()
+    for row in rows or []:
+        property_id = int(row["property_id"] or 0) if row["property_id"] else 0
+        order_id = str(record.get("order_id") or row["external_order_id"] or "").strip()
+        order_item_id = str(record.get("order_item_id") or "").strip()
+        dedupe_key = (property_id, order_id, order_item_id)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        property_address = _openletterconnect_row_property_address(db, row, record)
+        property_link = _openletterconnect_property_link(db, property_id)
+        contact_name = str(record.get("contact_name") or "").strip()
+        if not contact_name and row["person_id"]:
+            person = db.execute("SELECT first_name, last_name FROM people WHERE id = ?", (int(row["person_id"]),)).fetchone()
+            if person:
+                contact_name = " ".join([str(person["first_name"] or "").strip(), str(person["last_name"] or "").strip()]).strip()
+        alert_subject = property_address or f"order {order_id or 'unknown'}"
+        if order_id:
+            error_message = f"Bad Address: {alert_subject} (order {order_id})"
+        else:
+            error_message = f"Bad Address: {alert_subject}"
+        detail_lines = []
+        if property_address:
+            detail_lines.append(f"Property: {property_address}")
+        if property_link:
+            detail_lines.append(f"DeepSift: {property_link}")
+        if contact_name:
+            detail_lines.append(f"Contact: {contact_name}")
+        if order_id:
+            detail_lines.append(f"Order ID: {order_id}")
+        if order_item_id:
+            detail_lines.append(f"Mail Piece ID: {order_item_id}")
+        raw_status = str(record.get("raw_status") or "").strip()
+        if raw_status:
+            detail_lines.append(f"Provider Status: {raw_status}")
+        event_type = str(record.get("event_type") or "").strip()
+        if event_type:
+            detail_lines.append(f"Event: {event_type}")
+        event_at = str(record.get("event_at") or "").strip()
+        if event_at:
+            detail_lines.append(f"At: {event_at}")
+        detail_text = "\n".join(detail_lines)
+        emitted.append(
+            emit_provider_alert(
+                f"{PROVIDER_ALERT_SOURCE_PREFIX}openletterconnect",
+                error_message,
+                details=detail_text,
+                route=route,
+                status_code=422,
+                db=db,
+            )
+        )
+    return emitted
+
+
 def _extract_openletterconnect_contact_name(contact_obj):
     if not isinstance(contact_obj, dict):
         return ""
@@ -38998,6 +39102,7 @@ def _process_openletterconnect_event_record(db, record, payload):
             note_text,
             {"record": record, "payload": payload},
         )
+    _notify_openletterconnect_bad_address(db, rows, record, "/webhooks/openletterconnect/events")
 
     tag_plan = build_reisift_mail_status_tag_plan(record.get("display_status"), when=parse_db_time(record.get("event_at")))
     if unique_property_uuids:
@@ -39288,6 +39393,7 @@ def openletterconnect_order_status_webhook():
 
     now_txt = format_db_time(datetime.utcnow())
     note_status = status or "Update received"
+    normalized_status = _normalize_openletterconnect_status(status)
     for row in rows:
         db.execute(
             "UPDATE mail_orders SET status = COALESCE(NULLIF(?, ''), status), response_json = ? WHERE id = ?",
@@ -39323,6 +39429,16 @@ def openletterconnect_order_status_webhook():
                 json.dumps(payload),
             ),
         )
+    synthetic_record = {
+        "display_status": normalized_status,
+        "raw_status": status,
+        "order_id": external_order_id,
+        "order_item_id": "",
+        "contact_name": "",
+        "event_type": "order_status_webhook",
+        "event_at": now_txt,
+    }
+    _notify_openletterconnect_bad_address(db, rows, synthetic_record, "/webhooks/openletterconnect/order-status")
     db.commit()
     return jsonify({"ok": True, "updated_orders": len(rows)}), 200
 
@@ -40628,7 +40744,7 @@ def api_recent_provider_alerts():
         limit = 15
     rows = db.execute(
         """
-        SELECT id, source, route, status_code, error_message, created_at
+        SELECT id, source, route, status_code, error_message, details, created_at
         FROM app_errors
         WHERE source LIKE ?
           AND COALESCE(dismissed_at, '') = ''
@@ -40647,6 +40763,7 @@ def api_recent_provider_alerts():
                 "route": row["route"] or "",
                 "status_code": row["status_code"],
                 "error_message": row["error_message"] or "",
+                "details": row["details"] or "",
                 "created_at": row["created_at"] or "",
             }
         )

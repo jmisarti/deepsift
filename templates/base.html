@@ -120,6 +120,11 @@
         return (text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       }
 
+      function linkify(text) {
+        const safe = esc(text || '');
+        return safe.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>').replace(/\n/g, '<br>');
+      }
+
       function setCount(el, n) {
         if (!el) return;
         el.textContent = String(n);
@@ -186,10 +191,12 @@
         providerList.innerHTML = items.map((item) => {
           const provider = esc(item.provider_label || item.source || 'Provider');
           const message = esc(item.error_message || 'Provider error');
+          const details = String(item.details || '').trim();
           const route = esc(item.route || '');
           const createdAt = esc(item.created_at || '');
-          const meta = route ? `${createdAt} • ${route}` : createdAt;
-          return `<article class="top-notify-item top-notify-item-alert"><p class="top-notify-alert-title">${provider}</p><p class="top-notify-alert-body">${message}</p><p>${meta}</p></article>`;
+          const meta = route ? `${createdAt} | ${route}` : createdAt;
+          const detailHtml = details ? `<p class="top-notify-alert-details">${linkify(details)}</p>` : '';
+          return `<article class="top-notify-item top-notify-item-alert"><p class="top-notify-alert-title">${provider}</p><p class="top-notify-alert-body">${message}</p>${detailHtml}<p>${meta}</p></article>`;
         }).join('');
       }
 

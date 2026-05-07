@@ -12936,9 +12936,7 @@ def _reisift_mail_status_tag_variants(base_tag, when=None):
 def build_reisift_mail_status_tag_plan(status_label, when=None):
     normalized = str(status_label or "").strip().lower()
     mapping = {
-        "pending": "DMPending",
         "mailed": "DMMailed",
-        "in transit": "DMInTransit",
         "delivered": "DMDelivered",
         "bad address": "DMBadAddress",
         "qr scanned": "DMQRScanned",
@@ -12946,11 +12944,10 @@ def build_reisift_mail_status_tag_plan(status_label, when=None):
     base_tag = mapping.get(normalized)
     if not base_tag:
         return {"add": [], "remove_prefixes": []}
-    transient_prefixes = ["DMPending", "DMInTransit", "DMDelivered", "DMBadAddress"]
-    remove_prefixes = list(transient_prefixes) if normalized != "qr scanned" else []
+    if normalized == "qr scanned":
+        return {"add": _reisift_mail_status_tag_variants(base_tag, when=when), "remove_prefixes": []}
+    remove_prefixes = ["DMPending", "DMInTransit"]
     add_tags = _reisift_mail_status_tag_variants(base_tag, when=when)
-    if normalized in {"in transit", "delivered", "bad address"}:
-        add_tags.extend(_reisift_mail_status_tag_variants("DMMailed", when=when))
     return {
         "add": add_tags,
         "remove_prefixes": remove_prefixes,
@@ -39055,10 +39052,10 @@ def _normalize_openletterconnect_status(raw_status, event_type=""):
         return "In Transit"
     if "returned" in lower or "failed" in lower or "bad address" in lower or "undeliverable" in lower or "canceled" in lower:
         return "Bad Address"
-    if "mailed" in lower:
-        return "Mailed"
     if "processing" in lower or "not mailed" in lower or "pending" in lower or "created" in lower or "submitted" in lower or "queued" in lower:
         return "Pending"
+    if "mailed" in lower:
+        return "Mailed"
     return raw_text.title()
 
 
@@ -39067,6 +39064,79 @@ def _openletterconnect_event_status_update(display_status):
     if normalized == "qr scanned":
         return ""
     return str(display_status or "").strip()
+
+
+def _openletterconnect_status_label(value):
+    return str(value or "").strip().lower()
+
+
+def _openletterconnect_status_changed(previous_status, new_status):
+    previous_label = _openletterconnect_status_label(_normalize_openletterconnect_status(previous_status))
+    new_label = _openletterconnect_status_label(new_status)
+    return bool(new_label) and previous_label != new_label
+
+
+def _openletterconnect_timestamp_column_for_status(status_label):
+    normalized = _openletterconnect_status_label(status_label)
+    return {
+        "mailed": "mailed_at",
+        "in transit": "in_transit_at",
+        "delivered": "delivered_at",
+        "bad address": "bad_address_at",
+        "qr scanned": "qr_scanned_at",
+    }.get(normalized, "")
+
+
+def _openletterconnect_local_day_key(value):
+    dt = parse_db_time(value)
+    if not isinstance(dt, datetime):
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=EST_TZ)
+    else:
+        dt = dt.astimezone(EST_TZ)
+    return dt.strftime("%Y-%m-%d")
+
+
+def _should_emit_reisift_mail_status(status_label):
+    return _openletterconnect_status_label(status_label) in {"mailed", "delivered", "bad address"}
+
+
+def _property_has_mail_status_on_day(db, property_id, status_label, event_at, exclude_mail_order_id=0):
+    try:
+        property_id_int = int(property_id or 0)
+    except (TypeError, ValueError):
+        property_id_int = 0
+    try:
+        exclude_id_int = int(exclude_mail_order_id or 0)
+    except (TypeError, ValueError):
+        exclude_id_int = 0
+    if property_id_int <= 0:
+        return False
+    timestamp_col = _openletterconnect_timestamp_column_for_status(status_label)
+    if not timestamp_col:
+        return False
+    target_day = _openletterconnect_local_day_key(event_at)
+    if not target_day:
+        return False
+    rows = db.execute(
+        f"""
+        SELECT id, {timestamp_col} AS status_at
+        FROM mail_orders
+        WHERE property_id = ? AND {timestamp_col} IS NOT NULL
+        """,
+        (property_id_int,),
+    ).fetchall()
+    for row in rows:
+        try:
+            row_id = int(row["id"] or 0)
+        except (TypeError, ValueError):
+            row_id = 0
+        if exclude_id_int > 0 and row_id == exclude_id_int:
+            continue
+        if _openletterconnect_local_day_key(row["status_at"]) == target_day:
+            return True
+    return False
 
 
 def _openletterconnect_build_note_text(record):
@@ -39091,6 +39161,17 @@ def _openletterconnect_build_note_text(record):
             lines.append(f"UTM Campaign: {utm_details.get('utm_campaign')}")
         if utm_details.get("utm_property_address"):
             lines.append(f"UTM Property Address: {utm_details.get('utm_property_address')}")
+    return "\n".join(lines)
+
+
+def _openletterconnect_build_reisift_note_text(record):
+    lines = [f"OpenLetterConnect: {record.get('display_status') or 'Update'}"]
+    if record.get("contact_name"):
+        lines.append(f"Contact: {record['contact_name']}")
+    if record.get("event_at"):
+        lines.append(f"At: {record['event_at']}")
+    if record.get("scan_count"):
+        lines.append(f"Scan Count: {record['scan_count']}")
     return "\n".join(lines)
 
 
@@ -39312,6 +39393,9 @@ def _extract_openletterconnect_events(payload):
 def _apply_openletterconnect_event_to_mail_order(db, mail_order_row, record, payload):
     event_at = str(record.get("event_at") or format_db_time(datetime.utcnow())).strip()
     status_update = str(record.get("status_update") or "").strip()
+    previous_status = str(mail_order_row["status"] or "").strip()
+    status_changed = _openletterconnect_status_changed(previous_status, record.get("display_status"))
+    is_qr_scan = str(record.get("display_status") or "").strip().lower() == "qr scanned"
     update_bits = [
         "response_json = ?",
         "last_event_type = ?",
@@ -39320,22 +39404,22 @@ def _apply_openletterconnect_event_to_mail_order(db, mail_order_row, record, pay
         json.dumps(payload or {}, default=str),
         str(record.get("event_type") or "").strip(),
     ]
-    if status_update:
+    if status_update and status_changed:
         update_bits.extend(["status = ?", "status_updated_at = ?"])
         params.extend([status_update, event_at])
-        if status_update in {"Mailed", "In Transit", "Delivered", "Bad Address"}:
+        if status_update == "Mailed":
             update_bits.append("mailed_at = COALESCE(mailed_at, ?)")
             params.append(event_at)
         if status_update == "In Transit":
-            update_bits.append("in_transit_at = ?")
+            update_bits.append("in_transit_at = COALESCE(in_transit_at, ?)")
             params.append(event_at)
         elif status_update == "Delivered":
-            update_bits.append("delivered_at = ?")
+            update_bits.append("delivered_at = COALESCE(delivered_at, ?)")
             params.append(event_at)
         elif status_update == "Bad Address":
-            update_bits.append("bad_address_at = ?")
+            update_bits.append("bad_address_at = COALESCE(bad_address_at, ?)")
             params.append(event_at)
-    if str(record.get("display_status") or "").strip().lower() == "qr scanned":
+    if is_qr_scan:
         update_bits.append("qr_scanned_at = ?")
         params.append(event_at)
     params.append(int(mail_order_row["id"]))
@@ -39349,6 +39433,13 @@ def _apply_openletterconnect_event_to_mail_order(db, mail_order_row, record, pay
             """,
             (status_update, str(mail_order_row["external_order_id"] or "").strip()),
         )
+    return {
+        "status_changed": status_changed,
+        "is_qr_scan": is_qr_scan,
+        "previous_status": previous_status,
+        "status_update": status_update,
+        "event_at": event_at,
+    }
 
 
 def _process_openletterconnect_event_record(db, record, payload):
@@ -39368,47 +39459,70 @@ def _process_openletterconnect_event_record(db, record, payload):
         return {"updated_orders": 0, "ignored": True, "reason": "unknown_order_id"}
 
     unique_person_ids = set()
-    unique_property_ids = set()
-    unique_property_uuids = set()
+    reisift_targets = {}
+    should_emit_local_history = False
+    should_emit_bad_address_alert = False
+    display_status = str(record.get("display_status") or "").strip()
     for row in rows:
-        _apply_openletterconnect_event_to_mail_order(db, row, record, payload)
+        apply_result = _apply_openletterconnect_event_to_mail_order(db, row, record, payload)
         for pid in _mail_order_person_ids(row):
             unique_person_ids.add(int(pid))
-        if row["property_id"]:
-            unique_property_ids.add(int(row["property_id"]))
-            property_uuid = _get_local_property_uuid(db, int(row["property_id"]))
+        property_id = int(row["property_id"] or 0) if row["property_id"] else 0
+        if property_id:
+            property_uuid = _get_local_property_uuid(db, property_id)
             if property_uuid:
-                unique_property_uuids.add(property_uuid)
-        db.execute(
-            """
-            INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
-            VALUES (?, ?, 'Direct Mail Webhook', ?, ?)
-            """,
-            (
-                row["property_id"],
-                (row["person_id"] or (next(iter(unique_person_ids)) if unique_person_ids else None)),
-                str(record.get("display_status") or "Update"),
-                json.dumps({"record": record, "payload": payload}, default=str),
-            ),
-        )
+                if apply_result["is_qr_scan"]:
+                    reisift_targets[property_uuid] = property_id
+                elif (
+                    apply_result["status_changed"]
+                    and _should_emit_reisift_mail_status(display_status)
+                    and not _property_has_mail_status_on_day(
+                        db,
+                        property_id,
+                        display_status,
+                        apply_result["event_at"],
+                        exclude_mail_order_id=row["id"],
+                    )
+                ):
+                    reisift_targets[property_uuid] = property_id
+        emit_history = bool(apply_result["status_changed"] or apply_result["is_qr_scan"] or not str(record.get("status_update") or "").strip())
+        if emit_history:
+            should_emit_local_history = True
+            db.execute(
+                """
+                INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+                VALUES (?, ?, 'Direct Mail Webhook', ?, ?)
+                """,
+                (
+                    row["property_id"],
+                    (row["person_id"] or (next(iter(unique_person_ids)) if unique_person_ids else None)),
+                    display_status or "Update",
+                    json.dumps({"record": record, "payload": payload}, default=str),
+                ),
+            )
+        if display_status.lower() == "bad address" and apply_result["status_changed"]:
+            should_emit_bad_address_alert = True
 
     note_text = _openletterconnect_build_note_text(record)
-    for pid in sorted(unique_person_ids):
-        add_person_note(
-            db,
-            pid,
-            "OpenLetterConnect Webhook",
-            note_text,
-            {"record": record, "payload": payload},
-        )
-    _notify_openletterconnect_bad_address(db, rows, record, "/webhooks/openletterconnect/events")
+    if should_emit_local_history:
+        for pid in sorted(unique_person_ids):
+            add_person_note(
+                db,
+                pid,
+                "OpenLetterConnect Webhook",
+                note_text,
+                {"record": record, "payload": payload},
+            )
+    if should_emit_bad_address_alert:
+        _notify_openletterconnect_bad_address(db, rows, record, "/webhooks/openletterconnect/events")
 
-    tag_plan = build_reisift_mail_status_tag_plan(record.get("display_status"), when=parse_db_time(record.get("event_at")))
-    if unique_property_uuids:
+    tag_plan = build_reisift_mail_status_tag_plan(display_status, when=parse_db_time(record.get("event_at")))
+    if reisift_targets:
+        reisift_note_text = _openletterconnect_build_reisift_note_text(record)
         try:
             token = reisift_get_access_token()
-            for property_uuid in sorted(unique_property_uuids):
-                reisift_append_property_note(token, property_uuid, note_text)
+            for property_uuid in sorted(reisift_targets):
+                reisift_append_property_note(token, property_uuid, reisift_note_text)
                 if tag_plan.get("add") or tag_plan.get("remove_prefixes"):
                     reisift_sync_property_tags(
                         token,

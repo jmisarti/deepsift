@@ -7501,7 +7501,7 @@ def infer_touchpoint_update_from_status(status_text):
         update["channel_label"] = "VoIP"
     if "fax" in s:
         update["channel_label"] = "Fax"
-    if any(x in s for x in ["undeliverable", "not deliver", "no route", "failed", "failure"]):
+    if any(x in s for x in ["undeliverable", "undelivered", "not deliver", "no route", "failed", "failure"]):
         update["status"] = "Undeliverable"
     if any(x in s for x in ["no longer in service", "not in service", "disconnected", "deactivated"]):
         update["status"] = "Not in service"
@@ -14030,6 +14030,64 @@ def _build_submitted_lead_activity_index(db, earliest_since=None):
     return index
 
 
+def _submitted_lead_network_contact_norms(db, local_property_id):
+    property_id = int(local_property_id or 0)
+    if property_id <= 0:
+        return {"person_ids": [], "phone_norms": [], "email_norms": []}
+    property_row = db.execute(
+        """
+        SELECT id, owner_person_id, resident_person_id
+        FROM properties
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if not property_row:
+        return {"person_ids": [], "phone_norms": [], "email_norms": []}
+
+    network_ids, _relationships = build_property_network(db, property_row)
+    network_ids = [int(pid) for pid in network_ids if str(pid).isdigit() or isinstance(pid, int)]
+    if not network_ids:
+        return {"person_ids": [], "phone_norms": [], "email_norms": []}
+
+    placeholders = ",".join(["?"] * len(network_ids))
+    rows = db.execute(
+        f"""
+        SELECT person_id, channel_type, value
+        FROM touchpoints
+        WHERE person_id IN ({placeholders})
+          AND trim(COALESCE(value, '')) <> ''
+        ORDER BY id ASC
+        """,
+        tuple(network_ids),
+    ).fetchall()
+
+    phone_norms = []
+    email_norms = []
+    seen_phones = set()
+    seen_emails = set()
+    for row in rows:
+        channel_type = str(row["channel_type"] or "").strip().lower()
+        raw_value = str(row["value"] or "").strip()
+        if channel_type == "phone":
+            phone_norm = normalize_phone(raw_value)
+            if phone_norm and phone_norm not in seen_phones:
+                seen_phones.add(phone_norm)
+                phone_norms.append(phone_norm)
+        elif channel_type == "email":
+            email_norm = normalize_email(raw_value)
+            if email_norm and email_norm not in seen_emails:
+                seen_emails.add(email_norm)
+                email_norms.append(email_norm)
+
+    return {
+        "person_ids": network_ids,
+        "phone_norms": phone_norms,
+        "email_norms": email_norms,
+    }
+
+
 def _submitted_sms_message_key(item, direction):
     sms_id = str(item.get("sms_id") or "").strip()
     if sms_id:
@@ -14223,6 +14281,21 @@ def _build_submitted_lead_item(db, source, row):
                     db.execute(f"UPDATE {table_name} SET local_property_id = ? WHERE id = ?", (stored_local_property_id, int(row["id"])))
         except Exception:
             stored_local_property_id = 0
+    network_contact_norms = _submitted_lead_network_contact_norms(db, stored_local_property_id)
+    phone_norms = []
+    seen_phone_norms = set()
+    for value in [phone_value, *(network_contact_norms.get("phone_norms") or [])]:
+        normalized = normalize_phone(value)
+        if normalized and normalized not in seen_phone_norms:
+            seen_phone_norms.add(normalized)
+            phone_norms.append(normalized)
+    email_norms = []
+    seen_email_norms = set()
+    for value in [email_value, *(network_contact_norms.get("email_norms") or [])]:
+        normalized = normalize_email(value)
+        if normalized and normalized not in seen_email_norms:
+            seen_email_norms.add(normalized)
+            email_norms.append(normalized)
     return {
         "id": int(row["id"]),
         "source": source_low,
@@ -14252,8 +14325,9 @@ def _build_submitted_lead_item(db, source, row):
         "last_received_at": str(row["last_received_at"] or "").strip(),
         "phones": [{"value": phone_value, "type": "Seller", "status": "Captured"}] if phone_value else [],
         "emails": [{"value": email_value, "status": "Captured"}] if email_value else [],
-        "phone_norms": [phone_value] if phone_value else [],
-        "email_norms": [email_value] if email_value else [],
+        "phone_norms": phone_norms,
+        "email_norms": email_norms,
+        "network_person_ids": network_contact_norms.get("person_ids") or [],
         "street": street,
         "city": city,
         "state": state,

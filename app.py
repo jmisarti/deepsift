@@ -1977,6 +1977,13 @@ def format_property_address_line(street, city, state, postal_code):
     return ", ".join([p for p in parts if p])
 
 
+def build_fema_msc_search_url(street, city, state, postal_code=""):
+    address_line = format_property_address_line(street, city, state, postal_code)
+    if not address_line:
+        return "https://msc.fema.gov/portal/search"
+    return f"https://msc.fema.gov/portal/search?AddressQuery={quote(address_line, safe='')}"
+
+
 def append_note_line(existing_notes, note_line):
     base = (existing_notes or "").strip()
     addition = normalize_whitespace(note_line)
@@ -35294,6 +35301,12 @@ def property_detail(property_id):
         mail_sequence_enrollments=mail_sequence_enrollments,
         agent_trace=agent_trace,
         related_website_lead=related_website_lead,
+        fema_search_url=build_fema_msc_search_url(
+            prop["street"],
+            prop["city"],
+            prop["state"],
+            prop["postal_code"],
+        ),
         page_notice=(request.args.get("notice") or request.args.get("seq_notice") or "").strip(),
         page_error=(request.args.get("error") or "").strip(),
     )

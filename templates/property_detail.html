@@ -18,6 +18,7 @@
                 <button type="button" id="mailAllRelativesBtn" {% if not prop.owner_person_id %}disabled{% endif %}>Mail All Relatives</button>
                 <a href="{{ url_for('rentcast_tools_page', property_id=prop.id) }}">RentCast Valuation</a>
                 <a href="{{ fema_search_url }}" target="_blank" rel="noopener noreferrer">FEMA Flood Map</a>
+                <a href="{{ url_for('open_property_nj_map', property_id=prop.id) }}" target="_blank" rel="noopener noreferrer">NJ MAP Parcel</a>
                 <a href="{{ url_for('sequences_page') }}">Sequence Automation</a>
             </div>
         </details>

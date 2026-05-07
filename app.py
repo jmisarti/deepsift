@@ -1984,6 +1984,56 @@ def build_fema_msc_search_url(street, city, state, postal_code=""):
     return f"https://msc.fema.gov/portal/search?AddressQuery={quote(address_line, safe='')}"
 
 
+def geocode_address_via_census(street, city, state, postal_code=""):
+    clean_street = normalize_whitespace(street)
+    clean_city = normalize_whitespace(city)
+    clean_state = normalize_state_code(state) or normalize_whitespace(state)
+    clean_postal = normalize_postal_code(postal_code)
+    if not clean_street or not clean_city or not clean_state:
+        raise ValueError("Property address is incomplete for NJ MAP lookup.")
+
+    response = requests.get(
+        "https://geocoding.geo.census.gov/geocoder/locations/address",
+        params={
+            "street": clean_street,
+            "city": clean_city,
+            "state": clean_state,
+            "zip": clean_postal,
+            "benchmark": "Public_AR_Current",
+            "format": "json",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json() if response.content else {}
+    matches = (((payload or {}).get("result") or {}).get("addressMatches")) or []
+    if not matches:
+        raise ValueError("Census geocoder could not find coordinates for this property address.")
+    best = matches[0] if isinstance(matches[0], dict) else {}
+    coords = best.get("coordinates") if isinstance(best.get("coordinates"), dict) else {}
+    lng = coords.get("x")
+    lat = coords.get("y")
+    if lat is None or lng is None:
+        raise ValueError("Census geocoder returned a match without coordinates.")
+    return {
+        "latitude": float(lat),
+        "longitude": float(lng),
+        "matched_address": str(best.get("matchedAddress") or "").strip(),
+        "tiger_line_id": str(best.get("tigerLine") or "").strip(),
+        "side": str(best.get("side") or "").strip(),
+    }
+
+
+def build_nj_map_parcel_url(latitude, longitude, zoom=20):
+    lat_value = str(latitude)
+    lng_value = str(longitude)
+    return (
+        "https://www.nj-map.com/parcels/parcels/"
+        f"?override=1&zoom={int(zoom)}&lat={quote(lat_value, safe='')}&lng={quote(lng_value, safe='')}"
+        "&sc=0&show=1&basemap=Aerial%20Image%202020&layers=&ois=&oms=&po="
+    )
+
+
 def append_note_line(existing_notes, note_line):
     base = (existing_notes or "").strip()
     addition = normalize_whitespace(note_line)
@@ -35310,6 +35360,68 @@ def property_detail(property_id):
         page_notice=(request.args.get("notice") or request.args.get("seq_notice") or "").strip(),
         page_error=(request.args.get("error") or "").strip(),
     )
+
+
+@app.route("/property/<int:property_id>/nj-map")
+def open_property_nj_map(property_id):
+    ensure_db()
+    db = get_db()
+
+    prop = db.execute(
+        """
+        SELECT p.id,
+               a.street,
+               a.city,
+               a.state,
+               a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if prop is None:
+        return "Property not found", 404
+
+    try:
+        geocode = geocode_address_via_census(
+            prop["street"],
+            prop["city"],
+            prop["state"],
+            prop["postal_code"],
+        )
+        return redirect(
+            build_nj_map_parcel_url(
+                geocode["latitude"],
+                geocode["longitude"],
+            )
+        )
+    except Exception as exc:
+        log_app_error(
+            db,
+            source="nj_map_geocoder",
+            error_message=str(exc),
+            details=json.dumps(
+                {
+                    "property_id": property_id,
+                    "street": prop["street"],
+                    "city": prop["city"],
+                    "state": prop["state"],
+                    "postal_code": prop["postal_code"],
+                }
+            ),
+            route=f"/property/{property_id}/nj-map",
+            status_code=500,
+        )
+        db.commit()
+        return redirect(
+            url_for(
+                "property_detail",
+                property_id=property_id,
+                error=f"NJ MAP lookup failed: {exc}",
+            )
+        )
 
 
 @app.route("/property/<int:property_id>/reisift-link", methods=["POST"])

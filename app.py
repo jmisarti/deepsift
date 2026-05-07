@@ -6401,24 +6401,24 @@ def parse_db_time(value):
 
 
 def bulk_window_next_open(now_est):
-    start = now_est.replace(hour=10, minute=0, second=0, microsecond=0)
-    end = now_est.replace(hour=16, minute=30, second=0, microsecond=0)
+    start = now_est.replace(hour=9, minute=0, second=0, microsecond=0)
+    end = now_est.replace(hour=17, minute=0, second=0, microsecond=0)
     if now_est < start:
         return start
     if now_est > end:
         nxt = now_est + timedelta(days=1)
-        return nxt.replace(hour=10, minute=0, second=0, microsecond=0)
+        return nxt.replace(hour=9, minute=0, second=0, microsecond=0)
     return now_est
 
 
 def bulk_window_adjust(dt_est):
-    start = dt_est.replace(hour=10, minute=0, second=0, microsecond=0)
-    end = dt_est.replace(hour=16, minute=30, second=0, microsecond=0)
+    start = dt_est.replace(hour=9, minute=0, second=0, microsecond=0)
+    end = dt_est.replace(hour=17, minute=0, second=0, microsecond=0)
     if dt_est < start:
         return start
     if dt_est > end:
         nxt = dt_est + timedelta(days=1)
-        return nxt.replace(hour=10, minute=0, second=0, microsecond=0)
+        return nxt.replace(hour=9, minute=0, second=0, microsecond=0)
     return dt_est
 
 

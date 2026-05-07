@@ -1088,7 +1088,7 @@ if (commToNumberEl) commToNumberEl.addEventListener('change', () => {
 });
 
 document.getElementById('bulkSmsBtn').addEventListener('click', async () => {
-  const msg = window.prompt('Enter bulk SMS message. It will send one text per Mobile/Unknown number every 2-5 minutes between 10:00am and 4:30pm EST.');
+  const msg = window.prompt('Enter bulk SMS message. It will send one text per Mobile/Unknown number every 2-5 minutes between 9:00am and 5:00pm EST.');
   if (!msg || !msg.trim()) return;
   const res = await postJson(`/api/properties/${propertyId}/bulk-sms/start`, {
     message: msg.trim(),

@@ -3095,6 +3095,7 @@ def upsert_propertyleads_submission(
     processing_result=None,
     reisift_property_uuid="",
     reisift_owner_uuid="",
+    reisift_status=None,
     local_property_id=0,
     processed_at="",
 ):
@@ -3106,6 +3107,9 @@ def upsert_propertyleads_submission(
         "SELECT id FROM propertyleads_lead_submissions WHERE lead_key = ? LIMIT 1",
         (lead_key,),
     ).fetchone()
+    normalized_reisift_status = None
+    if reisift_status is not None:
+        normalized_reisift_status = normalize_whitespace(reisift_status or "new lead").lower() or "new lead"
     params = (
         str(fields.get("lead_id") or "").strip(),
         str(reisift_property_uuid or "").strip(),
@@ -3121,6 +3125,7 @@ def upsert_propertyleads_submission(
         json.dumps(payload or {}),
         processing_blob,
         str(status or "captured").strip() or "captured",
+        normalized_reisift_status,
         int(local_property_id or 0),
         str(processed_at or "").strip() or None,
     )
@@ -3142,6 +3147,7 @@ def upsert_propertyleads_submission(
                 latest_payload_json = ?,
                 processing_result_json = COALESCE(?, processing_result_json),
                 status = ?,
+                reisift_status = COALESCE(?, reisift_status),
                 local_property_id = COALESCE(NULLIF(?, 0), local_property_id),
                 processed_at = COALESCE(?, processed_at),
                 last_received_at = CURRENT_TIMESTAMP
@@ -3155,8 +3161,8 @@ def upsert_propertyleads_submission(
             INSERT INTO propertyleads_lead_submissions
                 (lead_key, lead_id, reisift_property_uuid, reisift_owner_uuid, latest_address, latest_phone, latest_email,
                  latest_name, latest_stage, county, lead_cost, source_label, latest_payload_json, processing_result_json,
-                 status, local_property_id, processed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 status, reisift_status, local_property_id, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'new lead'), ?, ?)
             """,
             (lead_key,) + params,
         )
@@ -3198,6 +3204,72 @@ def _build_propertyleads_notes(payload, fields, source_label="webhook"):
             continue
         lines.append(f"{label}: {value}")
     return "\n".join(lines)
+
+
+def _sync_propertyleads_existing_reisift_record(token, property_uuid, fields, notes, owner_uuid=""):
+    property_uuid = normalize_uuid(property_uuid)
+    owner_uuid = normalize_uuid(owner_uuid)
+    fields = fields if isinstance(fields, dict) else {}
+    out = {
+        "ok": bool(property_uuid),
+        "property_uuid": property_uuid,
+        "owner_uuid": owner_uuid,
+        "status_sync": None,
+        "list_sync": None,
+        "tag_sync": None,
+        "note_sync": None,
+        "contact_sync": None,
+        "warnings": [],
+    }
+    if not token or not property_uuid:
+        out["ok"] = False
+        out["warnings"].append("missing_token_or_property_uuid")
+        return out
+
+    try:
+        payload = fetch_reisift_property_payload(token, property_uuid)
+        owner_uuid = owner_uuid or normalize_uuid(_reisift_find_owner_uuid(payload))
+        out["owner_uuid"] = owner_uuid
+    except Exception as exc:
+        out["warnings"].append(f"fetch_property_failed: {exc}")
+
+    try:
+        out["status_sync"] = reisift_update_property_status(token, property_uuid, "new_lead")
+    except Exception as exc:
+        out["warnings"].append(f"status_sync_failed: {exc}")
+
+    try:
+        out["list_sync"] = reisift_sync_property_lists(token, property_uuid, ["PropertyLeadsPPL"])
+    except Exception as exc:
+        out["warnings"].append(f"list_sync_failed: {exc}")
+
+    try:
+        out["tag_sync"] = reisift_sync_property_tags(token, property_uuid, tags_to_add=["PropertyLeadsPPL"])
+    except Exception as exc:
+        out["warnings"].append(f"tag_sync_failed: {exc}")
+
+    try:
+        out["note_sync"] = reisift_append_property_note(token, property_uuid, notes)
+    except Exception as exc:
+        out["warnings"].append(f"note_sync_failed: {exc}")
+
+    phone = fields.get("phone") or ""
+    email = fields.get("email") or ""
+    if owner_uuid and (phone or email):
+        try:
+            out["contact_sync"] = reisift_upsert_owner_contacts(
+                token,
+                owner_uuid,
+                [{"number": phone, "type": "UNKNOWN"}] if phone else [],
+                [email] if email else [],
+            )
+        except Exception as exc:
+            out["warnings"].append(f"contact_sync_failed: {exc}")
+    elif phone or email:
+        out["warnings"].append("contact_sync_skipped_missing_owner_uuid")
+
+    out["ok"] = True
+    return out
 
 
 def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
@@ -3338,6 +3410,7 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
     duplicate_reason = ""
     contact_sync = None
     note_sync = None
+    existing_sync = None
     enrich_result = None
     create_result = None
     mode = "processed"
@@ -3358,7 +3431,7 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
                 owner_uuid = _reisift_find_owner_uuid(fetch_reisift_property_payload(token, created_uuid)) or owner_uuid
             except Exception:
                 pass
-        if token and owner_uuid and not contact_sync and (fields.get("phone") or fields.get("email")):
+        if token and owner_uuid and not contact_sync and not duplicate_existing and (fields.get("phone") or fields.get("email")):
             contact_sync = reisift_upsert_owner_contacts(
                 token,
                 owner_uuid,
@@ -3366,7 +3439,10 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
                 [fields.get("email")] if fields.get("email") else [],
             )
         if token and created_uuid and duplicate_existing:
-            note_sync = reisift_append_property_note(token, created_uuid, notes)
+            existing_sync = _sync_propertyleads_existing_reisift_record(token, created_uuid, fields, notes, owner_uuid=owner_uuid)
+            owner_uuid = existing_sync.get("owner_uuid") or owner_uuid
+            contact_sync = existing_sync.get("contact_sync") or contact_sync
+            note_sync = existing_sync.get("note_sync")
         if token and created_uuid and not duplicate_existing:
             enrich_result = create_result.get("enrich")
         if local_property_id > 0:
@@ -3404,9 +3480,11 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
                 "duplicate_reason": duplicate_reason,
                 "contact_sync": contact_sync,
                 "note_sync": note_sync,
+                "existing_sync": existing_sync,
             },
             reisift_property_uuid=created_uuid,
             reisift_owner_uuid=owner_uuid,
+            reisift_status="new lead",
             local_property_id=local_property_id,
             processed_at=format_db_time(datetime.utcnow()),
         )
@@ -3421,6 +3499,7 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
             "duplicate_reason": duplicate_reason,
             "contact_sync": contact_sync,
             "note_sync": note_sync,
+            "existing_sync": existing_sync,
             "enrich": enrich_result,
             "create_result": create_result,
             "slack_sent": True,
@@ -3435,6 +3514,99 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
             route="/webhooks/propertyleads/ppl",
             status_code=500,
         )
+        recovery_result = None
+        try:
+            token = reisift_get_access_token()
+            existing = reisift_find_existing_property_by_address(
+                token,
+                street=fields.get("street") or "",
+                city=fields.get("city") or "",
+                state=fields.get("state") or "",
+                postal_code=fields.get("postal_code") or "",
+                search_text=fields.get("address") or "",
+            )
+            recovered_uuid = normalize_uuid(existing.get("uuid") or "")
+            if recovered_uuid:
+                created_uuid = recovered_uuid
+                existing_sync = _sync_propertyleads_existing_reisift_record(token, created_uuid, fields, notes, owner_uuid=owner_uuid)
+                owner_uuid = existing_sync.get("owner_uuid") or owner_uuid
+                contact_sync = existing_sync.get("contact_sync")
+                note_sync = existing_sync.get("note_sync")
+                if local_property_id > 0:
+                    _set_local_property_uuid(db, local_property_id, created_uuid)
+                    _set_local_owner_uuid(db, local_property_id, owner_uuid)
+                recovery_result = {
+                    "ok": True,
+                    "recovered_uuid": created_uuid,
+                    "matched_existing": existing,
+                    "existing_sync": existing_sync,
+                    "original_error": err,
+                }
+                sift_link = _sift_record_url(created_uuid)
+                slack_lines = [
+                    "New PropertyLeads submission received",
+                    "Mode: sift_existing_recovered",
+                    f"Lead ID: {fields.get('lead_id') or '-'}",
+                    f"County: {fields.get('county') or '-'}",
+                    f"Address: {fields.get('address') or '-'}",
+                    f"Name: {fields.get('seller_name') or '-'}",
+                    f"Phone: {fields.get('phone') or '-'}",
+                    f"Email: {fields.get('email') or '-'}",
+                    f"ReiSift Record: {sift_link or '-'}",
+                    f"Recovered From Error: {err}",
+                ]
+                send_slack_notification(db, "\n".join(slack_lines), channel="#acquisitions")
+                upsert_propertyleads_submission(
+                    db,
+                    fields,
+                    payload,
+                    status="processed",
+                    source_label=source_label,
+                    processing_result={
+                        "ok": True,
+                        "event_key": event_key,
+                        "lead_key": lead_key,
+                        "created_uuid": created_uuid,
+                        "owner_uuid": owner_uuid,
+                        "duplicate_existing": True,
+                        "duplicate_reason": "Recovered existing REISift record after create/update failure.",
+                        "contact_sync": contact_sync,
+                        "note_sync": note_sync,
+                        "existing_sync": existing_sync,
+                        "recovery_result": recovery_result,
+                    },
+                    reisift_property_uuid=created_uuid,
+                    reisift_owner_uuid=owner_uuid,
+                    reisift_status="new lead",
+                    local_property_id=local_property_id,
+                    processed_at=format_db_time(datetime.utcnow()),
+                )
+                db.commit()
+                return {
+                    "ok": True,
+                    "event_key": event_key,
+                    "lead_key": lead_key,
+                    "created_uuid": created_uuid,
+                    "owner_uuid": owner_uuid,
+                    "duplicate_existing": True,
+                    "duplicate_reason": "Recovered existing REISift record after create/update failure.",
+                    "contact_sync": contact_sync,
+                    "note_sync": note_sync,
+                    "existing_sync": existing_sync,
+                    "recovery_result": recovery_result,
+                    "slack_sent": True,
+                }
+        except Exception as recovery_exc:
+            recovery_result = {"ok": False, "error": str(recovery_exc), "original_error": err}
+            log_app_error(
+                db,
+                source="propertyleads_ppl_existing_recovery",
+                error_message=str(recovery_exc),
+                details=traceback.format_exc(),
+                route="/webhooks/propertyleads/ppl",
+                status_code=500,
+            )
+
         sift_link = _sift_record_url(created_uuid)
         upsert_propertyleads_submission(
             db,
@@ -3449,9 +3621,11 @@ def process_propertyleads_ppl_payload(db, payload, source_label="webhook"):
                 "created_uuid": created_uuid,
                 "error": err,
                 "error_type": "server",
+                "recovery_result": recovery_result,
             },
             reisift_property_uuid=created_uuid,
             reisift_owner_uuid=owner_uuid,
+            reisift_status="new lead",
             local_property_id=local_property_id,
             processed_at=format_db_time(datetime.utcnow()),
         )

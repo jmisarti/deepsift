@@ -74,6 +74,9 @@
             </label>
             <button type="submit" data-loading-label="Sending...">Send to REISift</button>
         </form>
+        <div class="inline-actions">
+            <button type="button" id="syncRentcastReisiftBtn">Sync Latest RentCast Note to REISift</button>
+        </div>
         {% else %}
         <p class="muted-text">Link a REISift record to this property first, then you can append notes here.</p>
         {% endif %}
@@ -1100,6 +1103,21 @@ document.getElementById('bulkSmsBtn').addEventListener('click', async () => {
     return;
   }
   alert(`Bulk SMS queued. Targets: ${res.data.target_count}.`);
+});
+
+const syncRentcastReisiftBtn = document.getElementById('syncRentcastReisiftBtn');
+if (syncRentcastReisiftBtn) syncRentcastReisiftBtn.addEventListener('click', async () => {
+  if (window.startBusyButton) window.startBusyButton(syncRentcastReisiftBtn, 'Syncing...');
+  try {
+    const res = await postJson(`/api/properties/${propertyId}/rentcast-valuation-note/reisift-sync`, {});
+    if (!res.ok) {
+      alert((res.data && res.data.error) ? res.data.error : 'Unable to sync RentCast note to REISift.');
+      return;
+    }
+    alert((res.data && res.data.notice) ? res.data.notice : 'Latest RentCast valuation synced to REISift.');
+  } finally {
+    if (window.stopBusyButton) window.stopBusyButton(syncRentcastReisiftBtn);
+  }
 });
 
 setCommChannel('SMS');

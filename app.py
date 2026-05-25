@@ -24988,6 +24988,19 @@ def build_rentcast_valuation_note(payload, fallback_address="", saved_at=None):
     return "\n".join([line for line in lines if line]).strip()
 
 
+def extract_latest_rentcast_valuation_note(notes):
+    text = str(notes or "").strip()
+    marker = "RentCast Valuation |"
+    start = text.rfind(marker)
+    if start < 0:
+        return ""
+    latest = text[start:].strip()
+    next_block = latest.find("\n\n")
+    if next_block >= 0:
+        latest = latest[:next_block].strip()
+    return latest
+
+
 def _normalize_listing_address_variants(full_address):
     address = re.sub(r"\s+", " ", str(full_address or "").strip())
     if not address:
@@ -29692,6 +29705,59 @@ def save_property_rentcast_valuation_note(property_id):
             "notice": notice,
             "note_text": note_text,
             "reisift_note_sync": reisift_note_sync,
+        }
+    )
+
+
+@app.route("/api/properties/<int:property_id>/rentcast-valuation-note/reisift-sync", methods=["POST"])
+def sync_latest_property_rentcast_valuation_note_to_reisift(property_id):
+    ensure_db()
+    db = get_db()
+    property_row = db.execute(
+        """
+        SELECT id, owner_person_id, notes, reisift_property_uuid
+        FROM properties
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if property_row is None:
+        return jsonify({"ok": False, "error": "Property not found."}), 404
+
+    property_uuid = normalize_uuid(property_row["reisift_property_uuid"] or "")
+    if not property_uuid:
+        return jsonify({"ok": False, "error": "Property is not linked to a REISift record."}), 400
+
+    note_text = extract_latest_rentcast_valuation_note(property_row["notes"] or "")
+    if not note_text:
+        return jsonify({"ok": False, "error": "No saved RentCast valuation note found on this property."}), 400
+
+    try:
+        note_sync = reisift_append_property_note(reisift_get_access_token(), property_uuid, note_text)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "property_uuid": property_uuid}), 500
+
+    db.execute(
+        """
+        INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            property_id,
+            property_row["owner_person_id"],
+            "RentCast Valuation",
+            "Synced latest saved valuation to REISift",
+            note_text,
+        ),
+    )
+    db.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "notice": "Latest RentCast valuation synced to REISift.",
+            "note_text": note_text,
+            "reisift_note_sync": note_sync,
         }
     )
 

@@ -29620,6 +29620,7 @@ def save_property_rentcast_valuation_note(property_id):
         SELECT p.id,
                p.owner_person_id,
                p.notes,
+               p.reisift_property_uuid,
                a.street,
                a.city,
                a.state,
@@ -29648,6 +29649,20 @@ def save_property_rentcast_valuation_note(property_id):
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
 
+    reisift_note_sync = None
+    reisift_property_uuid = normalize_uuid(property_dict.get("reisift_property_uuid") or "")
+    if reisift_property_uuid:
+        try:
+            reisift_note_sync = reisift_append_property_note(
+                reisift_get_access_token(),
+                reisift_property_uuid,
+                note_text,
+            )
+        except Exception as exc:
+            reisift_note_sync = {"ok": False, "error": str(exc), "property_uuid": reisift_property_uuid}
+    else:
+        reisift_note_sync = {"ok": False, "skipped": True, "reason": "property_not_linked_to_reisift"}
+
     combined_notes = append_note_line(property_dict.get("notes") or "", note_text)
     db.execute("UPDATE properties SET notes = ? WHERE id = ?", (combined_notes, property_id))
     db.execute(
@@ -29659,16 +29674,24 @@ def save_property_rentcast_valuation_note(property_id):
             property_id,
             property_row["owner_person_id"],
             "RentCast Valuation",
-            "Saved to property notes",
+            "Saved to property notes and REISift" if reisift_note_sync.get("ok") else "Saved to property notes",
             note_text,
         ),
     )
     db.commit()
+    notice = "RentCast valuation saved to property notes."
+    if reisift_note_sync.get("ok"):
+        notice = "RentCast valuation saved to property notes and REISift."
+    elif reisift_note_sync.get("skipped"):
+        notice = "RentCast valuation saved to property notes. REISift sync skipped because this property is not linked."
+    else:
+        notice = "RentCast valuation saved to property notes, but REISift sync failed."
     return jsonify(
         {
             "ok": True,
-            "notice": "RentCast valuation saved to property notes.",
+            "notice": notice,
             "note_text": note_text,
+            "reisift_note_sync": reisift_note_sync,
         }
     )
 

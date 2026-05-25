@@ -24909,6 +24909,27 @@ def _rentcast_comparable_address(item):
     return direct or suffix or "Address unavailable"
 
 
+def _rentcast_comparable_date_text(value):
+    text = normalize_whitespace(str(value or ""))
+    if not text:
+        return ""
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})", text)
+    if match:
+        return match.group(1)
+    return text
+
+
+def _rentcast_correlation_percent_text(value):
+    if value is None:
+        return ""
+    percent = float(value)
+    if -1 <= percent <= 1:
+        percent *= 100
+    if percent.is_integer():
+        return f"{int(percent)}%"
+    return f"{percent:.1f}".rstrip("0").rstrip(".") + "%"
+
+
 def _format_rentcast_comparable_note_lines(comparables):
     rows = comparables if isinstance(comparables, list) else []
     lines = []
@@ -24941,13 +24962,13 @@ def _format_rentcast_comparable_note_lines(comparables):
         if distance is not None:
             details.append(f"{distance:.2f} mi")
         if correlation is not None:
-            details.append(f"corr {_rentcast_count_text(correlation)}")
+            details.append(f"corr {_rentcast_correlation_percent_text(correlation)}")
         if property_type:
             details.append(property_type)
         if year_built is not None:
             details.append(f"built {_rentcast_count_text(year_built)}")
         if listed_date:
-            details.append(f"date {listed_date}")
+            details.append(f"date {_rentcast_comparable_date_text(listed_date)}")
 
         line = f"{idx}. {_rentcast_comparable_address(item)}"
         if details:

@@ -24894,6 +24894,68 @@ def _summarize_rentcast_comparables(comparables):
     }
 
 
+def _rentcast_comparable_address(item):
+    item = item if isinstance(item, dict) else {}
+    direct = normalize_whitespace(
+        _rentcast_nested_value(item, "formattedAddress", "fullAddress", "addressLine1", "address") or ""
+    )
+    city = normalize_whitespace(_rentcast_nested_value(item, "city") or "")
+    state = normalize_whitespace(_rentcast_nested_value(item, "state") or "")
+    postal = normalize_whitespace(_rentcast_nested_value(item, "zipCode", "postalCode", "zipcode") or "")
+    state_postal = " ".join([part for part in [state, postal] if part]).strip()
+    suffix = ", ".join([part for part in [city, state_postal] if part]).strip()
+    if direct and suffix and suffix.lower() not in direct.lower():
+        return f"{direct}, {suffix}"
+    return direct or suffix or "Address unavailable"
+
+
+def _format_rentcast_comparable_note_lines(comparables):
+    rows = comparables if isinstance(comparables, list) else []
+    lines = []
+    for idx, item in enumerate(rows, start=1):
+        if not isinstance(item, dict):
+            continue
+        details = []
+        price = _rentcast_number_value(item, "price", "listPrice", "value")
+        beds = _rentcast_number_value(item, "bedrooms", "beds")
+        baths = _rentcast_number_value(item, "bathrooms", "baths")
+        sqft = _rentcast_number_value(item, "squareFootage", "square_feet", "livingArea", "sqft")
+        distance = _rentcast_number_value(item, "distance", "distanceMiles")
+        correlation = _rentcast_number_value(item, "correlation", "score", "similarity")
+        year_built = _rentcast_number_value(item, "yearBuilt", "year_built")
+        property_type = normalize_whitespace(_rentcast_nested_value(item, "propertyType", "property_type") or "")
+        listed_date = normalize_whitespace(_rentcast_nested_value(item, "listedDate", "lastSeenDate", "saleDate") or "")
+
+        if price is not None:
+            details.append(_rentcast_money_text(price))
+        bed_bath = " / ".join(
+            [
+                f"{_rentcast_count_text(beds)} bd" if beds is not None else "",
+                f"{_rentcast_count_text(baths)} ba" if baths is not None else "",
+            ]
+        ).strip(" /")
+        if bed_bath:
+            details.append(bed_bath)
+        if sqft is not None:
+            details.append(f"{_rentcast_count_text(sqft)} sqft")
+        if distance is not None:
+            details.append(f"{distance:.2f} mi")
+        if correlation is not None:
+            details.append(f"corr {_rentcast_count_text(correlation)}")
+        if property_type:
+            details.append(property_type)
+        if year_built is not None:
+            details.append(f"built {_rentcast_count_text(year_built)}")
+        if listed_date:
+            details.append(f"date {listed_date}")
+
+        line = f"{idx}. {_rentcast_comparable_address(item)}"
+        if details:
+            line += " | " + " | ".join(details)
+        lines.append(line)
+    return lines
+
+
 def build_rentcast_valuation_note(payload, fallback_address="", saved_at=None):
     payload = payload if isinstance(payload, dict) else {}
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -24984,6 +25046,10 @@ def build_rentcast_valuation_note(payload, fallback_address="", saved_at=None):
         lines.append(f"Average Comp Price: {_rentcast_money_text(comp_summary['average_price'])}")
     if comp_summary["price_per_sqft"] is not None:
         lines.append(f"Comp $/Sqft: {_rentcast_money_text(comp_summary['price_per_sqft'])}")
+    comp_lines = _format_rentcast_comparable_note_lines(comparables)
+    if comp_lines:
+        lines.append("Comparable Sales:")
+        lines.extend(comp_lines)
     lines.append("Source: RentCast AVM")
     return "\n".join([line for line in lines if line]).strip()
 

@@ -38454,6 +38454,28 @@ def _verify_smrtphone_webhook_request(db):
     return True, ""
 
 
+def _is_smrtagent_call_ended_event(payload, webhook, event_name=""):
+    payload = payload if isinstance(payload, dict) else {}
+    webhook = webhook if isinstance(webhook, dict) else {}
+    candidates = [
+        event_name,
+        extract_first_string_by_keys(payload, ["event", "eventType", "type", "name", "webhookType", "webhook_type"]),
+        extract_first_string_by_keys(webhook, ["event", "eventType", "type", "name", "webhookType", "webhook_type"]),
+    ]
+    for raw in candidates:
+        normalized = re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
+        if not normalized:
+            continue
+        if ("smrtagent" in normalized or "smartagent" in normalized) and (
+            "callended" in normalized
+            or "callcomplete" in normalized
+            or "endedcall" in normalized
+            or "completedcall" in normalized
+        ):
+            return True
+    return False
+
+
 def _dispatch_smrtphone_events_webhook(db, payload):
     payload = payload if isinstance(payload, dict) else {}
     webhook = payload.get("webhook") if isinstance(payload.get("webhook"), dict) else {}
@@ -38475,10 +38497,7 @@ def _dispatch_smrtphone_events_webhook(db, payload):
             ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "callID"],
         )
     )
-    if any(
-        str(payload.get(key) or webhook.get(key) or "").strip()
-        for key in ("phone_number_agent", "phone_number_caller")
-    ) or "agent" in event_name:
+    if _is_smrtagent_call_ended_event(payload, webhook, event_name):
         return smrtphone_agent_call_ended_webhook(payload=payload, db=db)
     if "delivery" in event_name or "callback" in event_name or (
         str(payload.get("smsId") or payload.get("sms_id") or payload.get("id") or "").strip()
@@ -39176,6 +39195,41 @@ def smrtphone_agent_call_ended_webhook(payload=None, db=None):
         or extract_first_string_by_keys(webhook, ["timestamp", "completed_at", "endedAt", "ended_at", "date"])
     ).strip()
     follow_up_number_display = format_phone_display(caller_number)
+
+    if call_sid:
+        existing_agent_event = db.execute(
+            """
+            SELECT id, processing_status
+            FROM smrtphone_webhook_events
+            WHERE event_type = 'agent_call_ended'
+              AND sms_id = ?
+              AND processing_status IN ('slack_sent', 'slack_disabled')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (call_sid,),
+        ).fetchone()
+        if existing_agent_event:
+            log_smrtphone_webhook_event(
+                db,
+                "agent_call_ended",
+                payload,
+                processing_status="deduped",
+                sms_id=call_sid,
+                from_number=from_number,
+                to_number=to_number,
+                error_text=f"duplicate call_sid; previous status={existing_agent_event['processing_status']}",
+            )
+            db.commit()
+            return jsonify(
+                {
+                    "ok": True,
+                    "deduped": True,
+                    "event": event_name or "smrtAgent Call Ended",
+                    "call_sid": call_sid,
+                    "slack_status": "deduped",
+                }
+            ), 200
 
     slack_title = "SmartAgent just completed a call"
     text_lines = [slack_title]

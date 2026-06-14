@@ -11237,13 +11237,17 @@ def parse_slack_ads_command(raw_text):
 
 
 def get_slack_settings(db):
+    bot_token = get_setting(db, "slack_bot_token", "") or os.getenv("SLACK_BOT_TOKEN", "")
+    bot_token = str(bot_token or "").strip().strip('"').strip("'").strip()
+    if bot_token.startswith("<") and bot_token.endswith(">"):
+        bot_token = bot_token[1:-1].strip()
     return {
         "webhook_url": get_setting(db, "slack_webhook_url", ""),
         "signing_secret": get_setting(db, "slack_signing_secret", ""),
         "default_channel": get_setting(db, "slack_default_channel", ""),
         "agent_ops_webhook_url": get_setting(db, "slack_agent_ops_webhook_url", ""),
         "agent_ops_channel": get_setting(db, "slack_agent_ops_channel", ""),
-        "bot_token": get_setting(db, "slack_bot_token", "") or os.getenv("SLACK_BOT_TOKEN", "").strip(),
+        "bot_token": bot_token,
     }
 
 

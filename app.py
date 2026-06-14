@@ -11895,6 +11895,7 @@ def run_manual_comping_skill_analysis(address, property_context=None, requested_
                 {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
             ],
             "tools": [{"type": "web_search_preview"}],
+            "max_output_tokens": 20000,
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -12206,7 +12207,18 @@ def process_slack_comp_request(request_id):
         if not row:
             return
         db.execute(
-            "UPDATE slack_comp_requests SET status = 'Running', started_at = CURRENT_TIMESTAMP, error_message = '' WHERE id = ?",
+            """
+            UPDATE slack_comp_requests
+            SET status = 'Running',
+                started_at = CURRENT_TIMESTAMP,
+                completed_at = NULL,
+                summary_text = '',
+                analysis_json = '',
+                report_path = '',
+                slack_file_id = '',
+                error_message = ''
+            WHERE id = ?
+            """,
             (request_id,),
         )
         commit_with_retry(db)

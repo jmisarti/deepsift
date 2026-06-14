@@ -67,3 +67,9 @@ This repo includes:
 - If your app must run 24/7 and receive webhooks reliably, do not depend on local machine + tunnel.
 - Selenium/web scraping workers should run as separate workers and push results into this app via API.
 
+## Slack Comp Reports
+- Point a Slack slash command at `POST /webhooks/slack/command`.
+- Use `comp <address>` or `comp property #128` from the existing Agent Ops command, or map a dedicated `/comp` command to the same endpoint.
+- XLSX upload requires `SLACK_BOT_TOKEN` or the Integrations tab `Slack Bot Token` setting with Slack file upload permissions.
+- The worker uses `OPENAI_COMPING_MODEL` plus web search and the manual SIFT comping framework; it does not use RentCast.
+

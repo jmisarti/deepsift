@@ -36,6 +36,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 try:
+    import openpyxl
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+except Exception:
+    openpyxl = None
+    Alignment = Border = Font = PatternFill = Side = get_column_letter = None
+try:
     from bs4 import BeautifulSoup
 except Exception:
     BeautifulSoup = None
@@ -902,6 +909,30 @@ def migrate_db(db):
         """
     )
     ensure_column(db, "app_errors", "dismissed_at", "dismissed_at TEXT")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS slack_comp_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT NOT NULL DEFAULT 'Queued',
+            property_id INTEGER,
+            address TEXT,
+            raw_text TEXT,
+            slack_channel_id TEXT,
+            slack_user_id TEXT,
+            slack_user_name TEXT,
+            response_url TEXT,
+            summary_text TEXT,
+            analysis_json TEXT,
+            report_path TEXT,
+            slack_file_id TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            started_at TEXT,
+            completed_at TEXT
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_slack_comp_requests_status ON slack_comp_requests(status, id)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS buyers (
@@ -11212,6 +11243,7 @@ def get_slack_settings(db):
         "default_channel": get_setting(db, "slack_default_channel", ""),
         "agent_ops_webhook_url": get_setting(db, "slack_agent_ops_webhook_url", ""),
         "agent_ops_channel": get_setting(db, "slack_agent_ops_channel", ""),
+        "bot_token": get_setting(db, "slack_bot_token", "") or os.getenv("SLACK_BOT_TOKEN", "").strip(),
     }
 
 
@@ -11483,6 +11515,576 @@ def send_slack_response_url(response_url, text, response_type="in_channel", repl
     if not response.ok:
         raise ValueError(f"Slack response_url failed ({response.status_code}): {response.text}")
     return {"ok": True}
+
+
+def _slack_text_limit(text, limit=3200):
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 18)].rstrip() + "\n... truncated"
+
+
+def _extract_openai_response_text(data):
+    if not isinstance(data, dict):
+        return ""
+    output_text = (data.get("output_text") or "").strip()
+    if output_text:
+        return output_text
+    for item in data.get("output", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content", []) or []:
+            if isinstance(part, dict) and part.get("type") in {"output_text", "text"} and part.get("text"):
+                return str(part["text"]).strip()
+    return ""
+
+
+def _comping_output_dir():
+    target = Path(os.getenv("COMPING_OUTPUT_DIR", "") or (DB_PATH.parent / "comping_reports")).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _slugify_filename(value, fallback="comp-report"):
+    text = re.sub(r"[^A-Za-z0-9]+", "-", str(value or "").strip()).strip("-").lower()
+    return (text or fallback)[:80]
+
+
+def _slack_comp_target(raw_text):
+    text = normalize_whitespace(raw_text or "")
+    if not text:
+        return {"ok": False, "error": "Use `comp <address>` or `comp property #128`."}
+    property_match = re.search(r"(?:property\s*#?|prop\s*#?|#)\s*(\d+)\b", text, re.IGNORECASE)
+    if property_match:
+        return {"ok": True, "property_id": int(property_match.group(1)), "address": ""}
+    if re.fullmatch(r"\d{1,8}", text):
+        return {"ok": True, "property_id": int(text), "address": ""}
+    return {"ok": True, "property_id": 0, "address": text}
+
+
+def _property_context_for_comp(db, property_id):
+    row = db.execute(
+        """
+        SELECT p.id,
+               p.status,
+               p.notes,
+               p.attom_last_sold_date,
+               p.attom_last_sold_price,
+               p.reisift_property_uuid,
+               a.street,
+               a.city,
+               a.state,
+               a.postal_code,
+               op.first_name AS owner_first,
+               op.last_name AS owner_last
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        LEFT JOIN people op ON op.id = p.owner_person_id
+        WHERE p.id = ?
+        LIMIT 1
+        """,
+        (int(property_id or 0),),
+    ).fetchone()
+    if not row:
+        raise ValueError(f"Property #{property_id} not found.")
+    address = ", ".join(
+        [
+            part
+            for part in [
+                normalize_whitespace(row["street"] or ""),
+                normalize_whitespace(row["city"] or ""),
+                " ".join(
+                    [
+                        normalize_whitespace(row["state"] or ""),
+                        normalize_whitespace(row["postal_code"] or ""),
+                    ]
+                ).strip(),
+            ]
+            if part
+        ]
+    ).strip()
+    owner_name = " ".join([x for x in [row["owner_first"], row["owner_last"]] if str(x or "").strip()]).strip()
+    context = {
+        "property_id": int(row["id"]),
+        "address": address,
+        "status": row["status"] or "",
+        "owner_name": owner_name,
+        "last_sold_date": row["attom_last_sold_date"] or "",
+        "last_sold_price": row["attom_last_sold_price"],
+        "reisift_property_uuid": row["reisift_property_uuid"] or "",
+        "notes": (row["notes"] or "")[-2500:],
+    }
+    return address, context
+
+
+def _comp_analysis_schema():
+    num = {"type": ["number", "null"]}
+    text = {"type": ["string", "null"]}
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "summary_text": {"type": "string"},
+            "subject_property": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "address": {"type": "string"},
+                    "city": text,
+                    "state": text,
+                    "zip": text,
+                    "county": text,
+                    "subdivision": text,
+                    "property_type": text,
+                    "gla": num,
+                    "lot_size": num,
+                    "beds": num,
+                    "baths": num,
+                    "year_built": num,
+                    "condition": text,
+                },
+                "required": ["address", "city", "state", "zip", "county", "subdivision", "property_type", "gla", "lot_size", "beds", "baths", "year_built", "condition"],
+            },
+            "comps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "address": {"type": "string"},
+                        "sale_date": text,
+                        "sale_price": num,
+                        "gla": num,
+                        "ppsf": num,
+                        "beds": num,
+                        "baths": num,
+                        "year_built": num,
+                        "condition": text,
+                        "distance": num,
+                        "total_adjustments": num,
+                        "adjusted_value": num,
+                        "source_url": text,
+                        "rationale": text,
+                    },
+                    "required": ["address", "sale_date", "sale_price", "gla", "ppsf", "beds", "baths", "year_built", "condition", "distance", "total_adjustments", "adjusted_value", "source_url", "rationale"],
+                },
+            },
+            "bucket_analysis": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "unrenovated_count": num,
+                    "unrenovated_median_ppsf": num,
+                    "renovated_count": num,
+                    "renovated_median_ppsf": num,
+                    "market_premium_pct": num,
+                },
+                "required": ["unrenovated_count", "unrenovated_median_ppsf", "renovated_count", "renovated_median_ppsf", "market_premium_pct"],
+            },
+            "market_overview": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "market_phase": text,
+                    "median_price": num,
+                    "median_ppsf": num,
+                    "avg_dom": num,
+                    "sale_to_list_ratio": num,
+                    "notes": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["market_phase", "median_price", "median_ppsf", "avg_dom", "sale_to_list_ratio", "notes"],
+            },
+            "arv_calculation": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "base_ppsf": num,
+                    "renovated_ppsf": num,
+                    "subject_gla": num,
+                    "base_arv": num,
+                    "feature_adjustments": num,
+                    "final_arv": num,
+                    "confidence_level": text,
+                    "confidence_band_pct": num,
+                    "arv_low": num,
+                    "arv_high": num,
+                },
+                "required": ["base_ppsf", "renovated_ppsf", "subject_gla", "base_arv", "feature_adjustments", "final_arv", "confidence_level", "confidence_band_pct", "arv_low", "arv_high"],
+            },
+            "adjustments_applied": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "comp_address": {"type": "string"},
+                        "adjustment_type": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "amount": num,
+                    },
+                    "required": ["comp_address", "adjustment_type", "reason", "amount"],
+                },
+            },
+            "sources": {"type": "array", "items": {"type": "string"}},
+            "recommendations": {"type": "array", "items": {"type": "string"}},
+            "caveats": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["summary_text", "subject_property", "comps", "bucket_analysis", "market_overview", "arv_calculation", "adjustments_applied", "sources", "recommendations", "caveats"],
+    }
+
+
+def run_manual_comping_skill_analysis(address, property_context=None, requested_by="Slack"):
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set")
+    address = normalize_whitespace(address or "")
+    if not address:
+        raise ValueError("Address is required.")
+    model = os.getenv("OPENAI_COMPING_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1")).strip() or "gpt-4.1"
+    property_context = property_context or {}
+    prompt = (
+        "Run the uploaded SIFT real-estate-comping workflow for this property.\n"
+        "This is NOT RentCast. Use public web sources and the manual comping framework.\n\n"
+        "Workflow rules:\n"
+        "- Determine if the state is disclosure or non-disclosure.\n"
+        "- For disclosure states, use the two-bucket method: dated/unrenovated versus renovated/premium comps.\n"
+        "- Favor same micro-pocket, same subdivision, same property style, similar GLA, similar build era, recent closed sales.\n"
+        "- Do not cross major roads or market boundaries unless inventory is thin, and explicitly note any relaxation.\n"
+        "- Check active/pending context, DOM, sale-to-list, and current market direction.\n"
+        "- Produce a practical ARV/current-market-value midpoint and low/high range.\n"
+        "- Include source URLs for comps and market context. Do not fabricate sale prices or sources.\n"
+        "- If public data is thin, say so in caveats and widen the confidence band.\n\n"
+        f"Requested by: {requested_by or 'Slack'}\n"
+        f"Subject address: {address}\n"
+        f"DeepSift context JSON: {json.dumps(property_context or {}, ensure_ascii=True)}\n\n"
+        "Return only the structured JSON requested by the schema."
+    )
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "You are an appraiser-grade real estate comp analyst for a wholesaling CRM. You use public sources carefully and distinguish facts from assumptions.",
+                        }
+                    ],
+                },
+                {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+            ],
+            "tools": [{"type": "web_search_preview"}],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "manual_comping_analysis",
+                    "schema": _comp_analysis_schema(),
+                    "strict": True,
+                }
+            },
+        },
+        timeout=240,
+    )
+    response.raise_for_status()
+    output_text = _extract_openai_response_text(response.json())
+    if not output_text:
+        raise ValueError("No comping analysis returned by OpenAI.")
+    return json.loads(output_text)
+
+
+def _xlsx_set_headers(ws, headers):
+    fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
+    font = Font(bold=True, color="FFFFFF")
+    border = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
+    for col, header in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+
+
+def _xlsx_autofit(ws, max_width=60):
+    for column in ws.columns:
+        letter = get_column_letter(column[0].column)
+        width = 10
+        for cell in column:
+            value = "" if cell.value is None else str(cell.value)
+            width = max(width, min(max_width, len(value) + 2))
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        ws.column_dimensions[letter].width = width
+
+
+def generate_manual_comping_xlsx(analysis, output_path):
+    if openpyxl is None:
+        raise ValueError("openpyxl is not installed; cannot generate XLSX comp report.")
+    analysis = analysis if isinstance(analysis, dict) else {}
+    wb = openpyxl.Workbook()
+    summary_ws = wb.active
+    summary_ws.title = "Executive Summary"
+
+    subject = analysis.get("subject_property") if isinstance(analysis.get("subject_property"), dict) else {}
+    arv = analysis.get("arv_calculation") if isinstance(analysis.get("arv_calculation"), dict) else {}
+    market = analysis.get("market_overview") if isinstance(analysis.get("market_overview"), dict) else {}
+
+    summary_ws["A1"] = "SIFT Manual Comping Report"
+    summary_ws["A1"].font = Font(bold=True, size=16, color="2F5496")
+    summary_rows = [
+        ("Generated", datetime.now(EST_TZ).strftime("%Y-%m-%d %I:%M %p %Z")),
+        ("Address", subject.get("address") or ""),
+        ("City / State / ZIP", " ".join([str(subject.get("city") or ""), str(subject.get("state") or ""), str(subject.get("zip") or "")]).strip()),
+        ("Final ARV / Value", arv.get("final_arv")),
+        ("Range Low", arv.get("arv_low")),
+        ("Range High", arv.get("arv_high")),
+        ("Confidence", arv.get("confidence_level")),
+        ("Market Phase", market.get("market_phase")),
+        ("Summary", analysis.get("summary_text") or ""),
+    ]
+    for row_idx, (label, value) in enumerate(summary_rows, start=3):
+        summary_ws.cell(row=row_idx, column=1, value=label).font = Font(bold=True)
+        summary_ws.cell(row=row_idx, column=2, value=value)
+    _xlsx_autofit(summary_ws)
+
+    subject_ws = wb.create_sheet("Subject")
+    _xlsx_set_headers(subject_ws, ["Field", "Value"])
+    for row_idx, key in enumerate(["address", "city", "state", "zip", "county", "subdivision", "property_type", "gla", "lot_size", "beds", "baths", "year_built", "condition"], start=2):
+        subject_ws.cell(row=row_idx, column=1, value=key.replace("_", " ").title())
+        subject_ws.cell(row=row_idx, column=2, value=subject.get(key))
+    _xlsx_autofit(subject_ws)
+
+    comps_ws = wb.create_sheet("Comparable Sales")
+    comp_headers = ["Address", "Sale Date", "Sale Price", "GLA", "PPSF", "Beds", "Baths", "Year", "Condition", "Distance", "Adjustments", "Adjusted Value", "Source URL", "Rationale"]
+    _xlsx_set_headers(comps_ws, comp_headers)
+    for row_idx, comp in enumerate(analysis.get("comps") or [], start=2):
+        comp = comp if isinstance(comp, dict) else {}
+        values = [
+            comp.get("address"),
+            comp.get("sale_date"),
+            comp.get("sale_price"),
+            comp.get("gla"),
+            comp.get("ppsf"),
+            comp.get("beds"),
+            comp.get("baths"),
+            comp.get("year_built"),
+            comp.get("condition"),
+            comp.get("distance"),
+            comp.get("total_adjustments"),
+            comp.get("adjusted_value"),
+            comp.get("source_url"),
+            comp.get("rationale"),
+        ]
+        for col_idx, value in enumerate(values, start=1):
+            comps_ws.cell(row=row_idx, column=col_idx, value=value)
+    _xlsx_autofit(comps_ws)
+
+    arv_ws = wb.create_sheet("ARV Calculation")
+    _xlsx_set_headers(arv_ws, ["Field", "Value"])
+    for row_idx, key in enumerate(["base_ppsf", "renovated_ppsf", "subject_gla", "base_arv", "feature_adjustments", "final_arv", "confidence_level", "confidence_band_pct", "arv_low", "arv_high"], start=2):
+        arv_ws.cell(row=row_idx, column=1, value=key.replace("_", " ").title())
+        arv_ws.cell(row=row_idx, column=2, value=arv.get(key))
+    _xlsx_autofit(arv_ws)
+
+    adjustments_ws = wb.create_sheet("Adjustments")
+    _xlsx_set_headers(adjustments_ws, ["Comp Address", "Adjustment Type", "Reason", "Amount"])
+    for row_idx, adj in enumerate(analysis.get("adjustments_applied") or [], start=2):
+        adj = adj if isinstance(adj, dict) else {}
+        adjustments_ws.cell(row=row_idx, column=1, value=adj.get("comp_address"))
+        adjustments_ws.cell(row=row_idx, column=2, value=adj.get("adjustment_type"))
+        adjustments_ws.cell(row=row_idx, column=3, value=adj.get("reason"))
+        adjustments_ws.cell(row=row_idx, column=4, value=adj.get("amount"))
+    _xlsx_autofit(adjustments_ws)
+
+    notes_ws = wb.create_sheet("Sources & Notes")
+    _xlsx_set_headers(notes_ws, ["Section", "Value"])
+    row_idx = 2
+    for section in ["sources", "recommendations", "caveats"]:
+        for value in analysis.get(section) or []:
+            notes_ws.cell(row=row_idx, column=1, value=section.replace("_", " ").title())
+            notes_ws.cell(row=row_idx, column=2, value=value)
+            row_idx += 1
+    for note in market.get("notes") or []:
+        notes_ws.cell(row=row_idx, column=1, value="Market Note")
+        notes_ws.cell(row=row_idx, column=2, value=note)
+        row_idx += 1
+    _xlsx_autofit(notes_ws)
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output)
+    return str(output)
+
+
+def slack_upload_file_external(db, channel_id, file_path, title="", initial_comment=""):
+    settings = get_slack_settings(db)
+    token = (settings.get("bot_token") or "").strip()
+    if not token:
+        raise ValueError("Slack bot token is not configured; XLSX upload requires files:write.")
+    channel = (channel_id or "").strip()
+    if not channel:
+        raise ValueError("Slack channel_id is missing.")
+    path = Path(file_path)
+    if not path.exists():
+        raise ValueError(f"File not found: {file_path}")
+    size = path.stat().st_size
+    filename = path.name
+    headers = {"Authorization": f"Bearer {token}"}
+    prep = requests.post(
+        "https://slack.com/api/files.getUploadURLExternal",
+        headers=headers,
+        data={"filename": filename, "length": str(size)},
+        timeout=30,
+    )
+    prep.raise_for_status()
+    prep_data = prep.json()
+    if not prep_data.get("ok"):
+        raise ValueError(f"Slack upload URL failed: {prep_data.get('error') or prep_data}")
+    upload_url = prep_data.get("upload_url")
+    file_id = prep_data.get("file_id")
+    with path.open("rb") as fh:
+        upload = requests.post(
+            upload_url,
+            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            data=fh,
+            timeout=90,
+        )
+    if not upload.ok:
+        raise ValueError(f"Slack file binary upload failed ({upload.status_code}): {upload.text}")
+    complete = requests.post(
+        "https://slack.com/api/files.completeUploadExternal",
+        headers=headers,
+        data={
+            "files": json.dumps([{"id": file_id, "title": title or filename}]),
+            "channel_id": channel,
+            "initial_comment": initial_comment or "",
+        },
+        timeout=30,
+    )
+    complete.raise_for_status()
+    complete_data = complete.json()
+    if not complete_data.get("ok"):
+        raise ValueError(f"Slack complete upload failed: {complete_data.get('error') or complete_data}")
+    return {"ok": True, "file_id": file_id, "response": complete_data}
+
+
+def process_slack_comp_request(request_id):
+    db = open_sqlite_connection()
+    try:
+        row = db.execute("SELECT * FROM slack_comp_requests WHERE id = ? LIMIT 1", (int(request_id),)).fetchone()
+        if not row:
+            return
+        db.execute(
+            "UPDATE slack_comp_requests SET status = 'Running', started_at = CURRENT_TIMESTAMP, error_message = '' WHERE id = ?",
+            (request_id,),
+        )
+        commit_with_retry(db)
+
+        property_context = {}
+        address = normalize_whitespace(row["address"] or "")
+        if int(row["property_id"] or 0) > 0:
+            address, property_context = _property_context_for_comp(db, int(row["property_id"]))
+        if not address:
+            raise ValueError("Comp request has no address.")
+
+        analysis = run_manual_comping_skill_analysis(
+            address,
+            property_context=property_context,
+            requested_by=row["slack_user_name"] or row["slack_user_id"] or "Slack",
+        )
+        subject = analysis.get("subject_property") if isinstance(analysis.get("subject_property"), dict) else {}
+        filename_base = _slugify_filename(subject.get("address") or address)
+        report_path = _comping_output_dir() / f"{filename_base}-comp-report-{int(request_id)}.xlsx"
+        generate_manual_comping_xlsx(analysis, report_path)
+        summary_text = _slack_text_limit(analysis.get("summary_text") or f"Comp report completed for {address}.", limit=2200)
+        initial_comment = f"SIFT comp report completed for {address}.\n\n{summary_text}"
+        upload_result = slack_upload_file_external(
+            db,
+            row["slack_channel_id"],
+            report_path,
+            title=f"SIFT Comp Report - {address}",
+            initial_comment=_slack_text_limit(initial_comment, limit=2800),
+        )
+        db.execute(
+            """
+            UPDATE slack_comp_requests
+            SET status = 'Completed',
+                summary_text = ?,
+                analysis_json = ?,
+                report_path = ?,
+                slack_file_id = ?,
+                completed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                analysis.get("summary_text") or "",
+                json.dumps(analysis, ensure_ascii=True),
+                str(report_path),
+                upload_result.get("file_id") or "",
+                request_id,
+            ),
+        )
+        commit_with_retry(db)
+        if row["response_url"]:
+            try:
+                send_slack_response_url(row["response_url"], f"Comp report #{request_id} finished and XLSX was uploaded.", response_type="ephemeral")
+            except Exception:
+                pass
+    except Exception as exc:
+        db.rollback()
+        message = f"Comp report #{request_id} failed: {exc}"
+        try:
+            db.execute(
+                """
+                UPDATE slack_comp_requests
+                SET status = 'Failed', error_message = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (str(exc), request_id),
+            )
+            log_app_error(
+                db,
+                source="slack_comp_worker",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="/webhooks/slack/command",
+                status_code=500,
+            )
+            commit_with_retry(db)
+        except Exception:
+            db.rollback()
+        try:
+            row = row if "row" in locals() else None
+            if row and row["response_url"]:
+                send_slack_response_url(row["response_url"], message, response_type="in_channel", replace_original=False)
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def launch_slack_comp_request(request_id):
+    worker = threading.Thread(target=process_slack_comp_request, args=(int(request_id),), daemon=True)
+    worker.start()
+    return worker
+
+
+def enqueue_slack_comp_request(db, target, raw_text="", channel_id="", user_id="", user_name="", response_url=""):
+    property_id = int(target.get("property_id") or 0)
+    address = normalize_whitespace(target.get("address") or "")
+    cur = db.execute(
+        """
+        INSERT INTO slack_comp_requests (
+            status, property_id, address, raw_text, slack_channel_id, slack_user_id,
+            slack_user_name, response_url
+        )
+        VALUES ('Queued', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (property_id or None, address, raw_text, channel_id, user_id, user_name, response_url),
+    )
+    request_id = int(cur.lastrowid or 0)
+    return request_id
 
 
 def verify_slack_signature(req, signing_secret):
@@ -34144,6 +34746,7 @@ def settings_page():
                     "slack_webhook_url": request.form.get("slack_webhook_url", ""),
                     "slack_signing_secret": request.form.get("slack_signing_secret", ""),
                     "slack_default_channel": request.form.get("slack_default_channel", ""),
+                    "slack_bot_token": request.form.get("slack_bot_token", ""),
                     "slack_agent_ops_webhook_url": request.form.get("slack_agent_ops_webhook_url", ""),
                     "slack_agent_ops_channel": request.form.get("slack_agent_ops_channel", ""),
                     "openletterconnect_api_key": request.form.get("openletterconnect_api_key", ""),
@@ -38194,10 +38797,13 @@ def slack_command_webhook():
     user_name = (request.form.get("user_name") or "").strip()
     user_id = (request.form.get("user_id") or "").strip()
     response_url = (request.form.get("response_url") or "").strip()
+    channel_id = (request.form.get("channel_id") or "").strip()
     base_url = (request.url_root or "").strip().rstrip("/")
     low = text.lower()
     tokens = [t for t in re.split(r"\s+", low) if t]
-    sub = tokens[0] if tokens else "help"
+    cmd_name = cmd.lower().lstrip("/")
+    dedicated_comp_command = cmd_name in {"comp", "comps", "siftcomp", "findcomps", "find-comps"}
+    sub = "comp" if dedicated_comp_command else (tokens[0] if tokens else "help")
     if sub in {"help", "?"}:
         return jsonify(
             {
@@ -38208,10 +38814,50 @@ def slack_command_webhook():
                     "• `queue` - pending Agent 2 actions\n"
                     "• `unresolved` - unresolved lead-watch items\n"
                     "• `d4d <address>` - add or flag a Driving For Dollars lead\n"
+                    "• `comp <address>` or `comp property #128` - run the manual SIFT comping worker and return XLSX\n"
                     "• `buyer <phone> [name] county(x,y) category(x,y) type(x,y)` - add or update a buyer\n"
                     "• `ads [30d] [platform(google,meta,...)]` - cached ad snapshot and spend\n"
                     "• `health` - agent endpoint health\n"
                     "• `help` - command list"
+                ),
+            }
+        )
+    if sub in {"comp", "comps", "findcomp", "find-comps"}:
+        comp_text = text if dedicated_comp_command else text.partition(" ")[2].strip()
+        target = _slack_comp_target(comp_text)
+        if not target.get("ok"):
+            return jsonify({"response_type": "ephemeral", "text": target.get("error") or "Use `comp <address>` or `comp property #128`."})
+        try:
+            request_id = enqueue_slack_comp_request(
+                db,
+                target,
+                raw_text=text,
+                channel_id=channel_id,
+                user_id=user_id,
+                user_name=user_name,
+                response_url=response_url,
+            )
+            db.commit()
+            launch_slack_comp_request(request_id)
+        except Exception as exc:
+            db.rollback()
+            log_app_error(
+                db,
+                source="slack_comp_enqueue",
+                error_message=str(exc),
+                details=json.dumps({"text": text, "user": user_name or user_id}),
+                route="/webhooks/slack/command",
+                status_code=500,
+            )
+            db.commit()
+            return jsonify({"response_type": "ephemeral", "text": f"Could not queue comp report: {exc}"})
+        label = f"property #{target.get('property_id')}" if int(target.get("property_id") or 0) else target.get("address")
+        return jsonify(
+            {
+                "response_type": "in_channel",
+                "text": (
+                    f"SIFT comp report #{request_id} started for {label}.\n"
+                    "I’ll research public comps with the manual comping framework and upload the XLSX here when it finishes."
                 ),
             }
         )

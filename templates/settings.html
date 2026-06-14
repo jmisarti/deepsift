@@ -235,6 +235,9 @@
             <label>Slack Default Channel (optional)
                 <input name="slack_default_channel" value="{{ slack_settings.default_channel }}" placeholder="#alerts">
             </label>
+            <label class="span2">Slack Bot Token (for XLSX uploads)
+                <input name="slack_bot_token" value="{{ slack_settings.bot_token }}" placeholder="xoxb-... with files:write">
+            </label>
             <label class="span2">Slack Agent Ops Webhook URL (optional)
                 <input name="slack_agent_ops_webhook_url" value="{{ slack_settings.agent_ops_webhook_url }}" placeholder="Dedicated webhook for #agent-ops">
             </label>

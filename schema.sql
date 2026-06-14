@@ -319,6 +319,29 @@ CREATE TABLE IF NOT EXISTS app_errors (
     dismissed_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS slack_comp_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL DEFAULT 'Queued',
+    property_id INTEGER,
+    address TEXT,
+    raw_text TEXT,
+    slack_channel_id TEXT,
+    slack_user_id TEXT,
+    slack_user_name TEXT,
+    response_url TEXT,
+    summary_text TEXT,
+    analysis_json TEXT,
+    report_path TEXT,
+    slack_file_id TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TEXT,
+    completed_at TEXT,
+    FOREIGN KEY(property_id) REFERENCES properties(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_slack_comp_requests_status ON slack_comp_requests(status, id);
+
 CREATE TABLE IF NOT EXISTS referral_realtors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     first_name TEXT NOT NULL,

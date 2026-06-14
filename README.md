@@ -70,6 +70,8 @@ This repo includes:
 ## Slack Comp Reports
 - Point a Slack slash command at `POST /webhooks/slack/command`.
 - Use `comp <address>` or `comp property #128` from the existing Agent Ops command, or map a dedicated `/comp` command to the same endpoint.
+- Railway only queues the request and uploads the finished XLSX back to Slack.
+- Codex claims queued jobs through `POST /api/slack-comp-requests/claim`, runs the uploaded `real-estate-comping` skill, then completes the job through `POST /api/slack-comp-requests/<id>/complete`.
 - XLSX upload requires `SLACK_BOT_TOKEN` or the Integrations tab `Slack Bot Token` setting with Slack file upload permissions.
-- The worker uses `OPENAI_COMPING_MODEL` plus web search and the manual SIFT comping framework; it does not use RentCast.
+- This flow is intentionally not RentCast and not an app-side recreation of the comping skill.
 

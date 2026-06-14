@@ -12329,6 +12329,136 @@ def enqueue_slack_comp_request(db, target, raw_text="", channel_id="", user_id="
     return request_id
 
 
+def _slack_comp_job_payload(db, row):
+    if row is None:
+        return None
+    item = dict(row)
+    property_context = {}
+    address = normalize_whitespace(item.get("address") or "")
+    property_id = int(item.get("property_id") or 0)
+    if property_id > 0:
+        address, property_context = _property_context_for_comp(db, property_id)
+    item["address"] = address
+    item["property_context"] = property_context
+    return item
+
+
+def claim_slack_comp_request_for_codex(db):
+    row = db.execute(
+        """
+        SELECT *
+        FROM slack_comp_requests
+        WHERE status = 'Queued'
+        ORDER BY id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    db.execute(
+        """
+        UPDATE slack_comp_requests
+        SET status = 'Claimed',
+            started_at = CURRENT_TIMESTAMP,
+            completed_at = NULL,
+            summary_text = '',
+            analysis_json = '',
+            report_path = '',
+            slack_file_id = '',
+            error_message = ''
+        WHERE id = ?
+        """,
+        (int(row["id"]),),
+    )
+    claimed = db.execute("SELECT * FROM slack_comp_requests WHERE id = ? LIMIT 1", (int(row["id"]),)).fetchone()
+    return _slack_comp_job_payload(db, claimed)
+
+
+def save_slack_comp_report_upload(db, request_id, uploaded_file=None, file_b64="", filename="", summary_text="", analysis_json=""):
+    row = db.execute("SELECT * FROM slack_comp_requests WHERE id = ? LIMIT 1", (int(request_id),)).fetchone()
+    if row is None:
+        raise ValueError(f"Comp request #{request_id} not found.")
+    target_dir = _comping_output_dir()
+    filename = _slugify_filename(filename or row["address"] or f"comp-request-{request_id}", fallback=f"comp-request-{request_id}")
+    if not filename.lower().endswith(".xlsx"):
+        filename = f"{filename}.xlsx"
+    report_path = target_dir / f"codex-{int(request_id)}-{filename}"
+    if uploaded_file is not None:
+        uploaded_file.save(report_path)
+    elif file_b64:
+        report_path.write_bytes(base64.b64decode(file_b64))
+    else:
+        raise ValueError("XLSX file is required.")
+    if not report_path.exists() or report_path.stat().st_size <= 0:
+        raise ValueError("Uploaded XLSX file was empty.")
+    address = normalize_whitespace(row["address"] or "")
+    if int(row["property_id"] or 0) > 0 and not address:
+        try:
+            address, _context = _property_context_for_comp(db, int(row["property_id"]))
+        except Exception:
+            address = f"property #{int(row['property_id'])}"
+    initial_comment = _slack_text_limit(
+        "\n\n".join(
+            [
+                f"SIFT Codex comp report completed for {address or f'request #{request_id}'}.",
+                summary_text,
+            ]
+        ),
+        limit=2800,
+    )
+    upload_result = slack_upload_file_external(
+        db,
+        row["slack_channel_id"],
+        report_path,
+        title=f"SIFT Codex Comp Report - {address or f'request #{request_id}'}",
+        initial_comment=initial_comment,
+    )
+    db.execute(
+        """
+        UPDATE slack_comp_requests
+        SET status = 'Completed',
+            summary_text = ?,
+            analysis_json = ?,
+            report_path = ?,
+            slack_file_id = ?,
+            error_message = '',
+            completed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            summary_text or "",
+            analysis_json or "",
+            str(report_path),
+            upload_result.get("file_id") or "",
+            int(request_id),
+        ),
+    )
+    return {"ok": True, "request_id": int(request_id), "report_path": str(report_path), "slack_file_id": upload_result.get("file_id") or ""}
+
+
+def fail_slack_comp_request(db, request_id, error_message):
+    message = normalize_whitespace(error_message or "") or "Codex comp worker failed."
+    row = db.execute("SELECT * FROM slack_comp_requests WHERE id = ? LIMIT 1", (int(request_id),)).fetchone()
+    if row is None:
+        raise ValueError(f"Comp request #{request_id} not found.")
+    db.execute(
+        """
+        UPDATE slack_comp_requests
+        SET status = 'Failed',
+            error_message = ?,
+            completed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (message, int(request_id)),
+    )
+    if row["response_url"]:
+        try:
+            send_slack_response_url(row["response_url"], f"SIFT Codex comp request #{request_id} failed: {message}", response_type="in_channel")
+        except Exception:
+            pass
+    return {"ok": True, "request_id": int(request_id), "error_message": message}
+
+
 def verify_slack_signature(req, signing_secret):
     secret = (signing_secret or "").strip()
     if not secret:
@@ -39080,7 +39210,6 @@ def slack_command_webhook():
                 response_url=response_url,
             )
             db.commit()
-            launch_slack_comp_request(request_id)
         except Exception as exc:
             db.rollback()
             log_app_error(
@@ -39098,8 +39227,8 @@ def slack_command_webhook():
             {
                 "response_type": "in_channel",
                 "text": (
-                    f"SIFT comp report #{request_id} started for {label}.\n"
-                    "I’ll research public comps with the manual comping framework and upload the XLSX here when it finishes."
+                    f"SIFT Codex comp request #{request_id} queued for {label}.\n"
+                    "Codex will run the uploaded real-estate-comping skill and upload the XLSX here when it finishes."
                 ),
             }
         )
@@ -39290,6 +39419,100 @@ def slack_command_webhook():
     if sub in {"health", "ping"}:
         return jsonify({"response_type": "ephemeral", "text": "DeepSift Agent Ops is online."})
     return jsonify({"response_type": "ephemeral", "text": f"Unknown agent-ops command `{text or cmd}`. Try `help`."})
+
+
+@app.route("/api/slack-comp-requests/claim", methods=["POST"])
+def slack_comp_requests_claim_api():
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    try:
+        job = claim_slack_comp_request_for_codex(db)
+        db.commit()
+        return jsonify({"ok": True, "job": job})
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="slack_comp_claim",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/api/slack-comp-requests/claim",
+            status_code=500,
+        )
+        db.commit()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/slack-comp-requests/<int:request_id>/complete", methods=["POST"])
+def slack_comp_requests_complete_api(request_id):
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        summary_text = normalize_whitespace(payload.get("summary_text") or "")
+        analysis_json = payload.get("analysis_json")
+        if not isinstance(analysis_json, str):
+            analysis_json = json.dumps(analysis_json or {}, ensure_ascii=True)
+        file_b64 = normalize_whitespace(payload.get("file_base64") or "")
+        filename = normalize_whitespace(payload.get("filename") or "")
+        uploaded_file = None
+    else:
+        summary_text = normalize_whitespace(request.form.get("summary_text") or "")
+        analysis_json = request.form.get("analysis_json") or ""
+        file_b64 = normalize_whitespace(request.form.get("file_base64") or "")
+        filename = normalize_whitespace(request.form.get("filename") or "")
+        uploaded_file = request.files.get("file") or request.files.get("report")
+        if uploaded_file is not None and not filename:
+            filename = uploaded_file.filename or ""
+    try:
+        result = save_slack_comp_report_upload(
+            db,
+            request_id,
+            uploaded_file=uploaded_file,
+            file_b64=file_b64,
+            filename=filename,
+            summary_text=summary_text,
+            analysis_json=analysis_json,
+        )
+        db.commit()
+        return jsonify(result)
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="slack_comp_complete",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route=f"/api/slack-comp-requests/{request_id}/complete",
+            status_code=500,
+        )
+        db.commit()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/slack-comp-requests/<int:request_id>/fail", methods=["POST"])
+def slack_comp_requests_fail_api(request_id):
+    ensure_db()
+    db = get_db()
+    if not integration_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True)
+    error_message = ""
+    if isinstance(payload, dict):
+        error_message = payload.get("error") or payload.get("error_message") or ""
+    if not error_message:
+        error_message = request.form.get("error") or request.form.get("error_message") or ""
+    try:
+        result = fail_slack_comp_request(db, request_id, error_message)
+        db.commit()
+        return jsonify(result)
+    except Exception as exc:
+        db.rollback()
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/webhooks/slack/events", methods=["POST"])

@@ -11624,11 +11624,59 @@ def _property_context_for_comp(db, property_id):
 def _comp_analysis_schema():
     num = {"type": ["number", "null"]}
     text = {"type": ["string", "null"]}
+    comp_item = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "address": {"type": "string"},
+            "sale_date": text,
+            "sale_price": num,
+            "gla": num,
+            "ppsf": num,
+            "beds": num,
+            "baths": num,
+            "year_built": num,
+            "condition": text,
+            "distance": num,
+            "total_adjustments": num,
+            "adjusted_value": num,
+            "source_url": text,
+            "rationale": text,
+            "weight": text,
+            "bucket": text,
+            "location_notes": text,
+            "adjustment_notes": text,
+            "data_confidence": text,
+        },
+        "required": [
+            "address",
+            "sale_date",
+            "sale_price",
+            "gla",
+            "ppsf",
+            "beds",
+            "baths",
+            "year_built",
+            "condition",
+            "distance",
+            "total_adjustments",
+            "adjusted_value",
+            "source_url",
+            "rationale",
+            "weight",
+            "bucket",
+            "location_notes",
+            "adjustment_notes",
+            "data_confidence",
+        ],
+    }
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "summary_text": {"type": "string"},
+            "comp_selection_strategy": {"type": "string"},
+            "subject_research_notes": {"type": "array", "items": {"type": "string"}},
             "subject_property": {
                 "type": "object",
                 "additionalProperties": False,
@@ -11646,10 +11694,58 @@ def _comp_analysis_schema():
                     "baths": num,
                     "year_built": num,
                     "condition": text,
+                    "parking": text,
+                    "basement": text,
+                    "hoa": text,
+                    "zoning": text,
+                    "last_sale_date": text,
+                    "last_sale_price": num,
                 },
-                "required": ["address", "city", "state", "zip", "county", "subdivision", "property_type", "gla", "lot_size", "beds", "baths", "year_built", "condition"],
+                "required": [
+                    "address",
+                    "city",
+                    "state",
+                    "zip",
+                    "county",
+                    "subdivision",
+                    "property_type",
+                    "gla",
+                    "lot_size",
+                    "beds",
+                    "baths",
+                    "year_built",
+                    "condition",
+                    "parking",
+                    "basement",
+                    "hoa",
+                    "zoning",
+                    "last_sale_date",
+                    "last_sale_price",
+                ],
             },
-            "comps": {
+            "comps": {"type": "array", "items": comp_item},
+            "active_pending": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "address": {"type": "string"},
+                        "status": text,
+                        "list_price": num,
+                        "gla": num,
+                        "ppsf": num,
+                        "beds": num,
+                        "baths": num,
+                        "days_on_market": num,
+                        "distance": num,
+                        "source_url": text,
+                        "read": text,
+                    },
+                    "required": ["address", "status", "list_price", "gla", "ppsf", "beds", "baths", "days_on_market", "distance", "source_url", "read"],
+                },
+            },
+            "excluded_comps": {
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -11658,19 +11754,10 @@ def _comp_analysis_schema():
                         "address": {"type": "string"},
                         "sale_date": text,
                         "sale_price": num,
-                        "gla": num,
-                        "ppsf": num,
-                        "beds": num,
-                        "baths": num,
-                        "year_built": num,
-                        "condition": text,
-                        "distance": num,
-                        "total_adjustments": num,
-                        "adjusted_value": num,
                         "source_url": text,
-                        "rationale": text,
+                        "reason_excluded": {"type": "string"},
                     },
-                    "required": ["address", "sale_date", "sale_price", "gla", "ppsf", "beds", "baths", "year_built", "condition", "distance", "total_adjustments", "adjusted_value", "source_url", "rationale"],
+                    "required": ["address", "sale_date", "sale_price", "source_url", "reason_excluded"],
                 },
             },
             "bucket_analysis": {
@@ -11679,11 +11766,13 @@ def _comp_analysis_schema():
                 "properties": {
                     "unrenovated_count": num,
                     "unrenovated_median_ppsf": num,
+                    "unrenovated_notes": text,
                     "renovated_count": num,
                     "renovated_median_ppsf": num,
+                    "renovated_notes": text,
                     "market_premium_pct": num,
                 },
-                "required": ["unrenovated_count", "unrenovated_median_ppsf", "renovated_count", "renovated_median_ppsf", "market_premium_pct"],
+                "required": ["unrenovated_count", "unrenovated_median_ppsf", "unrenovated_notes", "renovated_count", "renovated_median_ppsf", "renovated_notes", "market_premium_pct"],
             },
             "market_overview": {
                 "type": "object",
@@ -11694,9 +11783,11 @@ def _comp_analysis_schema():
                     "median_ppsf": num,
                     "avg_dom": num,
                     "sale_to_list_ratio": num,
+                    "inventory_read": text,
+                    "price_trend_read": text,
                     "notes": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["market_phase", "median_price", "median_ppsf", "avg_dom", "sale_to_list_ratio", "notes"],
+                "required": ["market_phase", "median_price", "median_ppsf", "avg_dom", "sale_to_list_ratio", "inventory_read", "price_trend_read", "notes"],
             },
             "arv_calculation": {
                 "type": "object",
@@ -11708,12 +11799,15 @@ def _comp_analysis_schema():
                     "base_arv": num,
                     "feature_adjustments": num,
                     "final_arv": num,
+                    "value_method": text,
+                    "same_street_anchor_read": text,
+                    "micro_market_read": text,
                     "confidence_level": text,
                     "confidence_band_pct": num,
                     "arv_low": num,
                     "arv_high": num,
                 },
-                "required": ["base_ppsf", "renovated_ppsf", "subject_gla", "base_arv", "feature_adjustments", "final_arv", "confidence_level", "confidence_band_pct", "arv_low", "arv_high"],
+                "required": ["base_ppsf", "renovated_ppsf", "subject_gla", "base_arv", "feature_adjustments", "final_arv", "value_method", "same_street_anchor_read", "micro_market_read", "confidence_level", "confidence_band_pct", "arv_low", "arv_high"],
             },
             "adjustments_applied": {
                 "type": "array",
@@ -11733,7 +11827,22 @@ def _comp_analysis_schema():
             "recommendations": {"type": "array", "items": {"type": "string"}},
             "caveats": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["summary_text", "subject_property", "comps", "bucket_analysis", "market_overview", "arv_calculation", "adjustments_applied", "sources", "recommendations", "caveats"],
+        "required": [
+            "summary_text",
+            "comp_selection_strategy",
+            "subject_research_notes",
+            "subject_property",
+            "comps",
+            "active_pending",
+            "excluded_comps",
+            "bucket_analysis",
+            "market_overview",
+            "arv_calculation",
+            "adjustments_applied",
+            "sources",
+            "recommendations",
+            "caveats",
+        ],
     }
 
 
@@ -11752,11 +11861,16 @@ def run_manual_comping_skill_analysis(address, property_context=None, requested_
         "Workflow rules:\n"
         "- Determine if the state is disclosure or non-disclosure.\n"
         "- For disclosure states, use the two-bucket method: dated/unrenovated versus renovated/premium comps.\n"
+        "- Return a workbook-grade analysis, not a quick AVM summary.\n"
+        "- Find 5 to 8 closed-sale comps when public data reasonably allows it. If fewer than 5 credible comps exist, explain exactly why in comp_selection_strategy and caveats.\n"
+        "- Include at least 2 active or pending listings when public data reasonably allows it, because live competition matters for pricing.\n"
+        "- Include excluded comps that looked plausible but were rejected, with the rejection reason.\n"
         "- Favor same micro-pocket, same subdivision, same property style, similar GLA, similar build era, recent closed sales.\n"
         "- Do not cross major roads or market boundaries unless inventory is thin, and explicitly note any relaxation.\n"
         "- Check active/pending context, DOM, sale-to-list, and current market direction.\n"
         "- Produce a practical ARV/current-market-value midpoint and low/high range.\n"
-        "- Include source URLs for comps and market context. Do not fabricate sale prices or sources.\n"
+        "- For every comp, include source URL, data confidence, bucket, weight, location notes, and adjustment notes.\n"
+        "- Include source URLs for comps and market context. Do not fabricate sale prices or sources; leave numeric fields null if not supportable.\n"
         "- If public data is thin, say so in caveats and widen the confidence band.\n\n"
         f"Requested by: {requested_by or 'Slack'}\n"
         f"Subject address: {address}\n"
@@ -11833,6 +11947,7 @@ def generate_manual_comping_xlsx(analysis, output_path):
     subject = analysis.get("subject_property") if isinstance(analysis.get("subject_property"), dict) else {}
     arv = analysis.get("arv_calculation") if isinstance(analysis.get("arv_calculation"), dict) else {}
     market = analysis.get("market_overview") if isinstance(analysis.get("market_overview"), dict) else {}
+    bucket = analysis.get("bucket_analysis") if isinstance(analysis.get("bucket_analysis"), dict) else {}
 
     summary_ws["A1"] = "SIFT Manual Comping Report"
     summary_ws["A1"].font = Font(bold=True, size=16, color="2F5496")
@@ -11845,6 +11960,10 @@ def generate_manual_comping_xlsx(analysis, output_path):
         ("Range High", arv.get("arv_high")),
         ("Confidence", arv.get("confidence_level")),
         ("Market Phase", market.get("market_phase")),
+        ("Value Method", arv.get("value_method")),
+        ("Same-Street / Best Anchor Read", arv.get("same_street_anchor_read")),
+        ("Micro-Market Read", arv.get("micro_market_read")),
+        ("Comp Selection Strategy", analysis.get("comp_selection_strategy") or ""),
         ("Summary", analysis.get("summary_text") or ""),
     ]
     for row_idx, (label, value) in enumerate(summary_rows, start=3):
@@ -11854,13 +11973,60 @@ def generate_manual_comping_xlsx(analysis, output_path):
 
     subject_ws = wb.create_sheet("Subject")
     _xlsx_set_headers(subject_ws, ["Field", "Value"])
-    for row_idx, key in enumerate(["address", "city", "state", "zip", "county", "subdivision", "property_type", "gla", "lot_size", "beds", "baths", "year_built", "condition"], start=2):
+    subject_keys = [
+        "address",
+        "city",
+        "state",
+        "zip",
+        "county",
+        "subdivision",
+        "property_type",
+        "gla",
+        "lot_size",
+        "beds",
+        "baths",
+        "year_built",
+        "condition",
+        "parking",
+        "basement",
+        "hoa",
+        "zoning",
+        "last_sale_date",
+        "last_sale_price",
+    ]
+    for row_idx, key in enumerate(subject_keys, start=2):
         subject_ws.cell(row=row_idx, column=1, value=key.replace("_", " ").title())
         subject_ws.cell(row=row_idx, column=2, value=subject.get(key))
+    row_idx = len(subject_keys) + 4
+    subject_ws.cell(row=row_idx, column=1, value="Subject Research Notes").font = Font(bold=True, color="2F5496")
+    for note in analysis.get("subject_research_notes") or []:
+        row_idx += 1
+        subject_ws.cell(row=row_idx, column=1, value=note)
+        subject_ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=2)
     _xlsx_autofit(subject_ws)
 
     comps_ws = wb.create_sheet("Comparable Sales")
-    comp_headers = ["Address", "Sale Date", "Sale Price", "GLA", "PPSF", "Beds", "Baths", "Year", "Condition", "Distance", "Adjustments", "Adjusted Value", "Source URL", "Rationale"]
+    comp_headers = [
+        "Address",
+        "Sale Date",
+        "Sale Price",
+        "GLA",
+        "PPSF",
+        "Beds",
+        "Baths",
+        "Year",
+        "Condition",
+        "Distance",
+        "Bucket",
+        "Weight",
+        "Adjustments",
+        "Adjusted Value",
+        "Location Notes",
+        "Adjustment Notes",
+        "Data Confidence",
+        "Source URL",
+        "Rationale",
+    ]
     _xlsx_set_headers(comps_ws, comp_headers)
     for row_idx, comp in enumerate(analysis.get("comps") or [], start=2):
         comp = comp if isinstance(comp, dict) else {}
@@ -11875,8 +12041,13 @@ def generate_manual_comping_xlsx(analysis, output_path):
             comp.get("year_built"),
             comp.get("condition"),
             comp.get("distance"),
+            comp.get("bucket"),
+            comp.get("weight"),
             comp.get("total_adjustments"),
             comp.get("adjusted_value"),
+            comp.get("location_notes"),
+            comp.get("adjustment_notes"),
+            comp.get("data_confidence"),
             comp.get("source_url"),
             comp.get("rationale"),
         ]
@@ -11884,12 +12055,67 @@ def generate_manual_comping_xlsx(analysis, output_path):
             comps_ws.cell(row=row_idx, column=col_idx, value=value)
     _xlsx_autofit(comps_ws)
 
+    active_ws = wb.create_sheet("Active Pending")
+    _xlsx_set_headers(active_ws, ["Address", "Status", "List Price", "GLA", "PPSF", "Beds", "Baths", "DOM", "Distance", "Source URL", "Read"])
+    for row_idx, item in enumerate(analysis.get("active_pending") or [], start=2):
+        item = item if isinstance(item, dict) else {}
+        for col_idx, value in enumerate(
+            [
+                item.get("address"),
+                item.get("status"),
+                item.get("list_price"),
+                item.get("gla"),
+                item.get("ppsf"),
+                item.get("beds"),
+                item.get("baths"),
+                item.get("days_on_market"),
+                item.get("distance"),
+                item.get("source_url"),
+                item.get("read"),
+            ],
+            start=1,
+        ):
+            active_ws.cell(row=row_idx, column=col_idx, value=value)
+    _xlsx_autofit(active_ws)
+
+    excluded_ws = wb.create_sheet("Excluded Comps")
+    _xlsx_set_headers(excluded_ws, ["Address", "Sale Date", "Sale Price", "Source URL", "Reason Excluded"])
+    for row_idx, item in enumerate(analysis.get("excluded_comps") or [], start=2):
+        item = item if isinstance(item, dict) else {}
+        for col_idx, value in enumerate(
+            [item.get("address"), item.get("sale_date"), item.get("sale_price"), item.get("source_url"), item.get("reason_excluded")],
+            start=1,
+        ):
+            excluded_ws.cell(row=row_idx, column=col_idx, value=value)
+    _xlsx_autofit(excluded_ws)
+
     arv_ws = wb.create_sheet("ARV Calculation")
     _xlsx_set_headers(arv_ws, ["Field", "Value"])
-    for row_idx, key in enumerate(["base_ppsf", "renovated_ppsf", "subject_gla", "base_arv", "feature_adjustments", "final_arv", "confidence_level", "confidence_band_pct", "arv_low", "arv_high"], start=2):
+    for row_idx, key in enumerate(["base_ppsf", "renovated_ppsf", "subject_gla", "base_arv", "feature_adjustments", "final_arv", "value_method", "same_street_anchor_read", "micro_market_read", "confidence_level", "confidence_band_pct", "arv_low", "arv_high"], start=2):
         arv_ws.cell(row=row_idx, column=1, value=key.replace("_", " ").title())
         arv_ws.cell(row=row_idx, column=2, value=arv.get(key))
     _xlsx_autofit(arv_ws)
+
+    market_ws = wb.create_sheet("Market Analysis")
+    _xlsx_set_headers(market_ws, ["Field", "Value"])
+    market_keys = ["market_phase", "median_price", "median_ppsf", "avg_dom", "sale_to_list_ratio", "inventory_read", "price_trend_read"]
+    for row_idx, key in enumerate(market_keys, start=2):
+        market_ws.cell(row=row_idx, column=1, value=key.replace("_", " ").title())
+        market_ws.cell(row=row_idx, column=2, value=market.get(key))
+    row_idx = len(market_keys) + 4
+    market_ws.cell(row=row_idx, column=1, value="Market Notes").font = Font(bold=True, color="2F5496")
+    for note in market.get("notes") or []:
+        row_idx += 1
+        market_ws.cell(row=row_idx, column=1, value=note)
+        market_ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=2)
+    _xlsx_autofit(market_ws)
+
+    bucket_ws = wb.create_sheet("Bucket Analysis")
+    _xlsx_set_headers(bucket_ws, ["Field", "Value"])
+    for row_idx, key in enumerate(["unrenovated_count", "unrenovated_median_ppsf", "unrenovated_notes", "renovated_count", "renovated_median_ppsf", "renovated_notes", "market_premium_pct"], start=2):
+        bucket_ws.cell(row=row_idx, column=1, value=key.replace("_", " ").title())
+        bucket_ws.cell(row=row_idx, column=2, value=bucket.get(key))
+    _xlsx_autofit(bucket_ws)
 
     adjustments_ws = wb.create_sheet("Adjustments")
     _xlsx_set_headers(adjustments_ws, ["Comp Address", "Adjustment Type", "Reason", "Amount"])

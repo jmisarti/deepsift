@@ -753,6 +753,8 @@ def require_login_if_enabled():
     if request.path.startswith("/oauth/amazon/") or request.path.startswith("/oauth/roku/"):
         return None
     # External integrations authenticate via API key header.
+    if request.path.startswith("/api/slack-comp-requests/"):
+        return None
     if request.path.startswith("/api/integrations/"):
         return None
     if session.get("auth_ok"):

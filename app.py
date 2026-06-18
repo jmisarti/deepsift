@@ -19984,6 +19984,7 @@ def run_website_step1_hold_once():
             create_result = None
             contact_sync = None
             note_sync = None
+            tag_sync = None
             duplicate_existing = False
             duplicate_reason = ""
             mode = "step1_only_timeout"
@@ -20007,6 +20008,7 @@ def run_website_step1_hold_once():
                 "create_result": create_result,
                 "contact_sync": contact_sync,
                 "note_sync": note_sync,
+                "tag_sync": tag_sync,
             }
             should_notify = False
             slack_result = {"sent": False, "error": ""}
@@ -20061,6 +20063,16 @@ def run_website_step1_hold_once():
                             )
                         if token and created_uuid and additional_note:
                             note_sync = reisift_append_property_note(token, created_uuid, additional_note)
+                if created_uuid:
+                    try:
+                        token = reisift_get_access_token()
+                        tag_sync = reisift_append_property_tags(
+                            token,
+                            created_uuid,
+                            _website_reisift_tags_list("Stage1", step1_payload),
+                        )
+                    except Exception as exc:
+                        tag_sync = {"ok": False, "property_uuid": created_uuid, "error": str(exc)}
 
                 should_notify = True
                 note_payload.update(
@@ -20094,6 +20106,7 @@ def run_website_step1_hold_once():
                     "create_result": create_result,
                     "contact_sync": contact_sync,
                     "note_sync": note_sync,
+                    "tag_sync": tag_sync,
                 }
                 log_app_error(
                     db,
@@ -20178,6 +20191,7 @@ def run_website_step1_hold_once():
                     "create_result": create_result,
                     "contact_sync": contact_sync,
                     "note_sync": note_sync,
+                    "tag_sync": tag_sync,
                     "slack_result": slack_result,
                 }
             )

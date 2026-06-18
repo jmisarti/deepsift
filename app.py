@@ -15894,6 +15894,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
     owner_uuid = owner_uuid or recovered_owner_uuid
     contact_sync = None
     note_sync = None
+    list_sync = None
     tag_sync = None
     enrich_result = None
     create_result = None
@@ -15946,6 +15947,11 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 [{"number": merged_fields.get("phone"), "type": "UNKNOWN"}] if merged_fields.get("phone") else [],
                 [merged_fields.get("email")] if merged_fields.get("email") else [],
             )
+        if token and created_uuid:
+            try:
+                list_sync = reisift_sync_property_lists(token, created_uuid, ["Carrot"])
+            except Exception as exc:
+                list_sync = {"ok": False, "property_uuid": created_uuid, "error": str(exc)}
         if token and created_uuid:
             try:
                 tag_sync = reisift_append_property_tags(
@@ -16024,6 +16030,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             "owner_uuid": owner_uuid,
             "contact_sync": contact_sync,
             "note_sync": note_sync,
+            "list_sync": list_sync,
             "tag_sync": tag_sync,
             "enrich": enrich_result,
             "create_result": create_result,
@@ -19984,6 +19991,7 @@ def run_website_step1_hold_once():
             create_result = None
             contact_sync = None
             note_sync = None
+            list_sync = None
             tag_sync = None
             duplicate_existing = False
             duplicate_reason = ""
@@ -20008,6 +20016,7 @@ def run_website_step1_hold_once():
                 "create_result": create_result,
                 "contact_sync": contact_sync,
                 "note_sync": note_sync,
+                "list_sync": list_sync,
                 "tag_sync": tag_sync,
             }
             should_notify = False
@@ -20066,6 +20075,10 @@ def run_website_step1_hold_once():
                 if created_uuid:
                     try:
                         token = reisift_get_access_token()
+                        try:
+                            list_sync = reisift_sync_property_lists(token, created_uuid, ["Carrot"])
+                        except Exception as exc:
+                            list_sync = {"ok": False, "property_uuid": created_uuid, "error": str(exc)}
                         tag_sync = reisift_append_property_tags(
                             token,
                             created_uuid,
@@ -20106,6 +20119,7 @@ def run_website_step1_hold_once():
                     "create_result": create_result,
                     "contact_sync": contact_sync,
                     "note_sync": note_sync,
+                    "list_sync": list_sync,
                     "tag_sync": tag_sync,
                 }
                 log_app_error(
@@ -20191,6 +20205,7 @@ def run_website_step1_hold_once():
                     "create_result": create_result,
                     "contact_sync": contact_sync,
                     "note_sync": note_sync,
+                    "list_sync": list_sync,
                     "tag_sync": tag_sync,
                     "slack_result": slack_result,
                 }

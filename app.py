@@ -2336,6 +2336,473 @@ def est_yesterday_start_utc(now_dt=None):
     return day_start_et.astimezone(timezone.utc).replace(tzinfo=None)
 
 
+SKIPSHERPA_PHONE_PRIORITY_ORDER = {
+    "call first": 0,
+    "call next": 1,
+    "call last": 2,
+    "call stale": 3,
+    "call unknown": 4,
+}
+
+PHONE_TOUCHPOINT_LABEL_ORDER = {
+    "mobile": 0,
+    "unknown": 1,
+    "voip": 2,
+    "landline": 3,
+    "fax": 4,
+}
+
+PHONE_TOUCHPOINT_DEFAULT_PRIORITY = 99
+
+
+def _is_truthyish(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _phone_reference_date(now_dt=None):
+    if isinstance(now_dt, datetime):
+        if now_dt.tzinfo is None:
+            return now_dt.date()
+        return now_dt.astimezone(EST_TZ).date()
+    if now_dt:
+        return now_dt
+    return datetime.now(EST_TZ).date()
+
+
+def _parse_skipsherpa_phone_last_seen(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _skipsherpa_phone_months_since_last_seen(value, now_dt=None):
+    seen_date = _parse_skipsherpa_phone_last_seen(value)
+    if seen_date is None:
+        return None
+    ref_date = _phone_reference_date(now_dt=now_dt)
+    months = (ref_date.year - seen_date.year) * 12 + (ref_date.month - seen_date.month)
+    if ref_date.day < seen_date.day:
+        months -= 1
+    return max(0, months)
+
+
+def _skipsherpa_phone_freshness_tag(last_seen, now_dt=None):
+    months = _skipsherpa_phone_months_since_last_seen(last_seen, now_dt=now_dt)
+    if months is None:
+        return "Call Unknown"
+    if months <= 18:
+        return "Call First"
+    if months <= 48:
+        return "Call Next"
+    if months <= 84:
+        return "Call Last"
+    return "Call Stale"
+
+
+def _skipsherpa_phone_priority_rank(tag_value):
+    tag = str(tag_value or "").strip().lower()
+    return SKIPSHERPA_PHONE_PRIORITY_ORDER.get(tag, PHONE_TOUCHPOINT_DEFAULT_PRIORITY)
+
+
+def _skipsherpa_phone_dnc_tags(dnc_statuses):
+    statuses = dnc_statuses if isinstance(dnc_statuses, list) else []
+    tags = []
+    seen = set()
+
+    def add_tag(tag_value):
+        tag = str(tag_value or "").strip()
+        key = tag.lower()
+        if not tag or key in seen:
+            return
+        seen.add(key)
+        tags.append(tag)
+
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        if _is_truthyish(status.get("is_registered")):
+            add_tag("DNC Registered")
+        if _is_truthyish(status.get("is_litigator")):
+            add_tag("DNC Litigator")
+    return tags
+
+
+def _has_skipsherpa_phone_metadata(note_obj):
+    if not isinstance(note_obj, dict):
+        return False
+    source = str(note_obj.get("source") or "").strip().lower()
+    dnc_statuses = note_obj.get("dnc_statuses")
+    return any(
+        [
+            "skipsherpa" in source,
+            bool(note_obj.get("raw_phone")) and isinstance(note_obj.get("raw_phone"), dict),
+            bool(str(note_obj.get("carrier") or "").strip()),
+            bool(str(note_obj.get("last_seen") or "").strip()),
+            isinstance(dnc_statuses, list) and bool(dnc_statuses),
+            bool(note_obj.get("phone_tags")),
+        ]
+    )
+
+
+def _enrich_skipsherpa_phone_touchpoint_note(note_obj, now_dt=None):
+    note = dict(note_obj or {})
+    raw_phone = note.get("raw_phone") if isinstance(note.get("raw_phone"), dict) else {}
+    has_metadata = _has_skipsherpa_phone_metadata(note)
+
+    carrier = str(note.get("carrier") or raw_phone.get("carrier") or "").strip()
+    last_seen = str(note.get("last_seen") or raw_phone.get("last_seen") or "").strip()
+    dnc_statuses = note.get("dnc_statuses")
+    if not isinstance(dnc_statuses, list):
+        raw_statuses = raw_phone.get("dnc_statuses") if isinstance(raw_phone, dict) else []
+        dnc_statuses = raw_statuses if isinstance(raw_statuses, list) else []
+
+    note["carrier"] = carrier
+    note["last_seen"] = last_seen
+    note["dnc_statuses"] = dnc_statuses
+    if raw_phone:
+        note["raw_phone"] = raw_phone
+
+    if not has_metadata:
+        note["phone_tags"] = []
+        note["phone_freshness_tag"] = ""
+        note["phone_dnc_tags"] = []
+        note["phone_tag_rank"] = PHONE_TOUCHPOINT_DEFAULT_PRIORITY
+        return note
+
+    freshness_tag = _skipsherpa_phone_freshness_tag(last_seen, now_dt=now_dt)
+    dnc_tags = _skipsherpa_phone_dnc_tags(dnc_statuses)
+    phone_tags = []
+    seen_tags = set()
+    for tag_value in [freshness_tag, *dnc_tags]:
+        tag = str(tag_value or "").strip()
+        key = tag.lower()
+        if not tag or key in seen_tags:
+            continue
+        seen_tags.add(key)
+        phone_tags.append(tag)
+
+    note["phone_tags"] = phone_tags
+    note["phone_freshness_tag"] = freshness_tag
+    note["phone_dnc_tags"] = dnc_tags
+    note["phone_tag_rank"] = _skipsherpa_phone_priority_rank(freshness_tag)
+    return note
+
+
+def _build_skipsherpa_phone_touchpoint_note(phone_payload, source="SkipSherpa"):
+    payload = phone_payload if isinstance(phone_payload, dict) else {}
+    return _enrich_skipsherpa_phone_touchpoint_note(
+        {
+            "source": (source or "").strip() or "SkipSherpa",
+            "carrier": payload.get("carrier"),
+            "last_seen": payload.get("last_seen"),
+            "dnc_statuses": payload.get("dnc_statuses") or [],
+            "raw_phone": payload,
+        }
+    )
+
+
+def _merge_skipsherpa_phone_touchpoint_notes(base_note, extra_note):
+    merged = dict(base_note or {})
+    extra = dict(extra_note or {})
+    if not extra:
+        return _enrich_skipsherpa_phone_touchpoint_note(merged)
+
+    for key in ("source", "carrier", "legacy_note"):
+        if not merged.get(key) and extra.get(key):
+            merged[key] = extra[key]
+
+    merged_last_seen = str(merged.get("last_seen") or "").strip()
+    extra_last_seen = str(extra.get("last_seen") or "").strip()
+    if extra_last_seen and (not merged_last_seen or extra_last_seen > merged_last_seen):
+        merged["last_seen"] = extra_last_seen
+
+    merged_statuses = merged.get("dnc_statuses")
+    extra_statuses = extra.get("dnc_statuses")
+    if (not isinstance(merged_statuses, list) or not merged_statuses) and isinstance(extra_statuses, list):
+        merged["dnc_statuses"] = extra_statuses
+
+    if not merged.get("raw_phone") and isinstance(extra.get("raw_phone"), dict):
+        merged["raw_phone"] = extra["raw_phone"]
+
+    return _enrich_skipsherpa_phone_touchpoint_note(merged)
+
+
+def _phone_touchpoint_label_rank(channel_label):
+    label = str(channel_label or "").strip().lower()
+    return PHONE_TOUCHPOINT_LABEL_ORDER.get(label, len(PHONE_TOUCHPOINT_LABEL_ORDER))
+
+
+def _phone_touchpoint_sort_key(item):
+    return (
+        int(item.get("phone_tag_rank", PHONE_TOUCHPOINT_DEFAULT_PRIORITY) or PHONE_TOUCHPOINT_DEFAULT_PRIORITY),
+        _phone_touchpoint_label_rank(item.get("channel_label")),
+        -int(item.get("id") or 0),
+    )
+
+
+def _phone_touchpoint_title(note_obj):
+    note = _enrich_skipsherpa_phone_touchpoint_note(note_obj)
+    if not _has_skipsherpa_phone_metadata(note):
+        return ""
+    parts = []
+    carrier = str(note.get("carrier") or "").strip()
+    last_seen = str(note.get("last_seen") or "").strip()
+    phone_tags = [str(tag or "").strip() for tag in (note.get("phone_tags") or []) if str(tag or "").strip()]
+    if carrier:
+        parts.append(f"Carrier: {carrier}")
+    parts.append(f"Last Seen: {last_seen or 'Unknown'}")
+    if phone_tags:
+        parts.append(f"Tags: {', '.join(phone_tags)}")
+    return " | ".join(parts)
+
+
+def _decorate_phone_touchpoint_row(row):
+    item = dict(row)
+    note_obj = parse_json_object(item.get("note") or "{}", default={})
+    enriched_note = _enrich_skipsherpa_phone_touchpoint_note(note_obj)
+    item["note_meta"] = enriched_note
+    item["phone_tags"] = list(enriched_note.get("phone_tags") or [])
+    item["phone_freshness_tag"] = str(enriched_note.get("phone_freshness_tag") or "").strip()
+    item["phone_dnc_tags"] = list(enriched_note.get("phone_dnc_tags") or [])
+    item["phone_tag_rank"] = int(enriched_note.get("phone_tag_rank", PHONE_TOUCHPOINT_DEFAULT_PRIORITY) or PHONE_TOUCHPOINT_DEFAULT_PRIORITY)
+    item["phone_tag_title"] = _phone_touchpoint_title(enriched_note)
+    item["phone_norm"] = normalize_phone(item.get("value") or "")
+    return item
+
+
+def _decorate_touchpoint_rows_for_display(rows):
+    phone_rows = []
+    other_rows = []
+    for row in rows or []:
+        channel_type = str(row["channel_type"] or "").strip().lower()
+        if channel_type == "phone":
+            phone_rows.append(_decorate_phone_touchpoint_row(row))
+        else:
+            other_rows.append(dict(row))
+    phone_rows.sort(key=_phone_touchpoint_sort_key)
+    return phone_rows + other_rows
+
+
+def _clean_person_ids(person_ids):
+    clean_ids = []
+    seen_ids = set()
+    for pid in person_ids or []:
+        try:
+            val = int(pid or 0)
+        except Exception:
+            continue
+        if val <= 0 or val in seen_ids:
+            continue
+        seen_ids.add(val)
+        clean_ids.append(val)
+    return clean_ids
+
+
+def _get_ranked_phone_touchpoints_for_people(db, person_ids):
+    clean_ids = _clean_person_ids(person_ids)
+    if not clean_ids:
+        return []
+    placeholders = ",".join(["?"] * len(clean_ids))
+    rows = db.execute(
+        f"""
+        SELECT id, person_id, channel_label, status, value, note
+        FROM touchpoints
+        WHERE person_id IN ({placeholders})
+          AND lower(channel_type) = 'phone'
+          AND trim(COALESCE(value, '')) <> ''
+        ORDER BY id DESC
+        """,
+        tuple(clean_ids),
+    ).fetchall()
+    decorated = []
+    for row in rows:
+        item = _decorate_phone_touchpoint_row(row)
+        if not item.get("phone_norm"):
+            continue
+        decorated.append(item)
+    decorated.sort(key=_phone_touchpoint_sort_key)
+
+    unique_rows = []
+    seen_numbers = set()
+    for item in decorated:
+        phone_norm = item.get("phone_norm") or ""
+        if phone_norm in seen_numbers:
+            continue
+        seen_numbers.add(phone_norm)
+        unique_rows.append(item)
+    return unique_rows
+
+
+def _get_ranked_phone_touchpoints_for_person(db, person_id):
+    return _get_ranked_phone_touchpoints_for_people(db, [person_id])
+
+
+def _collect_skipsherpa_phone_note_candidates_from_payload(payload):
+    candidates = {}
+
+    def add_phone(phone_payload):
+        if not isinstance(phone_payload, dict):
+            return
+        number = normalize_phone(
+            phone_payload.get("e164_format")
+            or phone_payload.get("local_format")
+            or phone_payload.get("number")
+            or phone_payload.get("phone")
+            or ""
+        )
+        if not number:
+            return
+        note = _build_skipsherpa_phone_touchpoint_note(phone_payload)
+        existing = candidates.get(number)
+        candidates[number] = _merge_skipsherpa_phone_touchpoint_notes(existing, note) if existing else note
+
+    payload_root = payload if isinstance(payload, dict) else {}
+    response = payload_root.get("response") if isinstance(payload_root.get("response"), dict) else payload_root
+    if not isinstance(response, dict):
+        return candidates
+
+    for property_result in response.get("property_results") or []:
+        property_payload = property_result.get("property") if isinstance(property_result, dict) else {}
+        if not isinstance(property_payload, dict):
+            continue
+        for owner_entry in property_payload.get("owners") or []:
+            person_payload = owner_entry.get("person") if isinstance(owner_entry, dict) else {}
+            if not isinstance(person_payload, dict):
+                continue
+            for phone_payload in person_payload.get("phone_numbers") or []:
+                add_phone(phone_payload)
+
+    for result in response.get("person_results") or []:
+        persons = result.get("persons") if isinstance(result, dict) else []
+        for person_payload in persons or []:
+            if not isinstance(person_payload, dict):
+                continue
+            for phone_payload in person_payload.get("phone_numbers") or []:
+                add_phone(phone_payload)
+
+    return candidates
+
+
+def _collect_skipsherpa_phone_note_candidates_for_property(db, property_id, person_ids):
+    candidates = {}
+
+    def merge_candidates(candidate_map):
+        for number, note in (candidate_map or {}).items():
+            existing = candidates.get(number)
+            candidates[number] = _merge_skipsherpa_phone_touchpoint_notes(existing, note) if existing else note
+
+    run_rows = db.execute(
+        """
+        SELECT response_json
+        FROM skiptrace_runs
+        WHERE property_id = ?
+        ORDER BY id DESC
+        """,
+        (int(property_id or 0),),
+    ).fetchall()
+    for row in run_rows:
+        merge_candidates(_collect_skipsherpa_phone_note_candidates_from_payload(parse_json_object(row["response_json"] or "{}", default={})))
+
+    clean_ids = _clean_person_ids(person_ids)
+    if clean_ids:
+        placeholders = ",".join(["?"] * len(clean_ids))
+        note_rows = db.execute(
+            f"""
+            SELECT payload_json
+            FROM person_notes
+            WHERE person_id IN ({placeholders})
+              AND lower(COALESCE(source, '')) LIKE 'skipsherpa%'
+            ORDER BY id DESC
+            """,
+            tuple(clean_ids),
+        ).fetchall()
+        for row in note_rows:
+            merge_candidates(_collect_skipsherpa_phone_note_candidates_from_payload(parse_json_object(row["payload_json"] or "{}", default={})))
+
+    return candidates
+
+
+def backfill_skipsherpa_phone_metadata_for_property(db, property_id):
+    property_id = int(property_id or 0)
+    prop = db.execute("SELECT id, owner_person_id FROM properties WHERE id = ?", (property_id,)).fetchone()
+    if not prop:
+        raise ValueError(f"Property {property_id} not found.")
+
+    network_ids, _ = build_property_network(db, prop)
+    person_ids = set(_clean_person_ids(network_ids))
+    if prop["owner_person_id"]:
+        person_ids.add(int(prop["owner_person_id"]))
+    clean_ids = sorted(person_ids)
+    if not clean_ids:
+        return {
+            "property_id": property_id,
+            "people_considered": 0,
+            "phones_seen": 0,
+            "candidate_numbers": 0,
+            "updated_touchpoints": 0,
+        }
+
+    candidates = _collect_skipsherpa_phone_note_candidates_for_property(db, property_id, clean_ids)
+    if not candidates:
+        return {
+            "property_id": property_id,
+            "people_considered": len(clean_ids),
+            "phones_seen": 0,
+            "candidate_numbers": 0,
+            "updated_touchpoints": 0,
+        }
+
+    placeholders = ",".join(["?"] * len(clean_ids))
+    rows = db.execute(
+        f"""
+        SELECT id, value, note
+        FROM touchpoints
+        WHERE person_id IN ({placeholders})
+          AND lower(channel_type) = 'phone'
+        ORDER BY id ASC
+        """,
+        tuple(clean_ids),
+    ).fetchall()
+
+    updated_touchpoints = 0
+    phones_seen = 0
+    for row in rows:
+        phone_norm = normalize_phone(row["value"] or "")
+        if not phone_norm:
+            continue
+        phones_seen += 1
+        candidate = candidates.get(phone_norm)
+        if not candidate:
+            continue
+        raw_note = str(row["note"] or "").strip()
+        current_note = parse_json_object(raw_note, default={})
+        if raw_note and not current_note:
+            current_note["legacy_note"] = raw_note
+        merged_note = _merge_skipsherpa_phone_touchpoint_notes(current_note, candidate)
+        old_note_json = json.dumps(current_note, sort_keys=True, ensure_ascii=True, default=str)
+        new_note_json = json.dumps(merged_note, sort_keys=True, ensure_ascii=True, default=str)
+        if new_note_json == old_note_json:
+            continue
+        db.execute("UPDATE touchpoints SET note = ? WHERE id = ?", (json.dumps(merged_note), row["id"]))
+        updated_touchpoints += 1
+
+    return {
+        "property_id": property_id,
+        "people_considered": len(clean_ids),
+        "phones_seen": phones_seen,
+        "candidate_numbers": len(candidates),
+        "updated_touchpoints": updated_touchpoints,
+    }
+
+
 def get_cached_contact_context(db, phone_raw):
     norm = normalize_phone(phone_raw)
     if not norm:
@@ -5188,6 +5655,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                 continue
             ptype = (ph.get("type") or "").strip().lower()
             label = {"mobile": "Mobile", "landline": "Landline", "voip": "VoIP"}.get(ptype, "Unknown")
+            note_meta = _build_skipsherpa_phone_touchpoint_note(ph)
             db.execute(
                 """
                 INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
@@ -5197,7 +5665,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                     owner_person_id,
                     label,
                     number,
-                    "Imported from SkipSherpa property owner payload",
+                    json.dumps(note_meta),
                     "",
                 ),
             )
@@ -5999,13 +6467,7 @@ def import_skipsherpa_person_result(db, property_id, person_id, lookup_response)
             ptype = (ph.get("type") or "").strip().lower()
             label = {"mobile": "Mobile", "landline": "Landline", "voip": "VoIP", "fax": "Fax"}.get(ptype, "Unknown")
             status = "Unknown"
-            note_meta = {
-                "source": "SkipSherpa",
-                "carrier": ph.get("carrier"),
-                "last_seen": ph.get("last_seen"),
-                "dnc_statuses": ph.get("dnc_statuses") or [],
-                "raw_phone": ph,
-            }
+            note_meta = _build_skipsherpa_phone_touchpoint_note(ph)
             db.execute(
                 """
                 INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
@@ -6833,22 +7295,9 @@ def render_sequence_template(template_text, person_row, property_row, owner_row=
 
 
 def get_best_phone_for_person(db, person_id):
-    rows = db.execute(
-        """
-        SELECT value, channel_label
-        FROM touchpoints
-        WHERE person_id = ? AND lower(channel_type) = 'phone' AND trim(COALESCE(value,'')) <> ''
-        ORDER BY CASE
-            WHEN lower(COALESCE(channel_label,'')) = 'mobile' THEN 0
-            WHEN lower(COALESCE(channel_label,'')) = 'unknown' THEN 1
-            ELSE 2
-        END, id DESC
-        LIMIT 1
-        """,
-        (person_id,),
-    ).fetchone()
+    rows = _get_ranked_phone_touchpoints_for_person(db, person_id)
     if rows:
-        return (rows["value"] or "").strip()
+        return str(rows[0]["value"] or "").strip()
     p = db.execute("SELECT primary_phone FROM people WHERE id = ?", (person_id,)).fetchone()
     return (p["primary_phone"] or "").strip() if p else ""
 
@@ -6928,33 +7377,19 @@ def validate_sms_recipient_for_person(db, person_id, to_number):
 
 
 def get_sequence_sms_targets(db, person_id):
-    rows = db.execute(
-        """
-        SELECT id, value, channel_label, status
-        FROM touchpoints
-        WHERE person_id = ? AND lower(channel_type) = 'phone' AND trim(COALESCE(value,'')) <> ''
-        ORDER BY id DESC
-        """,
-        (person_id,),
-    ).fetchall()
     keep = []
     skipped = []
-    seen = set()
-    for r in rows:
-        value = (r["value"] or "").strip()
-        label = (r["channel_label"] or "").strip().lower()
-        status = (r["status"] or "").strip().lower()
-        norm = normalize_phone(value)
-        if not norm:
+    for row in _get_ranked_phone_touchpoints_for_person(db, person_id):
+        value = str(row["value"] or "").strip()
+        label = str(row["channel_label"] or "").strip().lower()
+        status = str(row["status"] or "").strip().lower()
+        if not value:
             skipped.append({"value": value, "reason": "invalid phone format"})
             continue
-        if norm in seen:
-            continue
-        seen.add(norm)
         if label not in {"mobile", "unknown"}:
             skipped.append({"value": value, "reason": "not mobile/unknown"})
             continue
-        if not is_sms_touchpoint_allowed(r["channel_label"], r["status"]):
+        if not is_sms_touchpoint_allowed(row["channel_label"], row["status"]):
             skipped.append({"value": value, "reason": f"status={status}"})
             continue
         keep.append(value)
@@ -6989,76 +7424,34 @@ def get_sequence_mail_target(db, property_row, person_id):
 
 
 def get_manual_sms_targets_for_person(db, person_id):
-    rows = db.execute(
-        """
-        SELECT value, channel_label, status
-        FROM touchpoints
-        WHERE person_id = ? AND lower(channel_type) = 'phone' AND trim(COALESCE(value,'')) <> ''
-        ORDER BY
-            CASE
-                WHEN lower(COALESCE(channel_label,'')) = 'mobile' THEN 0
-                WHEN lower(COALESCE(channel_label,'')) = 'unknown' THEN 1
-                WHEN lower(COALESCE(channel_label,'')) = 'voip' THEN 2
-                ELSE 3
-            END,
-            id DESC
-        """,
-        (person_id,),
-    ).fetchall()
     keep = []
-    seen = set()
-    for r in rows:
-        value = (r["value"] or "").strip()
-        norm = normalize_phone(value)
-        if not norm or norm in seen:
-            continue
-        seen.add(norm)
-        label = (r["channel_label"] or "").strip().lower()
+    for row in _get_ranked_phone_touchpoints_for_person(db, person_id):
+        value = str(row["value"] or "").strip()
+        label = str(row["channel_label"] or "").strip().lower()
         if label not in {"mobile", "unknown", "voip"}:
             continue
-        if not is_sms_touchpoint_allowed(r["channel_label"], r["status"]):
+        if not is_sms_touchpoint_allowed(row["channel_label"], row["status"]):
             continue
         keep.append(value)
     return keep
 
 
 def get_display_phone_numbers_for_person(db, person_id):
-    rows = db.execute(
-        """
-        SELECT value, channel_label
-        FROM touchpoints
-        WHERE person_id = ? AND lower(channel_type) = 'phone' AND trim(COALESCE(value,'')) <> ''
-        ORDER BY
-            CASE
-                WHEN lower(COALESCE(channel_label,'')) = 'mobile' THEN 0
-                WHEN lower(COALESCE(channel_label,'')) = 'unknown' THEN 1
-                WHEN lower(COALESCE(channel_label,'')) = 'voip' THEN 2
-                WHEN lower(COALESCE(channel_label,'')) = 'landline' THEN 3
-                ELSE 4
-            END,
-            id DESC
-        """,
-        (person_id,),
-    ).fetchall()
-
     keep = []
     seen = set()
-
-    primary_row = db.execute("SELECT primary_phone FROM people WHERE id = ?", (person_id,)).fetchone()
-    primary_phone = (primary_row["primary_phone"] or "").strip() if primary_row else ""
-    if primary_phone:
-        primary_norm = normalize_phone(primary_phone)
-        if primary_norm:
-            keep.append(primary_phone)
-            seen.add(primary_norm)
-
-    for row in rows:
-        value = (row["value"] or "").strip()
+    for row in _get_ranked_phone_touchpoints_for_person(db, person_id):
+        value = str(row["value"] or "").strip()
         norm = normalize_phone(value)
         if not value or not norm or norm in seen:
             continue
         seen.add(norm)
         keep.append(value)
+
+    primary_row = db.execute("SELECT primary_phone FROM people WHERE id = ?", (person_id,)).fetchone()
+    primary_phone = (primary_row["primary_phone"] or "").strip() if primary_row else ""
+    primary_norm = normalize_phone(primary_phone)
+    if primary_phone and primary_norm and primary_norm not in seen:
+        keep.append(primary_phone)
     return keep
 
 
@@ -24692,18 +25085,7 @@ def _property_address_string(db, property_id):
 
 
 def collect_person_contact_items_for_reisift_sync(db, person_ids):
-    clean_ids = []
-    seen_ids = set()
-    for pid in person_ids or []:
-        try:
-            val = int(pid or 0)
-        except Exception:
-            continue
-        if val <= 0 or val in seen_ids:
-            continue
-        seen_ids.add(val)
-        clean_ids.append(val)
-
+    clean_ids = _clean_person_ids(person_ids)
     if not clean_ids:
         return [], []
 
@@ -24712,6 +25094,20 @@ def collect_person_contact_items_for_reisift_sync(db, person_ids):
     seen_phone = set()
     seen_email = set()
     placeholders = ",".join(["?"] * len(clean_ids))
+
+    for row in _get_ranked_phone_touchpoints_for_people(db, clean_ids):
+        value = str(row["value"] or "").strip()
+        phone_norm = normalize_phone(value)
+        if not phone_norm or phone_norm in seen_phone:
+            continue
+        seen_phone.add(phone_norm)
+        phone_items.append(
+            {
+                "number": value,
+                "type": _reisift_phone_type_from_touchpoint(row["channel_label"]),
+                "tags": list(row.get("phone_tags") or []),
+            }
+        )
 
     people_rows = db.execute(
         f"""
@@ -24728,43 +25124,30 @@ def collect_person_contact_items_for_reisift_sync(db, person_ids):
         email_norm = primary_email.lower()
         if phone_norm and phone_norm not in seen_phone:
             seen_phone.add(phone_norm)
-            phone_items.append({"number": primary_phone, "type": "UNKNOWN"})
+            phone_items.append({"number": primary_phone, "type": "UNKNOWN", "tags": []})
         if primary_email and email_norm not in seen_email:
             seen_email.add(email_norm)
             email_items.append(primary_email)
 
     tp_rows = db.execute(
         f"""
-        SELECT person_id, channel_type, channel_label, value
+        SELECT channel_type, value
         FROM touchpoints
         WHERE person_id IN ({placeholders})
-          AND lower(channel_type) IN ('phone', 'email')
+          AND lower(channel_type) = 'email'
         ORDER BY id ASC
         """,
         tuple(clean_ids),
     ).fetchall()
     for tp in tp_rows:
-        ctype = str(tp["channel_type"] or "").strip().lower()
         value = str(tp["value"] or "").strip()
         if not value:
             continue
-        if ctype == "phone":
-            phone_norm = normalize_phone(value)
-            if not phone_norm or phone_norm in seen_phone:
-                continue
-            seen_phone.add(phone_norm)
-            phone_items.append(
-                {
-                    "number": value,
-                    "type": _reisift_phone_type_from_touchpoint(tp["channel_label"]),
-                }
-            )
-        elif ctype == "email":
-            email_norm = value.lower()
-            if email_norm in seen_email:
-                continue
-            seen_email.add(email_norm)
-            email_items.append(value)
+        email_norm = value.lower()
+        if email_norm in seen_email:
+            continue
+        seen_email.add(email_norm)
+        email_items.append(value)
 
     return phone_items, email_items
 
@@ -24785,20 +25168,6 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
         "tag_sync": None,
     }
 
-    phones = []
-    seen_phone = set()
-    for p in phones_in:
-        if isinstance(p, dict):
-            number = normalize_phone(p.get("number") or p.get("phone") or "")
-            p_type = (p.get("type") or "UNKNOWN").strip().upper() or "UNKNOWN"
-        else:
-            number = normalize_phone(str(p or ""))
-            p_type = "UNKNOWN"
-        if not number or number in seen_phone:
-            continue
-        seen_phone.add(number)
-        phones.append({"number": number, "type": p_type, "tags": ["Relative"]})
-
     emails = []
     seen_email = set()
     for e in emails_in:
@@ -24811,7 +25180,7 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
         seen_email.add(value)
         emails.append(value)
 
-    if not phones and not emails:
+    if not phones_in and not emails:
         out["ok"] = True
         out["result"] = {"skipped": True, "reason": "no_contacts"}
         return out
@@ -24835,7 +25204,7 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
 
     property_payload = {}
     existing_owner = {}
-    existing_phone_numbers = set()
+    existing_phones_by_number = {}
     existing_emails = set()
     if out["property_uuid"]:
         try:
@@ -24844,11 +25213,11 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
             out["error"] = f"Owner lookup failed before skiptrace sync: {exc}"
             return out
         existing_owner = _reisift_find_first_owner_dict(property_payload)
-        existing_phone_numbers = {
-            normalize_phone(item.get("number") or "")
-            for item in _reisift_parse_owner_phones(existing_owner)
-            if normalize_phone(item.get("number") or "")
-        }
+        for item in _reisift_parse_owner_phones(existing_owner):
+            normalized = normalize_phone(item.get("number") or "")
+            if not normalized:
+                continue
+            existing_phones_by_number[normalized] = item
         existing_emails = {
             str(value or "").strip().lower()
             for value in _reisift_parse_owner_emails(existing_owner)
@@ -24875,7 +25244,34 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
         out["error"] = "No ReiSift owner UUID available for skiptrace contact sync."
         return out
 
-    phones = [item for item in phones if normalize_phone(item.get("number") or "") not in existing_phone_numbers]
+    phones = []
+    seen_phone = set()
+    for p in phones_in:
+        if isinstance(p, dict):
+            number = normalize_phone(p.get("number") or p.get("phone") or "")
+            p_type = (p.get("type") or "UNKNOWN").strip().upper() or "UNKNOWN"
+            raw_tags = p.get("tags") if isinstance(p.get("tags"), list) else []
+        else:
+            number = normalize_phone(str(p or ""))
+            p_type = "UNKNOWN"
+            raw_tags = []
+        if not number or number in seen_phone:
+            continue
+        seen_phone.add(number)
+        existing_phone = existing_phones_by_number.get(number) or {}
+        if p_type == "UNKNOWN" and str(existing_phone.get("type") or "").strip():
+            p_type = str(existing_phone.get("type") or "").strip().upper() or "UNKNOWN"
+        merged_tags = []
+        seen_tags = set()
+        for tag_value in ["Relative", *(existing_phone.get("tags") or []), *raw_tags]:
+            tag = str(tag_value or "").strip()
+            key = tag.lower()
+            if not tag or key in seen_tags:
+                continue
+            seen_tags.add(key)
+            merged_tags.append(tag)
+        phones.append({"number": number, "type": p_type, "tags": merged_tags})
+
     emails = [value for value in emails if str(value or "").strip().lower() not in existing_emails]
     out["phones_attempted"] = len(phones)
     out["emails_attempted"] = len(emails)
@@ -36497,6 +36893,7 @@ def property_detail(property_id):
             """,
             (prop["owner_person_id"],),
         ).fetchall()
+        owner_touchpoints = _decorate_touchpoint_rows_for_display(owner_touchpoints)
         owner_relationships = db.execute(
             """
             SELECT r.id AS relationship_id, r.relationship_type, r.note, r.relationship_order,
@@ -37024,6 +37421,7 @@ def person_detail(person_id):
         """,
         (person_id,),
     ).fetchall()
+    touchpoints = _decorate_touchpoint_rows_for_display(touchpoints)
     socials = db.execute(
         "SELECT * FROM social_accounts WHERE person_id = ? ORDER BY created_at DESC", (person_id,)
     ).fetchall()

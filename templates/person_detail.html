@@ -147,7 +147,7 @@
                     <form id="addPhoneForm" class="grid-form compact"><label>Type<select name="channel_label"><option>Landline</option><option>Mobile</option><option>VoIP</option><option>Fax</option><option>Unknown</option></select></label><label>Number <input name="value" required></label></form>
                 </details>
             </div>
-            <table class="crm-table contact-table"><thead><tr><th>Type</th><th>Number</th><th>Status</th><th></th></tr></thead><tbody id="phoneRows">{% for t in phone_rows %}<tr data-touchpoint-id="{{ t.id }}"><td><select class="touch-label" data-id="{{ t.id }}">{% for phone_type in ['Landline','Mobile','VoIP','Fax','Unknown'] %}<option value="{{ phone_type }}" {% if t.channel_label == phone_type %}selected{% endif %}>{{ phone_type }}</option>{% endfor %}</select></td><td>{{ t.value|fmt_phone }}</td><td><select class="touch-status" data-id="{{ t.id }}">{% for s in ['Correct','Incorrect','DNC','DNT','No Answer','Dead','Undeliverable','Not in service','Unknown'] %}<option value="{{ s }}" {% if t.status == s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></td><td><button type="button" class="icon-btn delete-touch" data-id="{{ t.id }}">x</button></td></tr>{% endfor %}</tbody></table>
+            <table class="crm-table contact-table"><thead><tr><th>Type</th><th>Number</th><th>Status</th><th></th></tr></thead><tbody id="phoneRows">{% for t in phone_rows %}<tr data-touchpoint-id="{{ t.id }}" data-phone-sort-rank="{{ t.phone_tag_rank or 99 }}"><td><select class="touch-label" data-id="{{ t.id }}">{% for phone_type in ['Landline','Mobile','VoIP','Fax','Unknown'] %}<option value="{{ phone_type }}" {% if t.channel_label == phone_type %}selected{% endif %}>{{ phone_type }}</option>{% endfor %}</select></td><td><div class="phone-value-stack" {% if t.phone_tag_title %}title="{{ t.phone_tag_title }}"{% endif %}><span>{{ t.value|fmt_phone }}</span>{% if t.phone_tags %}<div class="phone-tag-list">{% for tag in t.phone_tags %}<span class="pill phone-tag-pill" {% if t.phone_tag_title %}title="{{ t.phone_tag_title }}"{% endif %}>{{ tag }}</span>{% endfor %}</div>{% endif %}</div></td><td><select class="touch-status" data-id="{{ t.id }}">{% for s in ['Correct','Incorrect','DNC','DNT','No Answer','Dead','Undeliverable','Not in service','Unknown'] %}<option value="{{ s }}" {% if t.status == s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></td><td><button type="button" class="icon-btn delete-touch" data-id="{{ t.id }}">x</button></td></tr>{% endfor %}</tbody></table>
         </section>
 
         <section class="contact-card">
@@ -398,10 +398,17 @@ function applyPersonCommFilter() {
 function phoneTypeRank(label){
   const v=(label||'').toLowerCase();
   if(v==='mobile') return 0;
-  if(v==='landline') return 1;
+  if(v==='unknown') return 1;
   if(v==='voip') return 2;
-  if(v==='fax') return 3;
-  return 4;
+  if(v==='landline') return 3;
+  if(v==='fax') return 4;
+  return 5;
+}
+
+function phonePriorityRank(row){
+  const raw = Number.parseInt(row?.dataset?.phoneSortRank || '99', 10);
+  if (Number.isFinite(raw)) return raw;
+  return 99;
 }
 
 function sortPersonPhoneRows(){
@@ -409,6 +416,9 @@ function sortPersonPhoneRows(){
   if(!body) return;
   const rows=[...body.querySelectorAll('tr')];
   rows.sort((a,b)=>{
+    const pa = phonePriorityRank(a);
+    const pb = phonePriorityRank(b);
+    if (pa !== pb) return pa - pb;
     const la=a.querySelector('.touch-label')?.value||'Unknown';
     const lb=b.querySelector('.touch-label')?.value||'Unknown';
     return phoneTypeRank(la)-phoneTypeRank(lb);
@@ -814,7 +824,7 @@ function fmtEt(dt){
   }).format(parsed) + ' ET';
 }
 
-bindEnter('addPhoneForm', async(form)=>{ const label=form.querySelector('[name=channel_label]').value; const value=form.querySelector('[name=value]').value.trim(); if(!value) return; const res=await postJson(`/api/people/${personId}/touchpoints`, {channel_type:'Phone',channel_label:label,value,status:'Unknown'}); if(!res.ok||!res.data.id) return; const tr=document.createElement('tr'); tr.innerHTML=`<td><select class="touch-label" data-id="${res.data.id}"><option ${label==='Landline'?'selected':''}>Landline</option><option ${label==='Mobile'?'selected':''}>Mobile</option><option ${label==='VoIP'?'selected':''}>VoIP</option><option ${label==='Fax'?'selected':''}>Fax</option><option ${label==='Unknown'?'selected':''}>Unknown</option></select></td><td>${esc(formatPhone(value))}</td><td><select class="touch-status" data-id="${res.data.id}"><option>Correct</option><option>Incorrect</option><option>DNC</option><option>DNT</option><option>No Answer</option><option>Dead</option><option>Undeliverable</option><option>Not in service</option><option selected>Unknown</option></select></td><td><button type="button" class="icon-btn delete-touch" data-id="${res.data.id}">x</button></td>`; tr.classList.add('fade-highlight'); document.getElementById('phoneRows').appendChild(tr); sortPersonPhoneRows(); form.reset(); await refreshPersonCommTargets(); });
+bindEnter('addPhoneForm', async(form)=>{ const label=form.querySelector('[name=channel_label]').value; const value=form.querySelector('[name=value]').value.trim(); if(!value) return; const res=await postJson(`/api/people/${personId}/touchpoints`, {channel_type:'Phone',channel_label:label,value,status:'Unknown'}); if(!res.ok||!res.data.id) return; const tr=document.createElement('tr'); tr.dataset.touchpointId = res.data.id; tr.dataset.phoneSortRank = '99'; tr.innerHTML=`<td><select class="touch-label" data-id="${res.data.id}"><option ${label==='Landline'?'selected':''}>Landline</option><option ${label==='Mobile'?'selected':''}>Mobile</option><option ${label==='VoIP'?'selected':''}>VoIP</option><option ${label==='Fax'?'selected':''}>Fax</option><option ${label==='Unknown'?'selected':''}>Unknown</option></select></td><td><div class="phone-value-stack"><span>${esc(formatPhone(value))}</span></div></td><td><select class="touch-status" data-id="${res.data.id}"><option>Correct</option><option>Incorrect</option><option>DNC</option><option>DNT</option><option>No Answer</option><option>Dead</option><option>Undeliverable</option><option>Not in service</option><option selected>Unknown</option></select></td><td><button type="button" class="icon-btn delete-touch" data-id="${res.data.id}">x</button></td>`; tr.classList.add('fade-highlight'); document.getElementById('phoneRows').appendChild(tr); sortPersonPhoneRows(); form.reset(); await refreshPersonCommTargets(); });
 bindEnter('addEmailForm', async(form)=>{ const value=form.querySelector('[name=value]').value.trim(); if(!value) return; const res=await postJson(`/api/people/${personId}/touchpoints`, {channel_type:'Email',channel_label:'Email',value,status:'Unknown'}); if(!res.ok||!res.data.id) return; const tr=document.createElement('tr'); tr.innerHTML=`<td>${value}</td><td><select class="touch-status" data-id="${res.data.id}"><option>Valid</option><option>Correct</option><option>Incorrect</option><option>DNC</option><option>DNT</option><option>No Answer</option><option>Dead</option><option>Undeliverable</option><option>Not in service</option><option selected>Unknown</option></select></td><td><button type="button" class="icon-btn delete-touch" data-id="${res.data.id}">x</button></td>`; tr.classList.add('fade-highlight'); document.getElementById('emailRows').prepend(tr); form.reset(); await refreshPersonCommTargets(); });
 bindEnter('addSocialForm', async(form)=>{ const platform=form.querySelector('[name=platform]').value.trim(); const handle=form.querySelector('[name=handle]').value.trim(); const url=form.querySelector('[name=url]').value.trim(); if(!platform&&!handle&&!url) return; const res=await postJson(`/api/people/${personId}/socials`, {platform,handle,url,status:'Unverified'}); if(!res.ok||!res.data.id) return; const profileUrl=socialUrl(platform, handle, url); const tr=document.createElement('tr'); tr.innerHTML=`<td>${platform}</td><td><a href="${esc(profileUrl)}" target="_blank">${esc(handle || profileUrl)}</a></td><td><select class="social-status" data-id="${res.data.id}"><option selected>Unverified</option><option>Verified</option><option>Incorrect</option><option>Dead</option></select></td><td><button type="button" class="icon-btn delete-social" data-id="${res.data.id}">x</button></td>`; tr.classList.add('fade-highlight'); document.getElementById('socialRows').prepend(tr); form.reset(); });
 

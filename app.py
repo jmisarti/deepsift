@@ -872,6 +872,10 @@ def migrate_db(db):
     ensure_column(db, "people", "employer", "employer TEXT")
     ensure_column(db, "person_relationships", "relationship_order", "relationship_order INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "person_addresses", "is_default_mailing", "is_default_mailing INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "addresses", "is_verified_deliverable", "is_verified_deliverable INTEGER")
+    ensure_column(db, "addresses", "is_vacant", "is_vacant INTEGER")
+    ensure_column(db, "addresses", "attom_last_sold_date", "attom_last_sold_date TEXT")
+    ensure_column(db, "addresses", "attom_last_sold_price", "attom_last_sold_price REAL")
     ensure_column(db, "properties", "attom_last_sold_date", "attom_last_sold_date TEXT")
     ensure_column(db, "properties", "attom_last_sold_price", "attom_last_sold_price REAL")
     ensure_column(db, "properties", "reisift_property_uuid", "reisift_property_uuid TEXT")
@@ -1852,13 +1856,98 @@ def ensure_db():
     db.close()
 
 
-def create_address(db, street, city, state, postal_code):
+def _address_metadata_values(
+    *,
+    is_verified_deliverable=None,
+    is_vacant=None,
+    attom_last_sold_date="",
+    attom_last_sold_price=None,
+):
+    verified_value = None if is_verified_deliverable is None else (1 if _is_truthyish(is_verified_deliverable) else 0)
+    vacant_value = None if is_vacant is None else (1 if _is_truthyish(is_vacant) else 0)
+    sold_date = str(attom_last_sold_date or "").strip()
+    sold_price = attom_last_sold_price if attom_last_sold_price is not None else None
+    return {
+        "is_verified_deliverable": verified_value,
+        "is_vacant": vacant_value,
+        "attom_last_sold_date": sold_date,
+        "attom_last_sold_price": sold_price,
+    }
+
+
+def update_address_metadata(
+    db,
+    address_id,
+    *,
+    is_verified_deliverable=None,
+    is_vacant=None,
+    attom_last_sold_date="",
+    attom_last_sold_price=None,
+):
+    address_id = int(address_id or 0)
+    if address_id <= 0:
+        return
+    metadata = _address_metadata_values(
+        is_verified_deliverable=is_verified_deliverable,
+        is_vacant=is_vacant,
+        attom_last_sold_date=attom_last_sold_date,
+        attom_last_sold_price=attom_last_sold_price,
+    )
+    db.execute(
+        """
+        UPDATE addresses
+        SET is_verified_deliverable = COALESCE(?, is_verified_deliverable),
+            is_vacant = COALESCE(?, is_vacant),
+            attom_last_sold_date = COALESCE(NULLIF(?, ''), attom_last_sold_date),
+            attom_last_sold_price = COALESCE(?, attom_last_sold_price)
+        WHERE id = ?
+        """,
+        (
+            metadata["is_verified_deliverable"],
+            metadata["is_vacant"],
+            metadata["attom_last_sold_date"],
+            metadata["attom_last_sold_price"],
+            address_id,
+        ),
+    )
+
+
+def create_address(
+    db,
+    street,
+    city,
+    state,
+    postal_code,
+    *,
+    is_verified_deliverable=None,
+    is_vacant=None,
+    attom_last_sold_date="",
+    attom_last_sold_price=None,
+):
+    metadata = _address_metadata_values(
+        is_verified_deliverable=is_verified_deliverable,
+        is_vacant=is_vacant,
+        attom_last_sold_date=attom_last_sold_date,
+        attom_last_sold_price=attom_last_sold_price,
+    )
     cur = db.execute(
         """
-        INSERT INTO addresses (street, city, state, postal_code)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO addresses (
+            street, city, state, postal_code,
+            is_verified_deliverable, is_vacant, attom_last_sold_date, attom_last_sold_price
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (street.strip(), city.strip(), state.strip(), postal_code.strip()),
+        (
+            street.strip(),
+            city.strip(),
+            state.strip(),
+            postal_code.strip(),
+            metadata["is_verified_deliverable"],
+            metadata["is_vacant"],
+            metadata["attom_last_sold_date"] or None,
+            metadata["attom_last_sold_price"],
+        ),
     )
     return cur.lastrowid
 
@@ -1907,7 +1996,21 @@ def set_default_person_address(db, person_id, person_address_id):
     )
 
 
-def ensure_person_address_link(db, person_id, street, city, state, postal_code, label="Related Address", set_default=False):
+def ensure_person_address_link(
+    db,
+    person_id,
+    street,
+    city,
+    state,
+    postal_code,
+    label="Related Address",
+    set_default=False,
+    *,
+    is_verified_deliverable=None,
+    is_vacant=None,
+    attom_last_sold_date="",
+    attom_last_sold_price=None,
+):
     clean_street = (street or "").strip()
     clean_city = (city or "").strip()
     clean_state = (state or "").strip()
@@ -1922,11 +2025,29 @@ def ensure_person_address_link(db, person_id, street, city, state, postal_code, 
                 "UPDATE person_addresses SET label = ? WHERE id = ?",
                 (label, existing["person_address_id"]),
             )
+        update_address_metadata(
+            db,
+            existing["address_id"],
+            is_verified_deliverable=is_verified_deliverable,
+            is_vacant=is_vacant,
+            attom_last_sold_date=attom_last_sold_date,
+            attom_last_sold_price=attom_last_sold_price,
+        )
         if set_default:
             set_default_person_address(db, person_id, existing["person_address_id"])
         return int(existing["person_address_id"])
 
-    addr_id = create_address(db, clean_street, clean_city, clean_state, clean_postal)
+    addr_id = create_address(
+        db,
+        clean_street,
+        clean_city,
+        clean_state,
+        clean_postal,
+        is_verified_deliverable=is_verified_deliverable,
+        is_vacant=is_vacant,
+        attom_last_sold_date=attom_last_sold_date,
+        attom_last_sold_price=attom_last_sold_price,
+    )
     cur = db.execute(
         "INSERT INTO person_addresses (person_id, address_id, label, is_default_mailing) VALUES (?, ?, ?, ?)",
         (person_id, addr_id, label or "Related Address", 1 if set_default else 0),
@@ -1949,6 +2070,49 @@ def get_default_person_address_row(db, person_id):
         """,
         (person_id,),
     ).fetchone()
+
+
+def _address_metadata_from_skipsherpa_payload(address_payload):
+    payload = address_payload if isinstance(address_payload, dict) else {}
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    attom = payload.get("attom") if isinstance(payload.get("attom"), dict) else {}
+    return {
+        "is_verified_deliverable": payload.get("is_verified_deliverable"),
+        "is_vacant": metadata.get("is_vacant"),
+        "attom_last_sold_date": attom.get("attom_last_sold_date") or "",
+        "attom_last_sold_price": attom.get("attom_last_sold_price"),
+    }
+
+
+def _decorate_person_address_rows(rows):
+    items = []
+    for row in rows or []:
+        item = dict(row)
+        verified_raw = item.get("is_verified_deliverable")
+        vacant_raw = item.get("is_vacant")
+        street = str(item.get("street") or "").strip()
+        city = str(item.get("city") or "").strip()
+        state = str(item.get("state") or "").strip()
+        postal_code = str(item.get("postal_code") or "").strip()
+        city_state = ", ".join(part for part in [city, state] if part)
+        city_state_postal = " ".join(part for part in [city_state, postal_code] if part)
+        sold_date_raw = str(item.get("attom_last_sold_date") or "").strip()
+        item["mailability_state"] = "unknown" if verified_raw is None else ("good" if int(verified_raw or 0) == 1 else "bad")
+        item["vacancy_state"] = "unknown" if vacant_raw is None else ("bad" if int(vacant_raw or 0) == 1 else "good")
+        item["mailability_title"] = {
+            "good": "Mailable",
+            "bad": "Not mailable",
+            "unknown": "Mailability unknown",
+        }[item["mailability_state"]]
+        item["vacancy_title"] = {
+            "good": "Not vacant",
+            "bad": "Vacant",
+            "unknown": "Vacancy unknown",
+        }[item["vacancy_state"]]
+        item["last_sold_date_display"] = sold_date_raw.split("T", 1)[0] if sold_date_raw else ""
+        item["address_text"] = ", ".join(part for part in [street, city_state_postal] if part)
+        items.append(item)
+    return items
 
 
 def normalize_whitespace(value):
@@ -5608,6 +5772,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
             zipcode = (us.get("zipcode") or "").strip()
             if not (street and city and state and zipcode):
                 continue
+            addr_metadata = _address_metadata_from_skipsherpa_payload(addr_payload)
             ensure_person_address_link(
                 db,
                 owner_person_id,
@@ -5617,6 +5782,10 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                 zipcode,
                 label="SkipSherpa Owner Address",
                 set_default=False,
+                is_verified_deliverable=addr_metadata["is_verified_deliverable"],
+                is_vacant=addr_metadata["is_vacant"],
+                attom_last_sold_date=addr_metadata["attom_last_sold_date"],
+                attom_last_sold_price=addr_metadata["attom_last_sold_price"],
             )
 
         # Rule: when the property lookup returns a golden tax mailing address, use that as the default
@@ -6509,9 +6678,33 @@ def import_skipsherpa_person_result(db, property_id, person_id, lookup_response)
                 """,
                 (target_person_id, street, city, state, zipcode),
             ).fetchone()
+            addr_metadata = _address_metadata_from_skipsherpa_payload(a)
             if exists:
+                existing_address_id = db.execute(
+                    "SELECT address_id FROM person_addresses WHERE id = ? LIMIT 1",
+                    (exists["id"],),
+                ).fetchone()
+                if existing_address_id:
+                    update_address_metadata(
+                        db,
+                        existing_address_id["address_id"],
+                        is_verified_deliverable=addr_metadata["is_verified_deliverable"],
+                        is_vacant=addr_metadata["is_vacant"],
+                        attom_last_sold_date=addr_metadata["attom_last_sold_date"],
+                        attom_last_sold_price=addr_metadata["attom_last_sold_price"],
+                    )
                 continue
-            addr_id = create_address(db, street, city, state, zipcode)
+            addr_id = create_address(
+                db,
+                street,
+                city,
+                state,
+                zipcode,
+                is_verified_deliverable=addr_metadata["is_verified_deliverable"],
+                is_vacant=addr_metadata["is_vacant"],
+                attom_last_sold_date=addr_metadata["attom_last_sold_date"],
+                attom_last_sold_price=addr_metadata["attom_last_sold_price"],
+            )
             db.execute(
                 "INSERT INTO person_addresses (person_id, address_id, label) VALUES (?, ?, ?)",
                 (target_person_id, addr_id, "SkipSherpa Address"),
@@ -37455,7 +37648,8 @@ def person_detail(person_id):
     addresses = db.execute(
         """
         SELECT pa.id AS person_address_id, pa.address_id, pa.label, pa.created_at, pa.is_default_mailing,
-               a.street, a.city, a.state, a.postal_code
+               a.street, a.city, a.state, a.postal_code,
+               a.is_verified_deliverable, a.is_vacant, a.attom_last_sold_date, a.attom_last_sold_price
         FROM person_addresses pa
         JOIN addresses a ON a.id = pa.address_id
         WHERE pa.person_id = ?
@@ -37463,6 +37657,7 @@ def person_detail(person_id):
         """,
         (person_id,),
     ).fetchall()
+    addresses = _decorate_person_address_rows(addresses)
     current_mail_address_row = get_default_person_address_row(db, person_id)
     current_mail_person_address_id = int(current_mail_address_row["person_address_id"] or 0) if current_mail_address_row else 0
 

@@ -1002,6 +1002,51 @@ button:hover { filter: brightness(1.05); }
     min-width: 110px;
 }
 
+.address-last-sold-cell small {
+    color: var(--muted);
+    font-size: 0.78rem;
+}
+
+.address-status-cell {
+    width: 1%;
+    white-space: nowrap;
+}
+
+.address-status-icons {
+    align-items: center;
+    display: inline-flex;
+    gap: 0.35rem;
+    justify-content: center;
+}
+
+.address-status-icon {
+    color: #7d8792;
+    display: inline-flex;
+    line-height: 1;
+}
+
+.address-status-icon svg {
+    fill: none;
+    height: 18px;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.8;
+    width: 18px;
+}
+
+.address-status-good {
+    color: #afb8c2;
+}
+
+.address-status-bad {
+    color: #46515e;
+}
+
+.address-status-unknown {
+    color: #7d8792;
+}
+
 .profile-grid {
     margin-top: 0.7rem;
     display: grid;

@@ -202,12 +202,35 @@
                 </details>
             </div>
             <table class="crm-table contact-table">
-                <thead><tr><th>Label</th><th>Address</th><th>Mail</th></tr></thead>
+                <thead><tr><th>Address</th><th>Last Sold Date</th><th></th><th>Mail</th></tr></thead>
                 <tbody>
                     {% for a in addresses %}
                     <tr>
-                        <td>{{ a.label }}</td>
-                        <td>{{ a.street }}, {{ a.city }}, {{ a.state }} {{ a.postal_code }}</td>
+                        <td {% if a.label %}title="{{ a.label }}"{% endif %}>{{ a.address_text }}</td>
+                        <td class="address-last-sold-cell">
+                            {% if a.last_sold_date_display %}
+                            <small>{{ a.last_sold_date_display }}</small>
+                            {% else %}
+                            <small class="anon-muted">-</small>
+                            {% endif %}
+                        </td>
+                        <td class="address-status-cell">
+                            <div class="address-status-icons">
+                                <span class="address-status-icon address-status-{{ a.mailability_state }}" title="{{ a.mailability_title }}" aria-label="{{ a.mailability_title }}">
+                                    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                                        <path d="M3.5 7.5h17v9h-17z"></path>
+                                        <path d="m4.5 8.5 7.5 6 7.5-6"></path>
+                                    </svg>
+                                </span>
+                                <span class="address-status-icon address-status-{{ a.vacancy_state }}" title="{{ a.vacancy_title }}" aria-label="{{ a.vacancy_title }}">
+                                    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                                        <path d="M4.5 11.5 12 5l7.5 6.5"></path>
+                                        <path d="M7.5 10.5v8h9v-8"></path>
+                                        <path d="M10.25 18.5v-4h3.5v4"></path>
+                                    </svg>
+                                </span>
+                            </div>
+                        </td>
                         <td>
                             {% if default_property_id and not person.deceased and a.person_address_id != current_mail_person_address_id %}
                             <button
@@ -228,7 +251,7 @@
                     </tr>
                     {% endfor %}
                     {% if not addresses %}
-                    <tr><td colspan="3">No addresses on file.</td></tr>
+                    <tr><td colspan="4">No addresses on file.</td></tr>
                     {% endif %}
                 </tbody>
             </table>

@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS addresses (
     city TEXT NOT NULL,
     state TEXT NOT NULL,
     postal_code TEXT NOT NULL,
+    is_verified_deliverable INTEGER,
+    is_vacant INTEGER,
+    attom_last_sold_date TEXT,
+    attom_last_sold_price REAL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

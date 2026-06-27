@@ -1851,6 +1851,7 @@ def ensure_db():
     db = open_sqlite_connection()
     migrate_db(db)
     normalize_people_name_data(db)
+    backfill_openletterconnect_mail_orders(db)
     ensure_default_sequence_campaign(db)
     db.commit()
     db.close()
@@ -5404,6 +5405,7 @@ def place_openletterconnect_order(db, contacts, property_row, template_id=None, 
 def extract_openletterconnect_order_fields(payload):
     payload = payload if isinstance(payload, dict) else {}
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    data_order = data.get("order") if isinstance(data.get("order"), dict) else {}
     order_id = str(
         payload.get("id")
         or payload.get("orderId")
@@ -5411,13 +5413,30 @@ def extract_openletterconnect_order_fields(payload):
         or data.get("id")
         or data.get("orderId")
         or data.get("order_id")
+        or data_order.get("id")
+        or data_order.get("orderId")
+        or data_order.get("order_id")
         or ""
     ).strip()
+    if not order_id:
+        backup_candidates = [
+            payload.get("payloadBackupURL"),
+            data.get("payloadBackupURL"),
+            ((payload.get("meta") or {}).get("payloadBackup") or {}).get("s3Path") if isinstance(payload.get("meta"), dict) else "",
+            ((data.get("meta") or {}).get("payloadBackup") or {}).get("s3Path") if isinstance(data.get("meta"), dict) else "",
+        ]
+        for raw_value in backup_candidates:
+            match = re.search(r"order[-_/](\d+)(?:[-_/]|$)", str(raw_value or ""), flags=re.IGNORECASE)
+            if match:
+                order_id = match.group(1).strip()
+                break
     status = str(
         payload.get("status")
         or payload.get("order_status")
         or data.get("status")
         or data.get("order_status")
+        or data_order.get("status")
+        or data_order.get("order_status")
         or ""
     ).strip()
     cost = (
@@ -5425,12 +5444,137 @@ def extract_openletterconnect_order_fields(payload):
         or payload.get("cost")
         or data.get("totalCost")
         or data.get("cost")
+        or data_order.get("totalCost")
+        or data_order.get("cost")
+        or ((data.get("meta") or {}).get("perMailerCost") if isinstance(data.get("meta"), dict) else None)
     )
     return {
         "order_id": order_id,
         "status": status,
         "cost": cost,
     }
+
+
+def _backfill_mail_order_from_response_row(db, row):
+    raw_response = str(row["response_json"] or "").strip()
+    if not raw_response:
+        return False
+    try:
+        payload = json.loads(raw_response)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    order_fields = extract_openletterconnect_order_fields(payload)
+    external_order_id = str(order_fields.get("order_id") or "").strip()
+    status = str(order_fields.get("status") or "").strip()
+    cost = order_fields.get("cost")
+    update_bits = []
+    params = []
+
+    if external_order_id and not str(row["external_order_id"] or "").strip():
+        update_bits.append("external_order_id = ?")
+        params.append(external_order_id)
+    if status and not str(row["status"] or "").strip():
+        update_bits.append("status = ?")
+        params.append(status)
+        if not str(row["status_updated_at"] or "").strip():
+            update_bits.append("status_updated_at = COALESCE(status_updated_at, created_at)")
+    if cost is not None and row["cost"] is None:
+        update_bits.append("cost = ?")
+        params.append(cost)
+    if not str(row["last_event_type"] or "").strip():
+        update_bits.append("last_event_type = ?")
+        params.append("order_submitted")
+
+    if not update_bits:
+        return False
+    params.append(int(row["id"]))
+    db.execute(f"UPDATE mail_orders SET {', '.join(update_bits)} WHERE id = ?", tuple(params))
+    return True
+
+
+def backfill_openletterconnect_mail_orders(db):
+    rows = db.execute(
+        """
+        SELECT id, external_order_id, status, cost, status_updated_at, last_event_type, created_at, response_json
+        FROM mail_orders
+        WHERE COALESCE(response_json, '') <> ''
+          AND (
+                COALESCE(external_order_id, '') = ''
+             OR COALESCE(status, '') = ''
+             OR cost IS NULL
+             OR COALESCE(last_event_type, '') = ''
+          )
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        if _backfill_mail_order_from_response_row(db, row):
+            updated += 1
+    return updated
+
+
+def _find_mail_orders_for_openletterconnect_order(db, order_id):
+    clean_order_id = str(order_id or "").strip()
+    if not clean_order_id:
+        return []
+
+    rows = db.execute(
+        """
+        SELECT *
+        FROM mail_orders
+        WHERE external_order_id = ?
+        ORDER BY id DESC
+        """,
+        (clean_order_id,),
+    ).fetchall()
+    if rows:
+        return rows
+
+    candidates = db.execute(
+        """
+        SELECT *
+        FROM mail_orders
+        WHERE COALESCE(external_order_id, '') = ''
+          AND COALESCE(response_json, '') LIKE ?
+        ORDER BY id DESC
+        """,
+        (f"%{clean_order_id}%",),
+    ).fetchall()
+    if not candidates:
+        return []
+
+    matched_ids = []
+    for row in candidates:
+        if not _backfill_mail_order_from_response_row(db, row):
+            raw_response = str(row["response_json"] or "").strip()
+            if not raw_response:
+                continue
+            try:
+                payload = json.loads(raw_response)
+            except Exception:
+                continue
+            parsed = extract_openletterconnect_order_fields(payload if isinstance(payload, dict) else {})
+            if str(parsed.get("order_id") or "").strip() != clean_order_id:
+                continue
+        matched_ids.append(int(row["id"]))
+
+    if not matched_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in matched_ids)
+    return db.execute(
+        f"""
+        SELECT *
+        FROM mail_orders
+        WHERE id IN ({placeholders})
+        ORDER BY id DESC
+        """,
+        tuple(matched_ids),
+    ).fetchall()
 
 
 def _format_person_contact_for_mail(db, property_row, person_id, person_address_id=None):
@@ -41585,15 +41729,7 @@ def _process_openletterconnect_event_record(db, record, payload):
     order_id = str(record.get("order_id") or "").strip()
     if not order_id:
         return {"updated_orders": 0, "ignored": True, "reason": "missing_order_id"}
-    rows = db.execute(
-        """
-        SELECT *
-        FROM mail_orders
-        WHERE external_order_id = ?
-        ORDER BY id DESC
-        """,
-        (order_id,),
-    ).fetchall()
+    rows = _find_mail_orders_for_openletterconnect_order(db, order_id)
     if not rows:
         return {"updated_orders": 0, "ignored": True, "reason": "unknown_order_id"}
 
@@ -41931,15 +42067,7 @@ def openletterconnect_order_status_webhook():
     ).strip()
     if not external_order_id:
         return jsonify({"ok": True, "ignored": True, "reason": "missing order id"}), 200
-    rows = db.execute(
-        """
-        SELECT *
-        FROM mail_orders
-        WHERE external_order_id = ?
-        ORDER BY id DESC
-        """,
-        (external_order_id,),
-    ).fetchall()
+    rows = _find_mail_orders_for_openletterconnect_order(db, external_order_id)
     if not rows:
         return jsonify({"ok": True, "ignored": True, "reason": "unknown order id"}), 200
 

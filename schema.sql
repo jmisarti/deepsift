@@ -275,6 +275,7 @@ CREATE TABLE IF NOT EXISTS mail_orders (
     mode TEXT NOT NULL,
     template_id INTEGER NOT NULL,
     external_order_id TEXT,
+    external_order_item_id TEXT,
     status TEXT,
     cost REAL,
     recipient_count INTEGER NOT NULL DEFAULT 0,

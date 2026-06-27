@@ -894,6 +894,7 @@ def migrate_db(db):
     ensure_column(db, "reisift_followups", "tasks_json", "tasks_json TEXT")
     ensure_column(db, "mail_orders", "status_updated_at", "status_updated_at TEXT")
     ensure_column(db, "mail_orders", "last_event_type", "last_event_type TEXT")
+    ensure_column(db, "mail_orders", "external_order_item_id", "external_order_item_id TEXT")
     ensure_column(db, "mail_orders", "mailed_at", "mailed_at TEXT")
     ensure_column(db, "mail_orders", "in_transit_at", "in_transit_at TEXT")
     ensure_column(db, "mail_orders", "delivered_at", "delivered_at TEXT")
@@ -5404,8 +5405,13 @@ def place_openletterconnect_order(db, contacts, property_row, template_id=None, 
 
 def extract_openletterconnect_order_fields(payload):
     payload = payload if isinstance(payload, dict) else {}
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    raw_data = payload.get("data")
+    data = raw_data if isinstance(raw_data, dict) else {}
     data_order = data.get("order") if isinstance(data.get("order"), dict) else {}
+    data_order_item = data.get("orderItem") if isinstance(data.get("orderItem"), dict) else {}
+    if not data_order_item and isinstance(data.get("order_item"), dict):
+        data_order_item = data.get("order_item")
+    data_items = raw_data if isinstance(raw_data, list) else []
     order_id = str(
         payload.get("id")
         or payload.get("orderId")
@@ -5418,6 +5424,43 @@ def extract_openletterconnect_order_fields(payload):
         or data_order.get("order_id")
         or ""
     ).strip()
+    order_item_id = str(
+        payload.get("orderItemId")
+        or payload.get("order_item_id")
+        or data.get("orderItemId")
+        or data.get("order_item_id")
+        or data_order_item.get("id")
+        or data_order_item.get("orderItemId")
+        or data_order_item.get("order_item_id")
+        or ""
+    ).strip()
+    if (not order_id or not order_item_id) and data_items:
+        for item in data_items:
+            if not isinstance(item, dict):
+                continue
+            item_order = item.get("order") if isinstance(item.get("order"), dict) else {}
+            item_order_item = item.get("orderItem") if isinstance(item.get("orderItem"), dict) else {}
+            if not item_order_item and isinstance(item.get("order_item"), dict):
+                item_order_item = item.get("order_item")
+            if not order_id:
+                order_id = str(
+                    item_order.get("id")
+                    or item.get("orderId")
+                    or item.get("order_id")
+                    or item_order_item.get("orderId")
+                    or item_order_item.get("order_id")
+                    or ""
+                ).strip()
+            if not order_item_id:
+                order_item_id = str(
+                    item_order_item.get("id")
+                    or item.get("orderItemId")
+                    or item.get("order_item_id")
+                    or item.get("id")
+                    or ""
+                ).strip()
+            if order_id and order_item_id:
+                break
     if not order_id:
         backup_candidates = [
             payload.get("payloadBackupURL"),
@@ -5450,6 +5493,7 @@ def extract_openletterconnect_order_fields(payload):
     )
     return {
         "order_id": order_id,
+        "order_item_id": order_item_id,
         "status": status,
         "cost": cost,
     }
@@ -5468,6 +5512,7 @@ def _backfill_mail_order_from_response_row(db, row):
 
     order_fields = extract_openletterconnect_order_fields(payload)
     external_order_id = str(order_fields.get("order_id") or "").strip()
+    external_order_item_id = str(order_fields.get("order_item_id") or "").strip()
     status = str(order_fields.get("status") or "").strip()
     cost = order_fields.get("cost")
     update_bits = []
@@ -5476,6 +5521,9 @@ def _backfill_mail_order_from_response_row(db, row):
     if external_order_id and not str(row["external_order_id"] or "").strip():
         update_bits.append("external_order_id = ?")
         params.append(external_order_id)
+    if external_order_item_id and not str(row["external_order_item_id"] or "").strip():
+        update_bits.append("external_order_item_id = ?")
+        params.append(external_order_item_id)
     if status and not str(row["status"] or "").strip():
         update_bits.append("status = ?")
         params.append(status)
@@ -5498,11 +5546,12 @@ def _backfill_mail_order_from_response_row(db, row):
 def backfill_openletterconnect_mail_orders(db):
     rows = db.execute(
         """
-        SELECT id, external_order_id, status, cost, status_updated_at, last_event_type, created_at, response_json
+        SELECT id, external_order_id, external_order_item_id, status, cost, status_updated_at, last_event_type, created_at, response_json
         FROM mail_orders
         WHERE COALESCE(response_json, '') <> ''
           AND (
                 COALESCE(external_order_id, '') = ''
+             OR COALESCE(external_order_item_id, '') = ''
              OR COALESCE(status, '') = ''
              OR cost IS NULL
              OR COALESCE(last_event_type, '') = ''
@@ -5517,8 +5566,25 @@ def backfill_openletterconnect_mail_orders(db):
     return updated
 
 
-def _find_mail_orders_for_openletterconnect_order(db, order_id):
+def _find_mail_orders_for_openletterconnect_order(db, order_id, order_item_id=""):
     clean_order_id = str(order_id or "").strip()
+    clean_order_item_id = str(order_item_id or "").strip()
+    if not clean_order_id and not clean_order_item_id:
+        return []
+
+    if clean_order_item_id:
+        rows = db.execute(
+            """
+            SELECT *
+            FROM mail_orders
+            WHERE external_order_item_id = ?
+            ORDER BY id DESC
+            """,
+            (clean_order_item_id,),
+        ).fetchall()
+        if rows:
+            return rows
+
     if not clean_order_id:
         return []
 
@@ -41424,6 +41490,14 @@ def _property_has_mail_status_on_day(db, property_id, status_label, event_at, ex
 
 def _openletterconnect_build_note_text(record):
     lines = [f"OpenLetterConnect: {record.get('display_status') or 'Update'}"]
+    contexts = record.get("mail_contexts") if isinstance(record.get("mail_contexts"), list) else []
+    primary_context = contexts[0] if contexts and isinstance(contexts[0], dict) else {}
+    if primary_context.get("property_address"):
+        lines.append(f"Property: {primary_context.get('property_address')}")
+    if primary_context.get("mailing_address"):
+        lines.append(f"Mailing Address: {primary_context.get('mailing_address')}")
+    if primary_context.get("person_name"):
+        lines.append(f"Matched Person: {primary_context.get('person_name')}")
     if record.get("event_type"):
         lines.append(f"Event: {record['event_type']}")
     if record.get("order_id"):
@@ -41449,6 +41523,14 @@ def _openletterconnect_build_note_text(record):
 
 def _openletterconnect_build_reisift_note_text(record):
     lines = [f"OpenLetterConnect: {record.get('display_status') or 'Update'}"]
+    contexts = record.get("mail_contexts") if isinstance(record.get("mail_contexts"), list) else []
+    primary_context = contexts[0] if contexts and isinstance(contexts[0], dict) else {}
+    if primary_context.get("property_address"):
+        lines.append(f"Property: {primary_context.get('property_address')}")
+    if primary_context.get("mailing_address"):
+        lines.append(f"Mailing Address: {primary_context.get('mailing_address')}")
+    if primary_context.get("person_name"):
+        lines.append(f"Matched Person: {primary_context.get('person_name')}")
     if record.get("contact_name"):
         lines.append(f"Contact: {record['contact_name']}")
     if record.get("event_at"):
@@ -41497,6 +41579,110 @@ def _openletterconnect_row_property_address(db, mail_order_row, record):
         if formatted:
             return formatted
     return ""
+
+
+def _openletterconnect_address_from_contact(contact):
+    contact = contact if isinstance(contact, dict) else {}
+    return format_property_address_line(
+        contact.get("address1") or contact.get("street"),
+        contact.get("city"),
+        contact.get("state"),
+        contact.get("zip") or contact.get("postal_code"),
+    )
+
+
+def _openletterconnect_property_from_contact(contact):
+    contact = contact if isinstance(contact, dict) else {}
+    property_address = contact.get("propertyAddress")
+    if isinstance(property_address, dict):
+        return format_property_address_line(
+            property_address.get("address") or property_address.get("street"),
+            property_address.get("city"),
+            property_address.get("state"),
+            property_address.get("zip") or property_address.get("postal_code"),
+        )
+    return format_property_address_line(
+        property_address,
+        contact.get("propertyCity"),
+        contact.get("propertyState"),
+        contact.get("propertyZip") or contact.get("propertyPostalCode"),
+    )
+
+
+def _openletterconnect_contact_name_from_contact(contact):
+    contact = contact if isinstance(contact, dict) else {}
+    return " ".join(
+        [
+            str(contact.get("firstName") or contact.get("first_name") or "").strip(),
+            str(contact.get("lastName") or contact.get("last_name") or "").strip(),
+        ]
+    ).strip()
+
+
+def _openletterconnect_request_contacts(mail_order_row):
+    try:
+        request_payload = json.loads(mail_order_row["request_json"] or "{}") if mail_order_row else {}
+    except Exception:
+        request_payload = {}
+    contacts = request_payload.get("contacts") if isinstance(request_payload, dict) else []
+    return contacts if isinstance(contacts, list) else []
+
+
+def _openletterconnect_match_request_contact(mail_order_row, record):
+    contacts = [c for c in _openletterconnect_request_contacts(mail_order_row) if isinstance(c, dict)]
+    if not contacts:
+        return {}
+    if len(contacts) == 1:
+        return contacts[0]
+
+    row_person_id = str(mail_order_row["person_id"] or "").strip() if mail_order_row and mail_order_row["person_id"] else ""
+    if row_person_id:
+        for contact in contacts:
+            meta = contact.get("meta_data") if isinstance(contact.get("meta_data"), dict) else {}
+            if str(meta.get("person_id") or "").strip() == row_person_id:
+                return contact
+
+    record_contact_name = re.sub(r"\s+", " ", str(record.get("contact_name") or "").strip()).lower()
+    if record_contact_name:
+        for contact in contacts:
+            if _openletterconnect_contact_name_from_contact(contact).lower() == record_contact_name:
+                return contact
+
+    return {}
+
+
+def _openletterconnect_resolve_mail_context(db, mail_order_row, record):
+    contact = _openletterconnect_match_request_contact(mail_order_row, record)
+    meta = contact.get("meta_data") if isinstance(contact.get("meta_data"), dict) else {}
+    property_id = int(mail_order_row["property_id"] or 0) if mail_order_row and mail_order_row["property_id"] else 0
+    person_id = int(mail_order_row["person_id"] or 0) if mail_order_row and mail_order_row["person_id"] else 0
+    if not person_id and str(meta.get("person_id") or "").isdigit():
+        person_id = int(meta.get("person_id"))
+
+    person_name = ""
+    if person_id:
+        person = db.execute("SELECT first_name, last_name FROM people WHERE id = ?", (person_id,)).fetchone()
+        if person:
+            person_name = " ".join([str(person["first_name"] or "").strip(), str(person["last_name"] or "").strip()]).strip()
+    if not person_name:
+        person_name = _openletterconnect_contact_name_from_contact(contact)
+
+    property_address = _openletterconnect_row_property_address(db, mail_order_row, record)
+    if not property_address:
+        property_address = _openletterconnect_property_from_contact(contact)
+
+    mailing_address = _openletterconnect_address_from_contact(contact)
+    context = {
+        "mail_order_id": int(mail_order_row["id"]) if mail_order_row and mail_order_row["id"] else None,
+        "property_id": property_id or None,
+        "property_address": property_address,
+        "person_id": person_id or None,
+        "person_name": person_name,
+        "mailing_address": mailing_address,
+        "person_address_id": meta.get("person_address_id"),
+        "address_id": meta.get("address_id"),
+    }
+    return {k: v for k, v in context.items() if v not in ("", None)}
 
 
 def _notify_openletterconnect_bad_address(db, rows, record, route):
@@ -41642,10 +41828,12 @@ def _extract_openletterconnect_events(payload):
     elif "qr_code_scanned" in event_type_lower:
         data_dict = data if isinstance(data, dict) else {}
         order_details = data_dict.get("order_details") if isinstance(data_dict.get("order_details"), dict) else {}
+        order_item_details = data_dict.get("order_item_details") if isinstance(data_dict.get("order_item_details"), dict) else {}
         events.append(
             build_record(
                 0,
                 order_id=order_details.get("order_id") or data_dict.get("order_id") or payload.get("order_id") or "",
+                order_item_id=order_item_details.get("order_item_id") or data_dict.get("order_item_id") or payload.get("order_item_id") or "",
                 raw_status="QR Scanned",
                 event_at=_parse_openletterconnect_event_time(data_dict.get("scan_timestamp") or payload.get("created_at")),
                 contact_name=_extract_openletterconnect_contact_name(data_dict.get("scanned_by")),
@@ -41705,6 +41893,10 @@ def _apply_openletterconnect_event_to_mail_order(db, mail_order_row, record, pay
     if is_qr_scan:
         update_bits.append("qr_scanned_at = ?")
         params.append(event_at)
+    order_item_id = str(record.get("order_item_id") or "").strip()
+    if order_item_id and not str(mail_order_row["external_order_item_id"] or "").strip():
+        update_bits.append("external_order_item_id = ?")
+        params.append(order_item_id)
     params.append(int(mail_order_row["id"]))
     db.execute(f"UPDATE mail_orders SET {', '.join(update_bits)} WHERE id = ?", tuple(params))
     if status_update and str(mail_order_row["external_order_id"] or "").strip():
@@ -41729,7 +41921,8 @@ def _process_openletterconnect_event_record(db, record, payload):
     order_id = str(record.get("order_id") or "").strip()
     if not order_id:
         return {"updated_orders": 0, "ignored": True, "reason": "missing_order_id"}
-    rows = _find_mail_orders_for_openletterconnect_order(db, order_id)
+    order_item_id = str(record.get("order_item_id") or "").strip()
+    rows = _find_mail_orders_for_openletterconnect_order(db, order_id, order_item_id=order_item_id)
     if not rows:
         return {"updated_orders": 0, "ignored": True, "reason": "unknown_order_id"}
 
@@ -41738,8 +41931,20 @@ def _process_openletterconnect_event_record(db, record, payload):
     should_emit_local_history = False
     should_emit_bad_address_alert = False
     display_status = str(record.get("display_status") or "").strip()
+    mail_contexts = []
+    seen_contexts = set()
     for row in rows:
         apply_result = _apply_openletterconnect_event_to_mail_order(db, row, record, payload)
+        mail_context = _openletterconnect_resolve_mail_context(db, row, record)
+        context_key = (
+            mail_context.get("mail_order_id"),
+            mail_context.get("property_id"),
+            mail_context.get("person_id"),
+            mail_context.get("mailing_address"),
+        )
+        if mail_context and context_key not in seen_contexts:
+            seen_contexts.add(context_key)
+            mail_contexts.append(mail_context)
         for pid in _mail_order_person_ids(row):
             unique_person_ids.add(int(pid))
         property_id = int(row["property_id"] or 0) if row["property_id"] else 0
@@ -41772,12 +41977,14 @@ def _process_openletterconnect_event_record(db, record, payload):
                     row["property_id"],
                     (row["person_id"] or (next(iter(unique_person_ids)) if unique_person_ids else None)),
                     display_status or "Update",
-                    json.dumps({"record": record, "payload": payload}, default=str),
+                    json.dumps({"record": record, "payload": payload, "mail_context": mail_context}, default=str),
                 ),
             )
         if display_status.lower() == "bad address" and apply_result["status_changed"]:
             should_emit_bad_address_alert = True
 
+    if mail_contexts:
+        record["mail_contexts"] = mail_contexts
     note_text = _openletterconnect_build_note_text(record)
     if should_emit_local_history:
         for pid in sorted(unique_person_ids):

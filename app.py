@@ -42807,7 +42807,7 @@ def _phone_activity_disposition_bucket(value, duration_seconds=0):
         return "Incorrect #"
     if "out of service" in blob or "not in service" in blob or "disconnected" in blob:
         return "Out of Service"
-    if "no answer" in blob or "no_answer" in blob or "no-answer" in blob or "missed" in blob:
+    if "no answer" in blob or "no_answer" in blob or "no-answer" in blob or "missed" in blob or "voicemail" in blob:
         return "No Answer"
     if "answered" in blob or "connected" in blob:
         return "Answered"
@@ -42834,7 +42834,7 @@ def _apply_phone_activity_disposition_counts(row, disposition):
         row["dnc_count"] += 1
     if disposition == "DNT":
         row["dnt_count"] += 1
-    if disposition in {"Answered", "Correct #"} or "correct" in lookup:
+    if disposition in {"Answered", "Correct #"} or ("correct" in lookup and "incorrect" not in lookup):
         row["correct_count"] += 1
     if disposition == "Incorrect #":
         row["incorrect_count"] += 1

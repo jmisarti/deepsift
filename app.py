@@ -42564,6 +42564,8 @@ def _phone_activity_direction(event_type, payload):
         return "inbound"
     if any(marker in text for marker in ("outbound", "outgoing", "initiated", "smrtdial")):
         return "outbound"
+    if "call" in text:
+        return "outbound"
     return "unknown"
 
 
@@ -42615,15 +42617,15 @@ def _phone_activity_disposition_bucket(value):
         return "DNT"
     if "new lead" in blob or "new_lead" in blob or blob == "lead":
         return "Lead"
-    if "not interested" in blob or "not_interested" in blob:
+    if "not interested" in blob or "not_interested" in blob or "not-interested" in blob:
         return "Not Interested"
-    if "follow up" in blob or "follow-up" in blob or "callback" in blob:
+    if "follow up" in blob or "follow-up" in blob or "followup" in blob or "callback" in blob:
         return "Follow Up"
     if "wrong" in blob or "incorrect" in blob or "invalid" in blob:
         return "Incorrect #"
     if "out of service" in blob or "not in service" in blob or "disconnected" in blob:
         return "Out of Service"
-    if "no answer" in blob or "no_answer" in blob or "missed" in blob:
+    if "no answer" in blob or "no_answer" in blob or "no-answer" in blob or "missed" in blob:
         return "No Answer"
     if "answered" in blob or "connected" in blob:
         return "Answered"

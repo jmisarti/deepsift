@@ -725,6 +725,8 @@ def require_login_if_enabled():
         return None
     integration_api_allowlist = {
         "/api/webhooks/smrtphone/events",
+        "/api/phone-activity/rollups",
+        "/api/phone-activity/rollups/",
         "/api/webhooks/clever/events",
         "/api/call-recording-jobs",
         "/api/integrations/agent-trace/search",
@@ -42406,6 +42408,258 @@ def clear_unread_notifications():
     )
     db.commit()
     return jsonify({"ok": True, "cleared": int(cur.rowcount or 0)})
+
+
+def phone_activity_export_auth_ok(db, req):
+    token = (
+        get_setting(db, "phone_activity_export_token", "")
+        or os.getenv("DEEPSIFT_PHONE_ACTIVITY_TOKEN", "")
+        or os.getenv("PHONE_ACTIVITY_EXPORT_TOKEN", "")
+    ).strip()
+    supplied = (
+        (req.headers.get("X-Phone-Activity-Token") or "").strip()
+        or (req.headers.get("Authorization") or "").replace("Bearer", "").strip()
+        or (req.args.get("token") or "").strip()
+    )
+    if token and supplied and hmac.compare_digest(supplied, token):
+        return True
+    return integration_auth_ok(db, req)
+
+
+def phone_activity_rollup_export(days):
+    ensure_db()
+    db = get_db()
+    if not phone_activity_export_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    try:
+        window_days = max(1, min(31, int(days or request.args.get("days") or 7)))
+    except (TypeError, ValueError):
+        window_days = 7
+    end_at = datetime.utcnow().replace(microsecond=0)
+    start_at = end_at - timedelta(days=window_days)
+    rows = db.execute(
+        """
+        SELECT id, event_type, processing_status, sms_id, from_number, to_number, payload_json, received_at
+        FROM smrtphone_webhook_events
+        WHERE received_at >= ?
+          AND received_at < ?
+        ORDER BY received_at ASC
+        LIMIT 50000
+        """,
+        (start_at.strftime("%Y-%m-%d %H:%M:%S"), end_at.strftime("%Y-%m-%d %H:%M:%S")),
+    ).fetchall()
+    rollups = _phone_activity_rollups_from_smrtphone_rows(rows)
+    return jsonify({"ok": True, "rows_scanned": len(rows), "rollups": rollups})
+
+
+@app.route("/api/integrations/phone-activity/rollups", methods=["GET"])
+@app.route("/api/integrations/phone-activity/rollups/", methods=["GET"])
+@app.route("/api/phone-activity/rollups", methods=["GET"])
+@app.route("/api/phone-activity/rollups/", methods=["GET"])
+def phone_activity_rollups_api():
+    return phone_activity_rollup_export(request.args.get("days"))
+
+
+def _phone_activity_rollups_from_smrtphone_rows(rows):
+    grouped = {}
+    for row in rows:
+        event = _phone_activity_event_from_smrtphone_row(row)
+        if not event:
+            continue
+        key = (
+            event["bucket_start"],
+            event["user_key"],
+            event["user_name"],
+            event["business_number"],
+            event["channel"],
+            event["direction"],
+            event["disposition_bucket"],
+        )
+        if key not in grouped:
+            grouped[key] = {
+                "bucket_start": event["bucket_start"].isoformat(),
+                "user_key": event["user_key"],
+                "user_name": event["user_name"],
+                "business_number": event["business_number"],
+                "channel": event["channel"],
+                "direction": event["direction"],
+                "disposition_bucket": event["disposition_bucket"],
+                "event_count": 0,
+                "duration_event_count": 0,
+                "total_duration_seconds": 0,
+                "answered_count": 0,
+                "lead_count": 0,
+                "dnc_count": 0,
+                "dnt_count": 0,
+                "correct_count": 0,
+                "incorrect_count": 0,
+                "no_answer_count": 0,
+                "out_of_service_count": 0,
+                "not_interested_count": 0,
+                "follow_up_count": 0,
+            }
+        bucket = grouped[key]
+        bucket["event_count"] += 1
+        if event["duration_seconds"] > 0:
+            bucket["duration_event_count"] += 1
+            bucket["total_duration_seconds"] += event["duration_seconds"]
+        _apply_phone_activity_disposition_counts(bucket, event["disposition_bucket"])
+    return list(grouped.values())
+
+
+def _phone_activity_event_from_smrtphone_row(row):
+    payload = parse_json_object(row["payload_json"] or "{}", default={})
+    if not isinstance(payload, dict):
+        payload = {}
+    event_type = (
+        str(row["event_type"] or "").strip()
+        or extract_first_string_by_keys(payload, ["event", "eventType", "type", "name"])
+        or "smrtphone_event"
+    )
+    channel = _phone_activity_channel(event_type)
+    if channel not in {"call", "sms", "compliance"}:
+        return None
+    direction = _phone_activity_direction(event_type, payload)
+    from_number = normalize_phone(row["from_number"] or extract_first_string_by_keys(payload, ["from", "from_number", "fromNumber", "caller", "source", "ani", "phone_number_caller"]))
+    to_number = normalize_phone(row["to_number"] or extract_first_string_by_keys(payload, ["to", "to_number", "toNumber", "callee", "destination", "dnis", "phone_number_agent"]))
+    business_number = _phone_activity_business_number(direction, from_number, to_number)
+    happened_at = parse_flexible_datetime(row["received_at"]) or datetime.utcnow()
+    if happened_at.tzinfo is None:
+        happened_at = happened_at.replace(tzinfo=timezone.utc)
+    else:
+        happened_at = happened_at.astimezone(timezone.utc)
+    bucket_start = happened_at.replace(minute=0, second=0, microsecond=0)
+    user_name = _phone_activity_user_name(payload)
+    return {
+        "bucket_start": bucket_start,
+        "user_key": _phone_activity_user_key(payload, user_name),
+        "user_name": user_name,
+        "business_number": business_number,
+        "channel": channel,
+        "direction": direction,
+        "disposition_bucket": _phone_activity_disposition_bucket(
+            extract_first_string_by_keys(payload, ["callOutcome", "call_outcome", "outcome", "status", "disposition"])
+            or str(row["processing_status"] or "")
+            or event_type
+        ),
+        "duration_seconds": _phone_activity_duration_seconds(payload),
+    }
+
+
+def _phone_activity_channel(event_type):
+    text = str(event_type or "").casefold()
+    if any(marker in text for marker in ("sms", "text", "message")):
+        return "sms"
+    if any(marker in text for marker in ("dnc", "dnt", "do not call", "do not text")):
+        return "compliance"
+    if any(marker in text for marker in ("call", "dial", "agent")):
+        return "call"
+    return "event"
+
+
+def _phone_activity_direction(event_type, payload):
+    explicit = extract_first_string_by_keys(payload, ["direction", "callDirection", "call_direction"])
+    text = str(explicit or event_type or "").casefold()
+    if any(marker in text for marker in ("inbound", "incoming", "received")):
+        return "inbound"
+    if any(marker in text for marker in ("outbound", "outgoing", "initiated", "smrtdial")):
+        return "outbound"
+    return "unknown"
+
+
+def _phone_activity_business_number(direction, from_number, to_number):
+    if direction == "inbound":
+        return to_number or from_number or "unknown"
+    if direction == "outbound":
+        return from_number or to_number or "unknown"
+    return from_number or to_number or "unknown"
+
+
+def _phone_activity_user_name(payload):
+    return (
+        extract_first_string_by_keys(payload, ["agentName", "agent_name", "userName", "user_name", "user", "employee", "employeeName", "employee_name", "createdBy", "created_by"])
+        or "Unknown"
+    ).strip()
+
+
+def _phone_activity_user_key(payload, user_name):
+    value = extract_first_string_by_keys(payload, ["userId", "user_id", "agentId", "agent_id", "employeeId", "employee_id", "userEmail", "email"]) or user_name
+    return re.sub(r"[^a-z0-9@._-]+", "-", str(value or "").casefold()).strip("-") or "unknown"
+
+
+def _phone_activity_duration_seconds(payload):
+    raw = extract_first_string_by_keys(payload, ["durationSeconds", "duration_seconds", "callDurationSeconds", "call_duration_seconds", "callDuration", "call_duration", "duration"])
+    text = str(raw or "").strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return int(text)
+    parts = [part for part in text.split(":") if part.strip().isdigit()]
+    if len(parts) == 3:
+        hours, minutes, seconds = [int(part) for part in parts]
+        return hours * 3600 + minutes * 60 + seconds
+    if len(parts) == 2:
+        minutes, seconds = [int(part) for part in parts]
+        return minutes * 60 + seconds
+    return 0
+
+
+def _phone_activity_disposition_bucket(value):
+    text = str(value or "").strip()
+    blob = text.casefold()
+    if not blob:
+        return "Unknown"
+    if "do not call" in blob or "dnc" in blob:
+        return "DNC"
+    if "do not text" in blob or "dnt" in blob:
+        return "DNT"
+    if "new lead" in blob or "new_lead" in blob or blob == "lead":
+        return "Lead"
+    if "not interested" in blob or "not_interested" in blob:
+        return "Not Interested"
+    if "follow up" in blob or "follow-up" in blob or "callback" in blob:
+        return "Follow Up"
+    if "wrong" in blob or "incorrect" in blob or "invalid" in blob:
+        return "Incorrect #"
+    if "out of service" in blob or "not in service" in blob or "disconnected" in blob:
+        return "Out of Service"
+    if "no answer" in blob or "no_answer" in blob or "missed" in blob:
+        return "No Answer"
+    if "answered" in blob or "connected" in blob:
+        return "Answered"
+    if "delivered" in blob:
+        return "Delivered"
+    if "failed" in blob or "error" in blob:
+        return "Failed"
+    if "sent" in blob or "queued" in blob:
+        return "Sent"
+    if "received" in blob or "inbound" in blob:
+        return "Received"
+    return text[:80]
+
+
+def _apply_phone_activity_disposition_counts(row, disposition):
+    lookup = str(disposition or "").casefold()
+    if disposition in {"Answered", "Correct #", "Lead", "Follow Up"}:
+        row["answered_count"] += 1
+    if disposition == "Lead":
+        row["lead_count"] += 1
+    if disposition == "DNC":
+        row["dnc_count"] += 1
+    if disposition == "DNT":
+        row["dnt_count"] += 1
+    if disposition in {"Answered", "Correct #"} or "correct" in lookup:
+        row["correct_count"] += 1
+    if disposition == "Incorrect #":
+        row["incorrect_count"] += 1
+    if disposition == "No Answer":
+        row["no_answer_count"] += 1
+    if disposition == "Out of Service":
+        row["out_of_service_count"] += 1
+    if disposition == "Not Interested":
+        row["not_interested_count"] += 1
+    if disposition == "Follow Up":
+        row["follow_up_count"] += 1
 
 
 @app.route("/api/webhooks/smrtphone/events", methods=["GET"])

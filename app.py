@@ -42437,9 +42437,9 @@ def phone_activity_rollup_export(days):
         window_days = 7
     end_at = datetime.utcnow().replace(microsecond=0)
     start_at = end_at - timedelta(days=window_days)
-    rows = db.execute(
+    event_rows = db.execute(
         """
-        SELECT id, event_type, processing_status, sms_id, from_number, to_number, payload_json, received_at
+        SELECT id, event_type, processing_status, sms_id, from_number, to_number, communication_id, payload_json, received_at
         FROM smrtphone_webhook_events
         WHERE received_at >= ?
           AND received_at < ?
@@ -42448,8 +42448,44 @@ def phone_activity_rollup_export(days):
         """,
         (start_at.strftime("%Y-%m-%d %H:%M:%S"), end_at.strftime("%Y-%m-%d %H:%M:%S")),
     ).fetchall()
-    rollups = _phone_activity_rollups_from_smrtphone_rows(rows)
-    return jsonify({"ok": True, "rows_scanned": len(rows), "rollups": rollups})
+    communication_rows = db.execute(
+        """
+        SELECT id, channel, direction, from_number, to_number, status, sent_at, created_at, external_id
+        FROM communications
+        WHERE COALESCE(NULLIF(sent_at, ''), created_at) >= ?
+          AND COALESCE(NULLIF(sent_at, ''), created_at) < ?
+          AND upper(COALESCE(channel, '')) IN ('SMS', 'CALL')
+        ORDER BY COALESCE(NULLIF(sent_at, ''), created_at) ASC
+        LIMIT 50000
+        """,
+        (start_at.strftime("%Y-%m-%d %H:%M:%S"), end_at.strftime("%Y-%m-%d %H:%M:%S")),
+    ).fetchall()
+    call_job_rows = db.execute(
+        """
+        SELECT id, call_sid, from_number, to_number, fetch_status, analysis_status, summary_text, payload_json, analysis_json, created_at, updated_at
+        FROM call_recording_jobs
+        WHERE created_at >= ?
+          AND created_at < ?
+        ORDER BY created_at ASC
+        LIMIT 50000
+        """,
+        (start_at.strftime("%Y-%m-%d %H:%M:%S"), end_at.strftime("%Y-%m-%d %H:%M:%S")),
+    ).fetchall()
+    events = _phone_activity_events_from_source_rows(event_rows, communication_rows, call_job_rows)
+    rollups = _phone_activity_rollups_from_events(events)
+    return jsonify(
+        {
+            "ok": True,
+            "rows_scanned": len(event_rows) + len(communication_rows) + len(call_job_rows),
+            "source_rows": {
+                "smrtphone_webhook_events": len(event_rows),
+                "communications": len(communication_rows),
+                "call_recording_jobs": len(call_job_rows),
+            },
+            "events_scanned": len(events),
+            "rollups": rollups,
+        }
+    )
 
 
 @app.route("/api/integrations/phone-activity/rollups", methods=["GET"])
@@ -42460,12 +42496,55 @@ def phone_activity_rollups_api():
     return phone_activity_rollup_export(request.args.get("days"))
 
 
-def _phone_activity_rollups_from_smrtphone_rows(rows):
-    grouped = {}
-    for row in rows:
-        event = _phone_activity_event_from_smrtphone_row(row)
+def _phone_activity_events_from_source_rows(event_rows, communication_rows, call_job_rows):
+    communication_external_ids = {
+        str(row["external_id"] or "").strip()
+        for row in communication_rows
+        if str(row["external_id"] or "").strip()
+    }
+    call_jobs_by_sid = {}
+    for row in call_job_rows:
+        call_sid = str(row["call_sid"] or "").strip()
+        if call_sid:
+            call_jobs_by_sid[call_sid] = row
+
+    events = []
+    seen_call_sids = set()
+    for row in event_rows:
+        payload = parse_json_object(row["payload_json"] or "{}", default={})
+        if not isinstance(payload, dict):
+            payload = {}
+        call_sid = _phone_activity_call_sid_from_payload(payload)
+        event = _phone_activity_event_from_smrtphone_row(
+            row,
+            call_job=call_jobs_by_sid.get(call_sid),
+            communication_external_ids=communication_external_ids,
+            parsed_payload=payload,
+        )
         if not event:
             continue
+        if call_sid and event["channel"] == "call":
+            seen_call_sids.add(call_sid)
+        events.append(event)
+
+    for row in call_job_rows:
+        call_sid = str(row["call_sid"] or "").strip()
+        if call_sid and call_sid in seen_call_sids:
+            continue
+        event = _phone_activity_event_from_call_job_row(row)
+        if event:
+            events.append(event)
+
+    for row in communication_rows:
+        event = _phone_activity_event_from_communication_row(row)
+        if event:
+            events.append(event)
+    return events
+
+
+def _phone_activity_rollups_from_events(events):
+    grouped = {}
+    for event in events:
         key = (
             event["bucket_start"],
             event["user_key"],
@@ -42507,8 +42586,8 @@ def _phone_activity_rollups_from_smrtphone_rows(rows):
     return list(grouped.values())
 
 
-def _phone_activity_event_from_smrtphone_row(row):
-    payload = parse_json_object(row["payload_json"] or "{}", default={})
+def _phone_activity_event_from_smrtphone_row(row, call_job=None, communication_external_ids=None, parsed_payload=None):
+    payload = parsed_payload if isinstance(parsed_payload, dict) else parse_json_object(row["payload_json"] or "{}", default={})
     if not isinstance(payload, dict):
         payload = {}
     event_type = (
@@ -42518,6 +42597,9 @@ def _phone_activity_event_from_smrtphone_row(row):
     )
     channel = _phone_activity_channel(event_type)
     if channel not in {"call", "sms", "compliance"}:
+        return None
+    sms_id = str(row["sms_id"] or extract_sms_id_from_payload(payload) or "").strip()
+    if channel == "sms" and (row["communication_id"] or (sms_id and sms_id in (communication_external_ids or set()))):
         return None
     direction = _phone_activity_direction(event_type, payload)
     from_number = normalize_phone(row["from_number"] or extract_first_string_by_keys(payload, ["from", "from_number", "fromNumber", "caller", "source", "ani", "phone_number_caller"]))
@@ -42529,7 +42611,22 @@ def _phone_activity_event_from_smrtphone_row(row):
     else:
         happened_at = happened_at.astimezone(timezone.utc)
     bucket_start = happened_at.replace(minute=0, second=0, microsecond=0)
-    user_name = _phone_activity_user_name(payload)
+    call_job_payload = parse_json_object(call_job["payload_json"] or "{}", default={}) if call_job else {}
+    call_job_analysis = parse_json_object(call_job["analysis_json"] or "{}", default={}) if call_job else {}
+    user_name = (
+        _phone_activity_user_name(payload)
+        if _phone_activity_user_name(payload) != "Unknown"
+        else _phone_activity_user_name(call_job_payload)
+    )
+    duration_seconds = _phone_activity_duration_seconds(payload) or _phone_activity_duration_seconds(call_job_analysis) or _phone_activity_duration_seconds(call_job_payload)
+    raw_disposition = (
+        extract_first_string_by_keys(call_job_analysis, ["call_outcome_type", "callOutcome", "call_outcome", "outcome", "status", "disposition"])
+        or extract_first_string_by_keys(call_job_payload, ["call_outcome_type", "callOutcome", "call_outcome", "outcome", "status", "disposition"])
+        or extract_first_string_by_keys(payload, ["callOutcome", "call_outcome", "outcome", "status", "disposition"])
+        or str(row["processing_status"] or "")
+        or event_type
+    )
+    disposition_bucket = _phone_activity_disposition_bucket(raw_disposition, duration_seconds=duration_seconds)
     return {
         "bucket_start": bucket_start,
         "user_key": _phone_activity_user_key(payload, user_name),
@@ -42537,12 +42634,81 @@ def _phone_activity_event_from_smrtphone_row(row):
         "business_number": business_number,
         "channel": channel,
         "direction": direction,
-        "disposition_bucket": _phone_activity_disposition_bucket(
-            extract_first_string_by_keys(payload, ["callOutcome", "call_outcome", "outcome", "status", "disposition"])
-            or str(row["processing_status"] or "")
-            or event_type
-        ),
-        "duration_seconds": _phone_activity_duration_seconds(payload),
+        "disposition_bucket": disposition_bucket,
+        "duration_seconds": duration_seconds,
+    }
+
+
+def _phone_activity_event_from_communication_row(row):
+    channel = str(row["channel"] or "").strip().casefold()
+    if channel not in {"sms", "call"}:
+        return None
+    direction = _phone_activity_normalized_direction(row["direction"])
+    from_number = normalize_phone(row["from_number"])
+    to_number = normalize_phone(row["to_number"])
+    happened_at = parse_flexible_datetime(row["sent_at"] or row["created_at"]) or datetime.utcnow()
+    if happened_at.tzinfo is None:
+        happened_at = happened_at.replace(tzinfo=timezone.utc)
+    else:
+        happened_at = happened_at.astimezone(timezone.utc)
+    bucket_start = happened_at.replace(minute=0, second=0, microsecond=0)
+    user_name = "Unknown"
+    return {
+        "bucket_start": bucket_start,
+        "user_key": "unknown",
+        "user_name": user_name,
+        "business_number": _phone_activity_business_number(direction, from_number, to_number),
+        "channel": channel,
+        "direction": direction,
+        "disposition_bucket": _phone_activity_disposition_bucket(row["status"] or row["direction"] or channel),
+        "duration_seconds": 0,
+    }
+
+
+def _phone_activity_event_from_call_job_row(row):
+    payload = parse_json_object(row["payload_json"] or "{}", default={})
+    if not isinstance(payload, dict):
+        payload = {}
+    analysis = parse_json_object(row["analysis_json"] or "{}", default={})
+    if not isinstance(analysis, dict):
+        analysis = {}
+    webhook = payload.get("webhook") if isinstance(payload.get("webhook"), dict) else {}
+    direction = _phone_activity_direction(
+        extract_first_string_by_keys(analysis, ["call_direction", "direction"])
+        or extract_first_string_by_keys(payload, ["call_direction", "direction"])
+        or "call",
+        payload,
+    )
+    from_number = normalize_phone(row["from_number"] or extract_first_string_by_keys(payload, ["from", "from_number", "fromNumber", "caller", "source", "ani", "phone_number_caller"]))
+    to_number = normalize_phone(row["to_number"] or extract_first_string_by_keys(payload, ["to", "to_number", "toNumber", "callee", "destination", "dnis", "phone_number_agent"]))
+    happened_at = parse_flexible_datetime(row["created_at"]) or datetime.utcnow()
+    if happened_at.tzinfo is None:
+        happened_at = happened_at.replace(tzinfo=timezone.utc)
+    else:
+        happened_at = happened_at.astimezone(timezone.utc)
+    bucket_start = happened_at.replace(minute=0, second=0, microsecond=0)
+    user_name = (
+        _phone_activity_user_name(webhook)
+        if _phone_activity_user_name(webhook) != "Unknown"
+        else _phone_activity_user_name(payload)
+    )
+    duration_seconds = _phone_activity_duration_seconds(analysis) or _phone_activity_duration_seconds(payload)
+    raw_disposition = (
+        extract_first_string_by_keys(analysis, ["call_outcome_type", "callOutcome", "call_outcome", "outcome", "status", "disposition"])
+        or extract_first_string_by_keys(payload, ["call_outcome_type", "callOutcome", "call_outcome", "outcome", "status", "disposition"])
+        or row["analysis_status"]
+        or row["fetch_status"]
+        or "call"
+    )
+    return {
+        "bucket_start": bucket_start,
+        "user_key": _phone_activity_user_key(webhook if webhook else payload, user_name),
+        "user_name": user_name,
+        "business_number": _phone_activity_business_number(direction, from_number, to_number),
+        "channel": "call",
+        "direction": direction,
+        "disposition_bucket": _phone_activity_disposition_bucket(raw_disposition, duration_seconds=duration_seconds),
+        "duration_seconds": duration_seconds,
     }
 
 
@@ -42569,6 +42735,15 @@ def _phone_activity_direction(event_type, payload):
     return "unknown"
 
 
+def _phone_activity_normalized_direction(value):
+    text = str(value or "").strip().casefold()
+    if any(marker in text for marker in ("inbound", "incoming", "received")):
+        return "inbound"
+    if any(marker in text for marker in ("outbound", "outgoing", "sent", "delivered", "queued")):
+        return "outbound"
+    return "unknown"
+
+
 def _phone_activity_business_number(direction, from_number, to_number):
     if direction == "inbound":
         return to_number or from_number or "unknown"
@@ -42589,6 +42764,13 @@ def _phone_activity_user_key(payload, user_name):
     return re.sub(r"[^a-z0-9@._-]+", "-", str(value or "").casefold()).strip("-") or "unknown"
 
 
+def _phone_activity_call_sid_from_payload(payload):
+    return extract_first_string_by_keys(
+        payload,
+        ["call_sid", "callSid", "CallSid", "callsid", "sid", "call_id", "callId", "callID", "id"],
+    )
+
+
 def _phone_activity_duration_seconds(payload):
     raw = extract_first_string_by_keys(payload, ["durationSeconds", "duration_seconds", "callDurationSeconds", "call_duration_seconds", "callDuration", "call_duration", "duration"])
     text = str(raw or "").strip()
@@ -42606,7 +42788,7 @@ def _phone_activity_duration_seconds(payload):
     return 0
 
 
-def _phone_activity_disposition_bucket(value):
+def _phone_activity_disposition_bucket(value, duration_seconds=0):
     text = str(value or "").strip()
     blob = text.casefold()
     if not blob:
@@ -42628,6 +42810,8 @@ def _phone_activity_disposition_bucket(value):
     if "no answer" in blob or "no_answer" in blob or "no-answer" in blob or "missed" in blob:
         return "No Answer"
     if "answered" in blob or "connected" in blob:
+        return "Answered"
+    if int(duration_seconds or 0) > 0 and blob in {"completed", "complete", "stored", "success", "successful"}:
         return "Answered"
     if "delivered" in blob:
         return "Delivered"

@@ -34,10 +34,54 @@
                     <option value="asc" {% if sort_order == "asc" %}selected{% endif %}>Oldest First</option>
                 </select>
             </label>
+            <label>From
+                <input type="date" name="date_from" value="{{ filters.date_from }}">
+            </label>
+            <label>To
+                <input type="date" name="date_to" value="{{ filters.date_to }}">
+            </label>
+            <label>ReiSift Status
+                <select name="status">
+                    <option value="">All</option>
+                    {% for status in filter_options.statuses %}
+                    <option value="{{ status }}" {% if filters.status == status %}selected{% endif %}>{{ status }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>County
+                <select name="county">
+                    <option value="">All</option>
+                    {% for county in filter_options.counties %}
+                    <option value="{{ county }}" {% if filters.county == county %}selected{% endif %}>{{ county }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>Local Match
+                <select name="local_match">
+                    <option value="" {% if not filters.local_match %}selected{% endif %}>All</option>
+                    <option value="matched" {% if filters.local_match == "matched" %}selected{% endif %}>Matched</option>
+                    <option value="unmatched" {% if filters.local_match == "unmatched" %}selected{% endif %}>Unmatched</option>
+                </select>
+            </label>
+            <label>Local Status
+                <select name="local_status">
+                    <option value="">All</option>
+                    {% for status in filter_options.local_statuses %}
+                    <option value="{{ status }}" {% if filters.local_status == status %}selected{% endif %}>{{ status }}</option>
+                    {% endfor %}
+                </select>
+            </label>
             <button type="submit">Apply</button>
+            <a class="button-link secondary" href="{{ url_for('new_records_page') }}">Clear</a>
         </form>
         <form method="post" action="{{ url_for('new_records_refresh') }}" id="newRecordsRefreshForm">
             <input type="hidden" name="sort" value="{{ sort_order }}">
+            <input type="hidden" name="date_from" value="{{ filters.date_from }}">
+            <input type="hidden" name="date_to" value="{{ filters.date_to }}">
+            <input type="hidden" name="status" value="{{ filters.status }}">
+            <input type="hidden" name="county" value="{{ filters.county }}">
+            <input type="hidden" name="local_match" value="{{ filters.local_match }}">
+            <input type="hidden" name="local_status" value="{{ filters.local_status }}">
             <button type="submit">Refresh New Records</button>
         </form>
     </div>
@@ -49,7 +93,7 @@
     {% endif %}
     <div id="newRecordsBusy" class="busy-inline {% if refresh_state.status == 'running' or auto_refresh %}{% else %}hidden{% endif %}">
         <span class="busy-spinner" aria-hidden="true"></span>
-        <span id="newRecordsBusyText">{{ refresh_state.message or "Refreshing prospecting monitor New Records..." }}</span>
+        <span id="newRecordsBusyText">{{ refresh_state.message or "Refreshing New Records from ReiSift..." }}</span>
     </div>
     <div class="table-wrap">
         <table>
@@ -104,7 +148,7 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="8">No cached New Records yet. Click Refresh New Records.</td>
+                    <td colspan="8">No New Records matched these filters. Click Refresh New Records or clear the filters.</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -119,7 +163,7 @@
     const busy = document.getElementById('newRecordsBusy');
     const busyText = document.getElementById('newRecordsBusyText');
     if (busy) busy.classList.remove('hidden');
-    if (busyText) busyText.textContent = message || 'Refreshing prospecting monitor New Records...';
+    if (busyText) busyText.textContent = message || 'Refreshing New Records from ReiSift...';
   }
 
   async function pollRefreshStatus() {
@@ -151,7 +195,7 @@
   }
 
   async function refreshCacheAsync() {
-    setBusy('Starting prospecting monitor refresh...');
+    setBusy('Starting ReiSift refresh...');
     try {
       const res = await fetch('/api/new-records/refresh-cache', {
         method: 'POST',
@@ -163,7 +207,7 @@
         return;
       }
       const state = (data && data.state) || {};
-      setBusy(state.message || 'Refresh started. Waiting for prospecting monitor...');
+      setBusy(state.message || 'Refresh started. Waiting for ReiSift...');
       if (pollTimer) clearTimeout(pollTimer);
       pollTimer = setTimeout(pollRefreshStatus, 1000);
     } catch (err) {

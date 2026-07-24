@@ -133,7 +133,7 @@ REISIFT_MAP_BASE_URL = os.getenv("REISIFT_MAP_BASE_URL", "https://map.reisift.io
 REISIFT_UI_VERSION = "2022.02.01.7"
 REISIFT_UNTITLED_TASK_ASSIGNED_TO_USER = "54b27291-93e4-443c-8d2f-e9779955fcd1"
 REISIFT_FOLLOWUPS_EXCLUDE_TAG = os.getenv("REISIFT_FOLLOWUPS_EXCLUDE_TAG", "3cf5a950-ac8f-47b0-87e1-bcea2604e2e1").strip()
-REISIFT_NEW_RECORDS_STATUS = (os.getenv("REISIFT_NEW_RECORDS_STATUS") or "new_records").strip() or "new_records"
+REISIFT_NEW_RECORDS_STATUS = (os.getenv("REISIFT_NEW_RECORDS_STATUS") or "New Record").strip() or "New Record"
 REISIFT_NEW_RECORDS_COUNTIES = tuple(
     item.strip()
     for item in (os.getenv("REISIFT_NEW_RECORDS_COUNTIES") or "Essex,Union,Bergen").split(",")
@@ -26192,22 +26192,29 @@ def reisift_search_referral_rows(token, status_slug):
     return rows, int(payload.get("count") or len(rows))
 
 
-def reisift_search_property_rows_by_status(token, status_slug, limit=200, max_rows=1000):
+def reisift_search_property_rows_by_status(token, status_slug, counties=None, max_rows=1000):
     status_slug = (status_slug or "").strip()
     if not status_slug:
         return [], 0
     headers = reisift_auth_headers(token, {"x-http-method-override": "GET"})
-    page_size = max(1, min(200, int(limit or 200)))
-    max_rows = max(page_size, min(5000, int(max_rows or 1000)))
+    max_rows = max(1, min(5000, int(max_rows or 1000)))
+    county_values = [
+        normalize_whitespace(county)
+        for county in (counties or [])
+        if normalize_whitespace(county)
+    ]
     offset = 0
     rows = []
     total = 0
     while offset < max_rows:
+        must_query = {}
+        if county_values:
+            must_query["any_county"] = county_values
+        must_query["any_property_status"] = [status_slug]
         body = {
-            "limit": page_size,
             "offset": offset,
-            "ordering": "-created",
-            "query": {"must": {"any_property_status": [status_slug]}},
+            "ordering": "-list_count",
+            "query": {"must": must_query},
         }
         response = requests.post(
             f"{REISIFT_BASE_URL}/api/internal/property/",
@@ -26221,10 +26228,13 @@ def reisift_search_property_rows_by_status(token, status_slug, limit=200, max_ro
         total = int(payload.get("count") or total or len(page_rows))
         if not page_rows:
             break
-        rows.extend([row for row in page_rows if isinstance(row, dict)])
-        if len(page_rows) < page_size:
+        dict_rows = [row for row in page_rows if isinstance(row, dict)]
+        rows.extend(dict_rows)
+        offset += len(page_rows)
+        if total and offset >= total:
             break
-        offset += page_size
+        if not dict_rows:
+            break
     return rows[:max_rows], total or len(rows)
 
 
@@ -26402,41 +26412,102 @@ def fetch_reisift_property_log_rollup(token, property_uuid, max_rows=200):
     }
 
 
-def summarize_reisift_property(payload):
-    address = payload.get("address") or {}
+def extract_reisift_property_address(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    address = payload.get("address") if isinstance(payload.get("address"), dict) else {}
+    property_obj = payload.get("property") if isinstance(payload.get("property"), dict) else {}
+    property_address = property_obj.get("address") if isinstance(property_obj.get("address"), dict) else {}
+    candidates = [
+        {
+            "full_address": address.get("full_address"),
+            "street": address.get("street") or address.get("address") or address.get("line1"),
+            "city": address.get("city"),
+            "state": address.get("state"),
+            "postal_code": address.get("postal_code") or address.get("zip") or address.get("zipcode"),
+        },
+        {
+            "full_address": property_address.get("full_address"),
+            "street": property_address.get("street") or property_address.get("address") or property_address.get("line1"),
+            "city": property_address.get("city"),
+            "state": property_address.get("state"),
+            "postal_code": property_address.get("postal_code") or property_address.get("zip") or property_address.get("zipcode"),
+        },
+        {
+            "full_address": property_obj.get("full_address") or property_obj.get("property_full_address"),
+            "street": property_obj.get("street") or property_obj.get("property_address") or property_obj.get("address_line_1"),
+            "city": property_obj.get("city") or property_obj.get("property_city"),
+            "state": property_obj.get("state") or property_obj.get("property_state"),
+            "postal_code": property_obj.get("postal_code") or property_obj.get("zip") or property_obj.get("property_zip"),
+        },
+        {
+            "full_address": payload.get("full_address") or payload.get("property_full_address"),
+            "street": payload.get("street") or payload.get("property_address") or payload.get("address_line_1"),
+            "city": payload.get("city") or payload.get("property_city"),
+            "state": payload.get("state") or payload.get("property_state"),
+            "postal_code": payload.get("postal_code") or payload.get("zip") or payload.get("property_zip"),
+        },
+    ]
+    for candidate in candidates:
+        full_address = normalize_whitespace(candidate.get("full_address") or "")
+        street = normalize_whitespace(candidate.get("street") or "")
+        city = normalize_whitespace(candidate.get("city") or "")
+        state = normalize_state_code(candidate.get("state") or "")
+        postal_code = normalize_postal_code(candidate.get("postal_code") or "")
+        if full_address or street or city:
+            return {
+                "full_address": full_address,
+                "street": street,
+                "city": city,
+                "state": state,
+                "postal_code": postal_code,
+            }
+    return {"full_address": "", "street": "", "city": "", "state": "", "postal_code": ""}
+
+
+def summarize_reisift_property(payload, fallback_payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    fallback_payload = fallback_payload if isinstance(fallback_payload, dict) else {}
+    address = extract_reisift_property_address(payload)
+    fallback_address = extract_reisift_property_address(fallback_payload)
     full_address = (
-        str(address.get("full_address") or "").strip()
-        or ", ".join(
-        x
-        for x in [
+        address.get("full_address")
+        or format_property_address_line(
             address.get("street"),
             address.get("city"),
             address.get("state"),
-            address.get("postal_code") or address.get("zip"),
-        ]
-        if x
+            address.get("postal_code"),
+        )
+        or fallback_address.get("full_address")
+        or format_property_address_line(
+            fallback_address.get("street"),
+            fallback_address.get("city"),
+            fallback_address.get("state"),
+            fallback_address.get("postal_code"),
+        )
     )
-        )
     owner_names = []
-    owner = payload.get("owner") or {}
-    if owner:
-        owner_full = " ".join(
-            x for x in [(owner.get("first_name") or "").strip(), (owner.get("last_name") or "").strip()] if x
-        )
-        if owner_full:
-            owner_names.append(owner_full)
-    for o in payload.get("owners") or []:
-        full = (o.get("full_name") or "").strip()
-        if full:
-            owner_names.append(full)
-            continue
-        combined = " ".join(
-            x for x in [(o.get("first_name") or "").strip(), (o.get("last_name") or "").strip()] if x
-        )
-        if combined:
-            owner_names.append(combined)
+    for source_payload in [payload, fallback_payload]:
+        owner = source_payload.get("owner") or {}
+        if owner:
+            owner_full = " ".join(
+                x for x in [(owner.get("first_name") or "").strip(), (owner.get("last_name") or "").strip()] if x
+            )
+            if owner_full:
+                owner_names.append(owner_full)
+        for o in source_payload.get("owners") or []:
+            if not isinstance(o, dict):
+                continue
+            full = (o.get("full_name") or "").strip()
+            if full:
+                owner_names.append(full)
+                continue
+            combined = " ".join(
+                x for x in [(o.get("first_name") or "").strip(), (o.get("last_name") or "").strip()] if x
+            )
+            if combined:
+                owner_names.append(combined)
     return {
-        "status": payload.get("status"),
+        "status": payload.get("status") or fallback_payload.get("status"),
         "full_address": full_address,
         "owner_names": ", ".join(dict.fromkeys(owner_names)),
     }
@@ -26447,6 +26518,17 @@ def infer_county_from_reisift_payload(payload):
         return ""
     address = payload.get("address") if isinstance(payload.get("address"), dict) else {}
     county = (address.get("county") or address.get("county_name") or "").strip()
+    if county:
+        return county
+    property_obj = payload.get("property") if isinstance(payload.get("property"), dict) else {}
+    property_address = property_obj.get("address") if isinstance(property_obj.get("address"), dict) else {}
+    county = (
+        property_address.get("county")
+        or property_address.get("county_name")
+        or property_obj.get("county")
+        or property_obj.get("county_name")
+        or ""
+    ).strip()
     if county:
         return county
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
@@ -27624,13 +27706,11 @@ def reisift_added_at_dt(search_row, detail_payload):
 
 
 def find_local_property_id_for_reisift_payload(db, payload):
-    address = payload.get("address") if isinstance(payload, dict) else {}
-    if not isinstance(address, dict):
-        return None
+    address = extract_reisift_property_address(payload)
     street = (address.get("street") or "").strip().lower()
     city = (address.get("city") or "").strip().lower()
     state = (address.get("state") or "").strip().lower()
-    postal = (address.get("postal_code") or address.get("zip") or "").strip().lower()
+    postal = (address.get("postal_code") or "").strip().lower()
     if not street or not city:
         return None
     row = db.execute(
@@ -28140,14 +28220,18 @@ def sync_local_property_status_from_reisift_new_record(db, property_uuid, payloa
 def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_active=1):
     payload = payload if isinstance(payload, dict) else {}
     search_row = search_row if isinstance(search_row, dict) else {}
-    summary = summarize_reisift_property(payload or search_row)
+    summary = summarize_reisift_property(payload, fallback_payload=search_row)
     county = infer_county_from_reisift_payload(payload) or infer_county_from_reisift_payload(search_row)
     added_dt = reisift_added_at_dt(search_row, payload)
     updated_at = (
         str(payload.get("updated") or payload.get("updated_at") or payload.get("owner_updated") or "").strip()
         or str(search_row.get("updated") or search_row.get("updated_at") or search_row.get("owner_updated") or "").strip()
     )
-    local_sync = sync_local_property_status_from_reisift_new_record(db, property_uuid, payload or search_row, summary["status"])
+    match_payload = payload
+    match_address = extract_reisift_property_address(match_payload)
+    if not match_address.get("street") or not match_address.get("city"):
+        match_payload = search_row
+    local_sync = sync_local_property_status_from_reisift_new_record(db, property_uuid, match_payload, summary["status"])
     execute_with_retry(
         db,
         """
@@ -28192,7 +28276,12 @@ def refresh_reisift_new_records_cache(db):
     token = reisift_get_access_token()
     status_slug = REISIFT_NEW_RECORDS_STATUS
     target_counties = target_new_record_counties()
-    rows, total = reisift_search_property_rows_by_status(token, status_slug, limit=200, max_rows=2000)
+    rows, total = reisift_search_property_rows_by_status(
+        token,
+        status_slug,
+        counties=target_counties,
+        max_rows=2000,
+    )
     execute_with_retry(db, "UPDATE reisift_new_records SET is_active = 0")
     scanned = 0
     synced = 0
@@ -28210,7 +28299,7 @@ def refresh_reisift_new_records_cache(db):
         except Exception as exc:
             errors.append(f"{property_uuid}: detail fallback used ({exc})")
         county = infer_county_from_reisift_payload(details) or infer_county_from_reisift_payload(row)
-        if not is_target_new_record_county(county):
+        if county and not is_target_new_record_county(county):
             skipped_county += 1
             continue
         try:
@@ -28273,13 +28362,12 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
     def worker():
         db = open_sqlite_connection()
         try:
-            set_reisift_new_records_refresh_state(db, "running", "Refreshing prospecting monitor New Records...")
+            set_reisift_new_records_refresh_state(db, "running", "Refreshing New Records from ReiSift...")
             db.commit()
-            result = refresh_prospecting_new_records_once()
+            result = refresh_reisift_new_records_cache(db)
             message = (
-                f"Prospecting monitor refreshed; found {((result.get('sync') or {}).get('target_rows') or 0)} target row(s), "
-                f"matched {((result.get('sync') or {}).get('matched') or 0)} existing DeepSift record(s), "
-                f"updated {((result.get('sync') or {}).get('status_updates') or 0)} status value(s)."
+                f"Cached {result.get('synced', 0)} row(s) from {result.get('scanned', 0)} scanned; "
+                f"updated {result.get('local_updates', 0)} local status value(s)."
             )
             set_reisift_new_records_refresh_state(db, "complete", message, result=result)
             db.commit()
@@ -28315,52 +28403,94 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
     return {"ok": True, "started": True, "running": True, "state": state}
 
 
-def get_cached_new_records(db, sort_dir="desc"):
+def _new_record_row_date(row):
+    for candidate in [row.get("added_at"), row.get("reisift_updated_at"), row.get("last_synced_at")]:
+        dt = parse_flexible_datetime(candidate)
+        if dt is not None:
+            return dt
+    return datetime.min
+
+
+def _new_record_matches_filters(row, filters):
+    filters = filters if isinstance(filters, dict) else {}
+    date_from = _parse_iso_date_only(filters.get("date_from") or "")
+    date_to = _parse_iso_date_only(filters.get("date_to") or "")
+    row_dt = _new_record_row_date(row)
+    if (date_from or date_to) and row_dt == datetime.min:
+        return False
+    row_date = row_dt.date() if row_dt != datetime.min else None
+    if date_from and row_date and row_date < date_from:
+        return False
+    if date_to and row_date and row_date > date_to:
+        return False
+
+    status_filter = normalize_whitespace(filters.get("status") or "")
+    if status_filter and _normalize_reisift_status(row.get("status") or "") != _normalize_reisift_status(status_filter):
+        return False
+
+    county_filter = normalize_county_name(filters.get("county") or "")
+    if county_filter and normalize_county_name(row.get("county") or "") != county_filter:
+        return False
+
+    local_match = normalize_whitespace(filters.get("local_match") or "").lower()
+    has_local = bool(row.get("deep_dive_property_id"))
+    if local_match == "matched" and not has_local:
+        return False
+    if local_match == "unmatched" and has_local:
+        return False
+
+    local_status_filter = normalize_whitespace(filters.get("local_status") or "")
+    if local_status_filter:
+        local_status = normalize_whitespace(row.get("deep_dive_status") or row.get("local_status_after") or "")
+        if _normalize_reisift_status(local_status) != _normalize_reisift_status(local_status_filter):
+            return False
+    return True
+
+
+def get_new_record_filter_options(db):
+    rows = db.execute(
+        """
+        SELECT n.status,
+               n.county,
+               p.status AS deep_dive_status,
+               n.local_status_after
+        FROM reisift_new_records n
+        LEFT JOIN properties p ON p.id = n.local_property_id
+        WHERE n.is_active = 1
+        """
+    ).fetchall()
+    statuses = sorted({normalize_whitespace(row["status"] or "") for row in rows if normalize_whitespace(row["status"] or "")})
+    counties = sorted({normalize_whitespace(row["county"] or "") for row in rows if normalize_whitespace(row["county"] or "")})
+    local_statuses = sorted({
+        normalize_whitespace(row["deep_dive_status"] or row["local_status_after"] or "")
+        for row in rows
+        if normalize_whitespace(row["deep_dive_status"] or row["local_status_after"] or "")
+    })
+    return {"statuses": statuses, "counties": counties, "local_statuses": local_statuses}
+
+
+def get_cached_new_records(db, sort_dir="desc", filters=None):
     sort_reverse = str(sort_dir).lower() != "asc"
     rows = db.execute(
         """
-        SELECT u.*,
+        SELECT n.*,
                p.id AS deep_dive_property_id,
-               p.status AS deep_dive_status,
-               p.reisift_property_uuid AS local_reisift_property_uuid
-        FROM untitled_sheet_current u
-        LEFT JOIN properties p ON p.id = u.local_property_id
-        WHERE COALESCE(u.is_active, 1) = 1
-          AND trim(COALESCE(u.skiptrace_completed_at, '')) = ''
+               p.status AS deep_dive_status
+        FROM reisift_new_records n
+        LEFT JOIN properties p ON p.id = n.local_property_id
+        WHERE n.is_active = 1
         """
     ).fetchall()
     out = []
     for row in rows:
         item = dict(row)
-        county = infer_untitled_new_record_county(item)
-        if not county:
+        item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
+        item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
+        if not _new_record_matches_filters(item, filters):
             continue
-        status_value = item.get("deep_dive_status") or item.get("reisift_status") or "New Records"
-        if not is_new_record_status_value(status_value):
-            continue
-        address = _untitled_source_address(item)
-        local_uuid = normalize_uuid(item.get("local_reisift_property_uuid") or item.get("reisift_property_uuid") or "")
-        item["property_uuid"] = local_uuid
-        item["full_address"] = format_property_address_line(
-            address.get("street"),
-            address.get("city"),
-            address.get("state"),
-            address.get("postal_code"),
-        )
-        item["status"] = status_value if normalize_whitespace(status_value) else "New Records"
-        item["county"] = county
-        item["owner_names"] = _untitled_name_display(item)
-        item["added_at"] = item.get("first_seen_at") or ""
-        item["last_synced_at"] = item.get("last_seen_at") or item.get("last_changed_at") or ""
-        item["local_status_before"] = ""
-        item["local_status_after"] = item.get("deep_dive_status") or ""
-        item["sift_record_url"] = _sift_record_url(local_uuid) if local_uuid else ""
         out.append(item)
 
-    def sort_key(item):
-        return _untitled_last_seen_sort_dt(item)
-
-    out.sort(key=sort_key, reverse=sort_reverse)
+    out.sort(key=_new_record_row_date, reverse=sort_reverse)
     return out
 
 
@@ -34401,9 +34531,18 @@ def new_records_page():
     sort_order = (request.args.get("sort") or "desc").strip().lower()
     if sort_order not in {"asc", "desc"}:
         sort_order = "desc"
+    filters = {
+        "date_from": (request.args.get("date_from") or "").strip(),
+        "date_to": (request.args.get("date_to") or "").strip(),
+        "status": (request.args.get("status") or "").strip(),
+        "county": (request.args.get("county") or "").strip(),
+        "local_match": (request.args.get("local_match") or "").strip(),
+        "local_status": (request.args.get("local_status") or "").strip(),
+    }
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()
-    rows = get_cached_new_records(db, sort_dir=sort_order)
+    rows = get_cached_new_records(db, sort_dir=sort_order, filters=filters)
+    filter_options = get_new_record_filter_options(db)
     county_counts = {}
     local_match_count = 0
     local_update_count = 0
@@ -34420,8 +34559,10 @@ def new_records_page():
         notice=notice,
         error=error,
         sort_order=sort_order,
+        filters=filters,
+        filter_options=filter_options,
         auto_refresh=(request.args.get("refresh") or "0") == "1",
-        status_slug="New Records",
+        status_slug=REISIFT_NEW_RECORDS_STATUS,
         target_counties=target_new_record_counties(),
         last_refresh_at=get_setting(db, "reisift_new_records_last_refresh_at", ""),
         refresh_state=get_reisift_new_records_refresh_state(db),
@@ -34441,15 +34582,24 @@ def new_records_refresh():
     sort_order = (request.form.get("sort") or request.args.get("sort") or "desc").strip().lower()
     if sort_order not in {"asc", "desc"}:
         sort_order = "desc"
+    redirect_args = {
+        "sort": sort_order,
+        "date_from": (request.form.get("date_from") or request.args.get("date_from") or "").strip(),
+        "date_to": (request.form.get("date_to") or request.args.get("date_to") or "").strip(),
+        "status": (request.form.get("status") or request.args.get("status") or "").strip(),
+        "county": (request.form.get("county") or request.args.get("county") or "").strip(),
+        "local_match": (request.form.get("local_match") or request.args.get("local_match") or "").strip(),
+        "local_status": (request.form.get("local_status") or request.args.get("local_status") or "").strip(),
+    }
     try:
         data = start_reisift_new_records_refresh_job(triggered_by="manual_button")
         notice = "New Records refresh started. This page will update when the ReiSift pull finishes."
         if not data.get("started"):
             notice = "New Records refresh is already running. This page will update when it finishes."
-        return redirect(url_for("new_records_page", notice=notice, sort=sort_order, refresh=1))
+        return redirect(url_for("new_records_page", notice=notice, refresh=1, **redirect_args))
     except Exception as exc:
         db.rollback()
-        return redirect(url_for("new_records_page", error=f"Refresh failed: {exc}", sort=sort_order))
+        return redirect(url_for("new_records_page", error=f"Refresh failed: {exc}", **redirect_args))
 
 
 @app.route("/api/new-records/refresh-cache", methods=["POST"])

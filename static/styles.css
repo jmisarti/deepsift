@@ -174,6 +174,68 @@ body {
     gap: 0.35rem;
 }
 
+.filter-dropdown {
+    position: relative;
+}
+
+.filter-dropdown > summary {
+    border: 1px solid #d8dce6;
+    border-radius: 8px;
+    background: #fff;
+    color: #24324a;
+    cursor: pointer;
+    font-weight: 600;
+    list-style: none;
+    padding: 0.45rem 0.75rem;
+}
+
+.filter-dropdown > summary::-webkit-details-marker {
+    display: none;
+}
+
+.filter-dropdown[open] > summary {
+    border-color: #95a9d3;
+    box-shadow: 0 0 0 3px rgba(54, 100, 232, 0.09);
+}
+
+.filter-dropdown-panel {
+    background: #fff;
+    border: 1px solid #d8dce6;
+    border-radius: 12px;
+    box-shadow: 0 12px 28px rgba(16, 24, 40, 0.14);
+    display: grid;
+    gap: 0.65rem;
+    grid-template-columns: repeat(2, minmax(180px, 1fr));
+    min-width: min(520px, 88vw);
+    padding: 0.75rem;
+    position: absolute;
+    right: 0;
+    top: calc(100% + 0.45rem);
+    z-index: 60;
+}
+
+.filter-dropdown-panel label {
+    align-items: stretch;
+    display: grid;
+    gap: 0.25rem;
+}
+
+.filter-dropdown-actions {
+    align-items: center;
+    display: flex;
+    gap: 0.5rem;
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+}
+
+@media (max-width: 640px) {
+    .filter-dropdown-panel {
+        grid-template-columns: 1fr;
+        left: 0;
+        right: auto;
+    }
+}
+
 .loading-submit-form.is-submitting {
     pointer-events: none;
 }
@@ -482,6 +544,7 @@ body {
 .panel-actions {
     margin: 0.65rem 0 0.3rem;
     display: flex;
+    flex-wrap: wrap;
     gap: 0.6rem;
     align-items: center;
 }

@@ -34,45 +34,53 @@
                     <option value="asc" {% if sort_order == "asc" %}selected{% endif %}>Oldest First</option>
                 </select>
             </label>
-            <label>From
-                <input type="date" name="date_from" value="{{ filters.date_from }}">
-            </label>
-            <label>To
-                <input type="date" name="date_to" value="{{ filters.date_to }}">
-            </label>
-            <label>ReiSift Status
-                <select name="status">
-                    <option value="">All</option>
-                    {% for status in filter_options.statuses %}
-                    <option value="{{ status }}" {% if filters.status == status %}selected{% endif %}>{{ status }}</option>
-                    {% endfor %}
-                </select>
-            </label>
-            <label>County
-                <select name="county">
-                    <option value="">All</option>
-                    {% for county in filter_options.counties %}
-                    <option value="{{ county }}" {% if filters.county == county %}selected{% endif %}>{{ county }}</option>
-                    {% endfor %}
-                </select>
-            </label>
-            <label>Local Match
-                <select name="local_match">
-                    <option value="" {% if not filters.local_match %}selected{% endif %}>All</option>
-                    <option value="matched" {% if filters.local_match == "matched" %}selected{% endif %}>Matched</option>
-                    <option value="unmatched" {% if filters.local_match == "unmatched" %}selected{% endif %}>Unmatched</option>
-                </select>
-            </label>
-            <label>Local Status
-                <select name="local_status">
-                    <option value="">All</option>
-                    {% for status in filter_options.local_statuses %}
-                    <option value="{{ status }}" {% if filters.local_status == status %}selected{% endif %}>{{ status }}</option>
-                    {% endfor %}
-                </select>
-            </label>
             <button type="submit">Apply</button>
-            <a class="button-link secondary" href="{{ url_for('new_records_page') }}">Clear</a>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.local_match or filters.local_status %}open{% endif %}>
+                <summary>Filters</summary>
+                <div class="filter-dropdown-panel">
+                    <label>From
+                        <input type="date" name="date_from" value="{{ filters.date_from }}">
+                    </label>
+                    <label>To
+                        <input type="date" name="date_to" value="{{ filters.date_to }}">
+                    </label>
+                    <label>ReiSift Status
+                        <select name="status">
+                            <option value="">All</option>
+                            {% for status in filter_options.statuses %}
+                            <option value="{{ status }}" {% if filters.status == status %}selected{% endif %}>{{ status }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>County
+                        <select name="county">
+                            <option value="">All</option>
+                            {% for county in filter_options.counties %}
+                            <option value="{{ county }}" {% if filters.county == county %}selected{% endif %}>{{ county }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>Local Match
+                        <select name="local_match">
+                            <option value="" {% if not filters.local_match %}selected{% endif %}>All</option>
+                            <option value="matched" {% if filters.local_match == "matched" %}selected{% endif %}>Matched</option>
+                            <option value="unmatched" {% if filters.local_match == "unmatched" %}selected{% endif %}>Unmatched</option>
+                        </select>
+                    </label>
+                    <label>Local Status
+                        <select name="local_status">
+                            <option value="">All</option>
+                            {% for status in filter_options.local_statuses %}
+                            <option value="{{ status }}" {% if filters.local_status == status %}selected{% endif %}>{{ status }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <div class="filter-dropdown-actions">
+                        <button type="submit">Apply Filters</button>
+                        <a class="button-link secondary" href="{{ url_for('new_records_page') }}">Clear</a>
+                    </div>
+                </div>
+            </details>
         </form>
         <form method="post" action="{{ url_for('new_records_refresh') }}" id="newRecordsRefreshForm">
             <input type="hidden" name="sort" value="{{ sort_order }}">

@@ -26509,8 +26509,25 @@ def summarize_reisift_property(payload, fallback_payload=None):
     return {
         "status": payload.get("status") or fallback_payload.get("status"),
         "full_address": full_address,
-        "owner_names": ", ".join(dict.fromkeys(owner_names)),
+        "owner_names": dedupe_owner_names(owner_names),
     }
+
+
+def dedupe_owner_names(owner_names):
+    if isinstance(owner_names, str):
+        owner_names = re.split(r"\s*,\s*", owner_names)
+    deduped = []
+    seen = set()
+    for name in owner_names or []:
+        clean = normalize_whitespace(name)
+        if not clean:
+            continue
+        key = re.sub(r"[^a-z0-9]+", " ", clean.lower()).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(clean)
+    return ", ".join(deduped)
 
 
 def infer_county_from_reisift_payload(payload):
@@ -28486,6 +28503,7 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
         item = dict(row)
         item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
         item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
+        item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
         if not _new_record_matches_filters(item, filters):
             continue
         out.append(item)

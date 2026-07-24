@@ -20,9 +20,13 @@
 
             <nav class="sidebar-nav">
                 <div class="sidebar-group">
+                    <p class="sidebar-group-title">Prospects</p>
+                    <a class="sidebar-link {% if request.path.startswith('/new-records') %}active{% endif %}" href="{{ url_for('new_records_page') }}">New Records</a>
+                </div>
+
+                <div class="sidebar-group">
                     <p class="sidebar-group-title">Leads</p>
                     <a class="sidebar-link {% if request.path.startswith('/follow-ups') %}active{% endif %}" href="{{ url_for('follow_ups_page') }}">New Leads</a>
-                    <a class="sidebar-link {% if request.path.startswith('/new-records') %}active{% endif %}" href="{{ url_for('new_records_page') }}">New Records</a>
                     <a class="sidebar-link {% if request.path.startswith('/submitted-leads') %}active{% endif %}" href="{{ url_for('submitted_leads_page') }}">Submitted Leads</a>
                     <a class="sidebar-link {% if request.path.startswith('/anon') %}active{% endif %}" href="{{ url_for('anon_dashboard') }}">Anon Leads</a>
                     <a class="sidebar-link {% if request.path.startswith('/referral') %}active{% endif %}" href="{{ url_for('referral_dashboard') }}">Referral Leads</a>

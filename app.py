@@ -146,6 +146,9 @@ AGENT_REFRESH_WORKER_ENABLED = env_flag("AGENT_REFRESH_WORKER_ENABLED", True)
 AGENT_REFRESH_POLL_SECONDS = max(int((os.getenv("AGENT_REFRESH_POLL_SECONDS") or "30").strip() or "30"), 10)
 EMAIL_VALIDATION_QUEUE_WORKER_ENABLED = env_flag("EMAIL_VALIDATION_QUEUE_WORKER_ENABLED", True)
 EMAIL_VALIDATION_QUEUE_POLL_SECONDS = max(int((os.getenv("EMAIL_VALIDATION_QUEUE_POLL_SECONDS") or "30").strip() or "30"), 5)
+GMAIL_WATCH_RENEWAL_WORKER_ENABLED = env_flag("GMAIL_WATCH_RENEWAL_WORKER_ENABLED", True)
+GMAIL_WATCH_RENEWAL_POLL_SECONDS = max(int((os.getenv("GMAIL_WATCH_RENEWAL_POLL_SECONDS") or "86400").strip() or "86400"), 3600)
+GMAIL_PUBSUB_TOPIC_NAME = (os.getenv("GMAIL_PUBSUB_TOPIC_NAME") or "").strip()
 SMS_DECISION_DELAY_SECONDS = max(int((os.getenv("SMS_DECISION_DELAY_SECONDS") or "300").strip() or "300"), 30)
 WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or "600").strip() or "600"), 60)
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
@@ -19834,6 +19837,82 @@ def _get_gmail_api_access_token(settings):
     return access_token
 
 
+def get_gmail_pubsub_topic_name(db=None):
+    configured = ""
+    if db is not None:
+        configured = (get_setting(db, "email_gmail_pubsub_topic", "") or "").strip()
+    return configured or GMAIL_PUBSUB_TOPIC_NAME
+
+
+def renew_gmail_watch_once(db=None):
+    owns_db = db is None
+    if owns_db:
+        ensure_db()
+        db = open_sqlite_connection()
+    try:
+        settings = get_email_settings(db)
+        if (settings.get("provider") or "").strip().lower() != "gmail_api":
+            return {"ok": True, "skipped": "provider_not_gmail_api"}
+        topic_name = get_gmail_pubsub_topic_name(db)
+        if not topic_name:
+            return {"ok": False, "error": "Gmail Pub/Sub topic is not configured."}
+        access_token = _get_gmail_api_access_token(settings)
+        response = requests.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/watch",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={"topicName": topic_name, "labelIds": ["INBOX"]},
+            timeout=20,
+        )
+        try:
+            payload = response.json() if response.content else {}
+        except ValueError:
+            payload = {"raw_text": response.text}
+        if not response.ok:
+            raise ValueError(f"Gmail watch renewal failed ({response.status_code}): {payload}")
+
+        expiration_ms = str(payload.get("expiration") or "").strip()
+        expiration_utc = ""
+        if expiration_ms.isdigit():
+            expiration_utc = datetime.utcfromtimestamp(int(expiration_ms) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+        set_setting(db, "email_gmail_watch_history_id", str(payload.get("historyId") or "").strip())
+        set_setting(db, "email_gmail_watch_expiration_ms", expiration_ms)
+        set_setting(db, "email_gmail_watch_expiration_at", expiration_utc)
+        set_setting(db, "email_gmail_watch_last_renewed_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+        set_setting(db, "email_gmail_watch_last_error", "")
+        if owns_db:
+            db.commit()
+        return {
+            "ok": True,
+            "topic": topic_name,
+            "history_id": str(payload.get("historyId") or "").strip(),
+            "expiration": expiration_ms,
+            "expiration_at": expiration_utc,
+        }
+    except Exception as exc:
+        try:
+            set_setting(db, "email_gmail_watch_last_error", str(exc))
+            log_app_error(
+                db,
+                source="gmail_watch_renewal",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="renew_gmail_watch_once",
+                status_code=500,
+            )
+            if owns_db:
+                db.commit()
+        except Exception:
+            if owns_db:
+                db.rollback()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        if owns_db and db is not None:
+            db.close()
+
+
 def _ga4_api_headers(access_token):
     return {
         "Authorization": f"Bearer {access_token}",
@@ -20581,7 +20660,21 @@ def poll_gmail_inbound_once():
 
 
 def start_email_poll_worker():
-    return
+    global EMAIL_POLL_WORKER_STARTED
+    if EMAIL_POLL_WORKER_STARTED or not GMAIL_WATCH_RENEWAL_WORKER_ENABLED:
+        return
+    EMAIL_POLL_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                renew_gmail_watch_once()
+            except Exception:
+                pass
+            time.sleep(GMAIL_WATCH_RENEWAL_POLL_SECONDS)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
 
 
 def run_referral_on_market_refresh_once():

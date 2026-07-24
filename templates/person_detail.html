@@ -374,13 +374,23 @@
 </div>
 
 <script>
-const personId = {{ person.id }};
-const personCommPropertyId = {{ default_property_id if default_property_id else 'null' }};
+const personId = {{ person.id|tojson }};
+const personCommPropertyId = {{ (default_property_id if default_property_id else none)|tojson }};
 let personCommChannel = 'SMS';
 let personPhoneOptions = {{ person_phone_options|tojson }};
 let personEmailOptions = {{ person_email_options|tojson }};
 const patchJson = (url, body) => fetch(url, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-const postJson = (url, body) => fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(r=>r.json().then(j=>({ok:r.ok,data:j})));
+const postJson = async (url, body) => {
+  try {
+    const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const text = await r.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch (_err) { data = {error: text || `HTTP ${r.status}`}; }
+    return {ok: r.ok, data};
+  } catch (err) {
+    return {ok: false, data: {error: err && err.message ? err.message : 'Network request failed'}};
+  }
+};
 const delReq = (url) => fetch(url, {method:'DELETE'});
 function flash(el){ el.classList.add('fade-highlight'); setTimeout(()=>el.classList.remove('fade-highlight'),900); }
 function esc(text){ return (text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }

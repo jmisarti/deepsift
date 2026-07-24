@@ -606,7 +606,7 @@ body {
 }
 
 .new-records-table td:first-child,
-.new-records-table td:nth-child(4) {
+.new-records-table td:nth-child(6) {
     max-width: 260px;
     overflow: hidden;
     text-overflow: ellipsis;

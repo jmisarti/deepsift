@@ -35,7 +35,7 @@
                 </select>
             </label>
             <button type="submit">Apply</button>
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.local_match or filters.local_status %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.completeness or filters.owner_type %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>From
@@ -60,18 +60,19 @@
                             {% endfor %}
                         </select>
                     </label>
-                    <label>Local Match
-                        <select name="local_match">
-                            <option value="" {% if not filters.local_match %}selected{% endif %}>All</option>
-                            <option value="matched" {% if filters.local_match == "matched" %}selected{% endif %}>Matched</option>
-                            <option value="unmatched" {% if filters.local_match == "unmatched" %}selected{% endif %}>Unmatched</option>
+                    <label>Completeness
+                        <select name="completeness">
+                            <option value="">All</option>
+                            {% for value in filter_options.completeness %}
+                            <option value="{{ value }}" {% if filters.completeness == value %}selected{% endif %}>{{ value }}</option>
+                            {% endfor %}
                         </select>
                     </label>
-                    <label>Local Status
-                        <select name="local_status">
+                    <label>Owner
+                        <select name="owner_type">
                             <option value="">All</option>
-                            {% for status in filter_options.local_statuses %}
-                            <option value="{{ status }}" {% if filters.local_status == status %}selected{% endif %}>{{ status }}</option>
+                            {% for value in filter_options.owner_types %}
+                            <option value="{{ value }}" {% if filters.owner_type == value %}selected{% endif %}>{{ value }}</option>
                             {% endfor %}
                         </select>
                     </label>
@@ -88,8 +89,8 @@
             <input type="hidden" name="date_to" value="{{ filters.date_to }}">
             <input type="hidden" name="status" value="{{ filters.status }}">
             <input type="hidden" name="county" value="{{ filters.county }}">
-            <input type="hidden" name="local_match" value="{{ filters.local_match }}">
-            <input type="hidden" name="local_status" value="{{ filters.local_status }}">
+            <input type="hidden" name="completeness" value="{{ filters.completeness }}">
+            <input type="hidden" name="owner_type" value="{{ filters.owner_type }}">
             <button type="submit">Refresh New Records</button>
         </form>
     </div>
@@ -110,10 +111,10 @@
                     <th>Address</th>
                     <th>Status</th>
                     <th>County</th>
-                    <th>Owner(s)</th>
+                    <th>Completeness</th>
+                    <th>Owner</th>
+                    <th>Owner Name(s)</th>
                     <th>Date Added</th>
-                    <th>Local Match</th>
-                    <th>Local Status</th>
                     <th>SIFT</th>
                 </tr>
             </thead>
@@ -123,6 +124,8 @@
                     <td>{{ row.full_address or "-" }}</td>
                     <td><span class="pill">{{ row.status or "-" }}</span></td>
                     <td>{{ row.county or "-" }}</td>
+                    <td>{{ row.completeness or "-" }}</td>
+                    <td>{{ row.owner_type or "-" }}</td>
                     <td>{{ row.owner_names or "-" }}</td>
                     <td>{{ row.added_at|fmt_long_date }}</td>
                     <td>
@@ -130,26 +133,13 @@
                         <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.deep_dive_property_id) }}" title="Open in Deep Dive" aria-label="Open in Deep Dive">
                             <img class="tiny-link-icon" src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/08/cropped-nj-logo-tiny-32x32.png" alt="Deep Dive">
                         </a>
-                        {% else %}
-                        -
                         {% endif %}
-                    </td>
-                    <td>
-                        {% if row.deep_dive_property_id %}
-                        {{ row.local_status_after or row.deep_dive_status or "-" }}
-                        {% if row.local_status_before and row.local_status_before != row.local_status_after %}
-                        <br><span class="muted-text">was {{ row.local_status_before }}</span>
-                        {% endif %}
-                        {% else %}
-                        -
-                        {% endif %}
-                    </td>
-                    <td>
                         {% if row.sift_record_url %}
                         <a class="action-icon-link" href="{{ row.sift_record_url }}" target="_blank" rel="noopener" title="Open in REISift" aria-label="Open in REISift">
                             <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
                         </a>
-                        {% else %}
+                        {% endif %}
+                        {% if not row.deep_dive_property_id and not row.sift_record_url %}
                         -
                         {% endif %}
                     </td>

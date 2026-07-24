@@ -27710,6 +27710,9 @@ def parse_iso_datetime(value):
 
 
 def reisift_added_at_dt(search_row, detail_payload):
+    lp_dt = latest_lp_tag_datetime(search_row, detail_payload)
+    if lp_dt is not None:
+        return lp_dt
     candidates = []
     if isinstance(search_row, dict):
         candidates.extend([search_row.get("created"), search_row.get("created_at")])
@@ -27720,6 +27723,30 @@ def reisift_added_at_dt(search_row, detail_payload):
         if parsed is not None:
             return parsed
     return None
+
+
+def latest_lp_tag_datetime(*payloads):
+    dates = []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        tags = payload.get("tags")
+        if isinstance(tags, str):
+            tag_values = [tags]
+        elif isinstance(tags, list):
+            tag_values = tags
+        else:
+            tag_values = []
+        for tag in tag_values:
+            text = normalize_whitespace(tag)
+            match = re.search(r"\bLP\s*[-_ ]?(\d{6})\b", text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                dates.append(datetime.strptime(match.group(1), "%m%d%y"))
+            except ValueError:
+                continue
+    return max(dates) if dates else None
 
 
 def find_local_property_id_for_reisift_payload(db, payload):
@@ -28421,11 +28448,24 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
 
 
 def _new_record_row_date(row):
-    for candidate in [row.get("added_at"), row.get("reisift_updated_at"), row.get("last_synced_at")]:
+    for candidate in [row.get("added_at"), row.get("lp_added_at"), row.get("reisift_updated_at"), row.get("last_synced_at")]:
         dt = parse_flexible_datetime(candidate)
         if dt is not None:
             return dt
     return datetime.min
+
+
+def _new_record_payload(row):
+    return parse_json_object((row or {}).get("payload_json") or "{}", default={})
+
+
+def _new_record_owner_type(payload):
+    owner = payload.get("owner") if isinstance(payload, dict) and isinstance(payload.get("owner"), dict) else {}
+    return normalize_whitespace(owner.get("type") or "")
+
+
+def _new_record_completeness(payload):
+    return normalize_whitespace(payload.get("type") if isinstance(payload, dict) else "")
 
 
 def _new_record_matches_filters(row, filters):
@@ -28449,18 +28489,13 @@ def _new_record_matches_filters(row, filters):
     if county_filter and normalize_county_name(row.get("county") or "") != county_filter:
         return False
 
-    local_match = normalize_whitespace(filters.get("local_match") or "").lower()
-    has_local = bool(row.get("deep_dive_property_id"))
-    if local_match == "matched" and not has_local:
-        return False
-    if local_match == "unmatched" and has_local:
+    completeness_filter = normalize_whitespace(filters.get("completeness") or "").lower()
+    if completeness_filter and normalize_whitespace(row.get("completeness") or "").lower() != completeness_filter:
         return False
 
-    local_status_filter = normalize_whitespace(filters.get("local_status") or "")
-    if local_status_filter:
-        local_status = normalize_whitespace(row.get("deep_dive_status") or row.get("local_status_after") or "")
-        if _normalize_reisift_status(local_status) != _normalize_reisift_status(local_status_filter):
-            return False
+    owner_type_filter = normalize_whitespace(filters.get("owner_type") or "").lower()
+    if owner_type_filter and normalize_whitespace(row.get("owner_type") or "").lower() != owner_type_filter:
+        return False
     return True
 
 
@@ -28469,21 +28504,17 @@ def get_new_record_filter_options(db):
         """
         SELECT n.status,
                n.county,
-               p.status AS deep_dive_status,
-               n.local_status_after
+               n.payload_json
         FROM reisift_new_records n
-        LEFT JOIN properties p ON p.id = n.local_property_id
         WHERE n.is_active = 1
         """
     ).fetchall()
     statuses = sorted({normalize_whitespace(row["status"] or "") for row in rows if normalize_whitespace(row["status"] or "")})
     counties = sorted({normalize_whitespace(row["county"] or "") for row in rows if normalize_whitespace(row["county"] or "")})
-    local_statuses = sorted({
-        normalize_whitespace(row["deep_dive_status"] or row["local_status_after"] or "")
-        for row in rows
-        if normalize_whitespace(row["deep_dive_status"] or row["local_status_after"] or "")
-    })
-    return {"statuses": statuses, "counties": counties, "local_statuses": local_statuses}
+    payloads = [_new_record_payload(dict(row)) for row in rows]
+    completeness = sorted({value for value in (_new_record_completeness(payload) for payload in payloads) if value})
+    owner_types = sorted({value for value in (_new_record_owner_type(payload) for payload in payloads) if value})
+    return {"statuses": statuses, "counties": counties, "completeness": completeness, "owner_types": owner_types}
 
 
 def get_cached_new_records(db, sort_dir="desc", filters=None):
@@ -28501,6 +28532,13 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
     out = []
     for row in rows:
         item = dict(row)
+        payload = _new_record_payload(item)
+        lp_added_dt = latest_lp_tag_datetime(payload)
+        item["lp_added_at"] = format_db_time(lp_added_dt) if lp_added_dt else ""
+        if item["lp_added_at"]:
+            item["added_at"] = item["lp_added_at"]
+        item["completeness"] = _new_record_completeness(payload)
+        item["owner_type"] = _new_record_owner_type(payload)
         item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
         item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
         item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
@@ -34554,8 +34592,8 @@ def new_records_page():
         "date_to": (request.args.get("date_to") or "").strip(),
         "status": (request.args.get("status") or "").strip(),
         "county": (request.args.get("county") or "").strip(),
-        "local_match": (request.args.get("local_match") or "").strip(),
-        "local_status": (request.args.get("local_status") or "").strip(),
+        "completeness": (request.args.get("completeness") or "").strip(),
+        "owner_type": (request.args.get("owner_type") or "").strip(),
     }
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()
@@ -34606,8 +34644,8 @@ def new_records_refresh():
         "date_to": (request.form.get("date_to") or request.args.get("date_to") or "").strip(),
         "status": (request.form.get("status") or request.args.get("status") or "").strip(),
         "county": (request.form.get("county") or request.args.get("county") or "").strip(),
-        "local_match": (request.form.get("local_match") or request.args.get("local_match") or "").strip(),
-        "local_status": (request.form.get("local_status") or request.args.get("local_status") or "").strip(),
+        "completeness": (request.form.get("completeness") or request.args.get("completeness") or "").strip(),
+        "owner_type": (request.form.get("owner_type") or request.args.get("owner_type") or "").strip(),
     }
     try:
         data = start_reisift_new_records_refresh_job(triggered_by="manual_button")

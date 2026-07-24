@@ -133,6 +133,17 @@ REISIFT_MAP_BASE_URL = os.getenv("REISIFT_MAP_BASE_URL", "https://map.reisift.io
 REISIFT_UI_VERSION = "2022.02.01.7"
 REISIFT_UNTITLED_TASK_ASSIGNED_TO_USER = "54b27291-93e4-443c-8d2f-e9779955fcd1"
 REISIFT_FOLLOWUPS_EXCLUDE_TAG = os.getenv("REISIFT_FOLLOWUPS_EXCLUDE_TAG", "3cf5a950-ac8f-47b0-87e1-bcea2604e2e1").strip()
+REISIFT_NEW_RECORDS_STATUS = (os.getenv("REISIFT_NEW_RECORDS_STATUS") or "new_records").strip() or "new_records"
+REISIFT_NEW_RECORDS_COUNTIES = tuple(
+    item.strip()
+    for item in (os.getenv("REISIFT_NEW_RECORDS_COUNTIES") or "Essex,Union,Bergen").split(",")
+    if item.strip()
+)
+REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED = env_flag("REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED", True)
+REISIFT_NEW_RECORDS_REFRESH_HOUR_ET = max(
+    0,
+    min(23, int((os.getenv("REISIFT_NEW_RECORDS_REFRESH_HOUR_ET") or "6").strip() or "6")),
+)
 REISIFT_DISABLE_MAP_LOOKUP = env_flag("REISIFT_DISABLE_MAP_LOOKUP", True)
 OPENLETTERCONNECT_BASE_URL = os.getenv("OPENLETTERCONNECT_BASE_URL", "https://api.openletterconnect.com/api/v1")
 OPENLETTERCONNECT_TEMPLATE_ID = int(os.getenv("OPENLETTERCONNECT_TEMPLATE_ID", "9256"))
@@ -191,6 +202,7 @@ BULK_SMS_WORKER_STARTED = False
 EMAIL_POLL_WORKER_STARTED = False
 CLEVER_LEADS_WORKER_STARTED = False
 REFERRAL_MARKET_WORKER_STARTED = False
+REISIFT_NEW_RECORDS_WORKER_STARTED = False
 ADS_DASHBOARD_WORKER_STARTED = False
 CALL_RECORDING_WORKER_STARTED = False
 SMS_ANALYSIS_WORKER_STARTED = False
@@ -721,6 +733,7 @@ def require_login_if_enabled():
         start_ads_dashboard_worker()
         if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
             start_referral_on_market_worker()
+        start_reisift_new_records_worker()
         start_call_recording_worker()
         start_sms_analysis_worker()
         start_agent_refresh_worker()
@@ -897,6 +910,38 @@ def migrate_db(db):
     ensure_column(db, "reisift_referrals", "source_override_json", "source_override_json TEXT")
     ensure_column(db, "reisift_followups", "events_json", "events_json TEXT")
     ensure_column(db, "reisift_followups", "tasks_json", "tasks_json TEXT")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reisift_new_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            property_uuid TEXT NOT NULL UNIQUE,
+            status TEXT,
+            full_address TEXT,
+            owner_names TEXT,
+            county TEXT,
+            added_at TEXT,
+            reisift_updated_at TEXT,
+            local_property_id INTEGER,
+            local_status_before TEXT,
+            local_status_after TEXT,
+            payload_json TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            last_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(local_property_id) REFERENCES properties(id)
+        )
+        """
+    )
+    ensure_column(db, "reisift_new_records", "county", "county TEXT")
+    ensure_column(db, "reisift_new_records", "reisift_updated_at", "reisift_updated_at TEXT")
+    ensure_column(db, "reisift_new_records", "local_property_id", "local_property_id INTEGER")
+    ensure_column(db, "reisift_new_records", "local_status_before", "local_status_before TEXT")
+    ensure_column(db, "reisift_new_records", "local_status_after", "local_status_after TEXT")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_county ON reisift_new_records(is_active, county, added_at)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_local_property ON reisift_new_records(local_property_id)"
+    )
     ensure_column(db, "mail_orders", "status_updated_at", "status_updated_at TEXT")
     ensure_column(db, "mail_orders", "last_event_type", "last_event_type TEXT")
     ensure_column(db, "mail_orders", "external_order_item_id", "external_order_item_id TEXT")
@@ -20801,6 +20846,58 @@ def start_referral_on_market_worker():
     thread.start()
 
 
+def run_reisift_new_records_refresh_once(triggered_by="automation"):
+    ensure_db()
+    db = open_sqlite_connection()
+    try:
+        today_et = datetime.now(EST_TZ).strftime("%Y-%m-%d")
+        last_run_date = (get_setting(db, "reisift_new_records_last_run_date", "") or "").strip()
+        if triggered_by == "automation" and last_run_date == today_et:
+            return {"ok": True, "skipped": "already_ran_today", "date": today_et}
+        result = refresh_reisift_new_records_cache(db)
+        if triggered_by == "automation":
+            set_setting(db, "reisift_new_records_last_run_date", today_et)
+            db.commit()
+        return {"ok": True, "result": result, "date": today_et}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="reisift_new_records_worker",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="run_reisift_new_records_refresh_once",
+            status_code=500,
+        )
+        db.commit()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+def start_reisift_new_records_worker():
+    global REISIFT_NEW_RECORDS_WORKER_STARTED
+    if REISIFT_NEW_RECORDS_WORKER_STARTED or not REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED:
+        return
+    REISIFT_NEW_RECORDS_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                now_et = datetime.now(EST_TZ)
+                if now_et.hour == REISIFT_NEW_RECORDS_REFRESH_HOUR_ET and now_et.minute < 10:
+                    run_reisift_new_records_refresh_once(triggered_by="automation")
+                    # Prevent duplicate refreshes during the configured morning window.
+                    time.sleep(600)
+                    continue
+            except Exception:
+                pass
+            time.sleep(60)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
 def run_clever_leads_poll_once():
     ensure_db()
     db = open_sqlite_connection()
@@ -26076,6 +26173,42 @@ def reisift_search_referral_rows(token, status_slug):
     return rows, int(payload.get("count") or len(rows))
 
 
+def reisift_search_property_rows_by_status(token, status_slug, limit=200, max_rows=1000):
+    status_slug = (status_slug or "").strip()
+    if not status_slug:
+        return [], 0
+    headers = reisift_auth_headers(token, {"x-http-method-override": "GET"})
+    page_size = max(1, min(200, int(limit or 200)))
+    max_rows = max(page_size, min(5000, int(max_rows or 1000)))
+    offset = 0
+    rows = []
+    total = 0
+    while offset < max_rows:
+        body = {
+            "limit": page_size,
+            "offset": offset,
+            "ordering": "-created",
+            "query": {"must": {"any_property_status": [status_slug]}},
+        }
+        response = requests.post(
+            f"{REISIFT_BASE_URL}/api/internal/property/",
+            headers=headers,
+            json=body,
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        page_rows = payload.get("results") or []
+        total = int(payload.get("count") or total or len(page_rows))
+        if not page_rows:
+            break
+        rows.extend([row for row in page_rows if isinstance(row, dict)])
+        if len(page_rows) < page_size:
+            break
+        offset += page_size
+    return rows[:max_rows], total or len(rows)
+
+
 def fetch_reisift_property_payload(token, property_uuid):
     headers = {
         "Authorization": f"Bearer {token}",
@@ -27776,6 +27909,189 @@ def get_cached_followups(db, sort_dir="desc"):
             f.added_at {sort_sql},
             f.last_synced_at {sort_sql},
             f.id {sort_sql}
+        """
+    ).fetchall()
+
+
+def normalize_county_name(value):
+    text = normalize_whitespace(str(value or "")).lower()
+    text = re.sub(r"\bcounty\b", "", text).strip()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def target_new_record_counties():
+    return [item for item in REISIFT_NEW_RECORDS_COUNTIES if item]
+
+
+def is_target_new_record_county(county):
+    county_key = normalize_county_name(county)
+    targets = {normalize_county_name(item) for item in target_new_record_counties()}
+    return bool(county_key and county_key in targets)
+
+
+def _find_local_property_for_reisift_new_record(db, property_uuid, payload):
+    property_uuid = normalize_uuid(property_uuid)
+    if property_uuid:
+        row = db.execute(
+            """
+            SELECT id, status
+            FROM properties
+            WHERE lower(COALESCE(reisift_property_uuid, '')) = lower(?)
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (property_uuid,),
+        ).fetchone()
+        if row:
+            return row
+    local_id = find_local_property_id_for_reisift_payload(db, payload if isinstance(payload, dict) else {})
+    if not local_id:
+        return None
+    row = db.execute("SELECT id, status FROM properties WHERE id = ? LIMIT 1", (local_id,)).fetchone()
+    if row and property_uuid:
+        _set_local_property_uuid(db, int(row["id"]), property_uuid)
+    return row
+
+
+def sync_local_property_status_from_reisift_new_record(db, property_uuid, payload, status):
+    row = _find_local_property_for_reisift_new_record(db, property_uuid, payload)
+    if not row:
+        return {"local_property_id": None, "before": "", "after": ""}
+    local_property_id = int(row["id"])
+    before = str(row["status"] or "").strip()
+    after = normalize_whitespace(status or "") or before
+    if after and before != after:
+        db.execute("UPDATE properties SET status = ? WHERE id = ?", (after, local_property_id))
+        try:
+            db.execute(
+                """
+                INSERT INTO activity_log (property_id, activity_type, outcome, note)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    local_property_id,
+                    "ReiSift Status Sync",
+                    after,
+                    f"Updated from ReiSift New Records refresh. Previous local status: {before or '-'}",
+                ),
+            )
+        except Exception:
+            pass
+    return {"local_property_id": local_property_id, "before": before, "after": after}
+
+
+def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_active=1):
+    payload = payload if isinstance(payload, dict) else {}
+    search_row = search_row if isinstance(search_row, dict) else {}
+    summary = summarize_reisift_property(payload or search_row)
+    county = infer_county_from_reisift_payload(payload) or infer_county_from_reisift_payload(search_row)
+    added_dt = reisift_added_at_dt(search_row, payload)
+    updated_at = (
+        str(payload.get("updated") or payload.get("updated_at") or payload.get("owner_updated") or "").strip()
+        or str(search_row.get("updated") or search_row.get("updated_at") or search_row.get("owner_updated") or "").strip()
+    )
+    local_sync = sync_local_property_status_from_reisift_new_record(db, property_uuid, payload or search_row, summary["status"])
+    execute_with_retry(
+        db,
+        """
+        INSERT INTO reisift_new_records
+            (property_uuid, status, full_address, owner_names, county, added_at, reisift_updated_at,
+             local_property_id, local_status_before, local_status_after, payload_json, is_active, last_synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(property_uuid) DO UPDATE SET
+            status = excluded.status,
+            full_address = excluded.full_address,
+            owner_names = excluded.owner_names,
+            county = excluded.county,
+            added_at = excluded.added_at,
+            reisift_updated_at = excluded.reisift_updated_at,
+            local_property_id = excluded.local_property_id,
+            local_status_before = excluded.local_status_before,
+            local_status_after = excluded.local_status_after,
+            payload_json = excluded.payload_json,
+            is_active = excluded.is_active,
+            last_synced_at = excluded.last_synced_at
+        """,
+        (
+            property_uuid,
+            summary["status"],
+            summary["full_address"],
+            summary["owner_names"],
+            county,
+            format_db_time(added_dt) if added_dt else None,
+            updated_at,
+            local_sync["local_property_id"],
+            local_sync["before"],
+            local_sync["after"],
+            json.dumps(payload or search_row),
+            int(bool(is_active)),
+            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    return local_sync
+
+
+def refresh_reisift_new_records_cache(db):
+    token = reisift_get_access_token()
+    status_slug = REISIFT_NEW_RECORDS_STATUS
+    target_counties = target_new_record_counties()
+    rows, total = reisift_search_property_rows_by_status(token, status_slug, limit=200, max_rows=2000)
+    execute_with_retry(db, "UPDATE reisift_new_records SET is_active = 0")
+    scanned = 0
+    synced = 0
+    skipped_county = 0
+    local_updates = 0
+    errors = []
+    for row in rows:
+        scanned += 1
+        property_uuid = normalize_uuid(row.get("uuid") or "")
+        if not property_uuid:
+            continue
+        details = row
+        try:
+            details = fetch_reisift_property_payload(token, property_uuid)
+        except Exception as exc:
+            errors.append(f"{property_uuid}: detail fallback used ({exc})")
+        county = infer_county_from_reisift_payload(details) or infer_county_from_reisift_payload(row)
+        if not is_target_new_record_county(county):
+            skipped_county += 1
+            continue
+        try:
+            local_sync = upsert_reisift_new_record(db, property_uuid, details, search_row=row, is_active=1)
+            if local_sync.get("local_property_id") and local_sync.get("before") != local_sync.get("after"):
+                local_updates += 1
+            synced += 1
+        except Exception as exc:
+            errors.append(f"{property_uuid}: {exc}")
+    set_setting(db, "reisift_new_records_last_refresh_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    commit_with_retry(db)
+    return {
+        "status_slug": status_slug,
+        "target_counties": target_counties,
+        "total": total,
+        "scanned": scanned,
+        "synced": synced,
+        "skipped_county": skipped_county,
+        "local_updates": local_updates,
+        "errors": errors,
+    }
+
+
+def get_cached_new_records(db, sort_dir="desc"):
+    sort_sql = "DESC" if str(sort_dir).lower() != "asc" else "ASC"
+    return db.execute(
+        f"""
+        SELECT n.*,
+               p.id AS deep_dive_property_id,
+               p.status AS deep_dive_status
+        FROM reisift_new_records n
+        LEFT JOIN properties p ON p.id = n.local_property_id
+        WHERE n.is_active = 1
+        ORDER BY
+            CASE WHEN n.added_at IS NULL OR trim(n.added_at) = '' THEN 1 ELSE 0 END {sort_sql},
+            n.added_at {sort_sql},
+            n.last_synced_at {sort_sql},
+            n.id {sort_sql}
         """
     ).fetchall()
 
@@ -33808,6 +34124,78 @@ def follow_ups_page():
             "inbound_responses": inbound_responses_total,
         },
     )
+
+
+@app.route("/new-records")
+def new_records_page():
+    ensure_db()
+    db = get_db()
+    sort_order = (request.args.get("sort") or "desc").strip().lower()
+    if sort_order not in {"asc", "desc"}:
+        sort_order = "desc"
+    notice = (request.args.get("notice") or "").strip()
+    error = (request.args.get("error") or "").strip()
+    rows = get_cached_new_records(db, sort_dir=sort_order)
+    county_counts = {}
+    local_match_count = 0
+    local_update_count = 0
+    for row in rows:
+        county = str(row["county"] or "Unknown").strip() or "Unknown"
+        county_counts[county] = int(county_counts.get(county, 0)) + 1
+        if row["deep_dive_property_id"]:
+            local_match_count += 1
+        if str(row["local_status_before"] or "") != str(row["local_status_after"] or "") and row["deep_dive_property_id"]:
+            local_update_count += 1
+    return render_template(
+        "new_records.html",
+        rows=rows,
+        notice=notice,
+        error=error,
+        sort_order=sort_order,
+        auto_refresh=(request.args.get("refresh") or "0") == "1",
+        status_slug=REISIFT_NEW_RECORDS_STATUS,
+        target_counties=target_new_record_counties(),
+        last_refresh_at=get_setting(db, "reisift_new_records_last_refresh_at", ""),
+        summary={
+            "record_count": len(rows),
+            "local_match_count": local_match_count,
+            "local_update_count": local_update_count,
+            "county_counts": county_counts,
+        },
+    )
+
+
+@app.route("/new-records/refresh", methods=["POST"])
+def new_records_refresh():
+    ensure_db()
+    db = get_db()
+    sort_order = (request.form.get("sort") or request.args.get("sort") or "desc").strip().lower()
+    if sort_order not in {"asc", "desc"}:
+        sort_order = "desc"
+    try:
+        data = refresh_reisift_new_records_cache(db)
+        notice = (
+            f"New Records refreshed. {data['synced']} active rows cached from "
+            f"{data['scanned']} scanned ReiSift records; {data['local_updates']} local status update(s)."
+        )
+        if data["errors"]:
+            notice += f" {len(data['errors'])} warning(s)."
+        return redirect(url_for("new_records_page", notice=notice, sort=sort_order))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("new_records_page", error=f"Refresh failed: {exc}", sort=sort_order))
+
+
+@app.route("/api/new-records/refresh-cache", methods=["POST"])
+def new_records_refresh_cache_api():
+    ensure_db()
+    db = get_db()
+    try:
+        result = refresh_reisift_new_records_cache(db)
+        return jsonify({"ok": True, **result})
+    except Exception as exc:
+        db.rollback()
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/submitted-leads")
@@ -44249,6 +44637,7 @@ if __name__ == "__main__":
         start_ads_dashboard_worker()
         if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
             start_referral_on_market_worker()
+        start_reisift_new_records_worker()
         start_call_recording_worker()
         start_sms_analysis_worker()
         start_agent_refresh_worker()

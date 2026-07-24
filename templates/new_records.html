@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="cards page-summary-cards">
+    <article>
+        <h3>New Records</h3>
+        <p>{{ summary.record_count }}</p>
+    </article>
+    <article>
+        <h3>Matched Locally</h3>
+        <p>{{ summary.local_match_count }}</p>
+    </article>
+    <article>
+        <h3>Status Updates</h3>
+        <p>{{ summary.local_update_count }}</p>
+    </article>
+    <article>
+        <h3>Counties</h3>
+        <p>{{ target_counties|join(", ") }}</p>
+    </article>
+</section>
+
+<section class="panel">
+    <h2>New Records (ReiSift)</h2>
+    <p>
+        ReiSift status: <strong>{{ status_slug }}</strong>.
+        Counties: <strong>{{ target_counties|join(", ") }}</strong>.
+        {% if last_refresh_at %}Last refresh: <strong>{{ last_refresh_at|fmt_est_datetime }}</strong>.{% endif %}
+    </p>
+    <div class="panel-actions">
+        <form method="get" action="{{ url_for('new_records_page') }}" class="inline-form">
+            <label>Sort
+                <select name="sort">
+                    <option value="desc" {% if sort_order == "desc" %}selected{% endif %}>Newest First</option>
+                    <option value="asc" {% if sort_order == "asc" %}selected{% endif %}>Oldest First</option>
+                </select>
+            </label>
+            <button type="submit">Apply</button>
+        </form>
+        <form method="post" action="{{ url_for('new_records_refresh') }}">
+            <input type="hidden" name="sort" value="{{ sort_order }}">
+            <button type="submit">Refresh New Records</button>
+        </form>
+    </div>
+    {% if notice %}
+    <div class="notice-banner">{{ notice }}</div>
+    {% endif %}
+    {% if error %}
+    <div class="error-banner">{{ error }}</div>
+    {% endif %}
+    <div id="newRecordsBusy" class="busy-inline hidden">
+        <span class="busy-spinner" aria-hidden="true"></span>
+        <span id="newRecordsBusyText">Refreshing New Records from ReiSift...</span>
+    </div>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Address</th>
+                    <th>Status</th>
+                    <th>County</th>
+                    <th>Owner(s)</th>
+                    <th>Date Added</th>
+                    <th>Local Match</th>
+                    <th>Local Status</th>
+                    <th>SIFT</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr>
+                    <td>{{ row.full_address or "-" }}</td>
+                    <td><span class="pill">{{ row.status or "-" }}</span></td>
+                    <td>{{ row.county or "-" }}</td>
+                    <td>{{ row.owner_names or "-" }}</td>
+                    <td>{{ row.added_at|fmt_long_date }}</td>
+                    <td>
+                        {% if row.deep_dive_property_id %}
+                        <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.deep_dive_property_id) }}" title="Open in Deep Dive" aria-label="Open in Deep Dive">
+                            <img class="tiny-link-icon" src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/08/cropped-nj-logo-tiny-32x32.png" alt="Deep Dive">
+                        </a>
+                        {% else %}
+                        -
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if row.deep_dive_property_id %}
+                        {{ row.local_status_after or row.deep_dive_status or "-" }}
+                        {% if row.local_status_before and row.local_status_before != row.local_status_after %}
+                        <br><span class="muted-text">was {{ row.local_status_before }}</span>
+                        {% endif %}
+                        {% else %}
+                        -
+                        {% endif %}
+                    </td>
+                    <td>
+                        <a class="action-icon-link" href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener" title="Open in REISift" aria-label="Open in REISift">
+                            <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+                        </a>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="8">No cached New Records yet. Click Refresh New Records.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+<script>
+(() => {
+  async function refreshCacheAsync() {
+    const busy = document.getElementById('newRecordsBusy');
+    const busyText = document.getElementById('newRecordsBusyText');
+    if (!busy || !busyText) return;
+    busy.classList.remove('hidden');
+    busyText.textContent = 'Refreshing New Records from ReiSift...';
+    try {
+      const res = await fetch('/api/new-records/refresh-cache', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        busyText.textContent = `Refresh failed: ${(data && data.error) || 'Unknown error'}`;
+        return;
+      }
+      busyText.textContent = `Cached ${data.synced || 0} row(s); updated ${data.local_updates || 0} local status value(s). Refreshing view...`;
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.delete('refresh');
+      setTimeout(() => { window.location.href = nextUrl.toString(); }, 700);
+    } catch (err) {
+      busyText.textContent = `Refresh failed: ${err}`;
+    }
+  }
+
+  const autoRefresh = {{ 'true' if auto_refresh else 'false' }};
+  if (autoRefresh) refreshCacheAsync();
+})();
+</script>
+{% endblock %}

@@ -498,3 +498,24 @@ CREATE TABLE IF NOT EXISTS reisift_followups (
     last_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS reisift_new_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_uuid TEXT NOT NULL UNIQUE,
+    status TEXT,
+    full_address TEXT,
+    owner_names TEXT,
+    county TEXT,
+    added_at TEXT,
+    reisift_updated_at TEXT,
+    local_property_id INTEGER,
+    local_status_before TEXT,
+    local_status_after TEXT,
+    payload_json TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    last_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(local_property_id) REFERENCES properties(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_county ON reisift_new_records(is_active, county, added_at);
+CREATE INDEX IF NOT EXISTS idx_reisift_new_records_local_property ON reisift_new_records(local_property_id);
+

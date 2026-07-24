@@ -593,6 +593,29 @@ body {
     width: 100%;
 }
 
+.new-records-table {
+    font-size: 0.78rem;
+    min-width: 980px;
+    white-space: nowrap;
+}
+
+.new-records-table th,
+.new-records-table td {
+    padding: 0.38rem 0.5rem;
+    white-space: nowrap;
+}
+
+.new-records-table td:first-child,
+.new-records-table td:nth-child(4) {
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.new-records-table .pill {
+    font-size: 0.72rem;
+}
+
 .action-icon-link {
     align-items: center;
     display: inline-flex;

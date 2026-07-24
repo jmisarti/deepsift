@@ -36,7 +36,7 @@
             </label>
             <button type="submit">Apply</button>
         </form>
-        <form method="post" action="{{ url_for('new_records_refresh') }}">
+        <form method="post" action="{{ url_for('new_records_refresh') }}" id="newRecordsRefreshForm">
             <input type="hidden" name="sort" value="{{ sort_order }}">
             <button type="submit">Refresh New Records</button>
         </form>
@@ -47,9 +47,9 @@
     {% if error %}
     <div class="error-banner">{{ error }}</div>
     {% endif %}
-    <div id="newRecordsBusy" class="busy-inline hidden">
+    <div id="newRecordsBusy" class="busy-inline {% if refresh_state.status == 'running' or auto_refresh %}{% else %}hidden{% endif %}">
         <span class="busy-spinner" aria-hidden="true"></span>
-        <span id="newRecordsBusyText">Refreshing New Records from ReiSift...</span>
+        <span id="newRecordsBusyText">{{ refresh_state.message or "Refreshing New Records from ReiSift..." }}</span>
     </div>
     <div class="table-wrap">
         <table>
@@ -109,12 +109,45 @@
 </section>
 <script>
 (() => {
-  async function refreshCacheAsync() {
+  let pollTimer = null;
+
+  function setBusy(message) {
     const busy = document.getElementById('newRecordsBusy');
     const busyText = document.getElementById('newRecordsBusyText');
-    if (!busy || !busyText) return;
-    busy.classList.remove('hidden');
-    busyText.textContent = 'Refreshing New Records from ReiSift...';
+    if (busy) busy.classList.remove('hidden');
+    if (busyText) busyText.textContent = message || 'Refreshing New Records from ReiSift...';
+  }
+
+  async function pollRefreshStatus() {
+    const busyText = document.getElementById('newRecordsBusyText');
+    try {
+      const res = await fetch('/api/new-records/refresh-status');
+      const data = await res.json();
+      const state = (data && data.state) || {};
+      if (state.status === 'running') {
+        setBusy(state.message || 'Refresh still running...');
+        pollTimer = setTimeout(pollRefreshStatus, 3000);
+        return;
+      }
+      if (state.status === 'complete') {
+        setBusy(state.message || 'Refresh complete. Reloading...');
+        const nextUrl = new URL(window.location.href);
+        nextUrl.searchParams.delete('refresh');
+        setTimeout(() => { window.location.href = nextUrl.toString(); }, 700);
+        return;
+      }
+      if (state.status === 'error') {
+        setBusy(`Refresh failed: ${state.message || 'Unknown error'}`);
+        return;
+      }
+      if (busyText && !busyText.textContent.trim()) busyText.textContent = 'Refresh status unavailable.';
+    } catch (err) {
+      setBusy(`Refresh status check failed: ${err}`);
+    }
+  }
+
+  async function refreshCacheAsync() {
+    setBusy('Starting New Records refresh...');
     try {
       const res = await fetch('/api/new-records/refresh-cache', {
         method: 'POST',
@@ -122,20 +155,30 @@
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
-        busyText.textContent = `Refresh failed: ${(data && data.error) || 'Unknown error'}`;
+        setBusy(`Refresh failed: ${(data && data.error) || 'Unknown error'}`);
         return;
       }
-      busyText.textContent = `Cached ${data.synced || 0} row(s); updated ${data.local_updates || 0} local status value(s). Refreshing view...`;
-      const nextUrl = new URL(window.location.href);
-      nextUrl.searchParams.delete('refresh');
-      setTimeout(() => { window.location.href = nextUrl.toString(); }, 700);
+      const state = (data && data.state) || {};
+      setBusy(state.message || 'Refresh started. Waiting for ReiSift...');
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = setTimeout(pollRefreshStatus, 1000);
     } catch (err) {
-      busyText.textContent = `Refresh failed: ${err}`;
+      setBusy(`Refresh failed: ${err}`);
     }
+  }
+
+  const form = document.getElementById('newRecordsRefreshForm');
+  if (form) {
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      refreshCacheAsync();
+    });
   }
 
   const autoRefresh = {{ 'true' if auto_refresh else 'false' }};
   if (autoRefresh) refreshCacheAsync();
+  const initialStatus = {{ refresh_state.status|tojson }};
+  if (initialStatus === 'running') pollRefreshStatus();
 })();
 </script>
 {% endblock %}

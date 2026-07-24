@@ -225,6 +225,7 @@ ROKU_ADS_AUTHORIZE_URL = (os.getenv("ROKU_ADS_AUTHORIZE_URL") or "https://ads.ro
 ROKU_ADS_TOKEN_URL = (os.getenv("ROKU_ADS_TOKEN_URL") or "https://api.ads.roku.com/v1/developer/token").strip() or "https://api.ads.roku.com/v1/developer/token"
 ROKU_ADS_API_BASE_URL = (os.getenv("ROKU_ADS_API_BASE_URL") or "https://api.ads.roku.com/v1/developer").strip().rstrip("/") or "https://api.ads.roku.com/v1/developer"
 ADS_REFRESH_LOCK = threading.RLock()
+REISIFT_NEW_RECORDS_REFRESH_LOCK = threading.Lock()
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
     "running": False,
@@ -20848,6 +20849,8 @@ def start_referral_on_market_worker():
 
 def run_reisift_new_records_refresh_once(triggered_by="automation"):
     ensure_db()
+    if not REISIFT_NEW_RECORDS_REFRESH_LOCK.acquire(blocking=False):
+        return {"ok": True, "skipped": "refresh_already_running"}
     db = open_sqlite_connection()
     try:
         today_et = datetime.now(EST_TZ).strftime("%Y-%m-%d")
@@ -20873,6 +20876,7 @@ def run_reisift_new_records_refresh_once(triggered_by="automation"):
         return {"ok": False, "error": str(exc)}
     finally:
         db.close()
+        REISIFT_NEW_RECORDS_REFRESH_LOCK.release()
 
 
 def start_reisift_new_records_worker():
@@ -28077,6 +28081,86 @@ def refresh_reisift_new_records_cache(db):
     }
 
 
+def set_reisift_new_records_refresh_state(db, status, message="", result=None):
+    payload = {
+        "status": str(status or "").strip() or "unknown",
+        "message": str(message or "").strip(),
+        "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "result": result if isinstance(result, dict) else {},
+    }
+    set_setting(db, "reisift_new_records_refresh_state_json", json.dumps(payload))
+    return payload
+
+
+def get_reisift_new_records_refresh_state(db):
+    raw = get_setting(db, "reisift_new_records_refresh_state_json", "")
+    data = parse_json_object(raw or "{}", default={})
+    if not isinstance(data, dict) or not data:
+        return {"status": "idle", "message": "", "updated_at": "", "result": {}}
+    return {
+        "status": str(data.get("status") or "idle").strip() or "idle",
+        "message": str(data.get("message") or "").strip(),
+        "updated_at": str(data.get("updated_at") or "").strip(),
+        "result": data.get("result") if isinstance(data.get("result"), dict) else {},
+    }
+
+
+def start_reisift_new_records_refresh_job(triggered_by="manual"):
+    if not REISIFT_NEW_RECORDS_REFRESH_LOCK.acquire(blocking=False):
+        db = open_sqlite_connection()
+        try:
+            state = get_reisift_new_records_refresh_state(db)
+            if state.get("status") != "running":
+                state = set_reisift_new_records_refresh_state(db, "running", "Refresh already in progress.")
+                db.commit()
+            return {"ok": True, "started": False, "running": True, "state": state}
+        finally:
+            db.close()
+
+    def worker():
+        db = open_sqlite_connection()
+        try:
+            set_reisift_new_records_refresh_state(db, "running", "Refreshing New Records from ReiSift...")
+            db.commit()
+            result = refresh_reisift_new_records_cache(db)
+            message = (
+                f"Cached {result.get('synced', 0)} row(s) from {result.get('scanned', 0)} scanned; "
+                f"updated {result.get('local_updates', 0)} local status value(s)."
+            )
+            set_reisift_new_records_refresh_state(db, "complete", message, result=result)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            log_app_error(
+                db,
+                source="reisift_new_records_refresh_job",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="start_reisift_new_records_refresh_job",
+                status_code=500,
+            )
+            state = set_reisift_new_records_refresh_state(db, "error", str(exc), result={"error": str(exc)})
+            db.commit()
+            return state
+        finally:
+            db.close()
+            REISIFT_NEW_RECORDS_REFRESH_LOCK.release()
+
+    starter_db = open_sqlite_connection()
+    try:
+        state = set_reisift_new_records_refresh_state(
+            starter_db,
+            "running",
+            f"Refresh started ({triggered_by}).",
+        )
+        starter_db.commit()
+    finally:
+        starter_db.close()
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return {"ok": True, "started": True, "running": True, "state": state}
+
+
 def get_cached_new_records(db, sort_dir="desc"):
     sort_sql = "DESC" if str(sort_dir).lower() != "asc" else "ASC"
     return db.execute(
@@ -34156,6 +34240,7 @@ def new_records_page():
         status_slug=REISIFT_NEW_RECORDS_STATUS,
         target_counties=target_new_record_counties(),
         last_refresh_at=get_setting(db, "reisift_new_records_last_refresh_at", ""),
+        refresh_state=get_reisift_new_records_refresh_state(db),
         summary={
             "record_count": len(rows),
             "local_match_count": local_match_count,
@@ -34173,14 +34258,11 @@ def new_records_refresh():
     if sort_order not in {"asc", "desc"}:
         sort_order = "desc"
     try:
-        data = refresh_reisift_new_records_cache(db)
-        notice = (
-            f"New Records refreshed. {data['synced']} active rows cached from "
-            f"{data['scanned']} scanned ReiSift records; {data['local_updates']} local status update(s)."
-        )
-        if data["errors"]:
-            notice += f" {len(data['errors'])} warning(s)."
-        return redirect(url_for("new_records_page", notice=notice, sort=sort_order))
+        data = start_reisift_new_records_refresh_job(triggered_by="manual_button")
+        notice = "New Records refresh started. This page will update when the ReiSift pull finishes."
+        if not data.get("started"):
+            notice = "New Records refresh is already running. This page will update when it finishes."
+        return redirect(url_for("new_records_page", notice=notice, sort=sort_order, refresh=1))
     except Exception as exc:
         db.rollback()
         return redirect(url_for("new_records_page", error=f"Refresh failed: {exc}", sort=sort_order))
@@ -34191,11 +34273,18 @@ def new_records_refresh_cache_api():
     ensure_db()
     db = get_db()
     try:
-        result = refresh_reisift_new_records_cache(db)
+        result = start_reisift_new_records_refresh_job(triggered_by="api")
         return jsonify({"ok": True, **result})
     except Exception as exc:
         db.rollback()
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/new-records/refresh-status", methods=["GET"])
+def new_records_refresh_status_api():
+    ensure_db()
+    db = get_db()
+    return jsonify({"ok": True, "state": get_reisift_new_records_refresh_state(db)})
 
 
 @app.route("/submitted-leads")

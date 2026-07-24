@@ -18450,7 +18450,22 @@ def run_untitled_leads_snapshot_once():
             ),
         )
         db.commit()
-        return {"ok": True, "snapshot_id": snapshot_id, "summary": summary}
+        new_records_sync = {}
+        try:
+            new_records_sync = sync_existing_untitled_new_record_properties(db)
+            db.commit()
+        except Exception as sync_exc:
+            db.rollback()
+            log_app_error(
+                db,
+                source="untitled_new_records_sync",
+                error_message=str(sync_exc),
+                details=traceback.format_exc(),
+                route="run_untitled_leads_snapshot_once",
+                status_code=500,
+            )
+            db.commit()
+        return {"ok": True, "snapshot_id": snapshot_id, "summary": summary, "new_records_sync": new_records_sync}
     except Exception as exc:
         db.rollback()
         log_app_error(
@@ -27923,6 +27938,37 @@ def normalize_county_name(value):
     return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
 
+NEW_RECORD_COUNTY_CITY_MAP = {
+    "Essex": {
+        "belleville", "bloomfield", "caldwell", "cedar grove", "east orange", "essex fells",
+        "fairfield", "glen ridge", "irvington", "livingston", "maplewood", "millburn",
+        "montclair", "newark", "north caldwell", "nutley", "orange", "roseland",
+        "south orange", "verona", "west caldwell", "west orange",
+    },
+    "Union": {
+        "berkeley heights", "clark", "cranford", "elizabeth", "fanwood", "garwood",
+        "hillside", "kenilworth", "linden", "mountainside", "new providence", "plainfield",
+        "rahway", "roselle", "roselle park", "scotch plains", "springfield", "summit",
+        "union", "union township", "westfield", "winfield", "winfield park",
+    },
+    "Bergen": {
+        "allendale", "alpine", "bergenfield", "bogota", "carlstadt", "cliffside park",
+        "closter", "cresskill", "demarest", "dumont", "east rutherford", "edgewater",
+        "elmwood park", "emerson", "englewood", "englewood cliffs", "fair lawn",
+        "fairview", "fort lee", "franklin lakes", "garfield", "glen rock", "hackensack",
+        "harrington park", "hasbrouck heights", "haworth", "hillsdale", "ho ho kus",
+        "leonia", "little ferry", "lodi", "lyndhurst", "mahwah", "maywood", "midland park",
+        "montvale", "moonachie", "new milford", "north arlington", "northvale", "norwood",
+        "oakland", "old tappan", "oradell", "palisades park", "paramus", "park ridge",
+        "ramsey", "ridgefield", "ridgefield park", "ridgewood", "river edge", "river vale",
+        "rochelle park", "rockleigh", "rutherford", "saddle brook", "saddle river",
+        "south hackensack", "teaneck", "tenafly", "teterboro", "upper saddle river",
+        "waldwick", "wallington", "washington township", "westwood", "woodcliff lake",
+        "wood ridge", "wyckoff",
+    },
+}
+
+
 def target_new_record_counties():
     return [item for item in REISIFT_NEW_RECORDS_COUNTIES if item]
 
@@ -27931,6 +27977,113 @@ def is_target_new_record_county(county):
     county_key = normalize_county_name(county)
     targets = {normalize_county_name(item) for item in target_new_record_counties()}
     return bool(county_key and county_key in targets)
+
+
+def infer_untitled_new_record_county(row):
+    item = row if isinstance(row, dict) else {}
+    payload = parse_json_object(item.get("payload_json") or "{}")
+    for key in ["county", "personal_county", "property_county", "mailing_county"]:
+        county = normalize_whitespace(item.get(key) or (payload.get(key) if isinstance(payload, dict) else ""))
+        if is_target_new_record_county(county):
+            for configured in target_new_record_counties():
+                if normalize_county_name(configured) == normalize_county_name(county):
+                    return configured
+            return county
+    state = normalize_state_code(item.get("personal_state") or (payload.get("personal_state") if isinstance(payload, dict) else ""))
+    if state != "NJ":
+        return ""
+    city = normalize_county_name(item.get("personal_city") or (payload.get("personal_city") if isinstance(payload, dict) else ""))
+    if not city:
+        return ""
+    for county, cities in NEW_RECORD_COUNTY_CITY_MAP.items():
+        if city in cities and is_target_new_record_county(county):
+            return county
+    return ""
+
+
+def is_new_record_status_value(value):
+    normalized = _normalize_reisift_status(value)
+    return normalized in {"new record", "new records", "untouched", ""}
+
+
+def sync_existing_untitled_new_record_properties(db):
+    rows = db.execute(
+        """
+        SELECT u.*, p.status AS local_property_status
+        FROM untitled_sheet_current u
+        LEFT JOIN properties p ON p.id = u.local_property_id
+        WHERE COALESCE(u.is_active, 1) = 1
+          AND trim(COALESCE(u.skiptrace_completed_at, '')) = ''
+        """
+    ).fetchall()
+    matched = 0
+    status_updates = 0
+    target_rows = 0
+    now_text = format_db_time(datetime.utcnow())
+    for raw_row in rows:
+        row = dict(raw_row)
+        county = infer_untitled_new_record_county(row)
+        if not county:
+            continue
+        status_value = row.get("local_property_status") or row.get("reisift_status") or ""
+        if not is_new_record_status_value(status_value):
+            continue
+        target_rows += 1
+        address = _untitled_source_address(row)
+        property_id = int(row.get("local_property_id") or 0)
+        if property_id <= 0:
+            property_id = int(find_local_property_by_address(
+                db,
+                address.get("street") or "",
+                address.get("city") or "",
+                address.get("state") or "",
+                address.get("postal_code") or "",
+            ) or 0)
+        if property_id <= 0:
+            continue
+        prop = db.execute("SELECT id, status FROM properties WHERE id = ? LIMIT 1", (property_id,)).fetchone()
+        if not prop:
+            continue
+        matched += 1
+        before_status = normalize_whitespace(prop["status"] or "")
+        if before_status != "New Records":
+            db.execute("UPDATE properties SET status = ? WHERE id = ?", ("New Records", property_id))
+            status_updates += 1
+            try:
+                db.execute(
+                    """
+                    INSERT INTO activity_log (property_id, activity_type, outcome, note)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        property_id,
+                        "Prospecting Monitor",
+                        "New Records",
+                        f"Marked from prospecting-monitor refresh for {county} County. Previous status: {before_status or '-'}",
+                    ),
+                )
+            except Exception:
+                pass
+        _update_untitled_current_row_state(
+            db,
+            row.get("record_key") or "",
+            local_property_id=property_id,
+            reisift_status="New Records",
+            last_action_error="",
+        )
+    set_setting(db, "reisift_new_records_last_refresh_at", now_text)
+    return {"target_rows": target_rows, "matched": matched, "status_updates": status_updates}
+
+
+def refresh_prospecting_new_records_once():
+    snapshot_result = run_untitled_leads_snapshot_once()
+    db = open_sqlite_connection()
+    try:
+        sync_result = sync_existing_untitled_new_record_properties(db)
+        db.commit()
+    finally:
+        db.close()
+    return {"snapshot": snapshot_result, "sync": sync_result}
 
 
 def _find_local_property_for_reisift_new_record(db, property_uuid, payload):
@@ -28120,12 +28273,13 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
     def worker():
         db = open_sqlite_connection()
         try:
-            set_reisift_new_records_refresh_state(db, "running", "Refreshing New Records from ReiSift...")
+            set_reisift_new_records_refresh_state(db, "running", "Refreshing prospecting monitor New Records...")
             db.commit()
-            result = refresh_reisift_new_records_cache(db)
+            result = refresh_prospecting_new_records_once()
             message = (
-                f"Cached {result.get('synced', 0)} row(s) from {result.get('scanned', 0)} scanned; "
-                f"updated {result.get('local_updates', 0)} local status value(s)."
+                f"Prospecting monitor refreshed; found {((result.get('sync') or {}).get('target_rows') or 0)} target row(s), "
+                f"matched {((result.get('sync') or {}).get('matched') or 0)} existing DeepSift record(s), "
+                f"updated {((result.get('sync') or {}).get('status_updates') or 0)} status value(s)."
             )
             set_reisift_new_records_refresh_state(db, "complete", message, result=result)
             db.commit()
@@ -28162,22 +28316,52 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
 
 
 def get_cached_new_records(db, sort_dir="desc"):
-    sort_sql = "DESC" if str(sort_dir).lower() != "asc" else "ASC"
-    return db.execute(
-        f"""
-        SELECT n.*,
+    sort_reverse = str(sort_dir).lower() != "asc"
+    rows = db.execute(
+        """
+        SELECT u.*,
                p.id AS deep_dive_property_id,
-               p.status AS deep_dive_status
-        FROM reisift_new_records n
-        LEFT JOIN properties p ON p.id = n.local_property_id
-        WHERE n.is_active = 1
-        ORDER BY
-            CASE WHEN n.added_at IS NULL OR trim(n.added_at) = '' THEN 1 ELSE 0 END {sort_sql},
-            n.added_at {sort_sql},
-            n.last_synced_at {sort_sql},
-            n.id {sort_sql}
+               p.status AS deep_dive_status,
+               p.reisift_property_uuid AS local_reisift_property_uuid
+        FROM untitled_sheet_current u
+        LEFT JOIN properties p ON p.id = u.local_property_id
+        WHERE COALESCE(u.is_active, 1) = 1
+          AND trim(COALESCE(u.skiptrace_completed_at, '')) = ''
         """
     ).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        county = infer_untitled_new_record_county(item)
+        if not county:
+            continue
+        status_value = item.get("deep_dive_status") or item.get("reisift_status") or "New Records"
+        if not is_new_record_status_value(status_value):
+            continue
+        address = _untitled_source_address(item)
+        local_uuid = normalize_uuid(item.get("local_reisift_property_uuid") or item.get("reisift_property_uuid") or "")
+        item["property_uuid"] = local_uuid
+        item["full_address"] = format_property_address_line(
+            address.get("street"),
+            address.get("city"),
+            address.get("state"),
+            address.get("postal_code"),
+        )
+        item["status"] = status_value if normalize_whitespace(status_value) else "New Records"
+        item["county"] = county
+        item["owner_names"] = _untitled_name_display(item)
+        item["added_at"] = item.get("first_seen_at") or ""
+        item["last_synced_at"] = item.get("last_seen_at") or item.get("last_changed_at") or ""
+        item["local_status_before"] = ""
+        item["local_status_after"] = item.get("deep_dive_status") or ""
+        item["sift_record_url"] = _sift_record_url(local_uuid) if local_uuid else ""
+        out.append(item)
+
+    def sort_key(item):
+        return _untitled_last_seen_sort_dt(item)
+
+    out.sort(key=sort_key, reverse=sort_reverse)
+    return out
 
 
 def parse_followup_json_list(raw_value):
@@ -34228,7 +34412,7 @@ def new_records_page():
         county_counts[county] = int(county_counts.get(county, 0)) + 1
         if row["deep_dive_property_id"]:
             local_match_count += 1
-        if str(row["local_status_before"] or "") != str(row["local_status_after"] or "") and row["deep_dive_property_id"]:
+        if row["deep_dive_property_id"] and normalize_whitespace(row["deep_dive_status"] or "") == "New Records":
             local_update_count += 1
     return render_template(
         "new_records.html",
@@ -34237,7 +34421,7 @@ def new_records_page():
         error=error,
         sort_order=sort_order,
         auto_refresh=(request.args.get("refresh") or "0") == "1",
-        status_slug=REISIFT_NEW_RECORDS_STATUS,
+        status_slug="New Records",
         target_counties=target_new_record_counties(),
         last_refresh_at=get_setting(db, "reisift_new_records_last_refresh_at", ""),
         refresh_state=get_reisift_new_records_refresh_state(db),

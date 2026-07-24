@@ -22,7 +22,7 @@
 <section class="panel">
     <h2>New Records (ReiSift)</h2>
     <p>
-        ReiSift status: <strong>{{ status_slug }}</strong>.
+        Status: <strong>{{ status_slug }}</strong>.
         Counties: <strong>{{ target_counties|join(", ") }}</strong>.
         {% if last_refresh_at %}Last refresh: <strong>{{ last_refresh_at|fmt_est_datetime }}</strong>.{% endif %}
     </p>
@@ -49,7 +49,7 @@
     {% endif %}
     <div id="newRecordsBusy" class="busy-inline {% if refresh_state.status == 'running' or auto_refresh %}{% else %}hidden{% endif %}">
         <span class="busy-spinner" aria-hidden="true"></span>
-        <span id="newRecordsBusyText">{{ refresh_state.message or "Refreshing New Records from ReiSift..." }}</span>
+        <span id="newRecordsBusyText">{{ refresh_state.message or "Refreshing prospecting monitor New Records..." }}</span>
     </div>
     <div class="table-wrap">
         <table>
@@ -93,9 +93,13 @@
                         {% endif %}
                     </td>
                     <td>
-                        <a class="action-icon-link" href="https://app.reisift.io/records/properties/{{ row.property_uuid }}/details?page=1" target="_blank" rel="noopener" title="Open in REISift" aria-label="Open in REISift">
+                        {% if row.sift_record_url %}
+                        <a class="action-icon-link" href="{{ row.sift_record_url }}" target="_blank" rel="noopener" title="Open in REISift" aria-label="Open in REISift">
                             <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
                         </a>
+                        {% else %}
+                        -
+                        {% endif %}
                     </td>
                 </tr>
                 {% else %}
@@ -115,7 +119,7 @@
     const busy = document.getElementById('newRecordsBusy');
     const busyText = document.getElementById('newRecordsBusyText');
     if (busy) busy.classList.remove('hidden');
-    if (busyText) busyText.textContent = message || 'Refreshing New Records from ReiSift...';
+    if (busyText) busyText.textContent = message || 'Refreshing prospecting monitor New Records...';
   }
 
   async function pollRefreshStatus() {
@@ -147,7 +151,7 @@
   }
 
   async function refreshCacheAsync() {
-    setBusy('Starting New Records refresh...');
+    setBusy('Starting prospecting monitor refresh...');
     try {
       const res = await fetch('/api/new-records/refresh-cache', {
         method: 'POST',
@@ -159,7 +163,7 @@
         return;
       }
       const state = (data && data.state) || {};
-      setBusy(state.message || 'Refresh started. Waiting for ReiSift...');
+      setBusy(state.message || 'Refresh started. Waiting for prospecting monitor...');
       if (pollTimer) clearTimeout(pollTimer);
       pollTimer = setTimeout(pollRefreshStatus, 1000);
     } catch (err) {

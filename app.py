@@ -28275,7 +28275,22 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
     match_address = extract_reisift_property_address(match_payload)
     if not match_address.get("street") or not match_address.get("city"):
         match_payload = search_row
+    local_import = {"created": False, "skipped": True}
     local_sync = sync_local_property_status_from_reisift_new_record(db, property_uuid, match_payload, summary["status"])
+    if not local_sync.get("local_property_id"):
+        local_import = ensure_local_property_for_new_record_payload(
+            db,
+            property_uuid,
+            payload or search_row,
+            source="ReiSift New Records refresh",
+        )
+        if local_import.get("property_id"):
+            local_sync = sync_local_property_status_from_reisift_new_record(
+                db,
+                property_uuid,
+                match_payload,
+                summary["status"],
+            )
     execute_with_retry(
         db,
         """
@@ -28313,6 +28328,7 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         ),
     )
+    local_sync["local_import"] = local_import
     return local_sync
 
 
@@ -28331,6 +28347,9 @@ def refresh_reisift_new_records_cache(db):
     synced = 0
     skipped_county = 0
     local_updates = 0
+    local_imports = 0
+    imported_phones = 0
+    imported_emails = 0
     errors = []
     for row in rows:
         scanned += 1
@@ -28350,6 +28369,11 @@ def refresh_reisift_new_records_cache(db):
             local_sync = upsert_reisift_new_record(db, property_uuid, details, search_row=row, is_active=1)
             if local_sync.get("local_property_id") and local_sync.get("before") != local_sync.get("after"):
                 local_updates += 1
+            local_import = local_sync.get("local_import") if isinstance(local_sync.get("local_import"), dict) else {}
+            if local_import.get("property_id") and local_import.get("reason") != "already_matched":
+                local_imports += 1
+                imported_phones += int(local_import.get("phones_created") or 0)
+                imported_emails += int(local_import.get("emails_created") or 0)
             synced += 1
         except Exception as exc:
             errors.append(f"{property_uuid}: {exc}")
@@ -28363,6 +28387,9 @@ def refresh_reisift_new_records_cache(db):
         "synced": synced,
         "skipped_county": skipped_county,
         "local_updates": local_updates,
+        "local_imports": local_imports,
+        "imported_phones": imported_phones,
+        "imported_emails": imported_emails,
         "errors": errors,
     }
 
@@ -28411,6 +28438,7 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
             result = refresh_reisift_new_records_cache(db)
             message = (
                 f"Cached {result.get('synced', 0)} row(s) from {result.get('scanned', 0)} scanned; "
+                f"created/imported {result.get('local_imports', 0)} local record(s); "
                 f"updated {result.get('local_updates', 0)} local status value(s)."
             )
             set_reisift_new_records_refresh_state(db, "complete", message, result=result)
@@ -28738,6 +28766,225 @@ def extract_property_lists(payload):
             names.append(val)
     dedup = list(dict.fromkeys(names))
     return ", ".join(dedup)
+
+
+def _reisift_owner_name_parts(owner):
+    owner = owner if isinstance(owner, dict) else {}
+    full_name = normalize_whitespace(owner.get("full_name") or owner.get("name") or "")
+    if not full_name:
+        full_name = normalize_whitespace(" ".join(
+            part
+            for part in [
+                owner.get("first_name"),
+                owner.get("last_name"),
+            ]
+            if normalize_whitespace(part)
+        ))
+    if full_name:
+        parsed = _parse_seller_name_for_owner(full_name)
+        first = parsed.get("first_name") or normalize_whitespace(owner.get("first_name") or "")
+        last = parsed.get("last_name") or normalize_whitespace(owner.get("last_name") or "")
+    else:
+        first = normalize_whitespace(owner.get("first_name") or "")
+        last = normalize_whitespace(owner.get("last_name") or "")
+    if not first and not last and normalize_whitespace(owner.get("type") or "").lower() == "llc":
+        first = normalize_whitespace(owner.get("first_name") or "Company")
+        last = normalize_whitespace(owner.get("last_name") or "Owner")
+    return {"first_name": first or "ReiSift", "last_name": last or "Owner"}
+
+
+def _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, source_label):
+    owner = owner if isinstance(owner, dict) else {}
+    phones_created = 0
+    emails_created = 0
+    note = f"Imported from {source_label} (ReiSift UUID {property_uuid})."
+    for phone in owner.get("phones") or []:
+        if isinstance(phone, dict):
+            value = normalize_phone(phone.get("number") or phone.get("phone") or "")
+            label = normalize_whitespace(phone.get("type") or "Unknown").title()
+            status = normalize_whitespace(phone.get("status") or "Unknown").title()
+        else:
+            value = normalize_phone(phone or "")
+            label = "Unknown"
+            status = "Unknown"
+        if not value or touchpoint_exists(db, person_id, "Phone", value):
+            continue
+        db.execute(
+            """
+            INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
+            VALUES (?, 'Phone', ?, ?, ?, ?, ?)
+            """,
+            (person_id, label, value, status, note, ""),
+        )
+        phones_created += 1
+
+    for email in owner.get("emails") or []:
+        if isinstance(email, dict):
+            value = normalize_email(email.get("email") or email.get("value") or "")
+        else:
+            value = normalize_email(email or "")
+        if not value:
+            continue
+        result = upsert_email_touchpoint_and_queue_validation(
+            db,
+            person_id,
+            value,
+            note=note,
+            source="reisift_new_record",
+        )
+        if result.get("created"):
+            emails_created += 1
+    return {"phones_created": phones_created, "emails_created": emails_created}
+
+
+def _ensure_reisift_owner_address(db, person_id, owner, property_address, source_label, set_default=False):
+    owner = owner if isinstance(owner, dict) else {}
+    owner_address = extract_reisift_property_address(owner)
+    address = owner_address if owner_address.get("street") and owner_address.get("city") else property_address
+    if not address.get("street") or not address.get("city") or not address.get("state"):
+        return None
+    return ensure_person_address_link(
+        db,
+        person_id,
+        address.get("street") or "",
+        address.get("city") or "",
+        address.get("state") or "",
+        address.get("postal_code") or "",
+        label=source_label,
+        set_default=set_default,
+    )
+
+
+def ensure_local_property_for_new_record_payload(db, property_uuid, payload, source="ReiSift New Records"):
+    payload = payload if isinstance(payload, dict) else {}
+    property_uuid = normalize_uuid(property_uuid or payload.get("uuid") or "")
+    if not property_uuid:
+        return {"property_id": None, "created": False, "skipped": True, "reason": "missing_property_uuid"}
+    existing = _find_local_property_for_reisift_new_record(db, property_uuid, payload)
+    if existing:
+        return {"property_id": int(existing["id"]), "created": False, "skipped": False, "reason": "already_matched"}
+
+    owner_uuid = normalize_uuid(_reisift_find_owner_uuid(payload) or "")
+    address = extract_reisift_property_address(payload)
+    intake = ensure_local_property_for_reisift_sync(
+        db,
+        property_uuid,
+        owner_uuid=owner_uuid,
+        address=address,
+        source=source,
+        added_by="System",
+    )
+    property_id = int(intake.get("property_id") or 0)
+    property_created = bool(intake.get("created"))
+    owners = iter_reisift_payload_owners(payload)
+    owner_person_ids = []
+    phones_created = 0
+    emails_created = 0
+    owner_addresses_created = 0
+    lists_text = extract_property_lists(payload)
+    tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
+    now_text = format_db_time(datetime.utcnow())
+    property_address = address
+
+    for idx, owner in enumerate(owners):
+        parts = _reisift_owner_name_parts(owner)
+        owner_notes = f"Created/imported from {source} for ReiSift property {property_uuid}."
+        person_id = int(find_or_create_person_by_name_parts(db, parts["first_name"], parts["last_name"], notes=owner_notes) or 0)
+        if person_id <= 0:
+            continue
+        owner_person_ids.append(person_id)
+        if idx == 0:
+            db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (person_id, property_id))
+        contact_counts = _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, source)
+        phones_created += int(contact_counts.get("phones_created") or 0)
+        emails_created += int(contact_counts.get("emails_created") or 0)
+        phones, emails = extract_owner_contacts_from_payload({"owner": owner})
+        primary_phone = normalize_phone((phones[0] or {}).get("value") if phones else "")
+        primary_email = normalize_email((emails[0] or {}).get("value") if emails else "")
+        if primary_phone or primary_email:
+            person_row = db.execute(
+                "SELECT primary_phone, primary_email FROM people WHERE id = ? LIMIT 1",
+                (person_id,),
+            ).fetchone()
+            assignments = []
+            params = []
+            if primary_phone and person_row and not normalize_phone(person_row["primary_phone"] or ""):
+                assignments.append("primary_phone = ?")
+                params.append(primary_phone)
+            if primary_email and person_row and not normalize_email(person_row["primary_email"] or ""):
+                assignments.append("primary_email = ?")
+                params.append(primary_email)
+            if assignments:
+                params.append(person_id)
+                db.execute(f"UPDATE people SET {', '.join(assignments)} WHERE id = ?", tuple(params))
+        if _ensure_reisift_owner_address(
+            db,
+            person_id,
+            owner,
+            property_address,
+            "ReiSift New Record Address",
+            set_default=(idx == 0),
+        ):
+            owner_addresses_created += 1
+        add_person_note(
+            db,
+            person_id,
+            "ReiSift New Records",
+            f"Imported from ReiSift New Records refresh for {format_property_address_line(address.get('street'), address.get('city'), address.get('state'), address.get('postal_code')) or property_uuid}.",
+            {
+                "property_uuid": property_uuid,
+                "owner_uuid": normalize_uuid(owner.get("uuid") or ""),
+                "owner_type": owner.get("type"),
+                "lists": lists_text,
+                "tags": tags,
+            },
+        )
+
+    note_bits = [f"ReiSift New Records local import on {now_text}."]
+    if lists_text:
+        note_bits.append(f"Lists: {lists_text}.")
+    if tags:
+        note_bits.append(f"Tags: {', '.join(str(tag) for tag in tags if str(tag).strip())}.")
+    prop = db.execute("SELECT notes FROM properties WHERE id = ? LIMIT 1", (property_id,)).fetchone()
+    db.execute(
+        "UPDATE properties SET notes = ? WHERE id = ?",
+        (append_note_line((prop["notes"] if prop else ""), " ".join(note_bits)), property_id),
+    )
+    db.execute(
+        """
+        INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            property_id,
+            owner_person_ids[0] if owner_person_ids else None,
+            "ReiSift New Records",
+            "Local property imported",
+            json.dumps(
+                {
+                    "property_uuid": property_uuid,
+                    "owner_uuid": owner_uuid,
+                    "property_created": property_created,
+                    "owner_person_ids": owner_person_ids,
+                    "phones_created": phones_created,
+                    "emails_created": emails_created,
+                    "owner_addresses_created": owner_addresses_created,
+                    "lists": lists_text,
+                    "tags": tags,
+                }
+            ),
+        ),
+    )
+    return {
+        "property_id": property_id,
+        "created": property_created,
+        "skipped": False,
+        "owner_person_ids": owner_person_ids,
+        "phones_created": phones_created,
+        "emails_created": emails_created,
+        "owner_addresses_created": owner_addresses_created,
+        "lists": lists_text,
+    }
 
 
 def extract_payload_address(payload):

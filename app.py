@@ -636,6 +636,13 @@ def format_long_date(value):
     return f"{dt.strftime('%A, %B')} {dt.day}, {dt.year}"
 
 
+def format_short_date(value):
+    dt = parse_flexible_datetime(value)
+    if dt is None:
+        return value or "-"
+    return dt.strftime("%m/%d/%y")
+
+
 def format_est_datetime(value):
     dt = parse_flexible_datetime(value)
     if dt is None:
@@ -646,6 +653,7 @@ def format_est_datetime(value):
 
 
 app.jinja_env.filters["fmt_long_date"] = format_long_date
+app.jinja_env.filters["fmt_short_date"] = format_short_date
 app.jinja_env.filters["fmt_est_datetime"] = format_est_datetime
 
 
@@ -28545,6 +28553,53 @@ def get_new_record_filter_options(db):
     return {"statuses": statuses, "counties": counties, "completeness": completeness, "owner_types": owner_types}
 
 
+def property_activity_counts_for_new_record(db, property_id):
+    empty = {
+        "mail_out": 0,
+        "sms_out": 0,
+        "sms_in": 0,
+        "email_out": 0,
+        "email_in": 0,
+        "emails_opened": 0,
+    }
+    try:
+        clean_property_id = int(property_id or 0)
+    except Exception:
+        clean_property_id = 0
+    if clean_property_id <= 0:
+        return dict(empty)
+
+    row = db.execute(
+        """
+        SELECT
+            SUM(CASE WHEN upper(channel)='SMS' AND lower(direction)='outbound' THEN 1 ELSE 0 END) AS sms_out,
+            SUM(CASE WHEN upper(channel)='SMS' AND lower(direction)='inbound' THEN 1 ELSE 0 END) AS sms_in,
+            SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='outbound' THEN 1 ELSE 0 END) AS email_out,
+            SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='inbound' THEN 1 ELSE 0 END) AS email_in,
+            SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='outbound' AND COALESCE(open_count, 0) > 0 THEN 1 ELSE 0 END) AS emails_opened
+        FROM communications
+        WHERE property_id = ?
+        """,
+        (clean_property_id,),
+    ).fetchone()
+    mail_row = db.execute(
+        """
+        SELECT COUNT(*) AS mail_out
+        FROM mail_orders
+        WHERE property_id = ?
+        """,
+        (clean_property_id,),
+    ).fetchone()
+    return {
+        "mail_out": int((mail_row["mail_out"] if mail_row else 0) or 0),
+        "sms_out": int((row["sms_out"] if row else 0) or 0),
+        "sms_in": int((row["sms_in"] if row else 0) or 0),
+        "email_out": int((row["email_out"] if row else 0) or 0),
+        "email_in": int((row["email_in"] if row else 0) or 0),
+        "emails_opened": int((row["emails_opened"] if row else 0) or 0),
+    }
+
+
 def get_cached_new_records(db, sort_dir="desc", filters=None):
     sort_reverse = str(sort_dir).lower() != "asc"
     rows = db.execute(
@@ -28570,6 +28625,7 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
         item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
         item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
         item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
+        item.update(property_activity_counts_for_new_record(db, item.get("deep_dive_property_id")))
         if not _new_record_matches_filters(item, filters):
             continue
         out.append(item)

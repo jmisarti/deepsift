@@ -110,11 +110,14 @@
                 <tr>
                     <th>Address</th>
                     <th>Status</th>
-                    <th>County</th>
-                    <th>Completeness</th>
-                    <th>Owner</th>
                     <th>Owner Name(s)</th>
                     <th>Date Added</th>
+                    <th>Mail Out</th>
+                    <th>SMS Out</th>
+                    <th>SMS In</th>
+                    <th>Email Out</th>
+                    <th>Email In</th>
+                    <th>Emails Opened</th>
                     <th>SIFT</th>
                 </tr>
             </thead>
@@ -123,11 +126,14 @@
                 <tr>
                     <td>{{ row.full_address or "-" }}</td>
                     <td><span class="pill">{{ row.status or "-" }}</span></td>
-                    <td>{{ row.county or "-" }}</td>
-                    <td>{{ row.completeness or "-" }}</td>
-                    <td>{{ row.owner_type or "-" }}</td>
                     <td>{{ row.owner_names or "-" }}</td>
-                    <td>{{ row.added_at|fmt_long_date }}</td>
+                    <td>{{ row.added_at|fmt_short_date }}</td>
+                    <td>{{ row.mail_out }}</td>
+                    <td>{{ row.sms_out }}</td>
+                    <td>{{ row.sms_in }}</td>
+                    <td>{{ row.email_out }}</td>
+                    <td>{{ row.email_in }}</td>
+                    <td>{{ row.emails_opened }}</td>
                     <td>
                         {% if row.deep_dive_property_id %}
                         <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.deep_dive_property_id) }}" title="Open in Deep Dive" aria-label="Open in Deep Dive">
@@ -146,7 +152,7 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="8">No New Records matched these filters. Click Refresh New Records or clear the filters.</td>
+                    <td colspan="11">No New Records matched these filters. Click Refresh New Records or clear the filters.</td>
                 </tr>
                 {% endfor %}
             </tbody>

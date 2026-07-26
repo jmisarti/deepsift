@@ -594,26 +594,38 @@ body {
 }
 
 .new-records-table {
-    font-size: 0.78rem;
-    min-width: 980px;
+    font-size: 0.7rem;
+    min-width: 1080px;
     white-space: nowrap;
 }
 
 .new-records-table th,
 .new-records-table td {
-    padding: 0.38rem 0.5rem;
+    padding: 0.26rem 0.34rem;
     white-space: nowrap;
 }
 
 .new-records-table td:first-child,
-.new-records-table td:nth-child(6) {
-    max-width: 260px;
+.new-records-table td:nth-child(3) {
+    max-width: 230px;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
+.new-records-table th:nth-child(n+5):nth-child(-n+10),
+.new-records-table td:nth-child(n+5):nth-child(-n+10) {
+    text-align: center;
+    width: 3.9rem;
+}
+
+.new-records-table th:last-child,
+.new-records-table td:last-child {
+    text-align: center;
+    width: 3.4rem;
+}
+
 .new-records-table .pill {
-    font-size: 0.72rem;
+    font-size: 0.66rem;
 }
 
 .action-icon-link {

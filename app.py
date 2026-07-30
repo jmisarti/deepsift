@@ -25030,6 +25030,36 @@ def _reisift_find_first_owner_dict(payload):
     return {}
 
 
+def _reisift_iter_owner_dicts(payload):
+    owners = []
+    seen_obj_ids = set()
+    queue = [payload]
+    while queue:
+        current = queue.pop(0)
+        if isinstance(current, dict):
+            owner = current.get("owner")
+            if isinstance(owner, dict) and id(owner) not in seen_obj_ids:
+                seen_obj_ids.add(id(owner))
+                owners.append(owner)
+            owner_list = current.get("owners")
+            if isinstance(owner_list, list):
+                for item in owner_list:
+                    if isinstance(item, dict) and id(item) not in seen_obj_ids:
+                        seen_obj_ids.add(id(item))
+                        owners.append(item)
+            if any(k in current for k in ("first_name", "last_name", "full_name", "phones", "emails")) and id(current) not in seen_obj_ids:
+                seen_obj_ids.add(id(current))
+                owners.append(current)
+            for value in current.values():
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+        elif isinstance(current, list):
+            for item in current:
+                if isinstance(item, (dict, list)):
+                    queue.append(item)
+    return owners
+
+
 def _reisift_find_owner_uuid(payload):
     if not isinstance(payload, (dict, list)):
         return ""
@@ -25784,6 +25814,7 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
         "property_uuid": "",
         "owner_uuid": "",
         "phones_attempted": 0,
+        "phones_skipped_existing": 0,
         "emails_attempted": 0,
         "error": "",
         "result": None,
@@ -25835,14 +25866,17 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
             out["error"] = f"Owner lookup failed before skiptrace sync: {exc}"
             return out
         existing_owner = _reisift_find_first_owner_dict(property_payload)
-        for item in _reisift_parse_owner_phones(existing_owner):
-            normalized = normalize_phone(item.get("number") or "")
-            if not normalized:
-                continue
-            existing_phones_by_number[normalized] = item
+        owners_to_scan = _reisift_iter_owner_dicts(property_payload) or ([existing_owner] if existing_owner else [])
+        for owner_item in owners_to_scan:
+            for item in _reisift_parse_owner_phones(owner_item):
+                normalized = normalize_phone(item.get("number") or "")
+                if not normalized:
+                    continue
+                existing_phones_by_number.setdefault(normalized, item)
         existing_emails = {
             str(value or "").strip().lower()
-            for value in _reisift_parse_owner_emails(existing_owner)
+            for owner_item in owners_to_scan
+            for value in _reisift_parse_owner_emails(owner_item)
             if str(value or "").strip()
         }
 
@@ -25881,11 +25915,13 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
             continue
         seen_phone.add(number)
         existing_phone = existing_phones_by_number.get(number) or {}
-        if p_type == "UNKNOWN" and str(existing_phone.get("type") or "").strip():
-            p_type = str(existing_phone.get("type") or "").strip().upper() or "UNKNOWN"
+        if existing_phone:
+            # Never re-upsert existing ReiSift phones; omitted metadata can clear call status/disposition fields.
+            out["phones_skipped_existing"] += 1
+            continue
         merged_tags = []
         seen_tags = set()
-        for tag_value in ["Relative", *(existing_phone.get("tags") or []), *raw_tags]:
+        for tag_value in ["Relative", *raw_tags]:
             tag = str(tag_value or "").strip()
             key = tag.lower()
             if not tag or key in seen_tags:

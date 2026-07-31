@@ -656,14 +656,14 @@ body {
 }
 
 .new-records-table {
-    font-size: 0.7rem;
-    min-width: 1080px;
+    font-size: 0.68rem;
+    min-width: 1160px;
     white-space: nowrap;
 }
 
 .new-records-table th,
 .new-records-table td {
-    padding: 0.26rem 0.34rem;
+    padding: 0.24rem 0.28rem;
     white-space: nowrap;
 }
 
@@ -674,10 +674,10 @@ body {
     text-overflow: ellipsis;
 }
 
-.new-records-table th:nth-child(n+5):nth-child(-n+10),
-.new-records-table td:nth-child(n+5):nth-child(-n+10) {
+.new-records-table th:nth-child(n+5):nth-child(-n+12),
+.new-records-table td:nth-child(n+5):nth-child(-n+12) {
     text-align: center;
-    width: 3.9rem;
+    width: 3.35rem;
 }
 
 .new-records-table th:last-child,

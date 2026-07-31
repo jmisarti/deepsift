@@ -29757,10 +29757,74 @@ def get_new_record_filter_options(db):
     return {"statuses": statuses, "counties": counties, "completeness": completeness, "owner_types": owner_types}
 
 
+def _new_record_call_direction_from_job(db, row):
+    payload = parse_json_object(row["payload_json"] or "{}", default={})
+    if not isinstance(payload, dict):
+        payload = {}
+    analysis = parse_json_object(row["analysis_json"] or "{}", default={})
+    if not isinstance(analysis, dict):
+        analysis = {}
+    webhook = payload.get("webhook") if isinstance(payload.get("webhook"), dict) else {}
+    explicit = (
+        extract_first_string_by_keys(analysis, ["call_direction", "direction"])
+        or extract_first_string_by_keys(payload, ["call_direction", "direction", "callDirection"])
+        or extract_first_string_by_keys(webhook, ["call_direction", "direction", "callDirection"])
+    )
+    direction = _phone_activity_direction(explicit or "", payload)
+    if direction == "unknown" and webhook:
+        direction = _phone_activity_direction(explicit or "", webhook)
+    if direction == "unknown":
+        user_name = (
+            _phone_activity_user_name(webhook)
+            if webhook and _phone_activity_user_name(webhook) != "Unknown"
+            else _phone_activity_user_name(payload)
+        )
+        inferred = _infer_call_direction_from_numbers(
+            db,
+            row["from_number"],
+            row["to_number"],
+            agent_user_name="" if user_name == "Unknown" else user_name,
+        )
+        direction = str(inferred or "").strip().casefold()
+    return direction if direction in {"inbound", "outbound"} else "unknown"
+
+
+def local_call_counts_for_new_record(db, property_id):
+    counts = {"call_out": 0, "call_in": 0}
+    try:
+        clean_property_id = int(property_id or 0)
+    except Exception:
+        clean_property_id = 0
+    if clean_property_id <= 0:
+        return counts
+    rows = db.execute(
+        """
+        SELECT *
+        FROM call_recording_jobs
+        WHERE property_id = ?
+        """,
+        (clean_property_id,),
+    ).fetchall()
+    seen = set()
+    for row in rows:
+        dedupe_key = row["call_sid"] or f"{row['id']}:{row['from_number']}:{row['to_number']}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        direction = _new_record_call_direction_from_job(db, row)
+        if direction == "inbound":
+            counts["call_in"] += 1
+        elif direction == "outbound":
+            counts["call_out"] += 1
+    return counts
+
+
 def property_activity_counts_for_new_record(db, property_id, new_record_row=None):
     nr = new_record_row if isinstance(new_record_row, dict) else {}
     empty = {
         "mail_out": 0,
+        "call_out": int(nr.get("outbound_calls") or 0),
+        "call_in": int(nr.get("inbound_calls") or 0),
         "sms_out": int(nr.get("outbound_sms") or 0),
         "sms_in": int(nr.get("inbound_sms") or 0),
         "email_out": int(nr.get("outbound_email") or 0),
@@ -29795,8 +29859,11 @@ def property_activity_counts_for_new_record(db, property_id, new_record_row=None
         """,
         (clean_property_id,),
     ).fetchone()
+    call_counts = local_call_counts_for_new_record(db, clean_property_id)
     return {
         "mail_out": int((mail_row["mail_out"] if mail_row else 0) or 0),
+        "call_out": max(call_counts["call_out"], int(nr.get("outbound_calls") or 0)),
+        "call_in": max(call_counts["call_in"], int(nr.get("inbound_calls") or 0)),
         "sms_out": max(int((row["sms_out"] if row else 0) or 0), int(nr.get("outbound_sms") or 0)),
         "sms_in": max(int((row["sms_in"] if row else 0) or 0), int(nr.get("inbound_sms") or 0)),
         "email_out": max(int((row["email_out"] if row else 0) or 0), int(nr.get("outbound_email") or 0)),

@@ -113,6 +113,8 @@
                     <th>Owner Name(s)</th>
                     <th>Date Added</th>
                     <th>Mail Out</th>
+                    <th>Call Out</th>
+                    <th>Call In</th>
                     <th>SMS Out</th>
                     <th>SMS In</th>
                     <th>Email Out</th>
@@ -129,6 +131,8 @@
                     <td>{{ row.owner_names or "-" }}</td>
                     <td>{{ row.added_at|fmt_short_date }}</td>
                     <td>{{ row.mail_out }}</td>
+                    <td>{{ row.call_out }}</td>
+                    <td>{{ row.call_in }}</td>
                     <td>{{ row.sms_out }}</td>
                     <td>{{ row.sms_in }}</td>
                     <td>{{ row.email_out }}</td>
@@ -152,7 +156,7 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="11">No New Records matched these filters. Click Refresh New Records or clear the filters.</td>
+                    <td colspan="13">No New Records matched these filters. Click Refresh New Records or clear the filters.</td>
                 </tr>
                 {% endfor %}
             </tbody>

@@ -956,6 +956,15 @@ def migrate_db(db):
     ensure_column(db, "reisift_new_records", "local_property_id", "local_property_id INTEGER")
     ensure_column(db, "reisift_new_records", "local_status_before", "local_status_before TEXT")
     ensure_column(db, "reisift_new_records", "local_status_after", "local_status_after TEXT")
+    ensure_column(db, "reisift_new_records", "outbound_calls", "outbound_calls INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "inbound_calls", "inbound_calls INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "outbound_sms", "outbound_sms INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "inbound_sms", "inbound_sms INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "outbound_email", "outbound_email INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "inbound_email", "inbound_email INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "inbound_responses", "inbound_responses INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "events_json", "events_json TEXT")
+    ensure_column(db, "reisift_new_records", "tasks_json", "tasks_json TEXT")
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_county ON reisift_new_records(is_active, county, added_at)"
     )
@@ -29383,9 +29392,10 @@ def sync_local_property_status_from_reisift_new_record(db, property_uuid, payloa
     return {"local_property_id": local_property_id, "before": before, "after": after}
 
 
-def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_active=1):
+def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_active=1, sift_rollup=None):
     payload = payload if isinstance(payload, dict) else {}
     search_row = search_row if isinstance(search_row, dict) else {}
+    sift_rollup = sift_rollup if isinstance(sift_rollup, dict) else {}
     summary = summarize_reisift_property(payload, fallback_payload=search_row)
     county = infer_county_from_reisift_payload(payload) or infer_county_from_reisift_payload(search_row)
     added_dt = reisift_added_at_dt(search_row, payload)
@@ -29418,8 +29428,11 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
         """
         INSERT INTO reisift_new_records
             (property_uuid, status, full_address, owner_names, county, added_at, reisift_updated_at,
-             local_property_id, local_status_before, local_status_after, payload_json, is_active, last_synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             local_property_id, local_status_before, local_status_after,
+             outbound_calls, inbound_calls, outbound_sms, inbound_sms, outbound_email, inbound_email,
+             inbound_responses, events_json, tasks_json,
+             payload_json, is_active, last_synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(property_uuid) DO UPDATE SET
             status = excluded.status,
             full_address = excluded.full_address,
@@ -29430,6 +29443,15 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
             local_property_id = excluded.local_property_id,
             local_status_before = excluded.local_status_before,
             local_status_after = excluded.local_status_after,
+            outbound_calls = excluded.outbound_calls,
+            inbound_calls = excluded.inbound_calls,
+            outbound_sms = excluded.outbound_sms,
+            inbound_sms = excluded.inbound_sms,
+            outbound_email = excluded.outbound_email,
+            inbound_email = excluded.inbound_email,
+            inbound_responses = excluded.inbound_responses,
+            events_json = excluded.events_json,
+            tasks_json = excluded.tasks_json,
             payload_json = excluded.payload_json,
             is_active = excluded.is_active,
             last_synced_at = excluded.last_synced_at
@@ -29445,6 +29467,15 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
             local_sync["local_property_id"],
             local_sync["before"],
             local_sync["after"],
+            int(sift_rollup.get("outbound_calls") or 0),
+            int(sift_rollup.get("inbound_calls") or 0),
+            int(sift_rollup.get("outbound_sms") or 0),
+            int(sift_rollup.get("inbound_sms") or 0),
+            int(sift_rollup.get("outbound_email") or 0),
+            int(sift_rollup.get("inbound_email") or 0),
+            int(sift_rollup.get("inbound_responses") or 0),
+            json.dumps(sift_rollup.get("events") or []),
+            json.dumps(sift_rollup.get("tasks") or []),
             json.dumps(payload or search_row),
             int(bool(is_active)),
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
@@ -29490,12 +29521,34 @@ def refresh_reisift_new_records_cache(db):
             details = fetch_reisift_property_payload(token, property_uuid)
         except Exception as exc:
             errors.append(f"{property_uuid}: detail fallback used ({exc})")
+        sift_rollup = {
+            "outbound_calls": 0,
+            "inbound_calls": 0,
+            "outbound_sms": 0,
+            "inbound_sms": 0,
+            "outbound_email": 0,
+            "inbound_email": 0,
+            "inbound_responses": 0,
+            "events": [],
+            "tasks": [],
+        }
+        try:
+            sift_rollup = fetch_reisift_property_log_rollup(token, property_uuid, max_rows=120)
+        except Exception as exc:
+            errors.append(f"{property_uuid} logs: {exc}")
         county = infer_county_from_reisift_payload(details) or infer_county_from_reisift_payload(row)
         if county and not is_target_new_record_county(county):
             skipped_county += 1
             continue
         try:
-            local_sync = upsert_reisift_new_record(db, property_uuid, details, search_row=row, is_active=1)
+            local_sync = upsert_reisift_new_record(
+                db,
+                property_uuid,
+                details,
+                search_row=row,
+                is_active=1,
+                sift_rollup=sift_rollup,
+            )
             if local_sync.get("local_property_id") and local_sync.get("before") != local_sync.get("after"):
                 local_updates += 1
             local_import = local_sync.get("local_import") if isinstance(local_sync.get("local_import"), dict) else {}
@@ -29687,13 +29740,14 @@ def get_new_record_filter_options(db):
     return {"statuses": statuses, "counties": counties, "completeness": completeness, "owner_types": owner_types}
 
 
-def property_activity_counts_for_new_record(db, property_id):
+def property_activity_counts_for_new_record(db, property_id, new_record_row=None):
+    nr = new_record_row if isinstance(new_record_row, dict) else {}
     empty = {
         "mail_out": 0,
-        "sms_out": 0,
-        "sms_in": 0,
-        "email_out": 0,
-        "email_in": 0,
+        "sms_out": int(nr.get("outbound_sms") or 0),
+        "sms_in": int(nr.get("inbound_sms") or 0),
+        "email_out": int(nr.get("outbound_email") or 0),
+        "email_in": int(nr.get("inbound_email") or 0),
         "emails_opened": 0,
     }
     try:
@@ -29726,10 +29780,10 @@ def property_activity_counts_for_new_record(db, property_id):
     ).fetchone()
     return {
         "mail_out": int((mail_row["mail_out"] if mail_row else 0) or 0),
-        "sms_out": int((row["sms_out"] if row else 0) or 0),
-        "sms_in": int((row["sms_in"] if row else 0) or 0),
-        "email_out": int((row["email_out"] if row else 0) or 0),
-        "email_in": int((row["email_in"] if row else 0) or 0),
+        "sms_out": max(int((row["sms_out"] if row else 0) or 0), int(nr.get("outbound_sms") or 0)),
+        "sms_in": max(int((row["sms_in"] if row else 0) or 0), int(nr.get("inbound_sms") or 0)),
+        "email_out": max(int((row["email_out"] if row else 0) or 0), int(nr.get("outbound_email") or 0)),
+        "email_in": max(int((row["email_in"] if row else 0) or 0), int(nr.get("inbound_email") or 0)),
         "emails_opened": int((row["emails_opened"] if row else 0) or 0),
     }
 
@@ -29759,7 +29813,7 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
         item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
         item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
         item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
-        item.update(property_activity_counts_for_new_record(db, item.get("deep_dive_property_id")))
+        item.update(property_activity_counts_for_new_record(db, item.get("deep_dive_property_id"), item))
         if not _new_record_matches_filters(item, filters):
             continue
         out.append(item)

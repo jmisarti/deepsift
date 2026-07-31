@@ -13,6 +13,7 @@
         <a class="settings-tab {% if active_tab == 'direct_mail' %}active{% endif %}" href="{{ url_for('settings_page', tab='direct_mail') }}">Direct Mail Settings</a>
         <a class="settings-tab {% if active_tab == 'deep_dive' %}active{% endif %}" href="{{ url_for('settings_page', tab='deep_dive') }}">Deep Dive Settings</a>
         <a class="settings-tab {% if active_tab == 'referral' %}active{% endif %}" href="{{ url_for('settings_page', tab='referral') }}">Referral Settings</a>
+        <a class="settings-tab {% if active_tab == 'sms_automation' %}active{% endif %}" href="{{ url_for('settings_page', tab='sms_automation') }}">SMS Automation</a>
         <a class="settings-tab {% if active_tab == 'email' %}active{% endif %}" href="{{ url_for('settings_page', tab='email') }}">Email Settings</a>
         <a class="settings-tab {% if active_tab == 'ads' %}active{% endif %}" href="{{ url_for('settings_page', tab='ads') }}">Ad Platforms</a>
         <a class="settings-tab {% if active_tab == 'integrations' %}active{% endif %}" href="{{ url_for('settings_page', tab='integrations') }}">Integration Settings</a>
@@ -73,6 +74,69 @@
             </label>
             <button type="submit">Save Referral Settings</button>
         </form>
+    {% elif active_tab == 'sms_automation' %}
+        <p>Configure the dedicated sender pool for New Records SMS drafts. Phase 1 requires manual approval before sending.</p>
+        <form method="post" class="grid-form">
+            <input type="hidden" name="settings_tab" value="sms_automation">
+            <label class="span2">Automation SmrtPhone Number Pool
+                <textarea name="sms_automation_from_numbers" rows="4" placeholder="9733975960">{{ sms_automation_settings.from_numbers_raw }}</textarea>
+            </label>
+            <label>Number Strategy
+                <select name="sms_automation_number_strategy">
+                    <option value="rotate" {% if sms_automation_settings.number_strategy == 'rotate' %}selected{% endif %}>Rotate</option>
+                    <option value="default" {% if sms_automation_settings.number_strategy == 'default' %}selected{% endif %}>Default First Number</option>
+                    <option value="by_bucket" {% if sms_automation_settings.number_strategy == 'by_bucket' %}selected{% endif %}>By Bucket</option>
+                </select>
+            </label>
+            <label>Send Window Start
+                <input name="sms_automation_send_window_start" value="{{ sms_automation_settings.send_window_start }}" placeholder="09:15">
+            </label>
+            <label>Send Window End
+                <input name="sms_automation_send_window_end" value="{{ sms_automation_settings.send_window_end }}" placeholder="16:45">
+            </label>
+            <label>Max Sends / Number / Day
+                <input name="sms_automation_max_daily_per_number" value="{{ sms_automation_settings.max_daily_per_number }}" type="number" min="1">
+            </label>
+            <label>Minimum Gap Seconds
+                <input name="sms_automation_min_gap_seconds" value="{{ sms_automation_settings.min_gap_seconds }}" type="number" min="30">
+            </label>
+            <div class="span2 inline-actions">
+                <button type="submit">Save SMS Automation Settings</button>
+                <a class="button-link secondary" href="{{ url_for('sms_queue_page') }}">Open SMS Queue</a>
+            </div>
+        </form>
+        <h3>Routing Rules</h3>
+        <p class="muted-text">Rules are evaluated by priority. The highest-priority matching list/source and contact role determines the draft text. Multi-list records are flagged in the SMS Queue.</p>
+        <div class="table-wrap">
+            <table class="crm-table">
+                <thead>
+                    <tr>
+                        <th>Priority</th>
+                        <th>Rule</th>
+                        <th>List/Source Match</th>
+                        <th>Role</th>
+                        <th>Bucket</th>
+                        <th>Sequence</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for rule in sms_automation_rules %}
+                    <tr>
+                        <td>{{ rule.priority }}</td>
+                        <td>{{ rule.name }}</td>
+                        <td>{{ rule.list_contains or 'Fallback' }}</td>
+                        <td>{{ rule.contact_role }}</td>
+                        <td>{{ rule.bucket }}</td>
+                        <td>{{ rule.sequence_name }}</td>
+                        <td>{{ 'Active' if rule.is_active else 'Inactive' }}</td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="7">No SMS routing rules found.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
     {% elif active_tab == 'email' %}
         <p>Configure API-based outbound email providers.</p>
         <form method="post" class="grid-form">

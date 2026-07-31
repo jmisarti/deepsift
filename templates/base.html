@@ -22,6 +22,7 @@
                 <div class="sidebar-group">
                     <p class="sidebar-group-title">Prospects</p>
                     <a class="sidebar-link {% if request.path.startswith('/new-records') %}active{% endif %}" href="{{ url_for('new_records_page') }}">New Records</a>
+                    <a class="sidebar-link {% if request.path.startswith('/sms-queue') %}active{% endif %}" href="{{ url_for('sms_queue_page') }}">SMS Queue</a>
                 </div>
 
                 <div class="sidebar-group">

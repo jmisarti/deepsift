@@ -79,6 +79,68 @@ body {
     transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
 }
 
+.sms-queue-table-wrap {
+    overflow-x: auto;
+}
+
+.sms-queue-table {
+    font-size: 0.82rem;
+    min-width: 1180px;
+}
+
+.sms-queue-table th,
+.sms-queue-table td {
+    vertical-align: top;
+}
+
+.sms-message-form {
+    display: grid;
+    gap: 0.35rem;
+    min-width: 300px;
+}
+
+.sms-message-form textarea {
+    font-size: 0.82rem;
+    line-height: 1.35;
+    min-height: 74px;
+    resize: vertical;
+}
+
+.sms-queue-actions {
+    display: grid;
+    gap: 0.35rem;
+    min-width: 92px;
+}
+
+.sms-queue-reason {
+    color: var(--muted);
+    font-size: 0.74rem;
+    line-height: 1.25;
+    margin-top: 0.2rem;
+}
+
+.sms-queue-flags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    margin-top: 0.35rem;
+}
+
+.sms-queue-flags span {
+    background: #fff4d7;
+    border: 1px solid #efd48b;
+    border-radius: 999px;
+    color: #775600;
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 0.12rem 0.42rem;
+}
+
+.compact-icons {
+    gap: 0.25rem;
+    margin-top: 0.25rem;
+}
+
 .sidebar-link:hover {
     background: #18303e;
     border-color: #38515f;

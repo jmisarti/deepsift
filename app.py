@@ -161,6 +161,17 @@ GMAIL_WATCH_RENEWAL_WORKER_ENABLED = env_flag("GMAIL_WATCH_RENEWAL_WORKER_ENABLE
 GMAIL_WATCH_RENEWAL_POLL_SECONDS = max(int((os.getenv("GMAIL_WATCH_RENEWAL_POLL_SECONDS") or "86400").strip() or "86400"), 3600)
 GMAIL_PUBSUB_TOPIC_NAME = (os.getenv("GMAIL_PUBSUB_TOPIC_NAME") or "").strip()
 SMS_DECISION_DELAY_SECONDS = max(int((os.getenv("SMS_DECISION_DELAY_SECONDS") or "300").strip() or "300"), 30)
+SMS_AUTOMATION_DEFAULT_FROM_NUMBER = os.getenv("SMS_AUTOMATION_DEFAULT_FROM_NUMBER", "9733975960").strip() or "9733975960"
+SMS_AUTOMATION_DEFAULT_SEND_START = os.getenv("SMS_AUTOMATION_DEFAULT_SEND_START", "09:15").strip() or "09:15"
+SMS_AUTOMATION_DEFAULT_SEND_END = os.getenv("SMS_AUTOMATION_DEFAULT_SEND_END", "16:45").strip() or "16:45"
+SMS_AUTOMATION_DEFAULT_MAX_DAILY_PER_NUMBER = max(
+    int((os.getenv("SMS_AUTOMATION_DEFAULT_MAX_DAILY_PER_NUMBER") or "100").strip() or "100"),
+    1,
+)
+SMS_AUTOMATION_DEFAULT_GAP_SECONDS = max(
+    int((os.getenv("SMS_AUTOMATION_DEFAULT_GAP_SECONDS") or "75").strip() or "75"),
+    30,
+)
 WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or "600").strip() or "600"), 60)
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
 MARKET_STATUS_REMOTE_URL = (os.getenv("MARKET_STATUS_REMOTE_URL") or "").strip()
@@ -951,6 +962,120 @@ def migrate_db(db):
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_local_property ON reisift_new_records(local_property_id)"
     )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS property_source_info (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            property_id INTEGER NOT NULL UNIQUE,
+            property_uuid TEXT,
+            source_info_bucket TEXT,
+            sheriff_sale_date TEXT,
+            source_info_raw TEXT,
+            source_info_json TEXT,
+            last_checked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(property_id) REFERENCES properties(id)
+        )
+        """
+    )
+    ensure_column(db, "property_source_info", "property_uuid", "property_uuid TEXT")
+    ensure_column(db, "property_source_info", "source_info_bucket", "source_info_bucket TEXT")
+    ensure_column(db, "property_source_info", "sheriff_sale_date", "sheriff_sale_date TEXT")
+    ensure_column(db, "property_source_info", "source_info_raw", "source_info_raw TEXT")
+    ensure_column(db, "property_source_info", "source_info_json", "source_info_json TEXT")
+    ensure_column(db, "property_source_info", "last_checked_at", "last_checked_at TEXT")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_property_source_info_uuid ON property_source_info(property_uuid)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sms_automation_routing_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_key TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            list_contains TEXT,
+            bucket TEXT,
+            contact_role TEXT,
+            sequence_name TEXT,
+            template_body TEXT NOT NULL,
+            fallback_template_body TEXT,
+            review_flags_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    for col, ddl in [
+        ("rule_key", "rule_key TEXT"),
+        ("name", "name TEXT"),
+        ("priority", "priority INTEGER NOT NULL DEFAULT 0"),
+        ("is_active", "is_active INTEGER NOT NULL DEFAULT 1"),
+        ("list_contains", "list_contains TEXT"),
+        ("bucket", "bucket TEXT"),
+        ("contact_role", "contact_role TEXT"),
+        ("sequence_name", "sequence_name TEXT"),
+        ("template_body", "template_body TEXT NOT NULL DEFAULT ''"),
+        ("fallback_template_body", "fallback_template_body TEXT"),
+        ("review_flags_json", "review_flags_json TEXT"),
+        ("updated_at", "updated_at TEXT"),
+    ]:
+        ensure_column(db, "sms_automation_routing_rules", col, ddl)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_routing_rules_active ON sms_automation_routing_rules(is_active, priority)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sms_automation_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            queue_key TEXT NOT NULL UNIQUE,
+            property_id INTEGER NOT NULL,
+            person_id INTEGER,
+            touchpoint_id INTEGER,
+            phone_number TEXT NOT NULL,
+            from_number TEXT,
+            contact_role TEXT,
+            bucket TEXT,
+            rule_key TEXT,
+            sequence_name TEXT,
+            step_order INTEGER NOT NULL DEFAULT 1,
+            message_body TEXT NOT NULL,
+            rendered_variables_json TEXT,
+            source_info_json TEXT,
+            status TEXT NOT NULL DEFAULT 'Draft',
+            suppression_reason TEXT,
+            scheduled_for TEXT,
+            approved_at TEXT,
+            sent_at TEXT,
+            external_id TEXT,
+            communication_id INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(property_id) REFERENCES properties(id),
+            FOREIGN KEY(person_id) REFERENCES people(id),
+            FOREIGN KEY(touchpoint_id) REFERENCES touchpoints(id),
+            FOREIGN KEY(communication_id) REFERENCES communications(id)
+        )
+        """
+    )
+    for col, ddl in [
+        ("queue_key", "queue_key TEXT"),
+        ("from_number", "from_number TEXT"),
+        ("contact_role", "contact_role TEXT"),
+        ("bucket", "bucket TEXT"),
+        ("rule_key", "rule_key TEXT"),
+        ("sequence_name", "sequence_name TEXT"),
+        ("step_order", "step_order INTEGER NOT NULL DEFAULT 1"),
+        ("rendered_variables_json", "rendered_variables_json TEXT"),
+        ("source_info_json", "source_info_json TEXT"),
+        ("suppression_reason", "suppression_reason TEXT"),
+        ("scheduled_for", "scheduled_for TEXT"),
+        ("approved_at", "approved_at TEXT"),
+        ("sent_at", "sent_at TEXT"),
+        ("external_id", "external_id TEXT"),
+        ("communication_id", "communication_id INTEGER"),
+        ("updated_at", "updated_at TEXT"),
+    ]:
+        ensure_column(db, "sms_automation_queue", col, ddl)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_status ON sms_automation_queue(status, scheduled_for)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_property ON sms_automation_queue(property_id)")
     ensure_column(db, "mail_orders", "status_updated_at", "status_updated_at TEXT")
     ensure_column(db, "mail_orders", "last_event_type", "last_event_type TEXT")
     ensure_column(db, "mail_orders", "external_order_item_id", "external_order_item_id TEXT")
@@ -1894,6 +2019,7 @@ def init_db():
     migrate_db(db)
     normalize_people_name_data(db)
     ensure_default_sequence_campaign(db)
+    ensure_default_sms_automation_routing_rules(db)
 
     has_properties = db.execute("SELECT COUNT(*) AS c FROM properties").fetchone()["c"]
     if not has_properties:
@@ -1913,6 +2039,7 @@ def ensure_db():
     normalize_people_name_data(db)
     backfill_openletterconnect_mail_orders(db)
     ensure_default_sequence_campaign(db)
+    ensure_default_sms_automation_routing_rules(db)
     db.commit()
     db.close()
 
@@ -9260,6 +9387,52 @@ def get_deep_dive_sms_number(db):
 
 def get_referral_sms_number(db):
     return (get_setting(db, "referral_smrtphone_from", "") or "").strip() or SMRTPHONE_FROM_NUMBER
+
+
+def get_sms_automation_settings(db):
+    numbers = []
+    raw_numbers = get_setting(db, "sms_automation_from_numbers", SMS_AUTOMATION_DEFAULT_FROM_NUMBER)
+    for item in re.split(r"[,;\n]+", str(raw_numbers or "")):
+        normalized = normalize_phone(item)
+        if normalized and normalized not in numbers:
+            numbers.append(normalized)
+    if not numbers:
+        fallback = normalize_phone(SMS_AUTOMATION_DEFAULT_FROM_NUMBER) or normalize_phone(SMRTPHONE_FROM_NUMBER)
+        if fallback:
+            numbers.append(fallback)
+    strategy = (get_setting(db, "sms_automation_number_strategy", "rotate") or "rotate").strip().lower()
+    if strategy not in {"default", "rotate", "by_bucket"}:
+        strategy = "rotate"
+    try:
+        max_daily = int(get_setting(db, "sms_automation_max_daily_per_number", str(SMS_AUTOMATION_DEFAULT_MAX_DAILY_PER_NUMBER)) or SMS_AUTOMATION_DEFAULT_MAX_DAILY_PER_NUMBER)
+    except Exception:
+        max_daily = SMS_AUTOMATION_DEFAULT_MAX_DAILY_PER_NUMBER
+    try:
+        gap_seconds = int(get_setting(db, "sms_automation_min_gap_seconds", str(SMS_AUTOMATION_DEFAULT_GAP_SECONDS)) or SMS_AUTOMATION_DEFAULT_GAP_SECONDS)
+    except Exception:
+        gap_seconds = SMS_AUTOMATION_DEFAULT_GAP_SECONDS
+    return {
+        "from_numbers": numbers,
+        "from_numbers_raw": "\n".join(numbers),
+        "number_strategy": strategy,
+        "send_window_start": (get_setting(db, "sms_automation_send_window_start", SMS_AUTOMATION_DEFAULT_SEND_START) or SMS_AUTOMATION_DEFAULT_SEND_START).strip(),
+        "send_window_end": (get_setting(db, "sms_automation_send_window_end", SMS_AUTOMATION_DEFAULT_SEND_END) or SMS_AUTOMATION_DEFAULT_SEND_END).strip(),
+        "max_daily_per_number": max(1, max_daily),
+        "min_gap_seconds": max(30, gap_seconds),
+        "approval_mode": "manual",
+    }
+
+
+def select_sms_automation_from_number(db, bucket="", contact_role=""):
+    settings = get_sms_automation_settings(db)
+    numbers = settings.get("from_numbers") or []
+    if not numbers:
+        return get_deep_dive_sms_number(db)
+    if len(numbers) == 1 or settings.get("number_strategy") == "default":
+        return numbers[0]
+    seed = f"{bucket or ''}|{contact_role or ''}|{datetime.now(EST_TZ).strftime('%Y-%m-%d')}"
+    idx = int(hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:8], 16) % len(numbers)
+    return numbers[idx]
 
 
 def get_email_settings(db):
@@ -28362,6 +28535,788 @@ def refresh_prospecting_new_records_once():
     return {"snapshot": snapshot_result, "sync": sync_result}
 
 
+SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES = {
+    "wrong number",
+    "incorrect",
+    "dead",
+    "dnc",
+    "dnt",
+    "opt out",
+    "opt-out",
+    "undeliverable",
+    "not in service",
+    "invalid",
+    "bounced",
+}
+
+SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES = {"new record", "new records"}
+
+
+def _sms_bucket_from_payload(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    texts = _sms_source_terms_from_payload(payload)
+    haystack = " ".join(texts).lower()
+    if "sheriff" in haystack:
+        return "Sheriff Sale"
+    if "probate" in haystack:
+        return "Probate"
+    if "foreclosure" in haystack or "lis pendens" in haystack or "preforeclosure" in haystack:
+        return "Foreclosure"
+    return "General New Record"
+
+
+def _sms_source_terms_from_payload(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    texts = []
+    lists_text = extract_property_lists(payload)
+    if lists_text:
+        texts.append(lists_text)
+    for key in ["list", "list_name", "source", "source_name", "status", "tags"]:
+        val = payload.get(key)
+        if isinstance(val, list):
+            texts.extend([str(item) for item in val if str(item or "").strip()])
+        elif isinstance(val, dict):
+            texts.extend([str(v) for v in val.values() if str(v or "").strip()])
+        elif str(val or "").strip():
+            texts.append(str(val))
+    return [normalize_whitespace(text) for text in texts if normalize_whitespace(text)]
+
+
+def _sms_route_role(contact_role):
+    return "owner" if (contact_role or "").strip().lower() in {"owner", "co-owner", "co owner"} else "relative"
+
+
+def _sms_rule_tokens(rule):
+    return [
+        normalize_whitespace(token).lower()
+        for token in re.split(r"[,;\n|]+", str(rule.get("list_contains") if isinstance(rule, dict) else rule["list_contains"] or ""))
+        if normalize_whitespace(token)
+    ]
+
+
+def _sms_rule_source_matches(rule, source_terms):
+    tokens = _sms_rule_tokens(rule)
+    if not tokens:
+        return True
+    haystack = " ".join(str(term or "") for term in (source_terms or [])).lower()
+    return any(token in haystack for token in tokens)
+
+
+def _sms_rule_role_matches(rule, contact_role):
+    wanted = str((rule.get("contact_role") if isinstance(rule, dict) else rule["contact_role"]) or "").strip().lower()
+    if not wanted:
+        return True
+    return wanted == _sms_route_role(contact_role)
+
+
+def resolve_sms_automation_route(db, payload, contact_role):
+    payload = payload if isinstance(payload, dict) else {}
+    source_terms = _sms_source_terms_from_payload(payload)
+    rows = db.execute(
+        """
+        SELECT *
+        FROM sms_automation_routing_rules
+        WHERE COALESCE(is_active, 1) = 1
+        ORDER BY priority DESC, id ASC
+        """
+    ).fetchall()
+    matched_buckets = []
+    matched_rule_names = []
+    for row in rows:
+        if _sms_rule_tokens(row) and _sms_rule_source_matches(row, source_terms):
+            bucket = str(row["bucket"] or "").strip()
+            if bucket and bucket not in matched_buckets:
+                matched_buckets.append(bucket)
+            name = str(row["name"] or "").strip()
+            if name and name not in matched_rule_names:
+                matched_rule_names.append(name)
+    selected = None
+    fallback = None
+    for row in rows:
+        if not _sms_rule_role_matches(row, contact_role):
+            continue
+        tokens = _sms_rule_tokens(row)
+        if not tokens:
+            fallback = fallback or row
+            continue
+        if _sms_rule_source_matches(row, source_terms):
+            selected = row
+            break
+    selected = selected or fallback
+    if not selected:
+        bucket = _sms_bucket_from_payload(payload)
+        role = _sms_route_role(contact_role)
+        return {
+            "rule_key": f"fallback_{bucket.lower().replace(' ', '_')}_{role}",
+            "name": f"Fallback {bucket} {role.title()}",
+            "bucket": bucket,
+            "contact_role": role,
+            "sequence_name": _sms_sequence_name(bucket, role),
+            "template_body": _sms_template_for_bucket(bucket, role, has_sale_date=True),
+            "fallback_template_body": _sms_template_for_bucket(bucket, role, has_sale_date=False),
+            "review_flags": [],
+            "matched_buckets": matched_buckets,
+            "matched_rule_names": matched_rule_names,
+            "source_terms": source_terms,
+        }
+    return {
+        "rule_key": str(selected["rule_key"] or "").strip(),
+        "name": str(selected["name"] or "").strip(),
+        "bucket": str(selected["bucket"] or "").strip() or "General New Record",
+        "contact_role": str(selected["contact_role"] or "").strip() or _sms_route_role(contact_role),
+        "sequence_name": str(selected["sequence_name"] or "").strip() or _sms_sequence_name(selected["bucket"], contact_role),
+        "template_body": str(selected["template_body"] or "").strip(),
+        "fallback_template_body": str(selected["fallback_template_body"] or "").strip(),
+        "review_flags": parse_json_object(selected["review_flags_json"] or "[]", default=[]),
+        "matched_buckets": matched_buckets,
+        "matched_rule_names": matched_rule_names,
+        "source_terms": source_terms,
+    }
+
+
+def _sms_template_for_bucket(bucket, contact_role, has_sale_date=False):
+    bucket_key = (bucket or "").strip().lower()
+    role_key = (contact_role or "").strip().lower()
+    is_relative = role_key not in {"owner", "co-owner", "co owner"}
+    if bucket_key == "sheriff sale":
+        if is_relative:
+            if has_sale_date:
+                return "Hi {first_name}, this is Laura. I'm trying to reach the owner of {property_address}. I saw a sheriff sale may be scheduled for {sheriff_sale_date}. Are you connected to the owner?"
+            return "Hi {first_name}, this is Laura. I'm trying to reach the owner of {property_address}. I saw there may be a sheriff sale issue tied to the property. Are you connected to the owner?"
+        if has_sale_date:
+            return "Hi {first_name}, this is Laura. I'm reaching out about {property_address}. I saw a sheriff sale may be scheduled for {sheriff_sale_date}. Are you still looking at options before then?"
+        return "Hi {first_name}, this is Laura. I'm reaching out about {property_address}. I saw there may be a sheriff sale issue tied to the property. Are you still looking at options?"
+    if bucket_key == "probate":
+        if is_relative:
+            return "Hi {first_name}, this is Laura. I'm trying to reach the right person for {property_address}. Do you know who is handling the property?"
+        return "Hi {first_name}, this is Laura. I'm reaching out about {property_address}. Curious to know what the plans are with the property?"
+    if bucket_key == "foreclosure":
+        if is_relative:
+            return "Hi {first_name}, this is Laura. I'm trying to reach the owner of {property_address}. I saw there may be a foreclosure-related issue. Are you connected to them?"
+        return "Hi {first_name}, this is Laura. I'm reaching out about {property_address}. I saw there may be a foreclosure-related issue. Are you still looking at options for the property?"
+    if is_relative:
+        return "Hi {first_name}, this is Laura. I'm trying to reach the right person for {property_address}. Are you connected to the owner?"
+    return "Hi {first_name}, this is Laura. I'm reaching out about {property_address}. Are you the owner, or the right person to speak with?"
+
+
+def _default_sms_routing_rules():
+    return [
+        {
+            "rule_key": "sheriff_sale_owner",
+            "name": "Sheriff Sale - Owner",
+            "priority": 100,
+            "list_contains": "sheriff",
+            "bucket": "Sheriff Sale",
+            "contact_role": "owner",
+            "template_body": _sms_template_for_bucket("Sheriff Sale", "owner", has_sale_date=True),
+            "fallback_template_body": _sms_template_for_bucket("Sheriff Sale", "owner", has_sale_date=False),
+            "review_flags": ["time_sensitive"],
+        },
+        {
+            "rule_key": "sheriff_sale_relative",
+            "name": "Sheriff Sale - Relative",
+            "priority": 99,
+            "list_contains": "sheriff",
+            "bucket": "Sheriff Sale",
+            "contact_role": "relative",
+            "template_body": _sms_template_for_bucket("Sheriff Sale", "relative", has_sale_date=True),
+            "fallback_template_body": _sms_template_for_bucket("Sheriff Sale", "relative", has_sale_date=False),
+            "review_flags": ["time_sensitive", "relative_copy"],
+        },
+        {
+            "rule_key": "foreclosure_owner",
+            "name": "Foreclosure - Owner",
+            "priority": 80,
+            "list_contains": "foreclosure,lis pendens,preforeclosure",
+            "bucket": "Foreclosure",
+            "contact_role": "owner",
+            "template_body": _sms_template_for_bucket("Foreclosure", "owner"),
+            "fallback_template_body": "",
+            "review_flags": [],
+        },
+        {
+            "rule_key": "foreclosure_relative",
+            "name": "Foreclosure - Relative",
+            "priority": 79,
+            "list_contains": "foreclosure,lis pendens,preforeclosure",
+            "bucket": "Foreclosure",
+            "contact_role": "relative",
+            "template_body": _sms_template_for_bucket("Foreclosure", "relative"),
+            "fallback_template_body": "",
+            "review_flags": ["relative_copy"],
+        },
+        {
+            "rule_key": "probate_owner",
+            "name": "Probate - Owner",
+            "priority": 60,
+            "list_contains": "probate",
+            "bucket": "Probate",
+            "contact_role": "owner",
+            "template_body": _sms_template_for_bucket("Probate", "owner"),
+            "fallback_template_body": "",
+            "review_flags": [],
+        },
+        {
+            "rule_key": "probate_relative",
+            "name": "Probate - Relative",
+            "priority": 59,
+            "list_contains": "probate",
+            "bucket": "Probate",
+            "contact_role": "relative",
+            "template_body": _sms_template_for_bucket("Probate", "relative"),
+            "fallback_template_body": "",
+            "review_flags": ["relative_copy"],
+        },
+        {
+            "rule_key": "general_new_record_owner",
+            "name": "General New Record - Owner",
+            "priority": 10,
+            "list_contains": "",
+            "bucket": "General New Record",
+            "contact_role": "owner",
+            "template_body": _sms_template_for_bucket("General New Record", "owner"),
+            "fallback_template_body": "",
+            "review_flags": [],
+        },
+        {
+            "rule_key": "general_new_record_relative",
+            "name": "General New Record - Relative",
+            "priority": 9,
+            "list_contains": "",
+            "bucket": "General New Record",
+            "contact_role": "relative",
+            "template_body": _sms_template_for_bucket("General New Record", "relative"),
+            "fallback_template_body": "",
+            "review_flags": ["relative_copy"],
+        },
+    ]
+
+
+def ensure_default_sms_automation_routing_rules(db):
+    for rule in _default_sms_routing_rules():
+        existing = db.execute(
+            "SELECT id FROM sms_automation_routing_rules WHERE rule_key = ? LIMIT 1",
+            (rule["rule_key"],),
+        ).fetchone()
+        if existing:
+            continue
+        db.execute(
+            """
+            INSERT INTO sms_automation_routing_rules
+                (rule_key, name, priority, is_active, list_contains, bucket, contact_role,
+                 sequence_name, template_body, fallback_template_body, review_flags_json)
+            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                rule["rule_key"],
+                rule["name"],
+                int(rule["priority"]),
+                rule["list_contains"],
+                rule["bucket"],
+                rule["contact_role"],
+                _sms_sequence_name(rule["bucket"], rule["contact_role"]),
+                rule["template_body"],
+                rule["fallback_template_body"],
+                json.dumps(rule["review_flags"]),
+            ),
+        )
+
+
+def _sms_sequence_name(bucket, contact_role):
+    role = "Relative" if (contact_role or "").strip().lower() not in {"owner", "co-owner", "co owner"} else "Owner"
+    return f"{bucket or 'General New Record'} {role} SMS"
+
+
+def _extract_text_fragments(value, out=None, depth=0):
+    out = out if out is not None else []
+    if depth > 5:
+        return out
+    if isinstance(value, str):
+        text = normalize_whitespace(value)
+        if text:
+            out.append(text)
+    elif isinstance(value, dict):
+        preferred = [
+            "message",
+            "note",
+            "notes",
+            "body",
+            "text",
+            "description",
+            "content",
+            "title",
+            "summary",
+        ]
+        for key in preferred:
+            if key in value:
+                _extract_text_fragments(value.get(key), out=out, depth=depth + 1)
+        for key, val in value.items():
+            if key not in preferred:
+                _extract_text_fragments(val, out=out, depth=depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            _extract_text_fragments(item, out=out, depth=depth + 1)
+    return out
+
+
+def parse_reisift_source_info_text(text):
+    raw = str(text or "")
+    if not raw or "source info" not in raw.lower():
+        return {}
+    window = raw
+    idx = raw.lower().find("source info")
+    if idx >= 0:
+        window = raw[idx : idx + 900]
+    bucket = ""
+    sale_date = ""
+    bucket_match = re.search(r"\bbucket\s*:?\s*([^;\n\r]+)", window, flags=re.IGNORECASE)
+    if bucket_match:
+        bucket = normalize_whitespace(bucket_match.group(1))
+    sale_match = re.search(r"\bsale\s*:?\s*(\d{4}-\d{2}-\d{2})", window, flags=re.IGNORECASE)
+    if sale_match:
+        sale_date = sale_match.group(1)
+    if not sale_date:
+        sale_match = re.search(r"\bsale\s*:?\s*(\d{1,2}/\d{1,2}/\d{2,4})", window, flags=re.IGNORECASE)
+        if sale_match:
+            parsed = None
+            for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+                try:
+                    parsed = datetime.strptime(sale_match.group(1), fmt)
+                    break
+                except ValueError:
+                    continue
+            if parsed:
+                sale_date = parsed.strftime("%Y-%m-%d")
+    if not bucket and not sale_date:
+        return {}
+    return {
+        "source_info_bucket": bucket,
+        "sheriff_sale_date": sale_date,
+        "source_info_raw": normalize_whitespace(window),
+    }
+
+
+def fetch_reisift_property_messages(token, property_uuid, max_pages=2):
+    property_uuid = normalize_uuid(property_uuid)
+    if not token or not property_uuid:
+        return []
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "x-reisift-ui-version": REISIFT_UI_VERSION,
+    }
+    candidates = [
+        f"{REISIFT_BASE_URL}/api/internal/property/{property_uuid}/messages/?page={{page}}",
+        f"{REISIFT_BASE_URL}/api/internal/property/{property_uuid}/messages/?offset={{offset}}&limit=100",
+        f"{REISIFT_BASE_URL}/api/internal/property/{property_uuid}/logs/?offset={{offset}}&limit=100",
+    ]
+    out = []
+    for template in candidates:
+        for page in range(1, max_pages + 1):
+            url = template.format(page=page, offset=(page - 1) * 100)
+            try:
+                resp = requests.get(url, headers=headers, timeout=20)
+                if resp.status_code in {404, 405}:
+                    break
+                resp.raise_for_status()
+                payload = resp.json() if resp.headers.get("content-type", "").lower().startswith("application/json") else {}
+            except Exception:
+                if page == 1:
+                    break
+                continue
+            rows = []
+            if isinstance(payload, dict):
+                for key in ["results", "messages", "data", "items"]:
+                    if isinstance(payload.get(key), list):
+                        rows = payload.get(key)
+                        break
+                if not rows:
+                    rows = [payload]
+            elif isinstance(payload, list):
+                rows = payload
+            out.extend(rows)
+            if not rows:
+                break
+    return out
+
+
+def refresh_property_source_info_from_reisift(db, token, property_id, property_uuid):
+    property_id = int(property_id or 0)
+    property_uuid = normalize_uuid(property_uuid)
+    if property_id <= 0 or not property_uuid:
+        return {}
+    messages = fetch_reisift_property_messages(token, property_uuid)
+    parsed = {}
+    matched_text = ""
+    for item in messages:
+        fragments = _extract_text_fragments(item)
+        for text in fragments:
+            candidate = parse_reisift_source_info_text(text)
+            if candidate:
+                parsed = candidate
+                matched_text = text
+                break
+        if parsed:
+            break
+    existing = db.execute(
+        "SELECT source_info_bucket, sheriff_sale_date, source_info_raw FROM property_source_info WHERE property_id = ?",
+        (property_id,),
+    ).fetchone()
+    source_info = {
+        "source_info_bucket": parsed.get("source_info_bucket") or (existing["source_info_bucket"] if existing else ""),
+        "sheriff_sale_date": parsed.get("sheriff_sale_date") or (existing["sheriff_sale_date"] if existing else ""),
+        "source_info_raw": parsed.get("source_info_raw") or (existing["source_info_raw"] if existing else ""),
+        "matched_text": matched_text,
+        "message_count": len(messages),
+        "parsed": bool(parsed),
+    }
+    db.execute(
+        """
+        INSERT INTO property_source_info
+            (property_id, property_uuid, source_info_bucket, sheriff_sale_date, source_info_raw, source_info_json, last_checked_at)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(property_id) DO UPDATE SET
+            property_uuid = excluded.property_uuid,
+            source_info_bucket = excluded.source_info_bucket,
+            sheriff_sale_date = excluded.sheriff_sale_date,
+            source_info_raw = excluded.source_info_raw,
+            source_info_json = excluded.source_info_json,
+            last_checked_at = CURRENT_TIMESTAMP
+        """,
+        (
+            property_id,
+            property_uuid,
+            source_info["source_info_bucket"],
+            source_info["sheriff_sale_date"],
+            source_info["source_info_raw"],
+            json.dumps(source_info),
+        ),
+    )
+    return source_info
+
+
+def _sms_automation_property_row(db, property_id):
+    return db.execute(
+        """
+        SELECT p.id, p.status, p.owner_person_id, p.resident_person_id, p.reisift_property_uuid,
+               a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        LIMIT 1
+        """,
+        (int(property_id or 0),),
+    ).fetchone()
+
+
+def sms_automation_property_suppression_reason(db, property_id):
+    prop = _sms_automation_property_row(db, property_id)
+    if not prop:
+        return "Property no longer exists locally."
+    status = _normalize_reisift_status(prop["status"] or "")
+    if status not in SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES:
+        return f"Property status is '{prop['status'] or '-'}', not New Record."
+    return ""
+
+
+def sms_automation_touchpoint_suppression_reason(db, touchpoint_id):
+    row = db.execute(
+        "SELECT channel_label, status, value FROM touchpoints WHERE id = ? LIMIT 1",
+        (int(touchpoint_id or 0),),
+    ).fetchone()
+    if not row:
+        return "Phone touchpoint no longer exists."
+    label = (row["channel_label"] or "").strip().lower()
+    if label not in {"mobile", "unknown", ""}:
+        return f"Phone type '{row['channel_label'] or 'Unknown'}' is not SMS eligible."
+    status = (row["status"] or "").strip().lower()
+    if status in SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES:
+        return f"Phone status '{row['status'] or '-'}' is suppressed."
+    if not normalize_phone(row["value"]):
+        return "Phone number is invalid."
+    return ""
+
+
+def revalidate_sms_automation_queue(db, property_ids=None):
+    clauses = ["status IN ('Draft', 'Queued', 'Approved', 'Scheduled')"]
+    params = []
+    if property_ids:
+        ids = [int(pid) for pid in property_ids if int(pid or 0) > 0]
+        if ids:
+            clauses.append("property_id IN (" + ",".join(["?"] * len(ids)) + ")")
+            params.extend(ids)
+    rows = db.execute(
+        f"""
+        SELECT id, property_id, touchpoint_id
+        FROM sms_automation_queue
+        WHERE {' AND '.join(clauses)}
+        """,
+        tuple(params),
+    ).fetchall()
+    suppressed = 0
+    for row in rows:
+        reason = sms_automation_property_suppression_reason(db, row["property_id"])
+        if not reason:
+            reason = sms_automation_touchpoint_suppression_reason(db, row["touchpoint_id"])
+        if reason:
+            db.execute(
+                """
+                UPDATE sms_automation_queue
+                SET status = 'Suppressed', suppression_reason = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (reason, row["id"]),
+            )
+            suppressed += 1
+    return suppressed
+
+
+def _sms_automation_template_variables(person, prop, bucket, contact_role, source_info, lists_text):
+    person_first = (person["first_name"] if person else "") or ""
+    person_last = (person["last_name"] if person else "") or ""
+    property_address = format_property_address_line(prop["street"], prop["city"], prop["state"], prop["postal_code"]) if prop else ""
+    return {
+        "first_name": person_first,
+        "last_name": person_last,
+        "full_name": f"{person_first} {person_last}".strip(),
+        "owner_name": "",
+        "property_address": property_address,
+        "property_city": (prop["city"] if prop else "") or "",
+        "property_state": (prop["state"] if prop else "") or "",
+        "property_zip": (prop["postal_code"] if prop else "") or "",
+        "list_name": lists_text or bucket,
+        "sheriff_sale_date": (source_info or {}).get("sheriff_sale_date") or "",
+        "source_info_bucket": (source_info or {}).get("source_info_bucket") or "",
+        "county": "",
+        "contact_role": contact_role or "",
+    }
+
+
+def render_sms_automation_template(template, variables):
+    text = str(template or "")
+    variables = variables if isinstance(variables, dict) else {}
+    for key, value in variables.items():
+        text = text.replace("{" + key + "}", str(value or ""))
+    return normalize_whitespace(text)
+
+
+def collect_sms_automation_targets_for_property(db, property_id):
+    prop = _sms_automation_property_row(db, property_id)
+    if not prop:
+        return []
+    network_ids, _ = build_property_network(db, prop)
+    if prop["owner_person_id"] and int(prop["owner_person_id"]) not in network_ids:
+        network_ids.insert(0, int(prop["owner_person_id"]))
+    if not network_ids:
+        return []
+    placeholders = ",".join(["?"] * len(network_ids))
+    rows = db.execute(
+        f"""
+        SELECT t.id AS touchpoint_id, t.person_id, t.value, t.channel_label, t.status,
+               pe.first_name, pe.last_name
+        FROM touchpoints t
+        JOIN people pe ON pe.id = t.person_id
+        WHERE t.person_id IN ({placeholders})
+          AND lower(t.channel_type) = 'phone'
+        ORDER BY t.created_at ASC, t.id ASC
+        """,
+        tuple(network_ids),
+    ).fetchall()
+    out = []
+    seen = set()
+    for row in rows:
+        normalized = normalize_phone(row["value"])
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if sms_automation_touchpoint_suppression_reason(db, row["touchpoint_id"]):
+            continue
+        role = _reisift_contact_role_for_person(db, int(property_id), row["person_id"])
+        out.append({"row": row, "phone_norm": normalized, "contact_role": role})
+    return out
+
+
+def upsert_sms_automation_draft(db, property_id, target, route, source_info, payload):
+    prop = _sms_automation_property_row(db, property_id)
+    if not prop:
+        return "skipped"
+    row = target.get("row")
+    if not row:
+        return "skipped"
+    contact_role = target.get("contact_role") or "unknown"
+    route = route if isinstance(route, dict) else {}
+    bucket = route.get("bucket") or _sms_bucket_from_payload(payload if isinstance(payload, dict) else {})
+    lists_text = extract_property_lists(payload if isinstance(payload, dict) else {})
+    has_sale_date = bool((source_info or {}).get("sheriff_sale_date"))
+    if (bucket or "").strip().lower() == "sheriff sale" and not has_sale_date and route.get("fallback_template_body"):
+        template = route.get("fallback_template_body")
+    else:
+        template = route.get("template_body") or _sms_template_for_bucket(bucket, contact_role, has_sale_date=has_sale_date)
+    variables = _sms_automation_template_variables(row, prop, bucket, contact_role, source_info or {}, lists_text)
+    owner = db.execute("SELECT first_name, last_name FROM people WHERE id = ?", (prop["owner_person_id"],)).fetchone() if prop["owner_person_id"] else None
+    if owner:
+        variables["owner_name"] = f"{owner['first_name'] or ''} {owner['last_name'] or ''}".strip()
+    message = render_sms_automation_template(template, variables)
+    phone_norm = target.get("phone_norm") or normalize_phone(row["value"])
+    rule_key = route.get("rule_key") or f"{re.sub(r'[^a-z0-9]+', '_', (bucket or 'general').lower()).strip('_')}:{'relative' if contact_role.lower() not in {'owner', 'co-owner', 'co owner'} else 'owner'}"
+    queue_key = f"nr1:{property_id}:{row['person_id']}:{row['touchpoint_id']}:{phone_norm}:{rule_key}"
+    from_number = select_sms_automation_from_number(db, bucket=bucket, contact_role=contact_role)
+    review_flags = list(route.get("review_flags") or [])
+    if (bucket or "").strip().lower() == "sheriff sale" and not has_sale_date:
+        review_flags.append("sheriff_sale_date_not_parsed")
+    matched_buckets = route.get("matched_buckets") or []
+    if len(matched_buckets) > 1:
+        review_flags.append("multi_list_match")
+    source_json = {
+        "source_info": source_info or {},
+        "review_flags": list(dict.fromkeys([str(flag) for flag in review_flags if str(flag or "").strip()])),
+        "payload_lists": lists_text,
+        "routing": {
+            "rule_key": rule_key,
+            "rule_name": route.get("name") or "",
+            "matched_buckets": matched_buckets,
+            "matched_rule_names": route.get("matched_rule_names") or [],
+            "source_terms": route.get("source_terms") or [],
+        },
+    }
+    existing = db.execute(
+        "SELECT id, status FROM sms_automation_queue WHERE queue_key = ? LIMIT 1",
+        (queue_key,),
+    ).fetchone()
+    if existing:
+        if str(existing["status"] or "").strip() in {"Sent", "Sending"}:
+            return "already_sent"
+        db.execute(
+            """
+            UPDATE sms_automation_queue
+            SET from_number = ?,
+                contact_role = ?,
+                bucket = ?,
+                rule_key = ?,
+                sequence_name = ?,
+                message_body = ?,
+                rendered_variables_json = ?,
+                source_info_json = ?,
+                suppression_reason = CASE WHEN status = 'Suppressed' THEN suppression_reason ELSE '' END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                from_number,
+                contact_role,
+                bucket,
+                rule_key,
+                route.get("sequence_name") or _sms_sequence_name(bucket, contact_role),
+                message,
+                json.dumps(variables),
+                json.dumps(source_json),
+                existing["id"],
+            ),
+        )
+        return "updated"
+    db.execute(
+        """
+        INSERT INTO sms_automation_queue
+            (queue_key, property_id, person_id, touchpoint_id, phone_number, from_number, contact_role,
+             bucket, rule_key, sequence_name, step_order, message_body, rendered_variables_json,
+             source_info_json, status, scheduled_for)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 'Draft', ?)
+        """,
+        (
+            queue_key,
+            property_id,
+            row["person_id"],
+            row["touchpoint_id"],
+            phone_norm,
+            from_number,
+            contact_role,
+            bucket,
+            rule_key,
+            route.get("sequence_name") or _sms_sequence_name(bucket, contact_role),
+            message,
+            json.dumps(variables),
+            json.dumps(source_json),
+            format_db_time(datetime.utcnow()),
+        ),
+    )
+    return "created"
+
+
+def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=None):
+    token = token or ""
+    clauses = ["COALESCE(n.is_active, 1) = 1", "COALESCE(n.local_property_id, 0) > 0"]
+    params = []
+    if property_ids:
+        ids = [int(pid) for pid in property_ids if int(pid or 0) > 0]
+        if ids:
+            clauses.append("n.local_property_id IN (" + ",".join(["?"] * len(ids)) + ")")
+            params.extend(ids)
+    rows = db.execute(
+        f"""
+        SELECT n.*
+        FROM reisift_new_records n
+        WHERE {' AND '.join(clauses)}
+        ORDER BY COALESCE(n.added_at, n.last_synced_at) DESC, n.id DESC
+        LIMIT 2000
+        """,
+        tuple(params),
+    ).fetchall()
+    created = updated = skipped = suppressed = 0
+    touched_property_ids = set()
+    for row in rows:
+        property_id = int(row["local_property_id"] or 0)
+        if property_id <= 0:
+            skipped += 1
+            continue
+        touched_property_ids.add(property_id)
+        reason = sms_automation_property_suppression_reason(db, property_id)
+        if reason:
+            skipped += 1
+            continue
+        payload = parse_json_object(row["payload_json"] or "{}", default={})
+        source_terms = _sms_source_terms_from_payload(payload)
+        has_sheriff_source = "sheriff" in " ".join(source_terms).lower()
+        source_info = {}
+        if has_sheriff_source and token:
+            try:
+                source_info = refresh_property_source_info_from_reisift(db, token, property_id, row["property_uuid"])
+            except Exception as exc:
+                source_info = {"error": str(exc), "parsed": False}
+        else:
+            existing_source = db.execute(
+                "SELECT source_info_bucket, sheriff_sale_date, source_info_raw, source_info_json FROM property_source_info WHERE property_id = ?",
+                (property_id,),
+            ).fetchone()
+            if existing_source:
+                source_info = {
+                    "source_info_bucket": existing_source["source_info_bucket"] or "",
+                    "sheriff_sale_date": existing_source["sheriff_sale_date"] or "",
+                    "source_info_raw": existing_source["source_info_raw"] or "",
+                    "cached": True,
+                }
+        targets = collect_sms_automation_targets_for_property(db, property_id)
+        if not targets:
+            skipped += 1
+            continue
+        for target in targets:
+            route = resolve_sms_automation_route(db, payload, target.get("contact_role") or "")
+            outcome = upsert_sms_automation_draft(db, property_id, target, route, source_info, payload)
+            if outcome == "created":
+                created += 1
+            elif outcome == "updated":
+                updated += 1
+            else:
+                skipped += 1
+    suppressed += revalidate_sms_automation_queue(db, property_ids=touched_property_ids if touched_property_ids else property_ids)
+    return {
+        "records": len(rows),
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "suppressed": suppressed,
+    }
+
+
 def _find_local_property_for_reisift_new_record(db, property_uuid, payload):
     property_uuid = normalize_uuid(property_uuid)
     if property_uuid:
@@ -28529,6 +29484,11 @@ def refresh_reisift_new_records_cache(db):
             synced += 1
         except Exception as exc:
             errors.append(f"{property_uuid}: {exc}")
+    sms_queue = {"created": 0, "updated": 0, "skipped": 0, "suppressed": 0}
+    try:
+        sms_queue = generate_sms_automation_queue_for_new_records(db, token=token)
+    except Exception as exc:
+        errors.append(f"sms_queue: {exc}")
     set_setting(db, "reisift_new_records_last_refresh_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
     commit_with_retry(db)
     return {
@@ -28542,6 +29502,7 @@ def refresh_reisift_new_records_cache(db):
         "local_imports": local_imports,
         "imported_phones": imported_phones,
         "imported_emails": imported_emails,
+        "sms_queue": sms_queue,
         "errors": errors,
     }
 
@@ -28591,7 +29552,9 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
             message = (
                 f"Cached {result.get('synced', 0)} row(s) from {result.get('scanned', 0)} scanned; "
                 f"created/imported {result.get('local_imports', 0)} local record(s); "
-                f"updated {result.get('local_updates', 0)} local status value(s)."
+                f"updated {result.get('local_updates', 0)} local status value(s); "
+                f"SMS drafts created {((result.get('sms_queue') or {}).get('created', 0))}, "
+                f"suppressed {((result.get('sms_queue') or {}).get('suppressed', 0))}."
             )
             set_reisift_new_records_refresh_state(db, "complete", message, result=result)
             db.commit()
@@ -35128,6 +36091,332 @@ def new_records_refresh_status_api():
     return jsonify({"ok": True, "state": get_reisift_new_records_refresh_state(db)})
 
 
+def _sms_automation_today_window_utc():
+    now_et = datetime.now(EST_TZ)
+    start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_et = start_et + timedelta(days=1)
+    return (
+        start_et.astimezone(timezone.utc).replace(tzinfo=None),
+        end_et.astimezone(timezone.utc).replace(tzinfo=None),
+    )
+
+
+def _sms_automation_within_send_window(db):
+    settings = get_sms_automation_settings(db)
+    now_et = datetime.now(EST_TZ)
+    sh, sm = parse_hhmm(settings.get("send_window_start"), 9, 15)
+    eh, em = parse_hhmm(settings.get("send_window_end"), 16, 45)
+    start = now_et.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end = now_et.replace(hour=eh, minute=em, second=0, microsecond=0)
+    return start <= now_et <= end, start, end
+
+
+def _sms_automation_rate_limit_reason(db, from_number):
+    settings = get_sms_automation_settings(db)
+    from_norm = normalize_phone(from_number)
+    if not from_norm:
+        return "Missing automation from-number."
+    day_start, day_end = _sms_automation_today_window_utc()
+    sent_count = db.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM sms_automation_queue
+        WHERE replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+          AND status = 'Sent'
+          AND sent_at >= ?
+          AND sent_at < ?
+        """,
+        (f"%{from_norm}", format_db_time(day_start), format_db_time(day_end)),
+    ).fetchone()["c"]
+    if int(sent_count or 0) >= int(settings["max_daily_per_number"]):
+        return f"Daily cap reached for {format_phone_display(from_norm)} ({sent_count}/{settings['max_daily_per_number']})."
+    latest = db.execute(
+        """
+        SELECT sent_at
+        FROM sms_automation_queue
+        WHERE replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+          AND status = 'Sent'
+        ORDER BY sent_at DESC
+        LIMIT 1
+        """,
+        (f"%{from_norm}",),
+    ).fetchone()
+    if latest and latest["sent_at"]:
+        dt = parse_db_time(latest["sent_at"])
+        if dt:
+            elapsed = (datetime.utcnow() - dt).total_seconds()
+            if elapsed < int(settings["min_gap_seconds"]):
+                return f"Minimum gap not reached for {format_phone_display(from_norm)}; wait {int(settings['min_gap_seconds'] - elapsed)} second(s)."
+    return ""
+
+
+def _sms_automation_send_queue_item(db, queue_id):
+    row = db.execute("SELECT * FROM sms_automation_queue WHERE id = ? LIMIT 1", (int(queue_id or 0),)).fetchone()
+    if not row:
+        return {"ok": False, "error": "Queue item not found."}
+    if str(row["status"] or "") not in {"Draft", "Queued", "Approved", "Scheduled", "Failed"}:
+        return {"ok": False, "error": f"Queue item status '{row['status']}' cannot be sent."}
+    reason = sms_automation_property_suppression_reason(db, row["property_id"])
+    if not reason:
+        reason = sms_automation_touchpoint_suppression_reason(db, row["touchpoint_id"])
+    if reason:
+        db.execute(
+            "UPDATE sms_automation_queue SET status = 'Suppressed', suppression_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (reason, row["id"]),
+        )
+        return {"ok": False, "error": reason, "suppressed": True}
+    within, start, end = _sms_automation_within_send_window(db)
+    if not within:
+        return {
+            "ok": False,
+            "error": f"Outside send window ({start.strftime('%I:%M %p')} - {end.strftime('%I:%M %p')} ET).",
+        }
+    rate_reason = _sms_automation_rate_limit_reason(db, row["from_number"])
+    if rate_reason:
+        return {"ok": False, "error": rate_reason}
+    to_number = row["phone_number"]
+    body = row["message_body"]
+    from_number = row["from_number"] or select_sms_automation_from_number(db, row["bucket"], row["contact_role"])
+    try:
+        db.execute(
+            "UPDATE sms_automation_queue SET status = 'Sending', from_number = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (from_number, row["id"]),
+        )
+        send_res = send_smrtphone_sms(to_number, body, from_number=from_number)
+        status = send_res.get("status") or "Sent"
+        external_id = send_res.get("sms_id") or ""
+        cur = db.execute(
+            """
+            INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id)
+            VALUES (?, ?, 'SMS', 'Outbound', ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                row["property_id"],
+                row["person_id"],
+                from_number,
+                to_number,
+                body,
+                status,
+                format_db_time(datetime.utcnow()),
+                external_id,
+            ),
+        )
+        if row["person_id"]:
+            update_person_outreach_status_for_sms(db, row["person_id"], "outbound_success")
+        db.execute(
+            """
+            UPDATE sms_automation_queue
+            SET status = 'Sent',
+                sent_at = ?,
+                external_id = ?,
+                communication_id = ?,
+                suppression_reason = '',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (format_db_time(datetime.utcnow()), external_id, cur.lastrowid, row["id"]),
+        )
+        return {"ok": True, "communication_id": cur.lastrowid, "external_id": external_id}
+    except Exception as exc:
+        apply_touchpoint_status_inference(db, to_number, str(exc))
+        db.execute(
+            """
+            UPDATE sms_automation_queue
+            SET status = 'Failed',
+                suppression_reason = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (str(exc), row["id"]),
+        )
+        return {"ok": False, "error": str(exc)}
+
+
+def get_sms_automation_queue_rows(db, filters=None):
+    filters = filters if isinstance(filters, dict) else {}
+    clauses = []
+    params = []
+    status = (filters.get("status") or "").strip()
+    if status:
+        clauses.append("q.status = ?")
+        params.append(status)
+    bucket = (filters.get("bucket") or "").strip()
+    if bucket:
+        clauses.append("q.bucket = ?")
+        params.append(bucket)
+    role = (filters.get("contact_role") or "").strip()
+    if role:
+        if role.lower() == "relative":
+            clauses.append("lower(COALESCE(q.contact_role, '')) NOT IN ('owner', 'co-owner', 'co owner')")
+        else:
+            clauses.append("lower(COALESCE(q.contact_role, '')) IN ('owner', 'co-owner', 'co owner')")
+    where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = db.execute(
+        f"""
+        SELECT q.*, p.status AS property_status, p.reisift_property_uuid,
+               a.street, a.city, a.state, a.postal_code,
+               pe.first_name, pe.last_name, t.channel_label, t.status AS phone_status
+        FROM sms_automation_queue q
+        JOIN properties p ON p.id = q.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        LEFT JOIN people pe ON pe.id = q.person_id
+        LEFT JOIN touchpoints t ON t.id = q.touchpoint_id
+        {where_sql}
+        ORDER BY
+            CASE q.status
+                WHEN 'Draft' THEN 1
+                WHEN 'Queued' THEN 2
+                WHEN 'Approved' THEN 3
+                WHEN 'Scheduled' THEN 4
+                WHEN 'Failed' THEN 5
+                WHEN 'Suppressed' THEN 6
+                WHEN 'Held' THEN 7
+                WHEN 'Sent' THEN 8
+                ELSE 9
+            END,
+            q.updated_at DESC,
+            q.id DESC
+        LIMIT 500
+        """,
+        tuple(params),
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["property_address"] = format_property_address_line(d.get("street"), d.get("city"), d.get("state"), d.get("postal_code"))
+        d["person_name"] = f"{d.get('first_name') or ''} {d.get('last_name') or ''}".strip()
+        d["sift_url"] = _sift_record_url(d.get("reisift_property_uuid") or "")
+        src = parse_json_object(d.get("source_info_json") or "{}", default={})
+        d["review_flags"] = src.get("review_flags") if isinstance(src.get("review_flags"), list) else []
+        routing = src.get("routing") if isinstance(src.get("routing"), dict) else {}
+        d["routing_rule_name"] = str(routing.get("rule_name") or "").strip()
+        d["matched_buckets"] = routing.get("matched_buckets") if isinstance(routing.get("matched_buckets"), list) else []
+        out.append(d)
+    return out
+
+
+@app.route("/sms-queue")
+def sms_queue_page():
+    ensure_db()
+    db = get_db()
+    filters = {
+        "status": (request.args.get("status") or "").strip(),
+        "bucket": (request.args.get("bucket") or "").strip(),
+        "contact_role": (request.args.get("contact_role") or "").strip(),
+    }
+    notice = (request.args.get("notice") or "").strip()
+    error = (request.args.get("error") or "").strip()
+    rows = get_sms_automation_queue_rows(db, filters=filters)
+    summary_rows = db.execute(
+        """
+        SELECT status, COUNT(*) AS c
+        FROM sms_automation_queue
+        GROUP BY status
+        """
+    ).fetchall()
+    summary = {r["status"]: int(r["c"] or 0) for r in summary_rows}
+    return render_template(
+        "sms_queue.html",
+        rows=rows,
+        filters=filters,
+        notice=notice,
+        error=error,
+        summary=summary,
+        settings=get_sms_automation_settings(db),
+    )
+
+
+@app.route("/sms-queue/generate", methods=["POST"])
+def sms_queue_generate():
+    ensure_db()
+    db = get_db()
+    try:
+        token = reisift_get_access_token()
+        result = generate_sms_automation_queue_for_new_records(db, token=token)
+        db.commit()
+        notice = f"SMS queue refreshed: created {result['created']}, updated {result['updated']}, suppressed {result['suppressed']}."
+        return redirect(url_for("sms_queue_page", notice=notice))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("sms_queue_page", error=f"Generate failed: {exc}"))
+
+
+@app.route("/sms-queue/revalidate", methods=["POST"])
+def sms_queue_revalidate():
+    ensure_db()
+    db = get_db()
+    try:
+        suppressed = revalidate_sms_automation_queue(db)
+        db.commit()
+        return redirect(url_for("sms_queue_page", notice=f"Revalidated queue. Suppressed {suppressed} item(s)."))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("sms_queue_page", error=f"Revalidate failed: {exc}"))
+
+
+@app.route("/sms-queue/<int:queue_id>/update", methods=["POST"])
+def sms_queue_update_item(queue_id):
+    ensure_db()
+    db = get_db()
+    message_body = (request.form.get("message_body") or "").strip()
+    if not message_body:
+        return redirect(url_for("sms_queue_page", error="Message body is required."))
+    row = db.execute("SELECT status FROM sms_automation_queue WHERE id = ? LIMIT 1", (queue_id,)).fetchone()
+    if not row:
+        return redirect(url_for("sms_queue_page", error=f"SMS draft #{queue_id} was not found."))
+    if str(row["status"] or "") in {"Sent", "Sending"}:
+        return redirect(url_for("sms_queue_page", error=f"SMS draft #{queue_id} has already been sent and cannot be edited."))
+    db.execute(
+        """
+        UPDATE sms_automation_queue
+        SET message_body = ?,
+            status = CASE WHEN status = 'Suppressed' THEN status ELSE 'Draft' END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (message_body, queue_id),
+    )
+    db.commit()
+    return redirect(url_for("sms_queue_page", notice=f"Updated SMS draft #{queue_id}."))
+
+
+@app.route("/sms-queue/<int:queue_id>/action", methods=["POST"])
+def sms_queue_item_action(queue_id):
+    ensure_db()
+    db = get_db()
+    action = (request.form.get("action") or "").strip().lower()
+    try:
+        if action == "hold":
+            db.execute(
+                "UPDATE sms_automation_queue SET status = 'Held', suppression_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                ("Manually held for review.", queue_id),
+            )
+            db.commit()
+            return redirect(url_for("sms_queue_page", notice=f"Held SMS draft #{queue_id}."))
+        if action == "approve":
+            reason = revalidate_sms_automation_queue(db, property_ids=[])
+            row = db.execute("SELECT status FROM sms_automation_queue WHERE id = ?", (queue_id,)).fetchone()
+            if row and row["status"] == "Suppressed":
+                db.commit()
+                return redirect(url_for("sms_queue_page", error=f"Draft #{queue_id} is suppressed and cannot be approved."))
+            db.execute(
+                "UPDATE sms_automation_queue SET status = 'Approved', approved_at = ?, suppression_reason = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (format_db_time(datetime.utcnow()), queue_id),
+            )
+            db.commit()
+            return redirect(url_for("sms_queue_page", notice=f"Approved SMS draft #{queue_id}."))
+        if action == "send":
+            result = _sms_automation_send_queue_item(db, queue_id)
+            db.commit()
+            if result.get("ok"):
+                return redirect(url_for("sms_queue_page", notice=f"Sent SMS draft #{queue_id}."))
+            return redirect(url_for("sms_queue_page", error=f"Send failed for #{queue_id}: {result.get('error') or 'Unknown error'}"))
+        return redirect(url_for("sms_queue_page", error="Unknown SMS queue action."))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("sms_queue_page", error=f"SMS queue action failed: {exc}"))
+
+
 @app.route("/submitted-leads")
 def submitted_leads_page():
     ensure_db()
@@ -37257,6 +38546,18 @@ def settings_page():
         elif active_tab == "referral":
             set_setting(db, "referral_smrtphone_from", request.form.get("referral_smrtphone_from", ""))
             notice = "Referral settings saved."
+        elif active_tab == "sms_automation":
+            fields = {
+                "sms_automation_from_numbers": request.form.get("sms_automation_from_numbers", ""),
+                "sms_automation_number_strategy": request.form.get("sms_automation_number_strategy", "rotate"),
+                "sms_automation_send_window_start": request.form.get("sms_automation_send_window_start", SMS_AUTOMATION_DEFAULT_SEND_START),
+                "sms_automation_send_window_end": request.form.get("sms_automation_send_window_end", SMS_AUTOMATION_DEFAULT_SEND_END),
+                "sms_automation_max_daily_per_number": request.form.get("sms_automation_max_daily_per_number", str(SMS_AUTOMATION_DEFAULT_MAX_DAILY_PER_NUMBER)),
+                "sms_automation_min_gap_seconds": request.form.get("sms_automation_min_gap_seconds", str(SMS_AUTOMATION_DEFAULT_GAP_SECONDS)),
+            }
+            for key, value in fields.items():
+                set_setting(db, key, value)
+            notice = "SMS automation settings saved."
         elif active_tab == "email":
             fields = {
                 "email_from_name": request.form.get("email_from_name", ""),
@@ -37518,6 +38819,14 @@ def settings_page():
     skipsherpa_api_key = get_skipsherpa_api_key(db)
     rentcast_api_key = get_rentcast_api_key(db)
     slybroadcast_settings = get_slybroadcast_settings(db)
+    sms_automation_settings = get_sms_automation_settings(db)
+    sms_automation_rules = db.execute(
+        """
+        SELECT rule_key, name, priority, is_active, list_contains, bucket, contact_role, sequence_name
+        FROM sms_automation_routing_rules
+        ORDER BY priority DESC, id ASC
+        """
+    ).fetchall()
     deep_dive_smrtphone_from = get_setting(db, "deep_dive_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     referral_smrtphone_from = get_setting(db, "referral_smrtphone_from", SMRTPHONE_FROM_NUMBER)
     postage_options = []
@@ -37616,6 +38925,8 @@ def settings_page():
         skipsherpa_api_key=skipsherpa_api_key,
         rentcast_api_key=rentcast_api_key,
         slybroadcast_settings=slybroadcast_settings,
+        sms_automation_settings=sms_automation_settings,
+        sms_automation_rules=sms_automation_rules,
         active_tab=active_tab,
         deep_dive_smrtphone_from=deep_dive_smrtphone_from,
         referral_smrtphone_from=referral_smrtphone_from,

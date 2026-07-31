@@ -519,3 +519,70 @@ CREATE TABLE IF NOT EXISTS reisift_new_records (
 CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_county ON reisift_new_records(is_active, county, added_at);
 CREATE INDEX IF NOT EXISTS idx_reisift_new_records_local_property ON reisift_new_records(local_property_id);
 
+CREATE TABLE IF NOT EXISTS property_source_info (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_id INTEGER NOT NULL UNIQUE,
+    property_uuid TEXT,
+    source_info_bucket TEXT,
+    sheriff_sale_date TEXT,
+    source_info_raw TEXT,
+    source_info_json TEXT,
+    last_checked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(property_id) REFERENCES properties(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_property_source_info_uuid ON property_source_info(property_uuid);
+
+CREATE TABLE IF NOT EXISTS sms_automation_routing_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_key TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    list_contains TEXT,
+    bucket TEXT,
+    contact_role TEXT,
+    sequence_name TEXT,
+    template_body TEXT NOT NULL,
+    fallback_template_body TEXT,
+    review_flags_json TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sms_automation_routing_rules_active ON sms_automation_routing_rules(is_active, priority);
+
+CREATE TABLE IF NOT EXISTS sms_automation_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_key TEXT NOT NULL UNIQUE,
+    property_id INTEGER NOT NULL,
+    person_id INTEGER,
+    touchpoint_id INTEGER,
+    phone_number TEXT NOT NULL,
+    from_number TEXT,
+    contact_role TEXT,
+    bucket TEXT,
+    rule_key TEXT,
+    sequence_name TEXT,
+    step_order INTEGER NOT NULL DEFAULT 1,
+    message_body TEXT NOT NULL,
+    rendered_variables_json TEXT,
+    source_info_json TEXT,
+    status TEXT NOT NULL DEFAULT 'Draft',
+    suppression_reason TEXT,
+    scheduled_for TEXT,
+    approved_at TEXT,
+    sent_at TEXT,
+    external_id TEXT,
+    communication_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(property_id) REFERENCES properties(id),
+    FOREIGN KEY(person_id) REFERENCES people(id),
+    FOREIGN KEY(touchpoint_id) REFERENCES touchpoints(id),
+    FOREIGN KEY(communication_id) REFERENCES communications(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_status ON sms_automation_queue(status, scheduled_for);
+CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_property ON sms_automation_queue(property_id);

@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="cards page-summary-cards">
+    <article>
+        <h3>Draft</h3>
+        <p>{{ summary.get('Draft', 0) }}</p>
+    </article>
+    <article>
+        <h3>Approved</h3>
+        <p>{{ summary.get('Approved', 0) }}</p>
+    </article>
+    <article>
+        <h3>Sent</h3>
+        <p>{{ summary.get('Sent', 0) }}</p>
+    </article>
+    <article>
+        <h3>Suppressed</h3>
+        <p>{{ summary.get('Suppressed', 0) }}</p>
+    </article>
+</section>
+
+<section class="panel">
+    <h2>SMS Queue</h2>
+    <p class="muted-text">
+        Manual approval mode. Sender pool:
+        <strong>{% for number in settings.from_numbers %}{{ number|fmt_phone }}{% if not loop.last %}, {% endif %}{% endfor %}</strong>.
+        Window: <strong>{{ settings.send_window_start }}-{{ settings.send_window_end }} ET</strong>.
+        Cap: <strong>{{ settings.max_daily_per_number }}/number/day</strong>.
+    </p>
+
+    <div class="panel-actions">
+        <form method="get" action="{{ url_for('sms_queue_page') }}" class="inline-form">
+            <label>Status
+                <select name="status">
+                    <option value="">All</option>
+                    {% for status in ['Draft', 'Approved', 'Sent', 'Failed', 'Suppressed', 'Held'] %}
+                    <option value="{{ status }}" {% if filters.status == status %}selected{% endif %}>{{ status }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>Bucket
+                <select name="bucket">
+                    <option value="">All</option>
+                    {% for bucket in ['Sheriff Sale', 'Probate', 'Foreclosure', 'General New Record'] %}
+                    <option value="{{ bucket }}" {% if filters.bucket == bucket %}selected{% endif %}>{{ bucket }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>Role
+                <select name="contact_role">
+                    <option value="">All</option>
+                    <option value="owner" {% if filters.contact_role == 'owner' %}selected{% endif %}>Owner</option>
+                    <option value="relative" {% if filters.contact_role == 'relative' %}selected{% endif %}>Relative</option>
+                </select>
+            </label>
+            <button type="submit">Apply</button>
+            <a class="button-link secondary" href="{{ url_for('sms_queue_page') }}">Clear</a>
+        </form>
+        <form method="post" action="{{ url_for('sms_queue_generate') }}">
+            <button type="submit">Generate From New Records</button>
+        </form>
+        <form method="post" action="{{ url_for('sms_queue_revalidate') }}">
+            <button type="submit">Revalidate Queue</button>
+        </form>
+    </div>
+
+    {% if notice %}
+    <div class="notice-banner">{{ notice }}</div>
+    {% endif %}
+    {% if error %}
+    <div class="error-banner">{{ error }}</div>
+    {% endif %}
+
+    <div class="table-wrap sms-queue-table-wrap">
+        <table class="crm-table sms-queue-table">
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>Property</th>
+                    <th>Person</th>
+                    <th>Role</th>
+                    <th>Phone</th>
+                    <th>Bucket</th>
+                    <th>Message</th>
+                    <th>Sender</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr>
+                    <td>
+                        <span class="pill sms-status-{{ row.status|lower|replace(' ', '-') }}">{{ row.status }}</span>
+                        {% if row.suppression_reason %}
+                        <div class="sms-queue-reason">{{ row.suppression_reason }}</div>
+                        {% endif %}
+                        {% if row.review_flags %}
+                        <div class="sms-queue-flags">
+                            {% for flag in row.review_flags %}
+                            <span>{{ flag }}</span>
+                            {% endfor %}
+                        </div>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <div>{{ row.property_address or '-' }}</div>
+                        <div class="inline-actions compact-icons">
+                            <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.property_id) }}" title="Open in Deep Dive">
+                                <img class="tiny-link-icon" src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/08/cropped-nj-logo-tiny-32x32.png" alt="Deep Dive">
+                            </a>
+                            {% if row.sift_url %}
+                            <a class="action-icon-link" href="{{ row.sift_url }}" target="_blank" rel="noopener" title="Open in REISift">
+                                <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+                            </a>
+                            {% endif %}
+                        </div>
+                    </td>
+                    <td>{{ row.person_name or '-' }}</td>
+                    <td>{{ row.contact_role or '-' }}</td>
+                    <td>
+                        {{ row.phone_number|fmt_phone }}
+                        <div class="sms-queue-reason">{{ row.channel_label or 'Unknown' }} / {{ row.phone_status or '-' }}</div>
+                    </td>
+                    <td>
+                        {{ row.bucket or '-' }}
+                        {% if row.routing_rule_name %}
+                        <div class="sms-queue-reason">Rule: {{ row.routing_rule_name }}</div>
+                        {% endif %}
+                        {% if row.matched_buckets|length > 1 %}
+                        <div class="sms-queue-reason">Also matched: {{ row.matched_buckets|join(', ') }}</div>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <form method="post" action="{{ url_for('sms_queue_update_item', queue_id=row.id) }}" class="sms-message-form">
+                            <textarea name="message_body" rows="3" {% if row.status in ['Sent', 'Sending'] %}readonly{% endif %}>{{ row.message_body }}</textarea>
+                            <button type="submit" {% if row.status in ['Sent', 'Sending'] %}disabled{% endif %}>Save</button>
+                        </form>
+                    </td>
+                    <td>{{ row.from_number|fmt_phone }}</td>
+                    <td>
+                        <form method="post" action="{{ url_for('sms_queue_item_action', queue_id=row.id) }}" class="sms-queue-actions">
+                            <button type="submit" name="action" value="approve" {% if row.status in ['Sent', 'Suppressed'] %}disabled{% endif %}>Approve</button>
+                            <button type="submit" name="action" value="send" {% if row.status in ['Sent', 'Suppressed', 'Held'] %}disabled{% endif %}>Send Now</button>
+                            <button type="submit" name="action" value="hold" {% if row.status in ['Sent', 'Suppressed', 'Held'] %}disabled{% endif %}>Hold</button>
+                        </form>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="9">No SMS queue items match these filters. Generate from New Records to create drafts.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}

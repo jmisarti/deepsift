@@ -6153,6 +6153,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
     sync_phone_items, sync_email_items = collect_person_contact_items_for_reisift_sync(
         db,
         sorted(processed_owner_ids or ([primary_owner_id] if primary_owner_id else [])),
+        property_id=property_id,
     )
     skiptrace_sync = sync_skiptrace_contacts_to_reisift_owner(
         db,
@@ -7205,6 +7206,7 @@ def import_skipsherpa_person_result(db, property_id, person_id, lookup_response)
     sync_phone_items, sync_email_items = collect_person_contact_items_for_reisift_sync(
         db,
         sorted(touched_person_ids),
+        property_id=property_id,
     )
     skiptrace_sync = sync_skiptrace_contacts_to_reisift_owner(
         db,
@@ -17812,7 +17814,11 @@ def track_untitled_lead_in_sift(db, row, actor="", source="Anon queue"):
     property_uuid = normalize_uuid((row.get("reisift_property_uuid") or prop["reisift_property_uuid"] or ""))
     owner_uuid = normalize_uuid((row.get("reisift_owner_uuid") or prop["reisift_owner_uuid"] or ""))
     owner_person_id = int(prop["owner_person_id"] or 0)
-    phone_items, email_items = collect_person_contact_items_for_reisift_sync(db, [owner_person_id] if owner_person_id else [])
+    phone_items, email_items = collect_person_contact_items_for_reisift_sync(
+        db,
+        [owner_person_id] if owner_person_id else [],
+        property_id=property_id,
+    )
 
     owner_first = "Anonymous"
     owner_last = "Lead"
@@ -25736,7 +25742,81 @@ def _property_address_string(db, property_id):
     ).strip(", ").strip()
 
 
-def collect_person_contact_items_for_reisift_sync(db, person_ids):
+def _property_owner_person_id_for_contact_role(db, property_id):
+    try:
+        clean_property_id = int(property_id or 0)
+    except Exception:
+        clean_property_id = 0
+    if clean_property_id <= 0:
+        return 0
+    row = db.execute(
+        "SELECT owner_person_id FROM properties WHERE id = ? LIMIT 1",
+        (clean_property_id,),
+    ).fetchone()
+    return int((row["owner_person_id"] if row else 0) or 0)
+
+
+def _person_is_property_co_owner(db, owner_person_id, person_id):
+    owner_person_id = int(owner_person_id or 0)
+    person_id = int(person_id or 0)
+    if owner_person_id <= 0 or person_id <= 0 or owner_person_id == person_id:
+        return False
+    row = db.execute(
+        """
+        SELECT id
+        FROM person_relationships
+        WHERE lower(relationship_type) = 'co-owner'
+          AND (
+            (subject_person_id = ? AND related_person_id = ?)
+            OR (subject_person_id = ? AND related_person_id = ?)
+          )
+        LIMIT 1
+        """,
+        (owner_person_id, person_id, person_id, owner_person_id),
+    ).fetchone()
+    return bool(row)
+
+
+def _reisift_contact_role_for_person(db, property_id, person_id):
+    try:
+        clean_person_id = int(person_id or 0)
+    except Exception:
+        clean_person_id = 0
+    if clean_person_id <= 0:
+        return "unknown"
+    owner_person_id = _property_owner_person_id_for_contact_role(db, property_id)
+    if owner_person_id > 0 and clean_person_id == owner_person_id:
+        return "owner"
+    if _person_is_property_co_owner(db, owner_person_id, clean_person_id):
+        return "owner"
+    try:
+        clean_property_id = int(property_id or 0)
+    except Exception:
+        clean_property_id = 0
+    if clean_property_id > 0:
+        return "relative"
+    return "unknown"
+
+
+def _reisift_contact_tags_for_role(raw_tags, role):
+    tags = []
+    seen = set()
+    if str(role or "").strip().lower() == "relative":
+        tags.append("Relative")
+        seen.add("relative")
+    for raw_tag in raw_tags or []:
+        tag = str(raw_tag or "").strip()
+        key = tag.lower()
+        if not tag or key in seen:
+            continue
+        if key == "relative" and str(role or "").strip().lower() != "relative":
+            continue
+        seen.add(key)
+        tags.append(tag)
+    return tags
+
+
+def collect_person_contact_items_for_reisift_sync(db, person_ids, property_id=None):
     clean_ids = _clean_person_ids(person_ids)
     if not clean_ids:
         return [], []
@@ -25753,11 +25833,15 @@ def collect_person_contact_items_for_reisift_sync(db, person_ids):
         if not phone_norm or phone_norm in seen_phone:
             continue
         seen_phone.add(phone_norm)
+        role = _reisift_contact_role_for_person(db, property_id, row["person_id"])
+        raw_tags = list(row.get("phone_tags") or [])
         phone_items.append(
             {
                 "number": value,
                 "type": _reisift_phone_type_from_touchpoint(row["channel_label"]),
-                "tags": list(row.get("phone_tags") or []),
+                "tags": _reisift_contact_tags_for_role(raw_tags, role),
+                "contact_role": role,
+                "person_id": int(row["person_id"] or 0),
             }
         )
 
@@ -25776,7 +25860,16 @@ def collect_person_contact_items_for_reisift_sync(db, person_ids):
         email_norm = primary_email.lower()
         if phone_norm and phone_norm not in seen_phone:
             seen_phone.add(phone_norm)
-            phone_items.append({"number": primary_phone, "type": "UNKNOWN", "tags": []})
+            role = _reisift_contact_role_for_person(db, property_id, row["id"])
+            phone_items.append(
+                {
+                    "number": primary_phone,
+                    "type": "UNKNOWN",
+                    "tags": _reisift_contact_tags_for_role([], role),
+                    "contact_role": role,
+                    "person_id": int(row["id"] or 0),
+                }
+            )
         if primary_email and email_norm not in seen_email:
             seen_email.add(email_norm)
             email_items.append(primary_email)
@@ -25815,6 +25908,9 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
         "owner_uuid": "",
         "phones_attempted": 0,
         "phones_skipped_existing": 0,
+        "owner_phones_attempted": 0,
+        "relative_phones_attempted": 0,
+        "unknown_phones_attempted": 0,
         "emails_attempted": 0,
         "error": "",
         "result": None,
@@ -25907,10 +26003,12 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
             number = normalize_phone(p.get("number") or p.get("phone") or "")
             p_type = (p.get("type") or "UNKNOWN").strip().upper() or "UNKNOWN"
             raw_tags = p.get("tags") if isinstance(p.get("tags"), list) else []
+            contact_role = str(p.get("contact_role") or "").strip().lower() or "unknown"
         else:
             number = normalize_phone(str(p or ""))
             p_type = "UNKNOWN"
             raw_tags = []
+            contact_role = "unknown"
         if not number or number in seen_phone:
             continue
         seen_phone.add(number)
@@ -25921,17 +26019,25 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
             continue
         merged_tags = []
         seen_tags = set()
-        for tag_value in ["Relative", *raw_tags]:
+        for tag_value in raw_tags:
             tag = str(tag_value or "").strip()
             key = tag.lower()
             if not tag or key in seen_tags:
                 continue
             seen_tags.add(key)
             merged_tags.append(tag)
-        phones.append({"number": number, "type": p_type, "tags": merged_tags})
+        phones.append({"number": number, "type": p_type, "tags": merged_tags, "contact_role": contact_role})
 
     emails = [value for value in emails if str(value or "").strip().lower() not in existing_emails]
     out["phones_attempted"] = len(phones)
+    for phone_item in phones:
+        role = str(phone_item.get("contact_role") or "").strip().lower()
+        if role in {"owner", "co-owner", "co_owner"}:
+            out["owner_phones_attempted"] += 1
+        elif role == "relative":
+            out["relative_phones_attempted"] += 1
+        else:
+            out["unknown_phones_attempted"] += 1
     out["emails_attempted"] = len(emails)
     if not phones and not emails:
         out["ok"] = True
@@ -25947,6 +26053,8 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
     full_address = _property_address_string(db, property_id)
     for p in phones:
         linked_person = find_person_id_by_phone(db, p["number"])
+        role = str(p.get("contact_role") or "").strip().lower()
+        role_label = "owner/co-owner" if role in {"owner", "co-owner", "co_owner"} else (role or "unknown")
         upsert_cached_contact_context(
             db,
             p["number"],
@@ -25955,7 +26063,7 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
             classification="potential_seller",
             source="skiptrace_sync",
             confidence=0.9,
-            notes="Skiptrace contact synced to ReiSift owner as Relative.",
+            notes=f"Skiptrace contact synced to ReiSift owner as {role_label}.",
             reisift_property_uuid=out["property_uuid"],
             reisift_full_address=full_address,
             reisift_owner_name="",
@@ -29511,7 +29619,11 @@ def sync_d4d_property_to_reisift(db, property_id, added_by="", source="Slack D4D
 
     owner_person_id = int(prop["owner_person_id"] or 0)
     owner_person_ids = collect_property_owner_person_ids_for_reisift_sync(db, property_id)
-    phone_items, email_items = collect_person_contact_items_for_reisift_sync(db, owner_person_ids)
+    phone_items, email_items = collect_person_contact_items_for_reisift_sync(
+        db,
+        owner_person_ids,
+        property_id=property_id,
+    )
 
     owner_first = "Unknown"
     owner_last = "Owner"

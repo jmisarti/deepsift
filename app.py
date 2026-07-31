@@ -144,6 +144,7 @@ REISIFT_NEW_RECORDS_REFRESH_HOUR_ET = max(
     0,
     min(23, int((os.getenv("REISIFT_NEW_RECORDS_REFRESH_HOUR_ET") or "6").strip() or "6")),
 )
+REISIFT_NEW_RECORDS_LOG_ROLLUP_ENABLED = env_flag("REISIFT_NEW_RECORDS_LOG_ROLLUP_ENABLED", False)
 REISIFT_DISABLE_MAP_LOOKUP = env_flag("REISIFT_DISABLE_MAP_LOOKUP", True)
 OPENLETTERCONNECT_BASE_URL = os.getenv("OPENLETTERCONNECT_BASE_URL", "https://api.openletterconnect.com/api/v1")
 OPENLETTERCONNECT_TEMPLATE_ID = int(os.getenv("OPENLETTERCONNECT_TEMPLATE_ID", "9256"))
@@ -29395,7 +29396,31 @@ def sync_local_property_status_from_reisift_new_record(db, property_uuid, payloa
 def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_active=1, sift_rollup=None):
     payload = payload if isinstance(payload, dict) else {}
     search_row = search_row if isinstance(search_row, dict) else {}
-    sift_rollup = sift_rollup if isinstance(sift_rollup, dict) else {}
+    has_sift_rollup = isinstance(sift_rollup, dict)
+    if not has_sift_rollup:
+        existing_rollup = db.execute(
+            """
+            SELECT outbound_calls, inbound_calls, outbound_sms, inbound_sms,
+                   outbound_email, inbound_email, inbound_responses, events_json, tasks_json
+            FROM reisift_new_records
+            WHERE property_uuid = ?
+            LIMIT 1
+            """,
+            (property_uuid,),
+        ).fetchone()
+        sift_rollup = {
+            "outbound_calls": int((existing_rollup["outbound_calls"] if existing_rollup else 0) or 0),
+            "inbound_calls": int((existing_rollup["inbound_calls"] if existing_rollup else 0) or 0),
+            "outbound_sms": int((existing_rollup["outbound_sms"] if existing_rollup else 0) or 0),
+            "inbound_sms": int((existing_rollup["inbound_sms"] if existing_rollup else 0) or 0),
+            "outbound_email": int((existing_rollup["outbound_email"] if existing_rollup else 0) or 0),
+            "inbound_email": int((existing_rollup["inbound_email"] if existing_rollup else 0) or 0),
+            "inbound_responses": int((existing_rollup["inbound_responses"] if existing_rollup else 0) or 0),
+            "events": parse_followup_json_list(existing_rollup["events_json"] if existing_rollup else ""),
+            "tasks": parse_followup_json_list(existing_rollup["tasks_json"] if existing_rollup else ""),
+        }
+    else:
+        sift_rollup = sift_rollup if isinstance(sift_rollup, dict) else {}
     summary = summarize_reisift_property(payload, fallback_payload=search_row)
     county = infer_county_from_reisift_payload(payload) or infer_county_from_reisift_payload(search_row)
     added_dt = reisift_added_at_dt(search_row, payload)
@@ -29521,21 +29546,12 @@ def refresh_reisift_new_records_cache(db):
             details = fetch_reisift_property_payload(token, property_uuid)
         except Exception as exc:
             errors.append(f"{property_uuid}: detail fallback used ({exc})")
-        sift_rollup = {
-            "outbound_calls": 0,
-            "inbound_calls": 0,
-            "outbound_sms": 0,
-            "inbound_sms": 0,
-            "outbound_email": 0,
-            "inbound_email": 0,
-            "inbound_responses": 0,
-            "events": [],
-            "tasks": [],
-        }
-        try:
-            sift_rollup = fetch_reisift_property_log_rollup(token, property_uuid, max_rows=120)
-        except Exception as exc:
-            errors.append(f"{property_uuid} logs: {exc}")
+        sift_rollup = None
+        if REISIFT_NEW_RECORDS_LOG_ROLLUP_ENABLED:
+            try:
+                sift_rollup = fetch_reisift_property_log_rollup(token, property_uuid, max_rows=120)
+            except Exception as exc:
+                errors.append(f"{property_uuid} logs: {exc}")
         county = infer_county_from_reisift_payload(details) or infer_county_from_reisift_payload(row)
         if county and not is_target_new_record_county(county):
             skipped_county += 1
@@ -29579,6 +29595,7 @@ def refresh_reisift_new_records_cache(db):
         "imported_emails": imported_emails,
         "sms_queue": sms_queue,
         "search_failed": search_failed,
+        "log_rollup_enabled": REISIFT_NEW_RECORDS_LOG_ROLLUP_ENABLED,
         "errors": errors,
     }
 

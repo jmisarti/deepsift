@@ -26531,6 +26531,27 @@ def reisift_search_property_rows_by_status(token, status_slug, counties=None, ma
     offset = 0
     rows = []
     total = 0
+
+    def _post_search(body, allow_limit_fallback=True):
+        last_exc = None
+        for attempt in range(3):
+            response = requests.post(
+                f"{REISIFT_BASE_URL}/api/internal/property/",
+                headers=headers,
+                json=body,
+                timeout=45,
+            )
+            if response.status_code not in {502, 503, 504}:
+                response.raise_for_status()
+                return response
+            last_exc = requests.HTTPError(f"{response.status_code} Server Error: {response.reason} for url: {response.url}", response=response)
+            time.sleep(1.5 * (attempt + 1))
+        if allow_limit_fallback and "limit" not in body:
+            fallback_body = dict(body)
+            fallback_body["limit"] = 100
+            return _post_search(fallback_body, allow_limit_fallback=False)
+        raise last_exc or ValueError("ReiSift property search failed")
+
     while offset < max_rows:
         must_query = {}
         if county_values:
@@ -26541,13 +26562,7 @@ def reisift_search_property_rows_by_status(token, status_slug, counties=None, ma
             "ordering": "-list_count",
             "query": {"must": must_query},
         }
-        response = requests.post(
-            f"{REISIFT_BASE_URL}/api/internal/property/",
-            headers=headers,
-            json=body,
-            timeout=30,
-        )
-        response.raise_for_status()
+        response = _post_search(body)
         payload = response.json()
         page_rows = payload.get("results") or []
         total = int(payload.get("count") or total or len(page_rows))
@@ -29443,13 +29458,21 @@ def refresh_reisift_new_records_cache(db):
     token = reisift_get_access_token()
     status_slug = REISIFT_NEW_RECORDS_STATUS
     target_counties = target_new_record_counties()
-    rows, total = reisift_search_property_rows_by_status(
-        token,
-        status_slug,
-        counties=target_counties,
-        max_rows=2000,
-    )
-    execute_with_retry(db, "UPDATE reisift_new_records SET is_active = 0")
+    errors = []
+    search_failed = False
+    try:
+        rows, total = reisift_search_property_rows_by_status(
+            token,
+            status_slug,
+            counties=target_counties,
+            max_rows=2000,
+        )
+    except Exception as exc:
+        rows, total = [], 0
+        search_failed = True
+        errors.append(f"reisift_search: {exc}")
+    if not search_failed:
+        execute_with_retry(db, "UPDATE reisift_new_records SET is_active = 0")
     scanned = 0
     synced = 0
     skipped_county = 0
@@ -29457,7 +29480,6 @@ def refresh_reisift_new_records_cache(db):
     local_imports = 0
     imported_phones = 0
     imported_emails = 0
-    errors = []
     for row in rows:
         scanned += 1
         property_uuid = normalize_uuid(row.get("uuid") or "")
@@ -29503,6 +29525,7 @@ def refresh_reisift_new_records_cache(db):
         "imported_phones": imported_phones,
         "imported_emails": imported_emails,
         "sms_queue": sms_queue,
+        "search_failed": search_failed,
         "errors": errors,
     }
 
@@ -29556,6 +29579,10 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
                 f"SMS drafts created {((result.get('sms_queue') or {}).get('created', 0))}, "
                 f"suppressed {((result.get('sms_queue') or {}).get('suppressed', 0))}."
             )
+            if result.get("search_failed"):
+                message = "ReiSift search is temporarily unavailable; existing cache was preserved. " + message
+            elif result.get("errors"):
+                message += f" Warnings: {len(result.get('errors') or [])}."
             set_reisift_new_records_refresh_state(db, "complete", message, result=result)
             db.commit()
         except Exception as exc:

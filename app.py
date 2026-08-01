@@ -2030,6 +2030,7 @@ def init_db():
     normalize_people_name_data(db)
     ensure_default_sequence_campaign(db)
     ensure_default_sms_automation_routing_rules(db)
+    normalize_unsent_sms_queue_addresses(db)
 
     has_properties = db.execute("SELECT COUNT(*) AS c FROM properties").fetchone()["c"]
     if not has_properties:
@@ -2050,6 +2051,7 @@ def ensure_db():
     backfill_openletterconnect_mail_orders(db)
     ensure_default_sequence_campaign(db)
     ensure_default_sms_automation_routing_rules(db)
+    normalize_unsent_sms_queue_addresses(db)
     db.commit()
     db.close()
 
@@ -29099,13 +29101,15 @@ def revalidate_sms_automation_queue(db, property_ids=None):
 def _sms_automation_template_variables(person, prop, bucket, contact_role, source_info, lists_text):
     person_first = (person["first_name"] if person else "") or ""
     person_last = (person["last_name"] if person else "") or ""
-    property_address = format_property_address_line(prop["street"], prop["city"], prop["state"], prop["postal_code"]) if prop else ""
+    property_full_address = format_property_address_line(prop["street"], prop["city"], prop["state"], prop["postal_code"]) if prop else ""
+    property_address = normalize_whitespace(prop["street"] if prop else "") or property_full_address
     return {
         "first_name": person_first,
         "last_name": person_last,
         "full_name": f"{person_first} {person_last}".strip(),
         "owner_name": "",
         "property_address": property_address,
+        "property_full_address": property_full_address,
         "property_city": (prop["city"] if prop else "") or "",
         "property_state": (prop["state"] if prop else "") or "",
         "property_zip": (prop["postal_code"] if prop else "") or "",
@@ -29123,6 +29127,55 @@ def render_sms_automation_template(template, variables):
     for key, value in variables.items():
         text = text.replace("{" + key + "}", str(value or ""))
     return normalize_whitespace(text)
+
+
+def normalize_unsent_sms_queue_addresses(db):
+    rows = db.execute(
+        """
+        SELECT q.id, q.message_body, q.rendered_variables_json,
+               a.street, a.city, a.state, a.postal_code
+        FROM sms_automation_queue q
+        LEFT JOIN properties p ON p.id = q.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE COALESCE(q.status, '') NOT IN ('Sent', 'Sending')
+        """
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        message = str(row["message_body"] or "")
+        variables = parse_json_object(row["rendered_variables_json"] or "{}", default={})
+        if not isinstance(variables, dict):
+            variables = {}
+        full_address = str(variables.get("property_full_address") or variables.get("property_address") or "").strip()
+        db_full_address = format_property_address_line(row["street"], row["city"], row["state"], row["postal_code"])
+        if db_full_address and (not full_address or "," not in full_address):
+            full_address = db_full_address
+        short_address = normalize_whitespace(row["street"]) or full_address
+        if not message or not full_address or not short_address or full_address == short_address:
+            if short_address and variables.get("property_address") != short_address:
+                variables["property_address"] = short_address
+                variables["property_full_address"] = full_address
+                db.execute(
+                    "UPDATE sms_automation_queue SET rendered_variables_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (json.dumps(variables), row["id"]),
+                )
+                updated += 1
+            continue
+        new_message = message.replace(full_address, short_address)
+        if new_message == message:
+            continue
+        variables["property_address"] = short_address
+        variables["property_full_address"] = full_address
+        db.execute(
+            """
+            UPDATE sms_automation_queue
+            SET message_body = ?, rendered_variables_json = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (normalize_whitespace(new_message), json.dumps(variables), row["id"]),
+        )
+        updated += 1
+    return updated
 
 
 def collect_sms_automation_targets_for_property(db, property_id):

@@ -36720,9 +36720,14 @@ def sms_queue_revalidate():
     ensure_db()
     db = get_db()
     try:
-        suppressed = revalidate_sms_automation_queue(db)
+        result = generate_sms_automation_queue_for_new_records(db, token="")
         db.commit()
-        return redirect(url_for("sms_queue_page", notice=f"Revalidated queue. Suppressed {suppressed} item(s)."))
+        notice = (
+            "Revalidated queue: "
+            f"created {result['created']}, updated {result['updated']}, "
+            f"suppressed {result['suppressed']} item(s)."
+        )
+        return redirect(url_for("sms_queue_page", notice=notice))
     except Exception as exc:
         db.rollback()
         return redirect(url_for("sms_queue_page", error=f"Revalidate failed: {exc}"))

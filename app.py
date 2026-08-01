@@ -29826,6 +29826,40 @@ def _local_property_has_deepsift_skiptrace(db, property_id):
         "SELECT 1 FROM skiptrace_runs WHERE property_id = ? LIMIT 1",
         (clean_property_id,),
     ).fetchone()
+    if row:
+        return True
+    row = db.execute(
+        """
+        SELECT 1
+        FROM activity_log
+        WHERE property_id = ?
+          AND lower(COALESCE(activity_type, '')) LIKE '%skip trace%'
+        LIMIT 1
+        """,
+        (clean_property_id,),
+    ).fetchone()
+    if row:
+        return True
+    prop = _sms_automation_property_row(db, clean_property_id)
+    if not prop:
+        return False
+    network_ids, _ = build_property_network(db, prop)
+    if not network_ids:
+        return False
+    placeholders = ",".join(["?"] * len(network_ids))
+    row = db.execute(
+        f"""
+        SELECT 1
+        FROM person_notes
+        WHERE person_id IN ({placeholders})
+          AND (
+              lower(COALESCE(source, '')) LIKE 'skipsherpa%'
+              OR lower(COALESCE(note_body, '')) LIKE '%skip trace completed%'
+          )
+        LIMIT 1
+        """,
+        tuple(network_ids),
+    ).fetchone()
     return bool(row)
 
 
@@ -30100,6 +30134,11 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
         item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
         for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
             item[flag_key] = 1 if int(item.get(flag_key) or 0) else 0
+        live_property_id = item.get("deep_dive_property_id") or item.get("local_property_id")
+        live_flags = compute_new_record_contact_flags(db, live_property_id, payload)
+        item["rei_skipped"] = 1 if (item["rei_skipped"] or live_flags["rei_skipped"]) else 0
+        item["deep_skipped"] = 1 if live_flags["deep_skipped"] else 0
+        item["no_good_numbers"] = 1 if live_flags["no_good_numbers"] else 0
         item.update(property_activity_counts_for_new_record(db, item.get("deep_dive_property_id"), item))
         if not _new_record_matches_filters(item, filters):
             continue

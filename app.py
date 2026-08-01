@@ -966,6 +966,9 @@ def migrate_db(db):
     ensure_column(db, "reisift_new_records", "inbound_responses", "inbound_responses INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "reisift_new_records", "events_json", "events_json TEXT")
     ensure_column(db, "reisift_new_records", "tasks_json", "tasks_json TEXT")
+    ensure_column(db, "reisift_new_records", "rei_skipped", "rei_skipped INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "deep_skipped", "deep_skipped INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "no_good_numbers", "no_good_numbers INTEGER NOT NULL DEFAULT 0")
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_county ON reisift_new_records(is_active, county, added_at)"
     )
@@ -29501,6 +29504,12 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
                 match_payload,
                 summary["status"],
             )
+    contact_flags = compute_new_record_contact_flags(
+        db,
+        local_sync.get("local_property_id"),
+        payload,
+        fallback_payload=search_row,
+    )
     execute_with_retry(
         db,
         """
@@ -29509,8 +29518,9 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
              local_property_id, local_status_before, local_status_after,
              outbound_calls, inbound_calls, outbound_sms, inbound_sms, outbound_email, inbound_email,
              inbound_responses, events_json, tasks_json,
+             rei_skipped, deep_skipped, no_good_numbers,
              payload_json, is_active, last_synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(property_uuid) DO UPDATE SET
             status = excluded.status,
             full_address = excluded.full_address,
@@ -29530,6 +29540,9 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
             inbound_responses = excluded.inbound_responses,
             events_json = excluded.events_json,
             tasks_json = excluded.tasks_json,
+            rei_skipped = excluded.rei_skipped,
+            deep_skipped = excluded.deep_skipped,
+            no_good_numbers = excluded.no_good_numbers,
             payload_json = excluded.payload_json,
             is_active = excluded.is_active,
             last_synced_at = excluded.last_synced_at
@@ -29554,6 +29567,9 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
             int(sift_rollup.get("inbound_responses") or 0),
             json.dumps(sift_rollup.get("events") or []),
             json.dumps(sift_rollup.get("tasks") or []),
+            int(contact_flags["rei_skipped"]),
+            int(contact_flags["deep_skipped"]),
+            int(contact_flags["no_good_numbers"]),
             json.dumps(payload or search_row),
             int(bool(is_active)),
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
@@ -29761,6 +29777,126 @@ def _new_record_completeness(payload):
     return normalize_whitespace(payload.get("type") if isinstance(payload, dict) else "")
 
 
+def _new_record_yes_no_filter_value(value):
+    text = normalize_whitespace(value).lower()
+    if text in {"yes", "true", "1", "y"}:
+        return True
+    if text in {"no", "false", "0", "n"}:
+        return False
+    return None
+
+
+def _new_record_has_reisift_skiptrace(payload, fallback_payload=None):
+    payloads = [p for p in [payload, fallback_payload] if isinstance(p, dict)]
+    skip_texts = []
+    for item in payloads:
+        skip_texts.extend(_extract_reisift_property_tags(item))
+        skip_texts.extend(_sms_source_terms_from_payload(item))
+        for key in [
+            "skiptrace",
+            "skip_trace",
+            "skiptraced",
+            "skip_traced",
+            "skiptrace_completed_at",
+            "last_skiptraced_at",
+            "skiptrace_date",
+        ]:
+            if key in item:
+                value = item.get(key)
+                if value in (True, 1, "1", "true", "True", "yes", "Yes"):
+                    return True
+                if str(value or "").strip():
+                    skip_texts.append(f"{key}:{value}")
+    haystack = " ".join(str(text or "") for text in skip_texts).lower()
+    return bool(
+        re.search(r"\bskip\s*trac(?:e|ed|ing)\b", haystack)
+        or re.search(r"\bskiptraced\b", haystack)
+        or re.search(r"\bskipped\d{6}\b", haystack)
+    )
+
+
+def _local_property_has_deepsift_skiptrace(db, property_id):
+    try:
+        clean_property_id = int(property_id or 0)
+    except Exception:
+        clean_property_id = 0
+    if clean_property_id <= 0:
+        return False
+    row = db.execute(
+        "SELECT 1 FROM skiptrace_runs WHERE property_id = ? LIMIT 1",
+        (clean_property_id,),
+    ).fetchone()
+    return bool(row)
+
+
+def _new_record_is_bad_phone_status(status):
+    text = normalize_whitespace(status).lower()
+    if not text:
+        return False
+    bad_statuses = {value.lower() for value in SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES}
+    if text in bad_statuses:
+        return True
+    return any(
+        token in text
+        for token in [
+            "wrong",
+            "incorrect",
+            "dead",
+            "dnc",
+            "dnt",
+            "do not call",
+            "do not text",
+            "opt out",
+            "opt-out",
+            "undeliverable",
+            "not in service",
+            "invalid",
+            "disconnected",
+            "bad number",
+        ]
+    )
+
+
+def _new_record_no_good_numbers(db, property_id):
+    try:
+        clean_property_id = int(property_id or 0)
+    except Exception:
+        clean_property_id = 0
+    if clean_property_id <= 0:
+        return False
+    prop = _sms_automation_property_row(db, clean_property_id)
+    if not prop:
+        return False
+    network_ids, _ = build_property_network(db, prop)
+    if not network_ids:
+        return False
+    placeholders = ",".join(["?"] * len(network_ids))
+    rows = db.execute(
+        f"""
+        SELECT status
+        FROM touchpoints
+        WHERE person_id IN ({placeholders})
+          AND lower(channel_type) = 'phone'
+        """,
+        tuple(network_ids),
+    ).fetchall()
+    if not rows:
+        return False
+    bad_count = 0
+    for row in rows:
+        if _new_record_is_bad_phone_status(row["status"] or ""):
+            bad_count += 1
+    return bad_count == len(rows)
+
+
+def compute_new_record_contact_flags(db, local_property_id, payload, fallback_payload=None):
+    return {
+        "rei_skipped": 1 if _new_record_has_reisift_skiptrace(payload, fallback_payload=fallback_payload) else 0,
+        "deep_skipped": 1 if _local_property_has_deepsift_skiptrace(db, local_property_id) else 0,
+        "no_good_numbers": 1 if _new_record_no_good_numbers(db, local_property_id) else 0,
+    }
+
+
 def _new_record_matches_filters(row, filters):
     filters = filters if isinstance(filters, dict) else {}
     date_from = _parse_iso_date_only(filters.get("date_from") or "")
@@ -29789,6 +29925,18 @@ def _new_record_matches_filters(row, filters):
     owner_type_filter = normalize_whitespace(filters.get("owner_type") or "").lower()
     if owner_type_filter and normalize_whitespace(row.get("owner_type") or "").lower() != owner_type_filter:
         return False
+
+    for filter_key, row_key in [
+        ("rei_skipped", "rei_skipped"),
+        ("deep_skipped", "deep_skipped"),
+        ("no_good_numbers", "no_good_numbers"),
+    ]:
+        expected = _new_record_yes_no_filter_value(filters.get(filter_key) or "")
+        if expected is None:
+            continue
+        actual = bool(int(row.get(row_key) or 0))
+        if actual != expected:
+            return False
     return True
 
 
@@ -29950,6 +30098,8 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
         item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
         item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
         item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
+        for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
+            item[flag_key] = 1 if int(item.get(flag_key) or 0) else 0
         item.update(property_activity_counts_for_new_record(db, item.get("deep_dive_property_id"), item))
         if not _new_record_matches_filters(item, filters):
             continue
@@ -36226,6 +36376,9 @@ def new_records_page():
         "county": (request.args.get("county") or "").strip(),
         "completeness": (request.args.get("completeness") or "").strip(),
         "owner_type": (request.args.get("owner_type") or "").strip(),
+        "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
+        "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
+        "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),
     }
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()
@@ -36278,6 +36431,9 @@ def new_records_refresh():
         "county": (request.form.get("county") or request.args.get("county") or "").strip(),
         "completeness": (request.form.get("completeness") or request.args.get("completeness") or "").strip(),
         "owner_type": (request.form.get("owner_type") or request.args.get("owner_type") or "").strip(),
+        "rei_skipped": (request.form.get("rei_skipped") or request.args.get("rei_skipped") or "").strip(),
+        "deep_skipped": (request.form.get("deep_skipped") or request.args.get("deep_skipped") or "").strip(),
+        "no_good_numbers": (request.form.get("no_good_numbers") or request.args.get("no_good_numbers") or "").strip(),
     }
     try:
         data = start_reisift_new_records_refresh_job(triggered_by="manual_button")

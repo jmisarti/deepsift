@@ -35,7 +35,7 @@
                 </select>
             </label>
             <button type="submit">Apply</button>
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.completeness or filters.owner_type %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.completeness or filters.owner_type or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>From
@@ -76,6 +76,27 @@
                             {% endfor %}
                         </select>
                     </label>
+                    <label>ReiSkipped?
+                        <select name="rei_skipped">
+                            <option value="">All</option>
+                            <option value="yes" {% if filters.rei_skipped == 'yes' %}selected{% endif %}>Yes</option>
+                            <option value="no" {% if filters.rei_skipped == 'no' %}selected{% endif %}>No</option>
+                        </select>
+                    </label>
+                    <label>DeepSkipped?
+                        <select name="deep_skipped">
+                            <option value="">All</option>
+                            <option value="yes" {% if filters.deep_skipped == 'yes' %}selected{% endif %}>Yes</option>
+                            <option value="no" {% if filters.deep_skipped == 'no' %}selected{% endif %}>No</option>
+                        </select>
+                    </label>
+                    <label>NoGoodNumbers
+                        <select name="no_good_numbers">
+                            <option value="">All</option>
+                            <option value="yes" {% if filters.no_good_numbers == 'yes' %}selected{% endif %}>Yes</option>
+                            <option value="no" {% if filters.no_good_numbers == 'no' %}selected{% endif %}>No</option>
+                        </select>
+                    </label>
                     <div class="filter-dropdown-actions">
                         <button type="submit">Apply Filters</button>
                         <a class="button-link secondary" href="{{ url_for('new_records_page') }}">Clear</a>
@@ -91,6 +112,9 @@
             <input type="hidden" name="county" value="{{ filters.county }}">
             <input type="hidden" name="completeness" value="{{ filters.completeness }}">
             <input type="hidden" name="owner_type" value="{{ filters.owner_type }}">
+            <input type="hidden" name="rei_skipped" value="{{ filters.rei_skipped }}">
+            <input type="hidden" name="deep_skipped" value="{{ filters.deep_skipped }}">
+            <input type="hidden" name="no_good_numbers" value="{{ filters.no_good_numbers }}">
             <button type="submit">Refresh New Records</button>
         </form>
     </div>

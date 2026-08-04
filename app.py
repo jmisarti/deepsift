@@ -173,6 +173,15 @@ SMS_AUTOMATION_DEFAULT_GAP_SECONDS = max(
     int((os.getenv("SMS_AUTOMATION_DEFAULT_GAP_SECONDS") or "75").strip() or "75"),
     30,
 )
+SMS_AUTOMATION_AUTO_SEND_ENABLED = env_flag("SMS_AUTOMATION_AUTO_SEND_ENABLED", True)
+SMS_AUTOMATION_AUTO_SEND_POLL_SECONDS = max(
+    int((os.getenv("SMS_AUTOMATION_AUTO_SEND_POLL_SECONDS") or "60").strip() or "60"),
+    15,
+)
+SMS_AUTOMATION_AUTO_SEND_BATCH_LIMIT = max(
+    int((os.getenv("SMS_AUTOMATION_AUTO_SEND_BATCH_LIMIT") or "5").strip() or "5"),
+    1,
+)
 WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or "600").strip() or "600"), 60)
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
 MARKET_STATUS_REMOTE_URL = (os.getenv("MARKET_STATUS_REMOTE_URL") or "").strip()
@@ -218,6 +227,7 @@ REISIFT_NEW_RECORDS_WORKER_STARTED = False
 ADS_DASHBOARD_WORKER_STARTED = False
 CALL_RECORDING_WORKER_STARTED = False
 SMS_ANALYSIS_WORKER_STARTED = False
+SMS_AUTOMATION_SEND_WORKER_STARTED = False
 WEBSITE_LEADS_HOLD_WORKER_STARTED = False
 AGENT_REFRESH_WORKER_STARTED = False
 UNTITLED_LEADS_WORKER_STARTED = False
@@ -757,6 +767,7 @@ def require_login_if_enabled():
         start_reisift_new_records_worker()
         start_call_recording_worker()
         start_sms_analysis_worker()
+        start_sms_automation_send_worker()
         start_agent_refresh_worker()
     if not APP_AUTH_ENABLED:
         return None
@@ -36750,17 +36761,24 @@ def _sms_automation_send_queue_item(db, queue_id):
             "ok": False,
             "error": f"Outside send window ({start.strftime('%I:%M %p')} - {end.strftime('%I:%M %p')} ET).",
         }
-    rate_reason = _sms_automation_rate_limit_reason(db, row["from_number"])
-    if rate_reason:
-        return {"ok": False, "error": rate_reason}
     to_number = row["phone_number"]
     body = row["message_body"]
     from_number = row["from_number"] or select_sms_automation_from_number(db, row["bucket"], row["contact_role"])
+    rate_reason = _sms_automation_rate_limit_reason(db, from_number)
+    if rate_reason:
+        return {"ok": False, "error": rate_reason}
+    claim = db.execute(
+        """
+        UPDATE sms_automation_queue
+        SET status = 'Sending', from_number = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND status IN ('Draft', 'Queued', 'Approved', 'Scheduled', 'Failed')
+        """,
+        (from_number, row["id"]),
+    )
+    if claim.rowcount != 1:
+        return {"ok": False, "error": "Queue item was already claimed or sent by another worker."}
     try:
-        db.execute(
-            "UPDATE sms_automation_queue SET status = 'Sending', from_number = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (from_number, row["id"]),
-        )
         send_res = send_smrtphone_sms(to_number, body, from_number=from_number)
         status = send_res.get("status") or "Sent"
         external_id = send_res.get("sms_id") or ""
@@ -36811,6 +36829,132 @@ def _sms_automation_send_queue_item(db, queue_id):
         return {"ok": False, "error": str(exc)}
 
 
+def recover_stale_sms_automation_sending_rows(db, stale_minutes=15):
+    cutoff = format_db_time(datetime.utcnow() - timedelta(minutes=max(int(stale_minutes or 15), 1)))
+    cur = db.execute(
+        """
+        UPDATE sms_automation_queue
+        SET status = 'Failed',
+            suppression_reason = 'AutoSend claim timed out before completion; review before retry.',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'Sending'
+          AND datetime(COALESCE(NULLIF(updated_at, ''), NULLIF(created_at, ''))) < datetime(?)
+        """,
+        (cutoff,),
+    )
+    return int(cur.rowcount or 0)
+
+
+def run_sms_automation_send_once(limit=None):
+    if not SMS_AUTOMATION_AUTO_SEND_ENABLED:
+        return {"ok": True, "skipped": "disabled", "sent": 0, "suppressed": 0, "failed": 0}
+    batch_limit = int(limit or SMS_AUTOMATION_AUTO_SEND_BATCH_LIMIT)
+    ensure_db()
+    db = open_sqlite_connection()
+    sent = 0
+    suppressed = 0
+    failed = 0
+    blocked_reason = ""
+    details = []
+    try:
+        within, start, end = _sms_automation_within_send_window(db)
+        if not within:
+            return {
+                "ok": True,
+                "skipped": "outside_send_window",
+                "window": f"{start.strftime('%I:%M %p')} - {end.strftime('%I:%M %p')} ET",
+                "sent": 0,
+                "suppressed": 0,
+                "failed": 0,
+            }
+        recovered = recover_stale_sms_automation_sending_rows(db)
+        revalidate_sms_automation_queue(db, property_ids=None)
+        db.commit()
+        rows = db.execute(
+            """
+            SELECT id, from_number, bucket, contact_role
+            FROM sms_automation_queue
+            WHERE status IN ('Approved', 'Scheduled')
+              AND (
+                    COALESCE(scheduled_for, '') = ''
+                    OR datetime(scheduled_for) <= datetime('now')
+                  )
+            ORDER BY
+                datetime(COALESCE(NULLIF(scheduled_for, ''), NULLIF(approved_at, ''), NULLIF(created_at, ''))) ASC,
+                id ASC
+            LIMIT ?
+            """,
+            (batch_limit,),
+        ).fetchall()
+        for row in rows:
+            from_number = row["from_number"] or select_sms_automation_from_number(db, row["bucket"], row["contact_role"])
+            rate_reason = _sms_automation_rate_limit_reason(db, from_number)
+            if rate_reason:
+                blocked_reason = rate_reason
+                break
+            result = _sms_automation_send_queue_item(db, row["id"])
+            if result.get("ok"):
+                sent += 1
+                details.append({"id": row["id"], "status": "Sent", "external_id": result.get("external_id", "")})
+                db.commit()
+                continue
+            if result.get("suppressed"):
+                suppressed += 1
+                details.append({"id": row["id"], "status": "Suppressed", "error": result.get("error", "")})
+                db.commit()
+                continue
+            failed += 1
+            blocked_reason = result.get("error") or "Unknown AutoSend error"
+            details.append({"id": row["id"], "status": "Blocked", "error": blocked_reason})
+            db.commit()
+            if "Daily cap reached" in blocked_reason or "Minimum gap not reached" in blocked_reason:
+                break
+        return {
+            "ok": True,
+            "sent": sent,
+            "suppressed": suppressed,
+            "failed": failed,
+            "blocked_reason": blocked_reason,
+            "recovered": recovered,
+            "details": details,
+        }
+    except Exception as exc:
+        db.rollback()
+        try:
+            log_app_error(
+                db,
+                source="sms_automation_send_worker",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="run_sms_automation_send_once",
+                status_code=500,
+            )
+            db.commit()
+        except Exception:
+            pass
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+def start_sms_automation_send_worker():
+    global SMS_AUTOMATION_SEND_WORKER_STARTED
+    if SMS_AUTOMATION_SEND_WORKER_STARTED or not SMS_AUTOMATION_AUTO_SEND_ENABLED:
+        return
+    SMS_AUTOMATION_SEND_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                run_sms_automation_send_once(limit=SMS_AUTOMATION_AUTO_SEND_BATCH_LIMIT)
+            except Exception:
+                pass
+            time.sleep(SMS_AUTOMATION_AUTO_SEND_POLL_SECONDS)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
 def get_sms_automation_queue_rows(db, filters=None):
     filters = filters if isinstance(filters, dict) else {}
     clauses = []
@@ -36836,6 +36980,8 @@ def get_sms_automation_queue_rows(db, filters=None):
     if status:
         clauses.append("q.status = ?")
         params.append(status)
+    else:
+        clauses.append("COALESCE(q.status, '') NOT IN ('Approved', 'Scheduled', 'Sending', 'Sent')")
     bucket = (filters.get("bucket") or "").strip()
     if bucket:
         clauses.append("q.bucket = ?")
@@ -36989,7 +37135,11 @@ def get_sms_automation_schedule_rows(db):
         d["person_name"] = f"{d.get('first_name') or ''} {d.get('last_name') or ''}".strip()
         d["sift_url"] = _sift_record_url(d.get("reisift_property_uuid") or "")
         if d.get("status") == "Approved":
-            d["send_readiness"] = "Ready to send manually during the send window"
+            d["send_readiness"] = "AutoSend pending; sends during window/rate rules"
+        elif d.get("status") == "Scheduled":
+            d["send_readiness"] = "AutoSend scheduled; sends when due"
+        elif d.get("status") == "Queued":
+            d["send_readiness"] = "Queued; review or approve for AutoSend"
         elif d.get("status") == "Draft":
             d["send_readiness"] = "Awaiting approval"
         elif d.get("status") == "Held":
@@ -37121,7 +37271,7 @@ def sms_queue_update_item(queue_id):
     row = db.execute("SELECT status FROM sms_automation_queue WHERE id = ? LIMIT 1", (queue_id,)).fetchone()
     if not row:
         return redirect(url_for("sms_queue_page", error=f"SMS draft #{queue_id} was not found."))
-    if str(row["status"] or "") in {"Approved", "Sent", "Sending"}:
+    if str(row["status"] or "") in {"Approved", "Scheduled", "Sent", "Sending"}:
         return redirect(url_for("sms_queue_page", error=f"SMS draft #{queue_id} is approved or already sent and cannot be edited."))
     db.execute(
         """
@@ -37168,7 +37318,12 @@ def sms_queue_item_action(queue_id):
                 (format_db_time(datetime.utcnow()), queue_id),
             )
             db.commit()
-            return _sms_queue_action_response(True, f"Approved SMS draft #{queue_id}.", row_removed=True, status="Approved")
+            return _sms_queue_action_response(
+                True,
+                f"Approved SMS draft #{queue_id} for AutoSend.",
+                row_removed=True,
+                status="Approved",
+            )
         if action == "send":
             result = _sms_automation_send_queue_item(db, queue_id)
             db.commit()

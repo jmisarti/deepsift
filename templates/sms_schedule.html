@@ -22,9 +22,9 @@
 <section class="panel">
     <h2>SMS Schedule</h2>
     <p class="muted-text">
-        Manual approval mode is active. Approved rows are ready to send manually during
+        AutoSend mode is active. Approved rows send automatically during
         <strong>{{ settings.send_window_start }}-{{ settings.send_window_end }} ET</strong>.
-        The Scheduled For column shows the queue timestamp used for ordering; no background AutoSMS sender is active yet.
+        The worker respects sender rotation, the per-number daily cap, and the minimum gap between sends.
     </p>
     <div class="panel-actions">
         <a class="button-link secondary" href="{{ url_for('sms_queue_page') }}">Back to SMS Queue</a>

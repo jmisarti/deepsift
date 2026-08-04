@@ -22,10 +22,11 @@
 <section class="panel">
     <h2>SMS Queue</h2>
     <p class="muted-text">
-        Manual approval mode. Sender pool:
+        Approving a draft moves it into AutoSend. Sender pool:
         <strong>{% for number in settings.from_numbers %}{{ number|fmt_phone }}{% if not loop.last %}, {% endif %}{% endfor %}</strong>.
         Window: <strong>{{ settings.send_window_start }}-{{ settings.send_window_end }} ET</strong>.
         Cap: <strong>{{ settings.max_daily_per_number }}/number/day</strong>.
+        Send Now is still available as a manual override.
     </p>
 
     <div class="panel-actions">
@@ -54,8 +55,8 @@
             </label>
             <label>Status
                 <select name="status">
-                    <option value="">All</option>
-                    {% for status in ['Draft', 'Approved', 'Sent', 'Failed', 'Suppressed', 'Held'] %}
+                    <option value="">Review Queue</option>
+                    {% for status in ['Draft', 'Queued', 'Approved', 'Scheduled', 'Sending', 'Sent', 'Failed', 'Suppressed', 'Held'] %}
                     <option value="{{ status }}" {% if filters.status == status %}selected{% endif %}>{{ status }}</option>
                     {% endfor %}
                 </select>
@@ -162,15 +163,15 @@
                     </td>
                     <td>
                         <form method="post" action="{{ url_for('sms_queue_update_item', queue_id=row.id) }}" class="sms-message-form">
-                            <textarea name="message_body" rows="3" {% if row.status in ['Approved', 'Sent', 'Sending'] %}readonly{% endif %}>{{ row.message_body }}</textarea>
-                            <button type="submit" {% if row.status in ['Approved', 'Sent', 'Sending'] %}disabled{% endif %}>Save</button>
+                            <textarea name="message_body" rows="3" {% if row.status in ['Approved', 'Scheduled', 'Sent', 'Sending'] %}readonly{% endif %}>{{ row.message_body }}</textarea>
+                            <button type="submit" {% if row.status in ['Approved', 'Scheduled', 'Sent', 'Sending'] %}disabled{% endif %}>Save</button>
                         </form>
                     </td>
                     <td>{{ row.from_number|fmt_phone }}</td>
                     <td>
                         <form method="post" action="{{ url_for('sms_queue_item_action', queue_id=row.id) }}" class="sms-queue-actions">
-                            <button type="submit" name="sms_action" value="approve" data-loading-label="Approving..." {% if row.status in ['Sent', 'Suppressed'] %}disabled{% endif %}>Approve</button>
-                            <button type="submit" name="sms_action" value="send" data-loading-label="Sending..." {% if row.status in ['Sent', 'Suppressed', 'Held'] %}disabled{% endif %}>Send Now</button>
+                            <button type="submit" name="sms_action" value="approve" data-loading-label="Approving..." {% if row.status in ['Approved', 'Scheduled', 'Sending', 'Sent', 'Suppressed'] %}disabled{% endif %}>Approve AutoSend</button>
+                            <button type="submit" name="sms_action" value="send" data-loading-label="Sending..." {% if row.status in ['Sent', 'Suppressed', 'Held', 'Sending'] %}disabled{% endif %}>Send Now</button>
                             <button type="submit" name="sms_action" value="hold" data-loading-label="Holding..." {% if row.status in ['Sent', 'Suppressed', 'Held'] %}disabled{% endif %}>Hold</button>
                         </form>
                     </td>

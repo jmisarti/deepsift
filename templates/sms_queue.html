@@ -194,7 +194,6 @@
         if (!target) return;
         target.textContent = message || '';
         target.classList.toggle('hidden', !message);
-        if (message) target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
     function hideMessages() {

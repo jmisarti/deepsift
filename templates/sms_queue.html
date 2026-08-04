@@ -218,12 +218,26 @@
                 const response = await fetch(form.action, {
                     method: 'POST',
                     body,
+                    credentials: 'same-origin',
                     headers: {
                         'Accept': 'application/json',
                         'X-Requested-With': 'XMLHttpRequest'
                     }
                 });
-                const data = await response.json().catch(() => ({ ok: false, message: 'Unexpected server response.' }));
+                const contentType = response.headers.get('content-type') || '';
+                let data;
+                if (contentType.includes('application/json')) {
+                    data = await response.json();
+                } else {
+                    const text = await response.text();
+                    const shortText = text.replace(/\s+/g, ' ').trim().slice(0, 180);
+                    data = {
+                        ok: false,
+                        message: response.redirected
+                            ? 'The action was redirected, likely because your session expired. Please refresh/sign in and try again.'
+                            : `Unexpected server response (${response.status}). ${shortText || 'Please refresh and try again.'}`
+                    };
+                }
                 if (!response.ok || !data.ok) {
                     showMessage(error, data.message || 'SMS action failed.');
                     return;

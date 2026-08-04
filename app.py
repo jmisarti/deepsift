@@ -800,6 +800,11 @@ def require_login_if_enabled():
         return None
     if request.path.startswith("/api/"):
         return jsonify({"error": "Authentication required"}), 401
+    if (
+        request.headers.get("X-Requested-With") == "XMLHttpRequest"
+        or "application/json" in (request.headers.get("Accept") or "")
+    ):
+        return jsonify({"ok": False, "message": "Authentication required. Please refresh/sign in and try again."}), 401
     next_target = request.full_path if request.query_string else request.path
     return redirect(url_for("login", next=next_target))
 

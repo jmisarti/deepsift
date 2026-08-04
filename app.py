@@ -37141,7 +37141,7 @@ def sms_queue_update_item(queue_id):
 def sms_queue_item_action(queue_id):
     ensure_db()
     db = get_db()
-    action = (request.form.get("action") or "").strip().lower()
+    action = (request.form.get("sms_action") or request.form.get("action") or "").strip().lower()
     try:
         if action == "hold":
             db.execute(

@@ -169,9 +169,9 @@
                     <td>{{ row.from_number|fmt_phone }}</td>
                     <td>
                         <form method="post" action="{{ url_for('sms_queue_item_action', queue_id=row.id) }}" class="sms-queue-actions">
-                            <button type="submit" name="action" value="approve" data-loading-label="Approving..." {% if row.status in ['Sent', 'Suppressed'] %}disabled{% endif %}>Approve</button>
-                            <button type="submit" name="action" value="send" data-loading-label="Sending..." {% if row.status in ['Sent', 'Suppressed', 'Held'] %}disabled{% endif %}>Send Now</button>
-                            <button type="submit" name="action" value="hold" data-loading-label="Holding..." {% if row.status in ['Sent', 'Suppressed', 'Held'] %}disabled{% endif %}>Hold</button>
+                            <button type="submit" name="sms_action" value="approve" data-loading-label="Approving..." {% if row.status in ['Sent', 'Suppressed'] %}disabled{% endif %}>Approve</button>
+                            <button type="submit" name="sms_action" value="send" data-loading-label="Sending..." {% if row.status in ['Sent', 'Suppressed', 'Held'] %}disabled{% endif %}>Send Now</button>
+                            <button type="submit" name="sms_action" value="hold" data-loading-label="Holding..." {% if row.status in ['Sent', 'Suppressed', 'Held'] %}disabled{% endif %}>Hold</button>
                         </form>
                     </td>
                 </tr>
@@ -215,7 +215,8 @@
             try {
                 const body = new FormData(form);
                 if (submitter.name && submitter.value) body.set(submitter.name, submitter.value);
-                const response = await fetch(form.action, {
+                const actionUrl = form.getAttribute('action') || window.location.href;
+                const response = await fetch(actionUrl, {
                     method: 'POST',
                     body,
                     credentials: 'same-origin',

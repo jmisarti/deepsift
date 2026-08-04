@@ -28580,6 +28580,7 @@ def refresh_prospecting_new_records_once():
 
 
 SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES = {
+    "wrong",
     "wrong number",
     "incorrect",
     "dead",
@@ -28594,6 +28595,7 @@ SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES = {
 }
 
 SMS_AUTOMATION_LOCKED_QUEUE_STATUSES = {"Approved", "Sending", "Sent", "Held"}
+REISIFT_NEW_RECORD_TOUCHPOINT_SOURCE = "ReiSift New Records refresh"
 
 SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES = {"new record", "new records"}
 
@@ -29083,6 +29085,40 @@ def sms_automation_touchpoint_suppression_reason(db, touchpoint_id):
     return ""
 
 
+def extract_reisift_import_uuid_from_note(note):
+    match = re.search(r"\bReiSift UUID\s+([0-9a-fA-F-]{36})\b", str(note or ""))
+    return normalize_uuid(match.group(1)) if match else ""
+
+
+def active_reisift_new_record_uuid_for_property(db, property_id):
+    row = db.execute(
+        """
+        SELECT property_uuid
+        FROM reisift_new_records
+        WHERE local_property_id = ?
+          AND COALESCE(is_active, 1) = 1
+        ORDER BY COALESCE(added_at, last_synced_at) DESC, id DESC
+        LIMIT 1
+        """,
+        (int(property_id or 0),),
+    ).fetchone()
+    return normalize_uuid(row["property_uuid"] if row else "")
+
+
+def stale_reisift_new_record_touchpoint_reason(db, property_id, touchpoint_id, active_property_uuid=None):
+    row = db.execute("SELECT note FROM touchpoints WHERE id = ? LIMIT 1", (int(touchpoint_id or 0),)).fetchone()
+    if not row:
+        return ""
+    note = str(row["note"] or "")
+    if REISIFT_NEW_RECORD_TOUCHPOINT_SOURCE.lower() not in note.lower():
+        return ""
+    imported_uuid = extract_reisift_import_uuid_from_note(note)
+    active_uuid = normalize_uuid(active_property_uuid) or active_reisift_new_record_uuid_for_property(db, property_id)
+    if imported_uuid and active_uuid and imported_uuid != active_uuid:
+        return f"Stale ReiSIFT New Record phone from {imported_uuid}; active New Record is {active_uuid}."
+    return ""
+
+
 def revalidate_sms_automation_queue(db, property_ids=None):
     clauses = ["status IN ('Draft', 'Queued', 'Approved', 'Scheduled')"]
     params = []
@@ -29102,6 +29138,8 @@ def revalidate_sms_automation_queue(db, property_ids=None):
     suppressed = 0
     for row in rows:
         reason = sms_automation_property_suppression_reason(db, row["property_id"])
+        if not reason:
+            reason = stale_reisift_new_record_touchpoint_reason(db, row["property_id"], row["touchpoint_id"])
         if not reason:
             reason = sms_automation_touchpoint_suppression_reason(db, row["touchpoint_id"])
         if reason:
@@ -29197,7 +29235,7 @@ def normalize_unsent_sms_queue_addresses(db):
     return updated
 
 
-def collect_sms_automation_targets_for_property(db, property_id):
+def collect_sms_automation_targets_for_property(db, property_id, active_property_uuid=None):
     prop = _sms_automation_property_row(db, property_id)
     if not prop:
         return []
@@ -29209,7 +29247,7 @@ def collect_sms_automation_targets_for_property(db, property_id):
     placeholders = ",".join(["?"] * len(network_ids))
     rows = db.execute(
         f"""
-        SELECT t.id AS touchpoint_id, t.person_id, t.value, t.channel_label, t.status,
+        SELECT t.id AS touchpoint_id, t.person_id, t.value, t.channel_label, t.status, t.note,
                pe.first_name, pe.last_name
         FROM touchpoints t
         JOIN people pe ON pe.id = t.person_id
@@ -29225,9 +29263,11 @@ def collect_sms_automation_targets_for_property(db, property_id):
         normalized = normalize_phone(row["value"])
         if not normalized or normalized in seen:
             continue
-        seen.add(normalized)
+        if stale_reisift_new_record_touchpoint_reason(db, property_id, row["touchpoint_id"], active_property_uuid=active_property_uuid):
+            continue
         if sms_automation_touchpoint_suppression_reason(db, row["touchpoint_id"]):
             continue
+        seen.add(normalized)
         role = _reisift_contact_role_for_person(db, int(property_id), row["person_id"])
         out.append({"row": row, "phone_norm": normalized, "contact_role": role})
     return out
@@ -29481,7 +29521,7 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
                     "source_info_raw": existing_source["source_info_raw"] or "",
                     "cached": True,
                 }
-        targets = collect_sms_automation_targets_for_property(db, property_id)
+        targets = collect_sms_automation_targets_for_property(db, property_id, active_property_uuid=row["property_uuid"])
         if not targets:
             skipped += 1
             continue

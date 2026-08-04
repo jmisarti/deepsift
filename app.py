@@ -28593,6 +28593,8 @@ SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES = {
     "bounced",
 }
 
+SMS_AUTOMATION_LOCKED_QUEUE_STATUSES = {"Approved", "Sending", "Sent", "Held"}
+
 SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES = {"new record", "new records"}
 
 
@@ -29231,6 +29233,94 @@ def collect_sms_automation_targets_for_property(db, property_id):
     return out
 
 
+def sms_automation_queue_status_rank(status):
+    status_text = str(status or "").strip()
+    order = {
+        "Sent": 0,
+        "Sending": 1,
+        "Approved": 2,
+        "Held": 3,
+        "Draft": 4,
+        "Queued": 5,
+        "Scheduled": 6,
+        "Failed": 7,
+        "Suppressed": 8,
+    }
+    return order.get(status_text, 9)
+
+
+def find_sms_automation_queue_for_property_phone(db, property_id, phone_norm):
+    normalized = normalize_phone(phone_norm)
+    if not normalized:
+        return None
+    rows = db.execute(
+        """
+        SELECT id, status, queue_key, phone_number, created_at, updated_at
+        FROM sms_automation_queue
+        WHERE property_id = ?
+        ORDER BY id ASC
+        """,
+        (int(property_id or 0),),
+    ).fetchall()
+    matches = [dict(r) for r in rows if normalize_phone(r["phone_number"]) == normalized]
+    if not matches:
+        return None
+    matches.sort(key=lambda r: (sms_automation_queue_status_rank(r["status"]), int(r["id"] or 0)))
+    return matches[0]
+
+
+def suppress_duplicate_sms_automation_queue_items(db, property_ids=None):
+    clauses = []
+    params = []
+    if property_ids:
+        ids = sorted({int(pid) for pid in property_ids if int(pid or 0) > 0})
+        if ids:
+            clauses.append("property_id IN (" + ",".join(["?"] * len(ids)) + ")")
+            params.extend(ids)
+    where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = db.execute(
+        f"""
+        SELECT id, property_id, phone_number, status
+        FROM sms_automation_queue
+        {where_sql}
+        ORDER BY property_id ASC, id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+    groups = {}
+    for row in rows:
+        phone_norm = normalize_phone(row["phone_number"])
+        if not phone_norm:
+            continue
+        groups.setdefault((int(row["property_id"] or 0), phone_norm), []).append(dict(row))
+
+    suppressed = 0
+    for items in groups.values():
+        if len(items) <= 1:
+            continue
+        items.sort(key=lambda r: (sms_automation_queue_status_rank(r["status"]), int(r["id"] or 0)))
+        keep = items[0]
+        for item in items[1:]:
+            status = str(item["status"] or "").strip()
+            if status in {"Sent", "Sending", "Approved"}:
+                continue
+            if int(item["id"]) == int(keep["id"]):
+                continue
+            db.execute(
+                """
+                UPDATE sms_automation_queue
+                SET status = 'Suppressed',
+                    suppression_reason = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND status NOT IN ('Sent', 'Sending', 'Approved')
+                """,
+                (f"Duplicate SMS candidate for this property/phone; kept queue #{keep['id']}.", item["id"]),
+            )
+            suppressed += 1
+    return suppressed
+
+
 def upsert_sms_automation_draft(db, property_id, target, route, source_info, payload):
     prop = _sms_automation_property_row(db, property_id)
     if not prop:
@@ -29274,13 +29364,15 @@ def upsert_sms_automation_draft(db, property_id, target, route, source_info, pay
             "source_terms": route.get("source_terms") or [],
         },
     }
-    existing = db.execute(
-        "SELECT id, status FROM sms_automation_queue WHERE queue_key = ? LIMIT 1",
-        (queue_key,),
-    ).fetchone()
+    existing = find_sms_automation_queue_for_property_phone(db, property_id, phone_norm)
+    if not existing:
+        existing = db.execute(
+            "SELECT id, status FROM sms_automation_queue WHERE queue_key = ? LIMIT 1",
+            (queue_key,),
+        ).fetchone()
     if existing:
-        if str(existing["status"] or "").strip() in {"Sent", "Sending"}:
-            return "already_sent"
+        if str(existing["status"] or "").strip() in SMS_AUTOMATION_LOCKED_QUEUE_STATUSES:
+            return "already_locked"
         db.execute(
             """
             UPDATE sms_automation_queue
@@ -29356,7 +29448,7 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
         """,
         tuple(params),
     ).fetchall()
-    created = updated = skipped = suppressed = 0
+    created = updated = skipped = suppressed = duplicates_suppressed = 0
     touched_property_ids = set()
     for row in rows:
         property_id = int(row["local_property_id"] or 0)
@@ -29402,13 +29494,16 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
                 updated += 1
             else:
                 skipped += 1
-    suppressed += revalidate_sms_automation_queue(db, property_ids=touched_property_ids if touched_property_ids else property_ids)
+    cleanup_property_ids = touched_property_ids if touched_property_ids else property_ids
+    duplicates_suppressed += suppress_duplicate_sms_automation_queue_items(db, property_ids=cleanup_property_ids)
+    suppressed += revalidate_sms_automation_queue(db, property_ids=cleanup_property_ids)
     return {
         "records": len(rows),
         "created": created,
         "updated": updated,
         "skipped": skipped,
         "suppressed": suppressed,
+        "duplicates_suppressed": duplicates_suppressed,
     }
 
 
@@ -36833,7 +36928,10 @@ def sms_queue_generate():
         token = reisift_get_access_token()
         result = generate_sms_automation_queue_for_new_records(db, token=token)
         db.commit()
-        notice = f"SMS queue refreshed: created {result['created']}, updated {result['updated']}, suppressed {result['suppressed']}."
+        notice = (
+            f"SMS queue refreshed: created {result['created']}, updated {result['updated']}, "
+            f"suppressed {result['suppressed']}, duplicate candidates suppressed {result.get('duplicates_suppressed', 0)}."
+        )
         return redirect(url_for("sms_queue_page", notice=notice))
     except Exception as exc:
         db.rollback()
@@ -36850,7 +36948,8 @@ def sms_queue_revalidate():
         notice = (
             "Revalidated queue: "
             f"created {result['created']}, updated {result['updated']}, "
-            f"suppressed {result['suppressed']} item(s)."
+            f"suppressed {result['suppressed']} item(s), "
+            f"duplicate candidates suppressed {result.get('duplicates_suppressed', 0)}."
         )
         return redirect(url_for("sms_queue_page", notice=notice))
     except Exception as exc:
@@ -36868,8 +36967,8 @@ def sms_queue_update_item(queue_id):
     row = db.execute("SELECT status FROM sms_automation_queue WHERE id = ? LIMIT 1", (queue_id,)).fetchone()
     if not row:
         return redirect(url_for("sms_queue_page", error=f"SMS draft #{queue_id} was not found."))
-    if str(row["status"] or "") in {"Sent", "Sending"}:
-        return redirect(url_for("sms_queue_page", error=f"SMS draft #{queue_id} has already been sent and cannot be edited."))
+    if str(row["status"] or "") in {"Approved", "Sent", "Sending"}:
+        return redirect(url_for("sms_queue_page", error=f"SMS draft #{queue_id} is approved or already sent and cannot be edited."))
     db.execute(
         """
         UPDATE sms_automation_queue

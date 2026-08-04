@@ -159,8 +159,8 @@
                     </td>
                     <td>
                         <form method="post" action="{{ url_for('sms_queue_update_item', queue_id=row.id) }}" class="sms-message-form">
-                            <textarea name="message_body" rows="3" {% if row.status in ['Sent', 'Sending'] %}readonly{% endif %}>{{ row.message_body }}</textarea>
-                            <button type="submit" {% if row.status in ['Sent', 'Sending'] %}disabled{% endif %}>Save</button>
+                            <textarea name="message_body" rows="3" {% if row.status in ['Approved', 'Sent', 'Sending'] %}readonly{% endif %}>{{ row.message_body }}</textarea>
+                            <button type="submit" {% if row.status in ['Approved', 'Sent', 'Sending'] %}disabled{% endif %}>Save</button>
                         </form>
                     </td>
                     <td>{{ row.from_number|fmt_phone }}</td>

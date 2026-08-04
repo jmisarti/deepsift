@@ -36936,6 +36936,103 @@ def get_sms_automation_filter_options(db):
     }
 
 
+def get_sms_automation_schedule_rows(db):
+    rows = db.execute(
+        """
+        SELECT q.*, p.status AS property_status, p.reisift_property_uuid,
+               a.street, a.city, a.state, a.postal_code,
+               pe.first_name, pe.last_name, t.channel_label, t.status AS phone_status,
+               n.county AS property_county,
+               COALESCE(NULLIF(t.created_at, ''), NULLIF(q.created_at, '')) AS number_pulled_at
+        FROM sms_automation_queue q
+        JOIN properties p ON p.id = q.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        LEFT JOIN people pe ON pe.id = q.person_id
+        LEFT JOIN touchpoints t ON t.id = q.touchpoint_id
+        LEFT JOIN reisift_new_records n ON n.id = (
+            SELECT nr.id
+            FROM reisift_new_records nr
+            WHERE nr.local_property_id = p.id
+               OR (
+                    COALESCE(p.reisift_property_uuid, '') != ''
+                    AND nr.property_uuid = p.reisift_property_uuid
+               )
+            ORDER BY nr.id DESC
+            LIMIT 1
+        )
+        WHERE COALESCE(q.status, '') IN ('Draft', 'Queued', 'Approved', 'Scheduled', 'Failed', 'Held', 'Sending')
+        ORDER BY
+            CASE q.status
+                WHEN 'Approved' THEN 1
+                WHEN 'Scheduled' THEN 2
+                WHEN 'Queued' THEN 3
+                WHEN 'Draft' THEN 4
+                WHEN 'Failed' THEN 5
+                WHEN 'Held' THEN 6
+                WHEN 'Sending' THEN 7
+                ELSE 8
+            END,
+            datetime(COALESCE(NULLIF(q.scheduled_for, ''), NULLIF(q.approved_at, ''), NULLIF(q.created_at, ''))) ASC,
+            q.id ASC
+        LIMIT 1000
+        """
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["property_address"] = format_property_address_line(d.get("street"), d.get("city"), d.get("state"), d.get("postal_code"))
+        d["person_name"] = f"{d.get('first_name') or ''} {d.get('last_name') or ''}".strip()
+        d["sift_url"] = _sift_record_url(d.get("reisift_property_uuid") or "")
+        if d.get("status") == "Approved":
+            d["send_readiness"] = "Ready to send manually during the send window"
+        elif d.get("status") == "Draft":
+            d["send_readiness"] = "Awaiting approval"
+        elif d.get("status") == "Held":
+            d["send_readiness"] = "Held for review"
+        elif d.get("status") == "Failed":
+            d["send_readiness"] = "Failed; review before retry"
+        else:
+            d["send_readiness"] = d.get("status") or "-"
+        out.append(d)
+    return out
+
+
+def _sms_queue_wants_json():
+    return (
+        request.headers.get("X-Requested-With") == "XMLHttpRequest"
+        or "application/json" in (request.headers.get("Accept") or "")
+    )
+
+
+def _sms_queue_action_response(ok, message, status_code=200, **payload):
+    if _sms_queue_wants_json():
+        body = {"ok": bool(ok), "message": message}
+        body.update(payload)
+        return jsonify(body), status_code
+    target = "notice" if ok else "error"
+    return redirect(url_for("sms_queue_page", **{target: message}))
+
+
+@app.route("/sms-queue/schedule")
+def sms_queue_schedule_page():
+    ensure_db()
+    db = get_db()
+    summary_rows = db.execute(
+        """
+        SELECT status, COUNT(*) AS c
+        FROM sms_automation_queue
+        WHERE COALESCE(status, '') IN ('Draft', 'Queued', 'Approved', 'Scheduled', 'Failed', 'Held', 'Sending')
+        GROUP BY status
+        """
+    ).fetchall()
+    return render_template(
+        "sms_schedule.html",
+        rows=get_sms_automation_schedule_rows(db),
+        summary={r["status"]: int(r["c"] or 0) for r in summary_rows},
+        settings=get_sms_automation_settings(db),
+    )
+
+
 @app.route("/sms-queue")
 def sms_queue_page():
     ensure_db()
@@ -37047,29 +37144,37 @@ def sms_queue_item_action(queue_id):
                 ("Manually held for review.", queue_id),
             )
             db.commit()
-            return redirect(url_for("sms_queue_page", notice=f"Held SMS draft #{queue_id}."))
+            return _sms_queue_action_response(True, f"Held SMS draft #{queue_id}.", row_removed=True, status="Held")
         if action == "approve":
             reason = revalidate_sms_automation_queue(db, property_ids=[])
             row = db.execute("SELECT status FROM sms_automation_queue WHERE id = ?", (queue_id,)).fetchone()
             if row and row["status"] == "Suppressed":
                 db.commit()
+                if _sms_queue_wants_json():
+                    return _sms_queue_action_response(
+                        True,
+                        f"Draft #{queue_id} was suppressed during revalidation and removed from this view.",
+                        row_removed=True,
+                        status="Suppressed",
+                    )
                 return redirect(url_for("sms_queue_page", error=f"Draft #{queue_id} is suppressed and cannot be approved."))
             db.execute(
                 "UPDATE sms_automation_queue SET status = 'Approved', approved_at = ?, suppression_reason = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (format_db_time(datetime.utcnow()), queue_id),
             )
             db.commit()
-            return redirect(url_for("sms_queue_page", notice=f"Approved SMS draft #{queue_id}."))
+            return _sms_queue_action_response(True, f"Approved SMS draft #{queue_id}.", row_removed=True, status="Approved")
         if action == "send":
             result = _sms_automation_send_queue_item(db, queue_id)
             db.commit()
             if result.get("ok"):
-                return redirect(url_for("sms_queue_page", notice=f"Sent SMS draft #{queue_id}."))
-            return redirect(url_for("sms_queue_page", error=f"Send failed for #{queue_id}: {result.get('error') or 'Unknown error'}"))
-        return redirect(url_for("sms_queue_page", error="Unknown SMS queue action."))
+                send_payload = {k: v for k, v in result.items() if k != "ok"}
+                return _sms_queue_action_response(True, f"Sent SMS draft #{queue_id}.", row_removed=True, status="Sent", **send_payload)
+            return _sms_queue_action_response(False, f"Send failed for #{queue_id}: {result.get('error') or 'Unknown error'}", status_code=400)
+        return _sms_queue_action_response(False, "Unknown SMS queue action.", status_code=400)
     except Exception as exc:
         db.rollback()
-        return redirect(url_for("sms_queue_page", error=f"SMS queue action failed: {exc}"))
+        return _sms_queue_action_response(False, f"SMS queue action failed: {exc}", status_code=500)
 
 
 @app.route("/submitted-leads")

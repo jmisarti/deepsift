@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="cards page-summary-cards">
+    <article>
+        <h3>Draft</h3>
+        <p>{{ summary.get('Draft', 0) }}</p>
+    </article>
+    <article>
+        <h3>Approved</h3>
+        <p>{{ summary.get('Approved', 0) }}</p>
+    </article>
+    <article>
+        <h3>Scheduled</h3>
+        <p>{{ summary.get('Scheduled', 0) + summary.get('Queued', 0) }}</p>
+    </article>
+    <article>
+        <h3>Held/Failed</h3>
+        <p>{{ summary.get('Held', 0) + summary.get('Failed', 0) }}</p>
+    </article>
+</section>
+
+<section class="panel">
+    <h2>SMS Schedule</h2>
+    <p class="muted-text">
+        Manual approval mode is active. Approved rows are ready to send manually during
+        <strong>{{ settings.send_window_start }}-{{ settings.send_window_end }} ET</strong>.
+        The Scheduled For column shows the queue timestamp used for ordering; no background AutoSMS sender is active yet.
+    </p>
+    <div class="panel-actions">
+        <a class="button-link secondary" href="{{ url_for('sms_queue_page') }}">Back to SMS Queue</a>
+        <form method="post" action="{{ url_for('sms_queue_revalidate') }}">
+            <button type="submit">Revalidate + Find New Numbers</button>
+        </form>
+    </div>
+
+    <div class="table-wrap sms-queue-table-wrap">
+        <table class="crm-table sms-queue-table">
+            <thead>
+                <tr>
+                    <th>Scheduled For</th>
+                    <th>Status</th>
+                    <th>Readiness</th>
+                    <th>Property</th>
+                    <th>Person</th>
+                    <th>Phone</th>
+                    <th>Bucket</th>
+                    <th>Approved</th>
+                    <th>Number Pulled</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr>
+                    <td>{{ row.scheduled_for|fmt_est_datetime }}</td>
+                    <td><span class="pill sms-status-{{ row.status|lower|replace(' ', '-') }}">{{ row.status }}</span></td>
+                    <td>{{ row.send_readiness }}</td>
+                    <td>
+                        <div>{{ row.property_address or '-' }}</div>
+                        {% if row.property_county %}
+                        <div class="sms-queue-reason">{{ row.property_county }}</div>
+                        {% endif %}
+                        <div class="inline-actions compact-icons">
+                            <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.property_id) }}" title="Open in Deep Dive">
+                                <img class="tiny-link-icon" src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/08/cropped-nj-logo-tiny-32x32.png" alt="Deep Dive">
+                            </a>
+                            {% if row.sift_url %}
+                            <a class="action-icon-link" href="{{ row.sift_url }}" target="_blank" rel="noopener" title="Open in REISift">
+                                <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+                            </a>
+                            {% endif %}
+                        </div>
+                    </td>
+                    <td>{{ row.person_name or '-' }}</td>
+                    <td>
+                        {{ row.phone_number|fmt_phone }}
+                        <div class="sms-queue-reason">{{ row.channel_label or 'Unknown' }} / {{ row.phone_status or '-' }}</div>
+                    </td>
+                    <td>{{ row.bucket or '-' }}</td>
+                    <td>{{ row.approved_at|fmt_est_datetime }}</td>
+                    <td>{{ row.number_pulled_at|fmt_short_date }}</td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="9">No pending SMS queue items are currently scheduled or awaiting action.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}

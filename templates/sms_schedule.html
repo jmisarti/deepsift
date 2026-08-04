@@ -37,7 +37,7 @@
         <table class="crm-table sms-queue-table">
             <thead>
                 <tr>
-                    <th>Scheduled For</th>
+                    <th>Next Send</th>
                     <th>Status</th>
                     <th>Readiness</th>
                     <th>Property</th>
@@ -51,7 +51,7 @@
             <tbody>
                 {% for row in rows %}
                 <tr>
-                    <td>{{ row.scheduled_for|fmt_est_datetime }}</td>
+                    <td>{{ row.projected_send_at|fmt_est_datetime }}</td>
                     <td><span class="pill sms-status-{{ row.status|lower|replace(' ', '-') }}">{{ row.status }}</span></td>
                     <td>{{ row.send_readiness }}</td>
                     <td>

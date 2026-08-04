@@ -29475,7 +29475,7 @@ def upsert_sms_automation_draft(db, property_id, target, route, source_info, pay
             (queue_key, property_id, person_id, touchpoint_id, phone_number, from_number, contact_role,
              bucket, rule_key, sequence_name, step_order, message_body, rendered_variables_json,
              source_info_json, status, scheduled_for)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 'Draft', ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 'Draft', NULL)
         """,
         (
             queue_key,
@@ -29491,7 +29491,6 @@ def upsert_sms_automation_draft(db, property_id, target, route, source_info, pay
             message,
             json.dumps(variables),
             json.dumps(source_json),
-            format_db_time(datetime.utcnow()),
         ),
     )
     return "created"
@@ -36701,6 +36700,28 @@ def _sms_automation_within_send_window(db):
     return start <= now_et <= end, start, end
 
 
+def _sms_automation_adjust_to_send_window_utc(dt_utc, settings):
+    candidate_utc = dt_utc if isinstance(dt_utc, datetime) else datetime.utcnow()
+    candidate_et = candidate_utc.replace(tzinfo=timezone.utc).astimezone(EST_TZ)
+    sh, sm = parse_hhmm(settings.get("send_window_start"), 9, 15)
+    eh, em = parse_hhmm(settings.get("send_window_end"), 16, 45)
+    start_et = candidate_et.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end_et = candidate_et.replace(hour=eh, minute=em, second=0, microsecond=0)
+    if candidate_et < start_et:
+        target_et = start_et
+    elif candidate_et > end_et:
+        target_et = (candidate_et + timedelta(days=1)).replace(hour=sh, minute=sm, second=0, microsecond=0)
+    else:
+        target_et = candidate_et
+    return target_et.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _sms_automation_window_start_utc_for_et_date(et_date, settings):
+    sh, sm = parse_hhmm(settings.get("send_window_start"), 9, 15)
+    start_et = datetime(et_date.year, et_date.month, et_date.day, sh, sm, tzinfo=EST_TZ)
+    return start_et.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _sms_automation_rate_limit_reason(db, from_number):
     settings = get_sms_automation_settings(db)
     from_norm = normalize_phone(from_number)
@@ -36874,13 +36895,21 @@ def run_sms_automation_send_once(limit=None):
             """
             SELECT id, from_number, bucket, contact_role
             FROM sms_automation_queue
-            WHERE status IN ('Approved', 'Scheduled')
-              AND (
-                    COALESCE(scheduled_for, '') = ''
-                    OR datetime(scheduled_for) <= datetime('now')
+            WHERE status = 'Approved'
+               OR (
+                    status = 'Scheduled'
+                    AND (
+                        COALESCE(scheduled_for, '') = ''
+                        OR datetime(scheduled_for) <= datetime('now')
+                    )
                   )
             ORDER BY
-                datetime(COALESCE(NULLIF(scheduled_for, ''), NULLIF(approved_at, ''), NULLIF(created_at, ''))) ASC,
+                datetime(
+                    CASE
+                        WHEN status = 'Scheduled' THEN COALESCE(NULLIF(scheduled_for, ''), NULLIF(approved_at, ''), NULLIF(created_at, ''))
+                        ELSE COALESCE(NULLIF(approved_at, ''), NULLIF(created_at, ''))
+                    END
+                ) ASC,
                 id ASC
             LIMIT ?
             """,
@@ -37088,6 +37117,7 @@ def get_sms_automation_filter_options(db):
 
 
 def get_sms_automation_schedule_rows(db):
+    settings = get_sms_automation_settings(db)
     rows = db.execute(
         """
         SELECT q.*, p.status AS property_status, p.reisift_property_uuid,
@@ -37123,30 +37153,102 @@ def get_sms_automation_schedule_rows(db):
                 WHEN 'Sending' THEN 7
                 ELSE 8
             END,
-            datetime(COALESCE(NULLIF(q.scheduled_for, ''), NULLIF(q.approved_at, ''), NULLIF(q.created_at, ''))) ASC,
+            datetime(
+                CASE
+                    WHEN q.status = 'Scheduled' THEN COALESCE(NULLIF(q.scheduled_for, ''), NULLIF(q.approved_at, ''), NULLIF(q.created_at, ''))
+                    WHEN q.status = 'Approved' THEN COALESCE(NULLIF(q.approved_at, ''), NULLIF(q.created_at, ''))
+                    ELSE COALESCE(NULLIF(q.scheduled_for, ''), NULLIF(q.approved_at, ''), NULLIF(q.created_at, ''))
+                END
+            ) ASC,
             q.id ASC
         LIMIT 1000
         """
     ).fetchall()
     out = []
+    now_utc = datetime.utcnow()
+    now_et = datetime.now(EST_TZ)
+    day_start, day_end = _sms_automation_today_window_utc()
+    sent_rows = db.execute(
+        """
+        SELECT from_number, sent_at
+        FROM sms_automation_queue
+        WHERE status = 'Sent'
+          AND COALESCE(sent_at, '') != ''
+          AND sent_at >= ?
+          AND sent_at < ?
+        """,
+        (format_db_time(day_start), format_db_time(day_end)),
+    ).fetchall()
+    sent_counts_by_number_date = {}
+    latest_sent_by_number = {}
+    for sent in sent_rows:
+        from_norm = normalize_phone(sent["from_number"])
+        sent_dt = parse_db_time(sent["sent_at"])
+        if not from_norm or not sent_dt:
+            continue
+        sent_et_date = sent_dt.replace(tzinfo=timezone.utc).astimezone(EST_TZ).date()
+        key = (from_norm, sent_et_date.isoformat())
+        sent_counts_by_number_date[key] = sent_counts_by_number_date.get(key, 0) + 1
+        prior = latest_sent_by_number.get(from_norm)
+        if prior is None or sent_dt > prior:
+            latest_sent_by_number[from_norm] = sent_dt
+    next_available_by_number = {
+        num: dt + timedelta(seconds=int(settings["min_gap_seconds"]))
+        for num, dt in latest_sent_by_number.items()
+    }
+    projected_counts_by_number_date = dict(sent_counts_by_number_date)
     for r in rows:
         d = dict(r)
         d["property_address"] = format_property_address_line(d.get("street"), d.get("city"), d.get("state"), d.get("postal_code"))
         d["person_name"] = f"{d.get('first_name') or ''} {d.get('last_name') or ''}".strip()
         d["sift_url"] = _sift_record_url(d.get("reisift_property_uuid") or "")
         if d.get("status") == "Approved":
-            d["send_readiness"] = "AutoSend pending; sends during window/rate rules"
+            from_norm = normalize_phone(d.get("from_number")) or normalize_phone(select_sms_automation_from_number(db, d.get("bucket"), d.get("contact_role")))
+            candidate = max(now_utc, next_available_by_number.get(from_norm, now_utc))
+            projected = _sms_automation_adjust_to_send_window_utc(candidate, settings)
+            cap_blocked = False
+            while from_norm:
+                projected_et_date = projected.replace(tzinfo=timezone.utc).astimezone(EST_TZ).date()
+                count_key = (from_norm, projected_et_date.isoformat())
+                if projected_counts_by_number_date.get(count_key, 0) < int(settings["max_daily_per_number"]):
+                    break
+                cap_blocked = True
+                projected = _sms_automation_window_start_utc_for_et_date(projected_et_date + timedelta(days=1), settings)
+            d["projected_send_at"] = format_db_time(projected)
+            projected_counts_by_number_date[(from_norm, projected.replace(tzinfo=timezone.utc).astimezone(EST_TZ).date().isoformat())] = (
+                projected_counts_by_number_date.get((from_norm, projected.replace(tzinfo=timezone.utc).astimezone(EST_TZ).date().isoformat()), 0) + 1
+            )
+            next_available_by_number[from_norm] = projected + timedelta(seconds=int(settings["min_gap_seconds"]))
+            if cap_blocked:
+                d["send_readiness"] = "Daily cap reached; projected after reset"
+            elif projected <= now_utc + timedelta(seconds=10):
+                d["send_readiness"] = "Eligible now; AutoSend worker should send on next poll"
+            elif projected.date() != now_utc.date() or projected.replace(tzinfo=timezone.utc).astimezone(EST_TZ).date() != now_et.date():
+                d["send_readiness"] = "Outside today's window; projected for next send window"
+            else:
+                d["send_readiness"] = "Waiting for sender min-gap"
         elif d.get("status") == "Scheduled":
+            from_norm = normalize_phone(d.get("from_number")) or normalize_phone(select_sms_automation_from_number(db, d.get("bucket"), d.get("contact_role")))
+            scheduled_dt = parse_db_time(d.get("scheduled_for"))
+            candidate = max(now_utc, scheduled_dt or now_utc, next_available_by_number.get(from_norm, now_utc))
+            projected = _sms_automation_adjust_to_send_window_utc(candidate, settings)
+            d["projected_send_at"] = format_db_time(projected)
+            next_available_by_number[from_norm] = projected + timedelta(seconds=int(settings["min_gap_seconds"]))
             d["send_readiness"] = "AutoSend scheduled; sends when due"
         elif d.get("status") == "Queued":
+            d["projected_send_at"] = ""
             d["send_readiness"] = "Queued; review or approve for AutoSend"
         elif d.get("status") == "Draft":
+            d["projected_send_at"] = ""
             d["send_readiness"] = "Awaiting approval"
         elif d.get("status") == "Held":
+            d["projected_send_at"] = ""
             d["send_readiness"] = "Held for review"
         elif d.get("status") == "Failed":
+            d["projected_send_at"] = ""
             d["send_readiness"] = "Failed; review before retry"
         else:
+            d["projected_send_at"] = ""
             d["send_readiness"] = d.get("status") or "-"
         out.append(d)
     return out
@@ -37314,7 +37416,15 @@ def sms_queue_item_action(queue_id):
                     )
                 return redirect(url_for("sms_queue_page", error=f"Draft #{queue_id} is suppressed and cannot be approved."))
             db.execute(
-                "UPDATE sms_automation_queue SET status = 'Approved', approved_at = ?, suppression_reason = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                """
+                UPDATE sms_automation_queue
+                SET status = 'Approved',
+                    approved_at = ?,
+                    scheduled_for = NULL,
+                    suppression_reason = '',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
                 (format_db_time(datetime.utcnow()), queue_id),
             )
             db.commit()

@@ -29064,6 +29064,18 @@ def sms_automation_property_suppression_reason(db, property_id):
     status = _normalize_reisift_status(prop["status"] or "")
     if status not in SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES:
         return f"Property status is '{prop['status'] or '-'}', not New Record."
+    new_record_state = db.execute(
+        """
+        SELECT
+            COUNT(*) AS total_rows,
+            SUM(CASE WHEN COALESCE(is_active, 1) = 1 THEN 1 ELSE 0 END) AS active_rows
+        FROM reisift_new_records
+        WHERE local_property_id = ?
+        """,
+        (int(property_id or 0),),
+    ).fetchone()
+    if int((new_record_state["total_rows"] if new_record_state else 0) or 0) > 0 and int((new_record_state["active_rows"] if new_record_state else 0) or 0) <= 0:
+        return "Property is no longer active in the ReiSIFT New Records refresh."
     return ""
 
 

@@ -29546,7 +29546,7 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
                 updated += 1
             else:
                 skipped += 1
-    cleanup_property_ids = touched_property_ids if touched_property_ids else property_ids
+    cleanup_property_ids = property_ids if property_ids else None
     duplicates_suppressed += suppress_duplicate_sms_automation_queue_items(db, property_ids=cleanup_property_ids)
     suppressed += revalidate_sms_automation_queue(db, property_ids=cleanup_property_ids)
     return {

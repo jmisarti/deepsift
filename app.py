@@ -28080,18 +28080,32 @@ def reisift_added_at_dt(search_row, detail_payload):
     return None
 
 
+def iter_lp_tag_candidate_strings(value, depth=0):
+    if depth > 6:
+        return
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from iter_lp_tag_candidate_strings(item, depth + 1)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key or "")
+            if re.search(r"(tag|label|name|title|value|source|list)", key_text, flags=re.IGNORECASE):
+                yield from iter_lp_tag_candidate_strings(item, depth + 1)
+            elif isinstance(item, (dict, list)):
+                yield from iter_lp_tag_candidate_strings(item, depth + 1)
+
+
 def latest_lp_tag_datetime(*payloads):
     dates = []
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
-        tags = payload.get("tags")
-        if isinstance(tags, str):
-            tag_values = [tags]
-        elif isinstance(tags, list):
-            tag_values = tags
-        else:
-            tag_values = []
+        tag_values = list(_extract_reisift_property_tags(payload))
+        tag_values.extend(iter_lp_tag_candidate_strings(payload))
         for tag in tag_values:
             text = normalize_whitespace(tag)
             match = re.search(r"\bLP\s*[-_ ]?(\d{6})\b", text, flags=re.IGNORECASE)
@@ -36649,6 +36663,15 @@ def get_sms_automation_queue_rows(db, filters=None):
     filters = filters if isinstance(filters, dict) else {}
     clauses = []
     params = []
+    date_expr = "date(COALESCE(NULLIF(q.sent_at, ''), NULLIF(q.scheduled_for, ''), NULLIF(q.approved_at, ''), NULLIF(q.created_at, '')))"
+    date_from = (filters.get("date_from") or "").strip()
+    if date_from:
+        clauses.append(f"{date_expr} >= date(?)")
+        params.append(date_from)
+    date_to = (filters.get("date_to") or "").strip()
+    if date_to:
+        clauses.append(f"{date_expr} <= date(?)")
+        params.append(date_to)
     status = (filters.get("status") or "").strip()
     if status:
         clauses.append("q.status = ?")
@@ -36668,7 +36691,8 @@ def get_sms_automation_queue_rows(db, filters=None):
         f"""
         SELECT q.*, p.status AS property_status, p.reisift_property_uuid,
                a.street, a.city, a.state, a.postal_code,
-               pe.first_name, pe.last_name, t.channel_label, t.status AS phone_status
+               pe.first_name, pe.last_name, t.channel_label, t.status AS phone_status,
+               COALESCE(NULLIF(q.sent_at, ''), NULLIF(q.scheduled_for, ''), NULLIF(q.approved_at, ''), NULLIF(q.created_at, '')) AS queue_date
         FROM sms_automation_queue q
         JOIN properties p ON p.id = q.property_id
         LEFT JOIN addresses a ON a.id = p.property_address_id
@@ -36713,6 +36737,8 @@ def sms_queue_page():
     ensure_db()
     db = get_db()
     filters = {
+        "date_from": (request.args.get("date_from") or "").strip(),
+        "date_to": (request.args.get("date_to") or "").strip(),
         "status": (request.args.get("status") or "").strip(),
         "bucket": (request.args.get("bucket") or "").strip(),
         "contact_role": (request.args.get("contact_role") or "").strip(),

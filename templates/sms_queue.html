@@ -30,6 +30,12 @@
 
     <div class="panel-actions">
         <form method="get" action="{{ url_for('sms_queue_page') }}" class="inline-form">
+            <label>From
+                <input type="date" name="date_from" value="{{ filters.date_from }}">
+            </label>
+            <label>To
+                <input type="date" name="date_to" value="{{ filters.date_to }}">
+            </label>
             <label>Status
                 <select name="status">
                     <option value="">All</option>
@@ -75,6 +81,7 @@
         <table class="crm-table sms-queue-table">
             <thead>
                 <tr>
+                    <th>Date</th>
                     <th>Status</th>
                     <th>Property</th>
                     <th>Person</th>
@@ -89,6 +96,7 @@
             <tbody>
                 {% for row in rows %}
                 <tr>
+                    <td>{{ row.queue_date|fmt_short_date }}</td>
                     <td>
                         <span class="pill sms-status-{{ row.status|lower|replace(' ', '-') }}">{{ row.status }}</span>
                         {% if row.suppression_reason %}
@@ -147,7 +155,7 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="9">No SMS queue items match these filters. Generate from New Records to create drafts.</td>
+                    <td colspan="10">No SMS queue items match these filters. Generate from New Records to create drafts.</td>
                 </tr>
                 {% endfor %}
             </tbody>

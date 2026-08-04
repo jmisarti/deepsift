@@ -182,6 +182,7 @@ SMS_AUTOMATION_AUTO_SEND_BATCH_LIMIT = max(
     int((os.getenv("SMS_AUTOMATION_AUTO_SEND_BATCH_LIMIT") or "5").strip() or "5"),
     1,
 )
+SMS_AUTOMATION_REISIFT_SENT_TAG = "AutoSMS:Sent"
 WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or "600").strip() or "600"), 60)
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
 MARKET_STATUS_REMOTE_URL = (os.getenv("MARKET_STATUS_REMOTE_URL") or "").strip()
@@ -36761,6 +36762,16 @@ def _sms_automation_rate_limit_reason(db, from_number):
     return ""
 
 
+def sync_autosms_sent_tag_to_reisift(db, property_id):
+    property_uuid = _get_local_property_uuid(db, property_id)
+    if not property_uuid:
+        return {"ok": False, "skipped": True, "reason": "missing_reisift_property_uuid"}
+    token = reisift_get_access_token()
+    result = reisift_append_property_tags(token, property_uuid, [SMS_AUTOMATION_REISIFT_SENT_TAG])
+    result["property_uuid"] = property_uuid
+    return result
+
+
 def _sms_automation_send_queue_item(db, queue_id):
     row = db.execute("SELECT * FROM sms_automation_queue WHERE id = ? LIMIT 1", (int(queue_id or 0),)).fetchone()
     if not row:
@@ -36834,7 +36845,20 @@ def _sms_automation_send_queue_item(db, queue_id):
             """,
             (format_db_time(datetime.utcnow()), external_id, cur.lastrowid, row["id"]),
         )
-        return {"ok": True, "communication_id": cur.lastrowid, "external_id": external_id}
+        tag_sync = None
+        try:
+            tag_sync = sync_autosms_sent_tag_to_reisift(db, row["property_id"])
+        except Exception as exc:
+            tag_sync = {"ok": False, "error": str(exc)}
+            log_app_error(
+                db,
+                source="sms_automation_reisift_tag_sync",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="_sms_automation_send_queue_item",
+                status_code=500,
+            )
+        return {"ok": True, "communication_id": cur.lastrowid, "external_id": external_id, "reisift_tag_sync": tag_sync}
     except Exception as exc:
         apply_touchpoint_status_inference(db, to_number, str(exc))
         db.execute(

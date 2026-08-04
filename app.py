@@ -36663,15 +36663,23 @@ def get_sms_automation_queue_rows(db, filters=None):
     filters = filters if isinstance(filters, dict) else {}
     clauses = []
     params = []
-    date_expr = "date(COALESCE(NULLIF(q.sent_at, ''), NULLIF(q.scheduled_for, ''), NULLIF(q.approved_at, ''), NULLIF(q.created_at, '')))"
+    number_pulled_expr = "date(COALESCE(NULLIF(t.created_at, ''), NULLIF(q.created_at, '')))"
     date_from = (filters.get("date_from") or "").strip()
     if date_from:
-        clauses.append(f"{date_expr} >= date(?)")
+        clauses.append(f"{number_pulled_expr} >= date(?)")
         params.append(date_from)
     date_to = (filters.get("date_to") or "").strip()
     if date_to:
-        clauses.append(f"{date_expr} <= date(?)")
+        clauses.append(f"{number_pulled_expr} <= date(?)")
         params.append(date_to)
+    city = (filters.get("city") or "").strip()
+    if city:
+        clauses.append("lower(COALESCE(a.city, '')) = lower(?)")
+        params.append(city)
+    county = (filters.get("county") or "").strip()
+    if county:
+        clauses.append("lower(COALESCE(n.county, '')) = lower(?)")
+        params.append(county)
     status = (filters.get("status") or "").strip()
     if status:
         clauses.append("q.status = ?")
@@ -36692,12 +36700,24 @@ def get_sms_automation_queue_rows(db, filters=None):
         SELECT q.*, p.status AS property_status, p.reisift_property_uuid,
                a.street, a.city, a.state, a.postal_code,
                pe.first_name, pe.last_name, t.channel_label, t.status AS phone_status,
-               COALESCE(NULLIF(q.sent_at, ''), NULLIF(q.scheduled_for, ''), NULLIF(q.approved_at, ''), NULLIF(q.created_at, '')) AS queue_date
+               n.county AS property_county,
+               COALESCE(NULLIF(t.created_at, ''), NULLIF(q.created_at, '')) AS number_pulled_at
         FROM sms_automation_queue q
         JOIN properties p ON p.id = q.property_id
         LEFT JOIN addresses a ON a.id = p.property_address_id
         LEFT JOIN people pe ON pe.id = q.person_id
         LEFT JOIN touchpoints t ON t.id = q.touchpoint_id
+        LEFT JOIN reisift_new_records n ON n.id = (
+            SELECT nr.id
+            FROM reisift_new_records nr
+            WHERE nr.local_property_id = p.id
+               OR (
+                    COALESCE(p.reisift_property_uuid, '') != ''
+                    AND nr.property_uuid = p.reisift_property_uuid
+               )
+            ORDER BY nr.id DESC
+            LIMIT 1
+        )
         {where_sql}
         ORDER BY
             CASE q.status
@@ -36732,6 +36752,43 @@ def get_sms_automation_queue_rows(db, filters=None):
     return out
 
 
+def get_sms_automation_filter_options(db):
+    county_rows = db.execute(
+        """
+        SELECT DISTINCT n.county AS county
+        FROM sms_automation_queue q
+        JOIN properties p ON p.id = q.property_id
+        LEFT JOIN reisift_new_records n ON n.id = (
+            SELECT nr.id
+            FROM reisift_new_records nr
+            WHERE nr.local_property_id = p.id
+               OR (
+                    COALESCE(p.reisift_property_uuid, '') != ''
+                    AND nr.property_uuid = p.reisift_property_uuid
+               )
+            ORDER BY nr.id DESC
+            LIMIT 1
+        )
+        WHERE COALESCE(n.county, '') != ''
+        ORDER BY n.county COLLATE NOCASE
+        """
+    ).fetchall()
+    city_rows = db.execute(
+        """
+        SELECT DISTINCT a.city AS city
+        FROM sms_automation_queue q
+        JOIN properties p ON p.id = q.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE COALESCE(a.city, '') != ''
+        ORDER BY a.city COLLATE NOCASE
+        """
+    ).fetchall()
+    return {
+        "counties": [r["county"] for r in county_rows],
+        "cities": [r["city"] for r in city_rows],
+    }
+
+
 @app.route("/sms-queue")
 def sms_queue_page():
     ensure_db()
@@ -36739,6 +36796,8 @@ def sms_queue_page():
     filters = {
         "date_from": (request.args.get("date_from") or "").strip(),
         "date_to": (request.args.get("date_to") or "").strip(),
+        "county": (request.args.get("county") or "").strip(),
+        "city": (request.args.get("city") or "").strip(),
         "status": (request.args.get("status") or "").strip(),
         "bucket": (request.args.get("bucket") or "").strip(),
         "contact_role": (request.args.get("contact_role") or "").strip(),
@@ -36761,6 +36820,7 @@ def sms_queue_page():
         notice=notice,
         error=error,
         summary=summary,
+        filter_options=get_sms_automation_filter_options(db),
         settings=get_sms_automation_settings(db),
     )
 

@@ -30,11 +30,27 @@
 
     <div class="panel-actions">
         <form method="get" action="{{ url_for('sms_queue_page') }}" class="inline-form">
-            <label>From
+            <label>Numbers From
                 <input type="date" name="date_from" value="{{ filters.date_from }}">
             </label>
-            <label>To
+            <label>Numbers To
                 <input type="date" name="date_to" value="{{ filters.date_to }}">
+            </label>
+            <label>County
+                <select name="county">
+                    <option value="">All</option>
+                    {% for county in filter_options.counties %}
+                    <option value="{{ county }}" {% if filters.county == county %}selected{% endif %}>{{ county }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>City
+                <select name="city">
+                    <option value="">All</option>
+                    {% for city in filter_options.cities %}
+                    <option value="{{ city }}" {% if filters.city == city %}selected{% endif %}>{{ city }}</option>
+                    {% endfor %}
+                </select>
             </label>
             <label>Status
                 <select name="status">
@@ -81,7 +97,7 @@
         <table class="crm-table sms-queue-table">
             <thead>
                 <tr>
-                    <th>Date</th>
+                    <th>Number Pulled</th>
                     <th>Status</th>
                     <th>Property</th>
                     <th>Person</th>
@@ -96,7 +112,7 @@
             <tbody>
                 {% for row in rows %}
                 <tr>
-                    <td>{{ row.queue_date|fmt_short_date }}</td>
+                    <td>{{ row.number_pulled_at|fmt_short_date }}</td>
                     <td>
                         <span class="pill sms-status-{{ row.status|lower|replace(' ', '-') }}">{{ row.status }}</span>
                         {% if row.suppression_reason %}
@@ -112,6 +128,9 @@
                     </td>
                     <td>
                         <div>{{ row.property_address or '-' }}</div>
+                        {% if row.property_county %}
+                        <div class="sms-queue-reason">{{ row.property_county }}</div>
+                        {% endif %}
                         <div class="inline-actions compact-icons">
                             <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.property_id) }}" title="Open in Deep Dive">
                                 <img class="tiny-link-icon" src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/08/cropped-nj-logo-tiny-32x32.png" alt="Deep Dive">

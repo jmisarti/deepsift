@@ -31791,6 +31791,101 @@ def _reisift_owner_name_parts(owner):
     return {"first_name": first or "ReiSift", "last_name": last or "Owner"}
 
 
+def _reisift_owner_has_meaningful_name(owner):
+    owner = owner if isinstance(owner, dict) else {}
+    raw_parts = [
+        owner.get("full_name"),
+        owner.get("name"),
+        owner.get("first_name"),
+        owner.get("last_name"),
+    ]
+    raw_name = normalize_whitespace(" ".join(str(part or "") for part in raw_parts if normalize_whitespace(part)))
+    if not raw_name:
+        return False
+    generic = normalize_whitespace(raw_name).lower()
+    return generic not in {"reisift", "owner", "reisift owner", "unknown", "unknown owner", "company owner"}
+
+
+def _is_reisift_placeholder_owner_name(first_name, last_name):
+    first = normalize_whitespace(first_name).lower()
+    last = normalize_whitespace(last_name).lower()
+    return first == "reisift" and last == "owner"
+
+
+def _is_reisift_property_placeholder_person(db, person_id, property_uuid):
+    try:
+        person_id = int(person_id or 0)
+    except Exception:
+        person_id = 0
+    property_uuid = normalize_uuid(property_uuid or "")
+    if not person_id or not property_uuid:
+        return False
+    row = db.execute("SELECT first_name, last_name, notes FROM people WHERE id = ? LIMIT 1", (person_id,)).fetchone()
+    if not row or not _is_reisift_placeholder_owner_name(row["first_name"], row["last_name"]):
+        return False
+    notes = str(row["notes"] or "")
+    return property_uuid in notes and "Property-scoped ReiSIFT placeholder owner" in notes
+
+
+def get_or_create_reisift_property_placeholder_owner(db, property_id, property_uuid, source="ReiSift New Records refresh", owner_slot=0):
+    try:
+        property_id = int(property_id or 0)
+    except Exception:
+        property_id = 0
+    property_uuid = normalize_uuid(property_uuid or "")
+    if property_id <= 0:
+        return 0
+    existing_owner = db.execute(
+        """
+        SELECT owner.id, owner.first_name, owner.last_name, owner.notes
+        FROM properties p
+        JOIN people owner ON owner.id = p.owner_person_id
+        WHERE p.id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if existing_owner:
+        if not _is_reisift_placeholder_owner_name(existing_owner["first_name"], existing_owner["last_name"]):
+            return int(existing_owner["id"] or 0)
+        if _is_reisift_property_placeholder_person(db, existing_owner["id"], property_uuid):
+            return int(existing_owner["id"] or 0)
+
+    note_marker = f"Property-scoped ReiSIFT placeholder owner for property {property_id}"
+    if property_uuid:
+        note_marker += f" / ReiSIFT UUID {property_uuid}"
+    note_marker += f" / owner slot {int(owner_slot or 0)}."
+    row = db.execute(
+        """
+        SELECT id
+        FROM people
+        WHERE lower(first_name) = 'reisift'
+          AND lower(last_name) = 'owner'
+          AND notes LIKE ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (f"%{note_marker}%",),
+    ).fetchone()
+    if row:
+        return int(row["id"] or 0)
+    notes = f"{note_marker} Created/imported from {source}. Replace with a named owner if ReiSIFT ownership is updated later."
+    return int(create_person(db, "ReiSift", "Owner", notes=notes) or 0)
+
+
+def resolve_reisift_owner_person_for_property(db, property_id, property_uuid, owner, source="ReiSift New Records refresh", owner_slot=0):
+    parts = _reisift_owner_name_parts(owner)
+    if _reisift_owner_has_meaningful_name(owner):
+        return int(find_or_create_person_by_name_parts(db, parts["first_name"], parts["last_name"], notes=f"Created/imported from {source} for ReiSift property {property_uuid}.") or 0)
+    return get_or_create_reisift_property_placeholder_owner(
+        db,
+        property_id,
+        property_uuid,
+        source=source,
+        owner_slot=owner_slot,
+    )
+
+
 def _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, source_label):
     owner = owner if isinstance(owner, dict) else {}
     phones_created = 0
@@ -31856,9 +31951,9 @@ def _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, sourc
 
     for email in owner.get("emails") or []:
         if isinstance(email, dict):
-            value = normalize_email(email.get("email") or email.get("value") or "")
+            value = normalize_email_identity(email.get("email") or email.get("value") or "")
         else:
-            value = normalize_email(email or "")
+            value = normalize_email_identity(email or "")
         if not value:
             continue
         result = upsert_email_touchpoint_and_queue_validation(
@@ -31891,17 +31986,19 @@ def sync_reisift_owner_contacts_to_local_property(db, property_id, property_uuid
         return out
     prop = db.execute("SELECT owner_person_id FROM properties WHERE id = ? LIMIT 1", (property_id,)).fetchone()
     for idx, owner in enumerate(owners):
-        parts = _reisift_owner_name_parts(owner)
-        owner_notes = f"Created/imported from {source} for ReiSift property {property_uuid}."
         existing_owner_person_id = int((prop["owner_person_id"] if prop else 0) or 0)
-        if idx == 0 and existing_owner_person_id > 0:
-            person_id = existing_owner_person_id
-        else:
-            person_id = int(find_or_create_person_by_name_parts(db, parts["first_name"], parts["last_name"], notes=owner_notes) or 0)
+        person_id = resolve_reisift_owner_person_for_property(
+            db,
+            property_id,
+            property_uuid,
+            owner,
+            source=source,
+            owner_slot=idx,
+        )
         if person_id <= 0:
             continue
         out["owners_processed"] += 1
-        if idx == 0 and existing_owner_person_id <= 0:
+        if idx == 0 and person_id != existing_owner_person_id:
             db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (person_id, property_id))
         contact_counts = _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, source)
         for key in ["phones_created", "phones_updated", "phones_suppressed", "emails_created"]:
@@ -31961,9 +32058,14 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
     property_address = address
 
     for idx, owner in enumerate(owners):
-        parts = _reisift_owner_name_parts(owner)
-        owner_notes = f"Created/imported from {source} for ReiSift property {property_uuid}."
-        person_id = int(find_or_create_person_by_name_parts(db, parts["first_name"], parts["last_name"], notes=owner_notes) or 0)
+        person_id = resolve_reisift_owner_person_for_property(
+            db,
+            property_id,
+            property_uuid,
+            owner,
+            source=source,
+            owner_slot=idx,
+        )
         if person_id <= 0:
             continue
         owner_person_ids.append(person_id)
@@ -31976,7 +32078,7 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
         emails_created += int(contact_counts.get("emails_created") or 0)
         phones, emails = extract_owner_contacts_from_payload({"owner": owner})
         primary_phone = normalize_phone((phones[0] or {}).get("value") if phones else "")
-        primary_email = normalize_email((emails[0] or {}).get("value") if emails else "")
+        primary_email = normalize_email_identity((emails[0] or {}).get("value") if emails else "")
         if primary_phone or primary_email:
             person_row = db.execute(
                 "SELECT primary_phone, primary_email FROM people WHERE id = ? LIMIT 1",
@@ -31987,7 +32089,7 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
             if primary_phone and person_row and not normalize_phone(person_row["primary_phone"] or ""):
                 assignments.append("primary_phone = ?")
                 params.append(primary_phone)
-            if primary_email and person_row and not normalize_email(person_row["primary_email"] or ""):
+            if primary_email and person_row and not normalize_email_identity(person_row["primary_email"] or ""):
                 assignments.append("primary_email = ?")
                 params.append(primary_email)
             if assignments:
@@ -32064,6 +32166,141 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
         "emails_created": emails_created,
         "owner_addresses_created": owner_addresses_created,
         "lists": lists_text,
+    }
+
+
+def repair_reisift_placeholder_owner_contacts(db, limit=10000):
+    try:
+        limit = max(1, min(50000, int(limit or 10000)))
+    except Exception:
+        limit = 10000
+    rows = db.execute(
+        """
+        SELECT t.id AS touchpoint_id,
+               t.person_id AS old_person_id,
+               t.channel_type,
+               t.value,
+               t.note,
+               pe.first_name,
+               pe.last_name
+        FROM touchpoints t
+        JOIN people pe ON pe.id = t.person_id
+        WHERE lower(pe.first_name) = 'reisift'
+          AND lower(pe.last_name) = 'owner'
+          AND lower(COALESCE(t.note, '')) LIKE '%imported from reisift new records refresh%'
+          AND lower(COALESCE(t.note, '')) LIKE '%reisift uuid%'
+        ORDER BY t.id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    touched_properties = set()
+    moved_touchpoints = 0
+    properties_reassigned = 0
+    queue_rows_removed = 0
+    skipped = 0
+    seen_properties = set()
+    for row in rows:
+        property_uuid = extract_reisift_import_uuid_from_note(row["note"] or "")
+        if not property_uuid:
+            skipped += 1
+            continue
+        nr = db.execute(
+            """
+            SELECT property_uuid, local_property_id, payload_json
+            FROM reisift_new_records
+            WHERE property_uuid = ?
+            LIMIT 1
+            """,
+            (property_uuid,),
+        ).fetchone()
+        property_id = int((nr["local_property_id"] if nr else 0) or 0)
+        if property_id <= 0:
+            skipped += 1
+            continue
+        payload = parse_json_object(nr["payload_json"] or "{}", default={}) if nr else {}
+        target_person_id = get_or_create_reisift_property_placeholder_owner(
+            db,
+            property_id,
+            property_uuid,
+            source="ReiSift New Records repair",
+            owner_slot=0,
+        )
+        if target_person_id <= 0:
+            skipped += 1
+            continue
+        old_person_id = int(row["old_person_id"] or 0)
+        if old_person_id != target_person_id:
+            db.execute("UPDATE touchpoints SET person_id = ? WHERE id = ?", (target_person_id, row["touchpoint_id"]))
+            moved_touchpoints += 1
+            if str(row["channel_type"] or "").strip().lower() == "email":
+                queue_touchpoint_email_validation(
+                    db,
+                    row["touchpoint_id"],
+                    target_person_id,
+                    row["value"],
+                    source="reisift_new_record_repair",
+                )
+        prop = db.execute("SELECT owner_person_id FROM properties WHERE id = ? LIMIT 1", (property_id,)).fetchone()
+        if prop and int((prop["owner_person_id"] if prop else 0) or 0) == old_person_id and old_person_id != target_person_id:
+            db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (target_person_id, property_id))
+            properties_reassigned += 1
+        if property_id not in seen_properties:
+            owners = iter_reisift_payload_owners(payload)
+            property_address = extract_reisift_property_address(payload)
+            if owners:
+                _ensure_reisift_owner_address(
+                    db,
+                    target_person_id,
+                    owners[0],
+                    property_address,
+                    "ReiSift New Record Address",
+                    set_default=True,
+                )
+            seen_properties.add(property_id)
+        removed = db.execute(
+            """
+            DELETE FROM sms_automation_queue
+            WHERE touchpoint_id = ?
+              AND property_id <> ?
+              AND status IN ('Draft', 'Queued', 'Suppressed')
+              AND lower(COALESCE(suppression_reason, '')) LIKE 'stale reisift new record phone%'
+            """,
+            (row["touchpoint_id"], property_id),
+        ).rowcount
+        queue_rows_removed += max(0, int(removed or 0))
+        db.execute(
+            """
+            UPDATE sms_automation_queue
+            SET person_id = ?,
+                status = CASE
+                    WHEN status = 'Suppressed'
+                     AND lower(COALESCE(suppression_reason, '')) LIKE 'stale reisift new record phone%'
+                        THEN 'Draft'
+                    ELSE status
+                END,
+                suppression_reason = CASE
+                    WHEN lower(COALESCE(suppression_reason, '')) LIKE 'stale reisift new record phone%'
+                        THEN ''
+                    ELSE suppression_reason
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE touchpoint_id = ?
+              AND property_id = ?
+            """,
+            (target_person_id, row["touchpoint_id"], property_id),
+        )
+        touched_properties.add(property_id)
+    if touched_properties:
+        suppress_duplicate_sms_automation_queue_items(db, property_ids=list(touched_properties))
+        revalidate_sms_automation_queue(db, property_ids=list(touched_properties))
+    return {
+        "scanned": len(rows),
+        "moved_touchpoints": moved_touchpoints,
+        "properties_reassigned": properties_reassigned,
+        "queue_rows_removed": queue_rows_removed,
+        "affected_properties": len(touched_properties),
+        "skipped": skipped,
     }
 
 

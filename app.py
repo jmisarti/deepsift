@@ -2820,6 +2820,57 @@ def build_property_network(db, property_row):
     return sorted(network_ids), relationship_rows
 
 
+def build_sms_contact_network(db, property_row, max_depth=3):
+    base_ids = []
+    for key in ["owner_person_id", "resident_person_id"]:
+        try:
+            raw_id = property_row[key]
+        except Exception:
+            raw_id = None
+        try:
+            clean_id = int(raw_id or 0)
+        except Exception:
+            clean_id = 0
+        if clean_id > 0 and clean_id not in base_ids:
+            base_ids.append(clean_id)
+
+    network_ids = list(base_ids)
+    seen_ids = set(base_ids)
+    seen_relationship_ids = set()
+    relationship_rows = []
+    frontier = list(base_ids)
+    depth = 0
+    while frontier and depth < max(1, int(max_depth or 1)):
+        placeholders = ",".join(["?"] * len(frontier))
+        rows = db.execute(
+            f"""
+            SELECT * FROM person_relationships
+            WHERE subject_person_id IN ({placeholders}) OR related_person_id IN ({placeholders})
+            ORDER BY relationship_order ASC, id ASC
+            """,
+            tuple(frontier + frontier),
+        ).fetchall()
+        next_frontier = []
+        for rel in rows:
+            rel_id = int(rel["id"] or 0)
+            if rel_id not in seen_relationship_ids:
+                seen_relationship_ids.add(rel_id)
+                relationship_rows.append(rel)
+            for candidate in [rel["subject_person_id"], rel["related_person_id"]]:
+                try:
+                    clean_id = int(candidate or 0)
+                except Exception:
+                    clean_id = 0
+                if clean_id <= 0 or clean_id in seen_ids:
+                    continue
+                seen_ids.add(clean_id)
+                network_ids.append(clean_id)
+                next_frontier.append(clean_id)
+        frontier = next_frontier
+        depth += 1
+    return network_ids, relationship_rows
+
+
 def web_lookup(query, limit=5):
     if not query:
         return []
@@ -30983,7 +31034,7 @@ def collect_sms_automation_targets_for_property(db, property_id, active_property
     prop = _sms_automation_property_row(db, property_id)
     if not prop:
         return []
-    network_ids, _ = build_property_network(db, prop)
+    network_ids, _ = build_sms_contact_network(db, prop)
     if prop["owner_person_id"] and int(prop["owner_person_id"]) not in network_ids:
         network_ids.insert(0, int(prop["owner_person_id"]))
     if not network_ids:
@@ -31876,7 +31927,7 @@ def _local_property_has_deepsift_skiptrace(db, property_id):
     prop = _sms_automation_property_row(db, clean_property_id)
     if not prop:
         return False
-    network_ids, _ = build_property_network(db, prop)
+    network_ids, _ = build_sms_contact_network(db, prop)
     if not network_ids:
         return False
     placeholders = ",".join(["?"] * len(network_ids))
@@ -45585,7 +45636,7 @@ def start_property_bulk_sms(property_id):
     if not prop:
         return jsonify({"error": "property not found"}), 404
 
-    network_ids, _ = build_property_network(db, prop)
+    network_ids, _ = build_sms_contact_network(db, prop)
     if not network_ids:
         return jsonify({"error": "No contacts available for this property"}), 400
     placeholders = ",".join(["?"] * len(network_ids))

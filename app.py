@@ -2339,6 +2339,18 @@ def normalize_whitespace(value):
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
+def proper_case_name(value):
+    text = normalize_whitespace(value)
+    if not text:
+        return ""
+
+    def convert(match):
+        token = match.group(0)
+        return token[:1].upper() + token[1:].lower()
+
+    return re.sub(r"[A-Za-z]+", convert, text)
+
+
 def normalize_state_code(value):
     raw = normalize_whitespace(value).replace(".", "")
     if not raw:
@@ -7894,11 +7906,11 @@ def render_sequence_template(template_text, person_row, property_row, owner_row=
         property_city = (property_row["city"] or "").strip()
         property_state = (property_row["state"] or "").strip()
         property_zip = (property_row["postal_code"] or "").strip()
-    owner_first = (owner_row["first_name"] if owner_row else "") or ""
-    owner_last = (owner_row["last_name"] if owner_row else "") or ""
+    owner_first = proper_case_name((owner_row["first_name"] if owner_row else "") or "")
+    owner_last = proper_case_name((owner_row["last_name"] if owner_row else "") or "")
     owner_full = f"{owner_first} {owner_last}".strip()
-    person_first = (person_row["first_name"] if person_row else "") or ""
-    person_last = (person_row["last_name"] if person_row else "") or ""
+    person_first = proper_case_name((person_row["first_name"] if person_row else "") or "")
+    person_last = proper_case_name((person_row["last_name"] if person_row else "") or "")
     person_full = f"{person_first} {person_last}".strip()
     replacements = {
         "{first_name}": person_first,
@@ -7943,15 +7955,22 @@ def get_best_email_for_person(db, person_id):
 
 
 BLOCKED_CONTACT_STATUSES = {
+    "bad number",
+    "bounced",
+    "disconnected",
     "incorrect",
     "dnc",
     "dnt",
     "dead",
+    "do not call",
+    "do not text",
     "undeliverable",
     "not in service",
     "invalid",
-    "bounced",
     "opt out",
+    "opt-out",
+    "wrong",
+    "wrong number",
 }
 
 
@@ -7965,10 +7984,9 @@ def is_sms_channel_label_allowed(channel_label):
 
 def is_sms_touchpoint_allowed(channel_label, status):
     label = (channel_label or "").strip().lower()
-    st = (status or "").strip().lower()
     if not is_sms_channel_label_allowed(label):
         return False
-    if st in BLOCKED_CONTACT_STATUSES:
+    if is_bad_phone_status_text(status):
         return False
     return True
 
@@ -7993,8 +8011,7 @@ def validate_sms_recipient_for_person(db, person_id, to_number):
     for r in matches:
         if not is_sms_channel_label_allowed(r["channel_label"]):
             return False, f"phone type '{r['channel_label'] or 'Unknown'}' is not SMS-eligible"
-        st = (r["status"] or "").strip().lower()
-        if st in BLOCKED_CONTACT_STATUSES:
+        if is_bad_phone_status_text(r["status"]):
             return False, f"phone status '{r['status']}' is blocked for SMS"
     return True, ""
 
@@ -25407,6 +25424,77 @@ def _reisift_parse_owner_phones(owner):
     return phones
 
 
+def normalize_reisift_phone_label(phone_type):
+    text = normalize_whitespace(phone_type).lower()
+    if not text or text in {"unknown", "unk"}:
+        return ""
+    if any(token in text for token in ["mobile", "wireless", "cell"]):
+        return "Mobile"
+    if "voip" in text:
+        return "VoIP"
+    if "landline" in text:
+        return "Landline"
+    if "fax" in text:
+        return "Fax"
+    return normalize_whitespace(phone_type).title()
+
+
+def normalize_reisift_phone_disposition(status="", tags=None):
+    tags = tags if isinstance(tags, list) else []
+    haystack = " ".join([normalize_whitespace(status), *[normalize_whitespace(tag) for tag in tags]]).lower()
+    if not haystack or haystack in {"unknown", "unk", "none", "null"}:
+        return ""
+    if any(token in haystack for token in ["do not call", " dnc", "dnc ", "dnc", "litigator"]):
+        return "DNC"
+    if any(token in haystack for token in ["do not text", " dnt", "dnt ", "dnt"]):
+        return "DNT"
+    if any(token in haystack for token in ["opt out", "opt-out", "opted out", "unsubscribe"]):
+        return "Opt Out"
+    if any(token in haystack for token in ["wrong number", "bad number", "not owner", "not associated"]):
+        return "Wrong Number"
+    if any(token in haystack for token in ["disconnected", "not in service", "no longer in service", "deactivated"]):
+        return "Not in service"
+    if "dead" in haystack:
+        return "Dead"
+    if any(token in haystack for token in ["undeliverable", "undelivered", "not deliver", "no route", "bounced"]):
+        return "Undeliverable"
+    if any(token in haystack for token in ["invalid", "incorrect"]):
+        return "Incorrect"
+    if any(token in haystack for token in ["correct", "verified", "confirmed", "good number"]):
+        return "Correct"
+    return ""
+
+
+def is_hard_blocked_contact_status(status):
+    key = normalize_whitespace(status).lower()
+    return key in {"dnc", "dnt", "do not call", "do not text", "opt out", "opt-out"}
+
+
+def is_bad_phone_status_text(status):
+    key = normalize_whitespace(status).lower()
+    if not key:
+        return False
+    return key in BLOCKED_CONTACT_STATUSES or key in {value.lower() for value in SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES}
+
+
+def should_apply_reisift_phone_status(current_status, reisift_status):
+    desired = normalize_whitespace(reisift_status)
+    if not desired:
+        return False
+    current = normalize_whitespace(current_status)
+    current_key = current.lower()
+    desired_key = desired.lower()
+    if current_key == desired_key:
+        return False
+    if is_bad_phone_status_text(desired):
+        return True
+    if desired_key == "correct":
+        if is_hard_blocked_contact_status(current):
+            return False
+        return current_key in {"", "unknown", "manual", "captured", "new", "unchecked"} or not is_bad_phone_status_text(current)
+    return current_key in {"", "unknown"}
+
+
 def _reisift_build_property_create_payload(address_info_payload, input_payload):
     input_payload = input_payload or {}
     source_address = _reisift_find_first_address_dict(address_info_payload)
@@ -28597,18 +28685,22 @@ def refresh_prospecting_new_records_once():
 
 
 SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES = {
+    "bad number",
+    "bounced",
+    "disconnected",
     "wrong",
     "wrong number",
     "incorrect",
     "dead",
     "dnc",
     "dnt",
+    "do not call",
+    "do not text",
     "opt out",
     "opt-out",
     "undeliverable",
     "not in service",
     "invalid",
-    "bounced",
 }
 
 SMS_AUTOMATION_LOCKED_QUEUE_STATUSES = {"Approved", "Sending", "Sent", "Held"}
@@ -29107,7 +29199,7 @@ def sms_automation_touchpoint_suppression_reason(db, touchpoint_id):
     if label not in {"mobile", "unknown", ""}:
         return f"Phone type '{row['channel_label'] or 'Unknown'}' is not SMS eligible."
     status = (row["status"] or "").strip().lower()
-    if status in SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES:
+    if is_bad_phone_status_text(status):
         return f"Phone status '{row['status'] or '-'}' is suppressed."
     if not normalize_phone(row["value"]):
         return "Phone number is invalid."
@@ -29185,8 +29277,8 @@ def revalidate_sms_automation_queue(db, property_ids=None):
 
 
 def _sms_automation_template_variables(person, prop, bucket, contact_role, source_info, lists_text):
-    person_first = (person["first_name"] if person else "") or ""
-    person_last = (person["last_name"] if person else "") or ""
+    person_first = proper_case_name((person["first_name"] if person else "") or "")
+    person_last = proper_case_name((person["last_name"] if person else "") or "")
     property_full_address = format_property_address_line(prop["street"], prop["city"], prop["state"], prop["postal_code"]) if prop else ""
     property_address = normalize_whitespace(prop["street"] if prop else "") or property_full_address
     return {
@@ -29681,6 +29773,13 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
                 match_payload,
                 summary["status"],
             )
+    contact_sync = sync_reisift_owner_contacts_to_local_property(
+        db,
+        local_sync.get("local_property_id"),
+        property_uuid,
+        payload or search_row,
+        source="ReiSift New Records refresh",
+    )
     contact_flags = compute_new_record_contact_flags(
         db,
         local_sync.get("local_property_id"),
@@ -29753,6 +29852,7 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
         ),
     )
     local_sync["local_import"] = local_import
+    local_sync["contact_sync"] = contact_sync
     return local_sync
 
 
@@ -29781,6 +29881,8 @@ def refresh_reisift_new_records_cache(db):
     local_updates = 0
     local_imports = 0
     imported_phones = 0
+    updated_phones = 0
+    suppressed_phones = 0
     imported_emails = 0
     for row in rows:
         scanned += 1
@@ -29818,6 +29920,9 @@ def refresh_reisift_new_records_cache(db):
                 local_imports += 1
                 imported_phones += int(local_import.get("phones_created") or 0)
                 imported_emails += int(local_import.get("emails_created") or 0)
+            contact_sync = local_sync.get("contact_sync") if isinstance(local_sync.get("contact_sync"), dict) else {}
+            updated_phones += int(contact_sync.get("phones_updated") or 0)
+            suppressed_phones += int(contact_sync.get("phones_suppressed") or 0)
             synced += 1
         except Exception as exc:
             errors.append(f"{property_uuid}: {exc}")
@@ -29838,6 +29943,8 @@ def refresh_reisift_new_records_cache(db):
         "local_updates": local_updates,
         "local_imports": local_imports,
         "imported_phones": imported_phones,
+        "updated_phones": updated_phones,
+        "suppressed_phones": suppressed_phones,
         "imported_emails": imported_emails,
         "sms_queue": sms_queue,
         "search_failed": search_failed,
@@ -30041,31 +30148,7 @@ def _local_property_has_deepsift_skiptrace(db, property_id):
 
 
 def _new_record_is_bad_phone_status(status):
-    text = normalize_whitespace(status).lower()
-    if not text:
-        return False
-    bad_statuses = {value.lower() for value in SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES}
-    if text in bad_statuses:
-        return True
-    return any(
-        token in text
-        for token in [
-            "wrong",
-            "incorrect",
-            "dead",
-            "dnc",
-            "dnt",
-            "do not call",
-            "do not text",
-            "opt out",
-            "opt-out",
-            "undeliverable",
-            "not in service",
-            "invalid",
-            "disconnected",
-            "bad number",
-        ]
-    )
+    return is_bad_phone_status_text(status)
 
 
 def _new_record_no_good_numbers(db, property_id):
@@ -30543,18 +30626,54 @@ def _reisift_owner_name_parts(owner):
 def _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, source_label):
     owner = owner if isinstance(owner, dict) else {}
     phones_created = 0
+    phones_updated = 0
+    phones_suppressed = 0
     emails_created = 0
     note = f"Imported from {source_label} (ReiSift UUID {property_uuid})."
     for phone in owner.get("phones") or []:
         if isinstance(phone, dict):
             value = normalize_phone(phone.get("number") or phone.get("phone") or "")
-            label = normalize_whitespace(phone.get("type") or "Unknown").title()
-            status = normalize_whitespace(phone.get("status") or "Unknown").title()
+            label = normalize_reisift_phone_label(phone.get("type") or "Unknown") or "Unknown"
+            tags = _reisift_parse_phone_tags(phone.get("tags"))
+            status = normalize_reisift_phone_disposition(phone.get("status") or "", tags) or normalize_whitespace(phone.get("status") or "Unknown").title()
         else:
             value = normalize_phone(phone or "")
             label = "Unknown"
             status = "Unknown"
-        if not value or touchpoint_exists(db, person_id, "Phone", value):
+            tags = []
+        if not value:
+            continue
+        existing = find_touchpoint_row_by_value(db, person_id, "Phone", value)
+        if existing:
+            assignments = []
+            params = []
+            existing_label = normalize_whitespace(existing["channel_label"] or "")
+            existing_status = normalize_whitespace(existing["status"] or "")
+            next_label = existing_label
+            if label and label != "Unknown" and existing_label.lower() in {"", "unknown", "phone"}:
+                next_label = label
+            next_status = existing_status
+            if should_apply_reisift_phone_status(existing_status, status):
+                next_status = status
+            status_changed = next_status != existing_status
+            if next_label != existing_label:
+                assignments.append("channel_label = ?")
+                params.append(next_label)
+            if status_changed:
+                assignments.append("status = ?")
+                params.append(next_status)
+            if assignments:
+                merged_note = append_note_line(
+                    existing["note"] or "",
+                    f"ReiSIFT disposition sync from {source_label}: type={label or '-'}, status={status or '-'}, tags={', '.join(tags) if tags else '-'}."
+                )
+                assignments.append("note = ?")
+                params.append(merged_note)
+                params.append(existing["id"])
+                db.execute(f"UPDATE touchpoints SET {', '.join(assignments)} WHERE id = ?", tuple(params))
+                phones_updated += 1
+                if status_changed and is_bad_phone_status_text(next_status):
+                    phones_suppressed += 1
             continue
         db.execute(
             """
@@ -30564,6 +30683,8 @@ def _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, sourc
             (person_id, label, value, status, note, ""),
         )
         phones_created += 1
+        if is_bad_phone_status_text(status):
+            phones_suppressed += 1
 
     for email in owner.get("emails") or []:
         if isinstance(email, dict):
@@ -30581,7 +30702,43 @@ def _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, sourc
         )
         if result.get("created"):
             emails_created += 1
-    return {"phones_created": phones_created, "emails_created": emails_created}
+    return {"phones_created": phones_created, "phones_updated": phones_updated, "phones_suppressed": phones_suppressed, "emails_created": emails_created}
+
+
+def sync_reisift_owner_contacts_to_local_property(db, property_id, property_uuid, payload, source="ReiSift New Records refresh"):
+    property_id = int(property_id or 0)
+    property_uuid = normalize_uuid(property_uuid or "")
+    payload = payload if isinstance(payload, dict) else {}
+    out = {
+        "owners_processed": 0,
+        "phones_created": 0,
+        "phones_updated": 0,
+        "phones_suppressed": 0,
+        "emails_created": 0,
+    }
+    if property_id <= 0:
+        return out
+    owners = iter_reisift_payload_owners(payload)
+    if not owners:
+        return out
+    prop = db.execute("SELECT owner_person_id FROM properties WHERE id = ? LIMIT 1", (property_id,)).fetchone()
+    for idx, owner in enumerate(owners):
+        parts = _reisift_owner_name_parts(owner)
+        owner_notes = f"Created/imported from {source} for ReiSift property {property_uuid}."
+        existing_owner_person_id = int((prop["owner_person_id"] if prop else 0) or 0)
+        if idx == 0 and existing_owner_person_id > 0:
+            person_id = existing_owner_person_id
+        else:
+            person_id = int(find_or_create_person_by_name_parts(db, parts["first_name"], parts["last_name"], notes=owner_notes) or 0)
+        if person_id <= 0:
+            continue
+        out["owners_processed"] += 1
+        if idx == 0 and existing_owner_person_id <= 0:
+            db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (person_id, property_id))
+        contact_counts = _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, source)
+        for key in ["phones_created", "phones_updated", "phones_suppressed", "emails_created"]:
+            out[key] += int(contact_counts.get(key) or 0)
+    return out
 
 
 def _ensure_reisift_owner_address(db, person_id, owner, property_address, source_label, set_default=False):
@@ -30626,6 +30783,8 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
     owners = iter_reisift_payload_owners(payload)
     owner_person_ids = []
     phones_created = 0
+    phones_updated = 0
+    phones_suppressed = 0
     emails_created = 0
     owner_addresses_created = 0
     lists_text = extract_property_lists(payload)
@@ -30644,6 +30803,8 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
             db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (person_id, property_id))
         contact_counts = _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, source)
         phones_created += int(contact_counts.get("phones_created") or 0)
+        phones_updated += int(contact_counts.get("phones_updated") or 0)
+        phones_suppressed += int(contact_counts.get("phones_suppressed") or 0)
         emails_created += int(contact_counts.get("emails_created") or 0)
         phones, emails = extract_owner_contacts_from_payload({"owner": owner})
         primary_phone = normalize_phone((phones[0] or {}).get("value") if phones else "")
@@ -30714,6 +30875,8 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
                     "property_created": property_created,
                     "owner_person_ids": owner_person_ids,
                     "phones_created": phones_created,
+                    "phones_updated": phones_updated,
+                    "phones_suppressed": phones_suppressed,
                     "emails_created": emails_created,
                     "owner_addresses_created": owner_addresses_created,
                     "lists": lists_text,
@@ -30728,6 +30891,8 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
         "skipped": False,
         "owner_person_ids": owner_person_ids,
         "phones_created": phones_created,
+        "phones_updated": phones_updated,
+        "phones_suppressed": phones_suppressed,
         "emails_created": emails_created,
         "owner_addresses_created": owner_addresses_created,
         "lists": lists_text,

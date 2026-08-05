@@ -27096,6 +27096,10 @@ def infer_county_from_reisift_payload(payload):
     county = (metadata.get("county") or metadata.get("county_name") or "").strip()
     if county:
         return county
+    address = extract_reisift_property_address(payload)
+    county = county_from_zip5(address.get("postal_code") or address.get("full_address") or "")
+    if county:
+        return county
     return ""
 
 
@@ -28630,6 +28634,70 @@ def display_county_name(value):
     return normalize_whitespace(value).title()
 
 
+NEW_RECORD_COUNTY_ZIP5 = {
+    "Essex": (
+        "07003", "07006", "07009", "07004", "07017", "07018", "07021", "07028",
+        "07039", "07040", "07044", "07043", "07041", "07042", "07050", "07052",
+        "07068", "07078", "07079", "07102", "07106", "07103", "07104", "07109",
+        "07107", "07108", "07105", "07114", "07110", "07111", "07112",
+    ),
+    "Union": (
+        "07016", "07023", "07027", "07033", "07036", "07060", "07062", "07063",
+        "07064", "07065", "07066", "07076", "07081", "07088", "07083", "07090",
+        "07092", "07201", "07206", "07208", "07202", "07205", "07203", "07204",
+        "07901", "07922", "07974",
+    ),
+    "Bergen": (
+        "07010", "07020", "07024", "07026", "07022", "07031", "07057", "07070",
+        "07072", "07074", "07071", "07075", "07073", "07401", "07407", "07410",
+        "07417", "07423", "07430", "07432", "07436", "07446", "07450", "07452",
+        "07458", "07463", "07481", "07601", "07603", "07604", "07605", "07606",
+        "07607", "07608", "07621", "07624", "07626", "07628", "07627", "07630",
+        "07632", "07631", "07640", "07642", "07643", "07641", "07647", "07645",
+        "07646", "07649", "07644", "07648", "07650", "07656", "07657", "07652",
+        "07660", "07661", "07663", "07662", "07666", "07670", "07676", "07675",
+        "07677",
+    ),
+    "Middlesex": (
+        "08831", "08901", "08817", "08820", "08854", "08861", "08816", "07080",
+        "08840", "08902", "07008", "08882", "08837", "07067", "07095", "08857",
+        "08879",
+    ),
+    "Hudson": (
+        "07305", "07304", "07307", "07306", "07002", "07087", "07047", "07093",
+        "07029", "07032",
+    ),
+    "Passaic": (
+        "07501", "07055", "07011", "07522", "07013", "07470", "07503", "07512",
+        "07508", "07421", "07442", "07514",
+    ),
+    "Monmouth": (
+        "07728", "07726", "07724", "07740", "07731", "07734", "07735", "07712",
+        "07753", "07701", "07719", "07751",
+    ),
+    "Ocean": (
+        "08753", "08750", "08755", "08757", "08759", "08527", "08742", "08087",
+        "08005", "08731",
+    ),
+    "Burlington": (
+        "08046", "08015", "08016", "08075", "08053", "08057", "08060", "08068",
+        "08088", "08054", "08055", "08077", "08065",
+    ),
+}
+NEW_RECORD_ZIP5_COUNTY = {
+    zip5: county
+    for county, zip_codes in NEW_RECORD_COUNTY_ZIP5.items()
+    for zip5 in zip_codes
+}
+
+
+def county_from_zip5(value):
+    postal_code = normalize_postal_code(value)
+    if not postal_code:
+        return ""
+    return NEW_RECORD_ZIP5_COUNTY.get(postal_code[:5], "")
+
+
 NEW_RECORD_COUNTY_CITY_MAP = {
     "Essex": {
         "belleville", "bloomfield", "caldwell", "cedar grove", "east orange", "essex fells",
@@ -29841,7 +29909,11 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
     else:
         sift_rollup = sift_rollup if isinstance(sift_rollup, dict) else {}
     summary = summarize_reisift_property(payload, fallback_payload=search_row)
-    county = infer_county_from_reisift_payload(payload) or infer_county_from_reisift_payload(search_row)
+    county = (
+        infer_county_from_reisift_payload(payload)
+        or infer_county_from_reisift_payload(search_row)
+        or county_from_zip5(summary.get("full_address") or "")
+    )
     added_dt = reisift_added_at_dt(search_row, payload)
     updated_at = (
         str(payload.get("updated") or payload.get("updated_at") or payload.get("owner_updated") or "").strip()
@@ -30152,6 +30224,18 @@ def _new_record_payload(row):
     return parse_json_object((row or {}).get("payload_json") or "{}", default={})
 
 
+def infer_county_from_new_record_row(row):
+    item = row if isinstance(row, dict) else {}
+    county = display_county_name(item.get("county") or "")
+    if county:
+        return county
+    payload = _new_record_payload(item)
+    county = display_county_name(infer_county_from_reisift_payload(payload))
+    if county:
+        return county
+    return display_county_name(county_from_zip5(item.get("full_address") or ""))
+
+
 def _new_record_owner_type(payload):
     owner = payload.get("owner") if isinstance(payload, dict) and isinstance(payload.get("owner"), dict) else {}
     return normalize_whitespace(owner.get("type") or "")
@@ -30310,7 +30394,7 @@ def _new_record_matches_filters(row, filters):
 
     county_filter = normalize_county_name(filters.get("county") or "")
     if county_filter:
-        row_county = row.get("county") or infer_county_from_reisift_payload(_new_record_payload(row))
+        row_county = infer_county_from_new_record_row(row)
         if normalize_county_name(row_county or "") != county_filter:
             return False
 
@@ -30341,6 +30425,7 @@ def get_new_record_filter_options(db):
         """
         SELECT n.status,
                n.county,
+               n.full_address,
                n.payload_json
         FROM reisift_new_records n
         WHERE n.is_active = 1
@@ -30348,16 +30433,12 @@ def get_new_record_filter_options(db):
     ).fetchall()
     statuses = sorted({normalize_whitespace(row["status"] or "") for row in rows if normalize_whitespace(row["status"] or "")})
     payloads = [_new_record_payload(dict(row)) for row in rows]
-    counties = sorted(
-        {
-            county
-            for county in (
-                display_county_name(row["county"]) or display_county_name(infer_county_from_reisift_payload(payload))
-                for row, payload in zip(rows, payloads)
-            )
-            if county
-        }
-    )
+    county_values = set()
+    for row in rows:
+        county = infer_county_from_new_record_row(dict(row))
+        if county:
+            county_values.add(county)
+    counties = sorted(county_values)
     completeness = sorted({value for value in (_new_record_completeness(payload) for payload in payloads) if value})
     owner_types = sorted({value for value in (_new_record_owner_type(payload) for payload in payloads) if value})
     return {"statuses": statuses, "counties": counties, "completeness": completeness, "owner_types": owner_types}

@@ -28,6 +28,11 @@
         Cap: <strong>{{ settings.max_daily_per_number }}/number/day</strong>.
         Send Now is still available as a manual override.
     </p>
+    <p class="muted-text">
+        Showing <strong>{{ queue_total }}</strong> matching SMS queue item(s) across <strong>{{ queue_property_total }}</strong> propert{% if queue_property_total == 1 %}y{% else %}ies{% endif %}.
+        {% if queue_display_count < queue_total %}Displaying first <strong>{{ queue_display_count }}</strong>.{% endif %}
+        {% if filters.lists %}Selected list filters require records to match <strong>all</strong> selected lists.{% endif %}
+    </p>
 
     <div class="panel-actions">
         <form method="get" action="{{ url_for('sms_queue_page') }}" class="inline-form">
@@ -50,6 +55,30 @@
                     <option value="">All</option>
                     {% for city in filter_options.cities %}
                     <option value="{{ city }}" {% if filters.city == city %}selected{% endif %}>{{ city }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>ReiSIFT Lists
+                <select name="lists" multiple size="6">
+                    {% for list_name in filter_options.lists %}
+                    <option value="{{ list_name }}" {% if list_name in filters.lists %}selected{% endif %}>{{ list_name }}</option>
+                    {% endfor %}
+                </select>
+                <span class="help-text">Hold Ctrl/Cmd to select multiple. Records must match all selected lists.</span>
+            </label>
+            <label>Completeness
+                <select name="completeness">
+                    <option value="">All</option>
+                    {% for value in filter_options.completeness %}
+                    <option value="{{ value }}" {% if filters.completeness == value %}selected{% endif %}>{{ value }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>Owner
+                <select name="owner_type">
+                    <option value="">All</option>
+                    {% for value in filter_options.owner_types %}
+                    <option value="{{ value }}" {% if filters.owner_type == value or (filters.owner_type|lower == 'individual' and value == 'person') %}selected{% endif %}>{% if value == 'person' %}Individual{% else %}{{ value|title }}{% endif %}</option>
                     {% endfor %}
                 </select>
             </label>

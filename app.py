@@ -37784,6 +37784,7 @@ def start_sms_automation_send_worker():
 
 def get_sms_automation_queue_rows(db, filters=None):
     filters = filters if isinstance(filters, dict) else {}
+    display_limit = 500
     clauses = []
     params = []
     number_pulled_expr = "date(COALESCE(NULLIF(t.created_at, ''), NULLIF(q.created_at, '')))"
@@ -37795,14 +37796,8 @@ def get_sms_automation_queue_rows(db, filters=None):
     if date_to:
         clauses.append(f"{number_pulled_expr} <= date(?)")
         params.append(date_to)
-    city = (filters.get("city") or "").strip()
-    if city:
-        clauses.append("lower(COALESCE(a.city, '')) = lower(?)")
-        params.append(city)
-    county = (filters.get("county") or "").strip()
-    if county:
-        clauses.append("lower(COALESCE(n.county, '')) = lower(?)")
-        params.append(county)
+    # County/city can be inferred from the linked New Records payload, so apply
+    # them after enrichment instead of filtering on potentially blank SQL fields.
     status = (filters.get("status") or "").strip()
     if status:
         clauses.append("q.status = ?")
@@ -37826,6 +37821,8 @@ def get_sms_automation_queue_rows(db, filters=None):
                a.street, a.city, a.state, a.postal_code,
                pe.first_name, pe.last_name, t.channel_label, t.status AS phone_status,
                n.county AS property_county,
+               n.full_address AS new_record_full_address,
+               n.payload_json AS new_record_payload_json,
                COALESCE(NULLIF(t.created_at, ''), NULLIF(q.created_at, '')) AS number_pulled_at
         FROM sms_automation_queue q
         JOIN properties p ON p.id = q.property_id
@@ -37858,13 +37855,25 @@ def get_sms_automation_queue_rows(db, filters=None):
             END,
             q.updated_at DESC,
             q.id DESC
-        LIMIT 500
         """,
         tuple(params),
     ).fetchall()
     out = []
     for r in rows:
         d = dict(r)
+        new_record_row = {
+            "county": d.get("property_county") or "",
+            "full_address": d.get("new_record_full_address") or d.get("property_address") or "",
+            "payload_json": d.get("new_record_payload_json") or "{}",
+        }
+        payload = _new_record_payload(new_record_row)
+        d["property_county"] = infer_county_from_new_record_row(new_record_row) or d.get("property_county") or ""
+        d["property_city"] = infer_city_from_new_record_row(new_record_row) or d.get("city") or ""
+        d["owner_type"] = _new_record_owner_type(payload)
+        d["completeness"] = _new_record_completeness(payload)
+        d["property_list_names"] = _new_record_list_names(payload)
+        if not _sms_queue_matches_new_record_filters(d, filters):
+            continue
         d["property_address"] = format_property_address_line(d.get("street"), d.get("city"), d.get("state"), d.get("postal_code"))
         d["person_name"] = f"{d.get('first_name') or ''} {d.get('last_name') or ''}".strip()
         d["sift_url"] = _sift_record_url(d.get("reisift_property_uuid") or "")
@@ -37874,15 +37883,53 @@ def get_sms_automation_queue_rows(db, filters=None):
         d["routing_rule_name"] = str(routing.get("rule_name") or "").strip()
         d["matched_buckets"] = routing.get("matched_buckets") if isinstance(routing.get("matched_buckets"), list) else []
         out.append(d)
-    return out
+    property_ids = set()
+    for row in out:
+        try:
+            property_id = int(row.get("property_id") or 0)
+        except Exception:
+            property_id = 0
+        if property_id > 0:
+            property_ids.add(property_id)
+    return {
+        "rows": out[:display_limit],
+        "total": len(out),
+        "property_total": len(property_ids),
+        "display_limit": display_limit,
+    }
+
+
+def _sms_queue_matches_new_record_filters(row, filters):
+    filters = filters if isinstance(filters, dict) else {}
+    county_filter = normalize_county_name(filters.get("county") or "")
+    if county_filter and normalize_county_name(row.get("property_county") or "") != county_filter:
+        return False
+    city_filter = normalize_whitespace(filters.get("city") or "").lower()
+    if city_filter and normalize_whitespace(row.get("property_city") or row.get("city") or "").lower() != city_filter:
+        return False
+    completeness_filter = normalize_whitespace(filters.get("completeness") or "").lower()
+    if completeness_filter and normalize_whitespace(row.get("completeness") or "").lower() != completeness_filter:
+        return False
+    owner_type_filter = normalize_new_record_owner_type(filters.get("owner_type") or "")
+    if owner_type_filter and normalize_new_record_owner_type(row.get("owner_type") or "") != owner_type_filter:
+        return False
+    selected_lists = filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")
+    selected_list_keys = {normalize_whitespace(item).lower() for item in selected_lists if normalize_whitespace(item)}
+    if selected_list_keys:
+        row_list_keys = {normalize_whitespace(item).lower() for item in (row.get("property_list_names") or []) if normalize_whitespace(item)}
+        if not selected_list_keys.issubset(row_list_keys):
+            return False
+    return True
 
 
 def get_sms_automation_filter_options(db):
-    county_rows = db.execute(
+    rows = db.execute(
         """
-        SELECT DISTINCT n.county AS county
+        SELECT n.county, n.full_address, n.payload_json,
+               a.city AS local_city
         FROM sms_automation_queue q
         JOIN properties p ON p.id = q.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
         LEFT JOIN reisift_new_records n ON n.id = (
             SELECT nr.id
             FROM reisift_new_records nr
@@ -37894,23 +37941,38 @@ def get_sms_automation_filter_options(db):
             ORDER BY nr.id DESC
             LIMIT 1
         )
-        WHERE COALESCE(n.county, '') != ''
-        ORDER BY n.county COLLATE NOCASE
         """
     ).fetchall()
-    city_rows = db.execute(
-        """
-        SELECT DISTINCT a.city AS city
-        FROM sms_automation_queue q
-        JOIN properties p ON p.id = q.property_id
-        LEFT JOIN addresses a ON a.id = p.property_address_id
-        WHERE COALESCE(a.city, '') != ''
-        ORDER BY a.city COLLATE NOCASE
-        """
-    ).fetchall()
+    payloads = []
+    counties = set()
+    cities = set()
+    for row in rows:
+        item = dict(row)
+        payload = _new_record_payload(item)
+        payloads.append(payload)
+        county = infer_county_from_new_record_row(item)
+        if county:
+            counties.add(county)
+        city = infer_city_from_new_record_row(item) or normalize_whitespace(item.get("local_city") or "")
+        if city:
+            cities.add(city)
+    completeness = sorted({value for value in (_new_record_completeness(payload) for payload in payloads) if value})
+    owner_types = sorted({value for value in (_new_record_owner_type(payload) for payload in payloads) if value})
+    lists = sorted(
+        {
+            list_name
+            for payload in payloads
+            for list_name in _new_record_list_names(payload)
+            if normalize_whitespace(list_name)
+        },
+        key=lambda value: value.lower(),
+    )
     return {
-        "counties": [r["county"] for r in county_rows],
-        "cities": [r["city"] for r in city_rows],
+        "counties": sorted(counties),
+        "cities": sorted(cities, key=lambda value: value.lower()),
+        "completeness": completeness,
+        "owner_types": owner_types,
+        "lists": lists,
     }
 
 
@@ -38097,13 +38159,17 @@ def sms_queue_page():
         "date_to": (request.args.get("date_to") or "").strip(),
         "county": (request.args.get("county") or "").strip(),
         "city": (request.args.get("city") or "").strip(),
+        "lists": [normalize_whitespace(item) for item in request.args.getlist("lists") if normalize_whitespace(item)],
+        "completeness": (request.args.get("completeness") or "").strip(),
+        "owner_type": (request.args.get("owner_type") or "").strip(),
         "status": (request.args.get("status") or "").strip(),
         "bucket": (request.args.get("bucket") or "").strip(),
         "contact_role": (request.args.get("contact_role") or "").strip(),
     }
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()
-    rows = get_sms_automation_queue_rows(db, filters=filters)
+    queue_result = get_sms_automation_queue_rows(db, filters=filters)
+    rows = queue_result["rows"]
     summary_rows = db.execute(
         """
         SELECT status, COUNT(*) AS c
@@ -38119,6 +38185,10 @@ def sms_queue_page():
         notice=notice,
         error=error,
         summary=summary,
+        queue_total=queue_result["total"],
+        queue_property_total=queue_result["property_total"],
+        queue_display_count=len(rows),
+        queue_display_limit=queue_result["display_limit"],
         filter_options=get_sms_automation_filter_options(db),
         settings=get_sms_automation_settings(db),
     )

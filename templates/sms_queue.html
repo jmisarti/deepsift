@@ -36,7 +36,7 @@
 
     <div class="panel-actions">
         <form method="get" action="{{ url_for('sms_queue_page') }}" class="inline-form">
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers or filters.status or filters.bucket or filters.contact_role %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers or filters.status or filters.bucket or filters.contact_role %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>Numbers From
@@ -83,6 +83,13 @@
                             {% for value in filter_options.owner_types %}
                             <option value="{{ value }}" {% if filters.owner_type == value or (filters.owner_type|lower == 'individual' and value == 'person') %}selected{% endif %}>{% if value == 'person' %}Individual{% else %}{{ value|title }}{% endif %}</option>
                             {% endfor %}
+                        </select>
+                    </label>
+                    <label>Owner Out of State?
+                        <select name="owner_out_of_state">
+                            <option value="">All</option>
+                            <option value="yes" {% if filters.owner_out_of_state == 'yes' %}selected{% endif %}>Yes</option>
+                            <option value="no" {% if filters.owner_out_of_state == 'no' %}selected{% endif %}>No</option>
                         </select>
                     </label>
                     <label>ReiSkipped?

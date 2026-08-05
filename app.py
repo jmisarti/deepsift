@@ -30375,6 +30375,39 @@ def _new_record_list_names(payload):
     return extract_property_list_names(payload)
 
 
+def _new_record_owner_address_states(payload):
+    states = []
+    seen = set()
+    for owner in iter_reisift_payload_owners(payload):
+        candidates = [owner]
+        for key in ["address", "mailing_address", "mailingAddress", "mail_address", "mailAddress", "mailing"]:
+            value = owner.get(key) if isinstance(owner, dict) else None
+            if isinstance(value, dict):
+                candidates.append(value)
+        for candidate in candidates:
+            address = extract_reisift_property_address(candidate)
+            state = normalize_state_code(address.get("state") or "")
+            if not state:
+                state = normalize_state_code(
+                    candidate.get("mailing_state")
+                    or candidate.get("mailingState")
+                    or candidate.get("address_state")
+                    or candidate.get("state")
+                    or ""
+                )
+            if state and state not in seen:
+                seen.add(state)
+                states.append(state)
+    return states
+
+
+def _new_record_owner_out_of_state(payload):
+    states = _new_record_owner_address_states(payload)
+    if not states:
+        return None
+    return any(state != "NJ" for state in states)
+
+
 def _new_record_yes_no_filter_value(value):
     text = normalize_whitespace(value).lower()
     if text in {"yes", "true", "1", "y"}:
@@ -30539,6 +30572,14 @@ def _new_record_matches_filters(row, filters):
     owner_type_filter = normalize_new_record_owner_type(filters.get("owner_type") or "")
     if owner_type_filter and normalize_new_record_owner_type(row.get("owner_type") or "") != owner_type_filter:
         return False
+
+    owner_out_of_state_filter = _new_record_yes_no_filter_value(filters.get("owner_out_of_state") or "")
+    if owner_out_of_state_filter is not None:
+        actual = row.get("owner_out_of_state")
+        if actual is None:
+            return False
+        if bool(actual) != owner_out_of_state_filter:
+            return False
 
     selected_lists = filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")
     selected_list_keys = {normalize_whitespace(item).lower() for item in selected_lists if normalize_whitespace(item)}
@@ -30964,6 +31005,7 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
             item["added_at"] = item["lp_added_at"]
         item["completeness"] = _new_record_completeness(payload)
         item["owner_type"] = _new_record_owner_type(payload)
+        item["owner_out_of_state"] = _new_record_owner_out_of_state(payload)
         item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
         item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
         item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
@@ -37357,6 +37399,7 @@ def new_records_page():
         "lists": [normalize_whitespace(item) for item in request.args.getlist("lists") if normalize_whitespace(item)],
         "completeness": (request.args.get("completeness") or "").strip(),
         "owner_type": (request.args.get("owner_type") or "").strip(),
+        "owner_out_of_state": (request.args.get("owner_out_of_state") or "").strip(),
         "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),
@@ -37421,6 +37464,7 @@ def new_records_refresh():
         "lists": [normalize_whitespace(item) for item in (request.form.getlist("lists") or request.args.getlist("lists")) if normalize_whitespace(item)],
         "completeness": (request.form.get("completeness") or request.args.get("completeness") or "").strip(),
         "owner_type": (request.form.get("owner_type") or request.args.get("owner_type") or "").strip(),
+        "owner_out_of_state": (request.form.get("owner_out_of_state") or request.args.get("owner_out_of_state") or "").strip(),
         "rei_skipped": (request.form.get("rei_skipped") or request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.form.get("deep_skipped") or request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.form.get("no_good_numbers") or request.args.get("no_good_numbers") or "").strip(),
@@ -37874,6 +37918,7 @@ def get_sms_automation_queue_rows(db, filters=None):
         d["property_county"] = infer_county_from_new_record_row(new_record_row) or d.get("property_county") or ""
         d["property_city"] = infer_city_from_new_record_row(new_record_row) or d.get("city") or ""
         d["owner_type"] = _new_record_owner_type(payload)
+        d["owner_out_of_state"] = _new_record_owner_out_of_state(payload)
         d["completeness"] = _new_record_completeness(payload)
         d["property_list_names"] = _new_record_list_names(payload)
         try:
@@ -37925,6 +37970,13 @@ def _sms_queue_matches_new_record_filters(row, filters):
     owner_type_filter = normalize_new_record_owner_type(filters.get("owner_type") or "")
     if owner_type_filter and normalize_new_record_owner_type(row.get("owner_type") or "") != owner_type_filter:
         return False
+    owner_out_of_state_filter = _new_record_yes_no_filter_value(filters.get("owner_out_of_state") or "")
+    if owner_out_of_state_filter is not None:
+        actual = row.get("owner_out_of_state")
+        if actual is None:
+            return False
+        if bool(actual) != owner_out_of_state_filter:
+            return False
     selected_lists = filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")
     selected_list_keys = {normalize_whitespace(item).lower() for item in selected_lists if normalize_whitespace(item)}
     if selected_list_keys:
@@ -38185,6 +38237,7 @@ def sms_queue_page():
         "lists": [normalize_whitespace(item) for item in request.args.getlist("lists") if normalize_whitespace(item)],
         "completeness": (request.args.get("completeness") or "").strip(),
         "owner_type": (request.args.get("owner_type") or "").strip(),
+        "owner_out_of_state": (request.args.get("owner_out_of_state") or "").strip(),
         "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),

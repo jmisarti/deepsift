@@ -42,7 +42,7 @@
                 </select>
             </label>
             <button type="submit">Apply</button>
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>From
@@ -99,6 +99,13 @@
                             {% endfor %}
                         </select>
                     </label>
+                    <label>Owner Out of State?
+                        <select name="owner_out_of_state">
+                            <option value="">All</option>
+                            <option value="yes" {% if filters.owner_out_of_state == 'yes' %}selected{% endif %}>Yes</option>
+                            <option value="no" {% if filters.owner_out_of_state == 'no' %}selected{% endif %}>No</option>
+                        </select>
+                    </label>
                     <label>ReiSkipped?
                         <select name="rei_skipped">
                             <option value="">All</option>
@@ -139,6 +146,7 @@
             {% endfor %}
             <input type="hidden" name="completeness" value="{{ filters.completeness }}">
             <input type="hidden" name="owner_type" value="{{ filters.owner_type }}">
+            <input type="hidden" name="owner_out_of_state" value="{{ filters.owner_out_of_state }}">
             <input type="hidden" name="rei_skipped" value="{{ filters.rei_skipped }}">
             <input type="hidden" name="deep_skipped" value="{{ filters.deep_skipped }}">
             <input type="hidden" name="no_good_numbers" value="{{ filters.no_good_numbers }}">

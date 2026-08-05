@@ -531,6 +531,19 @@ CREATE TABLE IF NOT EXISTS reisift_new_records (
 CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_county ON reisift_new_records(is_active, county, added_at);
 CREATE INDEX IF NOT EXISTS idx_reisift_new_records_local_property ON reisift_new_records(local_property_id);
 
+CREATE TABLE IF NOT EXISTS reisift_new_record_lists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_uuid TEXT NOT NULL,
+    list_name TEXT NOT NULL,
+    list_id TEXT,
+    list_key TEXT NOT NULL,
+    last_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(property_uuid, list_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reisift_new_record_lists_property ON reisift_new_record_lists(property_uuid);
+CREATE INDEX IF NOT EXISTS idx_reisift_new_record_lists_key ON reisift_new_record_lists(list_key);
+
 CREATE TABLE IF NOT EXISTS property_source_info (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     property_id INTEGER NOT NULL UNIQUE,

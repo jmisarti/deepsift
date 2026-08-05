@@ -1066,6 +1066,25 @@ def migrate_db(db):
     )
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS reisift_new_record_lists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            property_uuid TEXT NOT NULL,
+            list_name TEXT NOT NULL,
+            list_id TEXT,
+            list_key TEXT NOT NULL,
+            last_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(property_uuid, list_key)
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reisift_new_record_lists_property ON reisift_new_record_lists(property_uuid)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reisift_new_record_lists_key ON reisift_new_record_lists(list_key)"
+    )
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS property_source_info (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             property_id INTEGER NOT NULL UNIQUE,
@@ -30134,8 +30153,10 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         ),
     )
+    list_sync = sync_reisift_new_record_lists(db, property_uuid, payload or search_row)
     local_sync["local_import"] = local_import
     local_sync["contact_sync"] = contact_sync
+    local_sync["list_sync"] = list_sync
     return local_sync
 
 
@@ -30550,6 +30571,82 @@ def compute_new_record_contact_flags(db, local_property_id, payload, fallback_pa
     }
 
 
+def sync_reisift_new_record_lists(db, property_uuid, payload):
+    property_uuid = normalize_uuid(property_uuid)
+    if not property_uuid:
+        return {"synced": 0}
+    items = extract_property_list_items(payload if isinstance(payload, dict) else {})
+    now_text = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    execute_with_retry(db, "DELETE FROM reisift_new_record_lists WHERE property_uuid = ?", (property_uuid,))
+    for item in items:
+        execute_with_retry(
+            db,
+            """
+            INSERT INTO reisift_new_record_lists (property_uuid, list_name, list_id, list_key, last_synced_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(property_uuid, list_key) DO UPDATE SET
+                list_name = excluded.list_name,
+                list_id = excluded.list_id,
+                last_synced_at = excluded.last_synced_at
+            """,
+            (
+                property_uuid,
+                item["list_name"],
+                item.get("list_id") or "",
+                item["list_key"],
+                now_text,
+            ),
+        )
+    return {"synced": len(items)}
+
+
+def backfill_reisift_new_record_lists(db, only_missing=False):
+    where_sql = "WHERE COALESCE(payload_json, '') <> ''"
+    if only_missing:
+        where_sql += " AND NOT EXISTS (SELECT 1 FROM reisift_new_record_lists l WHERE l.property_uuid = reisift_new_records.property_uuid)"
+    rows = db.execute(
+        f"""
+        SELECT property_uuid, payload_json
+        FROM reisift_new_records
+        {where_sql}
+        """
+    ).fetchall()
+    properties = 0
+    list_rows = 0
+    for row in rows:
+        payload = parse_json_object(row["payload_json"] or "{}", default={})
+        result = sync_reisift_new_record_lists(db, row["property_uuid"], payload)
+        properties += 1
+        list_rows += int(result.get("synced") or 0)
+    return {"properties": properties, "list_rows": list_rows}
+
+
+def reisift_new_record_list_names_for_properties(db, property_uuids):
+    clean_uuids = []
+    for value in property_uuids or []:
+        uuid = normalize_uuid(value)
+        if uuid:
+            clean_uuids.append(uuid)
+    clean_uuids = list(dict.fromkeys(clean_uuids))
+    if not clean_uuids:
+        return {}
+    out = {uuid: [] for uuid in clean_uuids}
+    for chunk in iter_query_chunks(clean_uuids):
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = db.execute(
+            f"""
+            SELECT property_uuid, list_name
+            FROM reisift_new_record_lists
+            WHERE property_uuid IN ({placeholders})
+            ORDER BY list_name COLLATE NOCASE ASC
+            """,
+            tuple(chunk),
+        ).fetchall()
+        for row in rows:
+            out.setdefault(row["property_uuid"], []).append(row["list_name"])
+    return out
+
+
 def _new_record_matches_filters(row, filters):
     filters = filters if isinstance(filters, dict) else {}
     date_from = _parse_iso_date_only(filters.get("date_from") or "")
@@ -30641,15 +30738,27 @@ def get_new_record_filter_options(db):
     cities = sorted(city_values, key=lambda value: value.lower())
     completeness = sorted({value for value in (_new_record_completeness(payload) for payload in payloads) if value})
     owner_types = sorted({value for value in (_new_record_owner_type(payload) for payload in payloads) if value})
-    lists = sorted(
-        {
-            list_name
-            for payload in payloads
-            for list_name in _new_record_list_names(payload)
-            if normalize_whitespace(list_name)
-        },
-        key=lambda value: value.lower(),
-    )
+    list_rows = db.execute(
+        """
+        SELECT DISTINCT l.list_name
+        FROM reisift_new_record_lists l
+        JOIN reisift_new_records n ON n.property_uuid = l.property_uuid
+        WHERE n.is_active = 1
+          AND COALESCE(l.list_name, '') <> ''
+        ORDER BY l.list_name COLLATE NOCASE ASC
+        """
+    ).fetchall()
+    lists = [row["list_name"] for row in list_rows]
+    if not lists:
+        lists = sorted(
+            {
+                list_name
+                for payload in payloads
+                for list_name in _new_record_list_names(payload)
+                if normalize_whitespace(list_name)
+            },
+            key=lambda value: value.lower(),
+        )
     return {"statuses": statuses, "counties": counties, "cities": cities, "completeness": completeness, "owner_types": owner_types, "lists": lists}
 
 
@@ -31006,6 +31115,10 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
         WHERE n.is_active = 1
         """
     ).fetchall()
+    list_names_by_uuid = reisift_new_record_list_names_for_properties(
+        db,
+        [row["property_uuid"] for row in rows],
+    )
     candidates = []
     local_property_ids = []
     for row in rows:
@@ -31023,7 +31136,7 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
         item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
         item["county"] = infer_county_from_new_record_row(item)
         item["city"] = infer_city_from_new_record_row(item)
-        item["property_list_names"] = _new_record_list_names(payload)
+        item["property_list_names"] = list_names_by_uuid.get(item.get("property_uuid") or "") or _new_record_list_names(payload)
         item["property_lists"] = ", ".join(item["property_list_names"])
         for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
             item[flag_key] = 1 if int(item.get(flag_key) or 0) else 0
@@ -31232,18 +31345,40 @@ def apply_referral_source_override(payload, override):
 
 
 def extract_property_list_names(payload):
+    return [item["list_name"] for item in extract_property_list_items(payload)]
+
+
+def normalize_reisift_list_key(value):
+    return normalize_whitespace(value or "").lower()
+
+
+def extract_property_list_items(payload):
     lists = payload.get("lists") if isinstance(payload, dict) else []
     if not isinstance(lists, list):
         return []
-    names = []
-    for item in lists:
-        if isinstance(item, dict):
-            val = (item.get("title") or item.get("name") or item.get("label") or item.get("id") or "").strip()
+    items = []
+    seen = set()
+    for raw_item in lists:
+        list_id = ""
+        if isinstance(raw_item, dict):
+            list_id = normalize_uuid(raw_item.get("uuid") or raw_item.get("id") or "")
+            list_name = normalize_whitespace(
+                raw_item.get("title")
+                or raw_item.get("name")
+                or raw_item.get("label")
+                or raw_item.get("id")
+                or ""
+            )
         else:
-            val = str(item or "").strip()
-        if val:
-            names.append(val)
-    return list(dict.fromkeys(names))
+            list_name = normalize_whitespace(raw_item or "")
+        if not list_name:
+            continue
+        list_key = normalize_reisift_list_key(list_name)
+        if not list_key or list_key in seen:
+            continue
+        seen.add(list_key)
+        items.append({"list_name": list_name, "list_id": list_id, "list_key": list_key})
+    return items
 
 
 def extract_property_lists(payload):
@@ -37877,6 +38012,7 @@ def get_sms_automation_queue_rows(db, filters=None):
                a.street, a.city, a.state, a.postal_code,
                pe.first_name, pe.last_name, t.channel_label, t.status AS phone_status,
                n.county AS property_county,
+               n.property_uuid AS new_record_property_uuid,
                n.full_address AS new_record_full_address,
                n.payload_json AS new_record_payload_json,
                n.rei_skipped AS new_record_rei_skipped,
@@ -37919,6 +38055,10 @@ def get_sms_automation_queue_rows(db, filters=None):
     ).fetchall()
     out = []
     raw_rows = [dict(r) for r in rows]
+    list_names_by_uuid = reisift_new_record_list_names_for_properties(
+        db,
+        [row.get("new_record_property_uuid") for row in raw_rows],
+    )
     live_flags_by_property = bulk_new_record_local_contact_flags(db, [row.get("property_id") for row in raw_rows])
     for d in raw_rows:
         new_record_row = {
@@ -37932,7 +38072,7 @@ def get_sms_automation_queue_rows(db, filters=None):
         d["owner_type"] = _new_record_owner_type(payload)
         d["owner_out_of_state"] = _new_record_owner_out_of_state(payload)
         d["completeness"] = _new_record_completeness(payload)
-        d["property_list_names"] = _new_record_list_names(payload)
+        d["property_list_names"] = list_names_by_uuid.get(d.get("new_record_property_uuid") or "") or _new_record_list_names(payload)
         try:
             property_id = int(d.get("property_id") or 0)
         except Exception:
@@ -38012,7 +38152,7 @@ def _sms_queue_matches_new_record_filters(row, filters):
 def get_sms_automation_filter_options(db):
     rows = db.execute(
         """
-        SELECT n.county, n.full_address, n.payload_json,
+        SELECT n.property_uuid, n.county, n.full_address, n.payload_json,
                a.city AS local_city
         FROM sms_automation_queue q
         JOIN properties p ON p.id = q.property_id
@@ -38031,6 +38171,10 @@ def get_sms_automation_filter_options(db):
         """
     ).fetchall()
     payloads = []
+    list_names_by_uuid = reisift_new_record_list_names_for_properties(
+        db,
+        [row["property_uuid"] for row in rows],
+    )
     counties = set()
     cities = set()
     for row in rows:
@@ -38048,12 +38192,22 @@ def get_sms_automation_filter_options(db):
     lists = sorted(
         {
             list_name
-            for payload in payloads
-            for list_name in _new_record_list_names(payload)
+            for names in list_names_by_uuid.values()
+            for list_name in names
             if normalize_whitespace(list_name)
         },
         key=lambda value: value.lower(),
     )
+    if not lists:
+        lists = sorted(
+            {
+                list_name
+                for payload in payloads
+                for list_name in _new_record_list_names(payload)
+                if normalize_whitespace(list_name)
+            },
+            key=lambda value: value.lower(),
+        )
     return {
         "counties": sorted(counties),
         "cities": sorted(cities, key=lambda value: value.lower()),

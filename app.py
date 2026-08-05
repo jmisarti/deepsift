@@ -28386,6 +28386,33 @@ def latest_lp_tag_datetime(*payloads):
                 dates.append(datetime.strptime(match.group(1), "%m%d%y"))
             except ValueError:
                 continue
+        for tag in tag_values:
+            text = normalize_whitespace(tag)
+            month_year = re.search(
+                r"\b(?:LP|List\s+Purchased(?:\s+(?:County|Propstream))?)\s+([A-Za-z]{3,9})\s+(\d{4})\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if month_year:
+                try:
+                    dates.append(datetime.strptime(f"{month_year.group(1)} 1 {month_year.group(2)}", "%b %d %Y"))
+                    continue
+                except ValueError:
+                    try:
+                        dates.append(datetime.strptime(f"{month_year.group(1)} 1 {month_year.group(2)}", "%B %d %Y"))
+                        continue
+                    except ValueError:
+                        pass
+            numeric_month_year = re.search(
+                r"\bList\s+Purchased(?:\s+(?:County|Propstream))?\s+(\d{1,2})/(\d{4})\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if numeric_month_year:
+                try:
+                    dates.append(datetime(int(numeric_month_year.group(2)), int(numeric_month_year.group(1)), 1))
+                except ValueError:
+                    pass
     return max(dates) if dates else None
 
 

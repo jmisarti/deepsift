@@ -2839,6 +2839,18 @@ def normalize_email(value):
     return raw if "@" in raw else ""
 
 
+def normalize_email_identity(value):
+    email = normalize_email(value)
+    if "@" not in email:
+        return email
+    local, domain = email.rsplit("@", 1)
+    domain = domain.strip().lower()
+    if domain in {"gmail.com", "googlemail.com"}:
+        local = local.split("+", 1)[0].replace(".", "")
+        domain = "gmail.com"
+    return f"{local}@{domain}" if local and domain else email
+
+
 def est_day_start_utc(now_dt=None):
     now_et = (now_dt or datetime.utcnow().replace(tzinfo=timezone.utc)).astimezone(EST_TZ)
     day_start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -6489,8 +6501,10 @@ def touchpoint_exists(db, person_id, channel_type, value):
     if channel_type.lower() == "phone":
         target = normalize_phone(value)
         return any(normalize_phone(r["value"]) == target for r in rows)
-    target = value.strip().lower()
-    return any((r["value"] or "").strip().lower() == target for r in rows)
+    target = normalize_email_identity(value)
+    if channel_type.lower() == "email":
+        return any(normalize_email_identity(r["value"]) == target for r in rows)
+    return any((r["value"] or "").strip().lower() == (value or "").strip().lower() for r in rows)
 
 
 def find_touchpoint_row_by_value(db, person_id, channel_type, value):
@@ -6506,15 +6520,15 @@ def find_touchpoint_row_by_value(db, person_id, channel_type, value):
             if normalize_phone(row["value"]) == target:
                 return row
         return None
-    target = normalize_email(value)
+    target = normalize_email_identity(value)
     for row in rows:
-        if normalize_email(row["value"]) == target:
+        if normalize_email_identity(row["value"]) == target:
             return row
     return None
 
 
 def upsert_email_touchpoint_and_queue_validation(db, person_id, email_value, note="", source="manual_touchpoint"):
-    email = normalize_email(email_value)
+    email = normalize_email_identity(email_value)
     if not person_id or not email:
         return {"touchpoint_id": 0, "created": False, "queued": False}
 
@@ -6563,6 +6577,8 @@ def _touchpoint_key(channel_type, value):
     raw = (value or "").strip()
     if ctype == "phone":
         return (ctype, normalize_phone(raw))
+    if ctype == "email":
+        return (ctype, normalize_email_identity(raw))
     return (ctype, raw.lower())
 
 
@@ -9196,7 +9212,7 @@ def log_email_validation_result(db, person_id, email_value, touch_status, valida
         person_id = int(person_id or 0)
     except Exception:
         person_id = 0
-    email_value = normalize_email(email_value)
+    email_value = normalize_email_identity(email_value)
     if not person_id or not email_value:
         return
     provider_status = str((validation_result or {}).get("provider_status") or "").strip() or str(touch_status or "").strip()
@@ -13715,7 +13731,7 @@ def _normalize_untitled_email_values(*raw_values):
         else:
             candidates = re.split(r"[,;\n]+", str(raw_value))
         for candidate in candidates:
-            email = normalize_email(candidate)
+            email = normalize_email_identity(candidate)
             if email and email not in seen:
                 seen.add(email)
                 emails.append(email)
@@ -13736,7 +13752,7 @@ def _untitled_campaign_emails(prepared_row):
 
 
 def _emailoctopus_member_id(email_address):
-    return hashlib.md5((normalize_email(email_address) or "").encode("utf-8")).hexdigest()
+    return hashlib.md5((normalize_email_identity(email_address) or "").encode("utf-8")).hexdigest()
 
 
 def _safe_response_payload(response):
@@ -13756,7 +13772,7 @@ def _emailoctopus_is_tag_limit_error(payload):
 
 
 def verify_email_with_emaillistverify(api_key, email_address):
-    email_address = normalize_email(email_address)
+    email_address = normalize_email_identity(email_address)
     if not api_key:
         return {
             "ok": False,
@@ -13826,7 +13842,7 @@ def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value,
         touchpoint_id = int(touchpoint_id or 0)
     except Exception:
         touchpoint_id = 0
-    email_value = normalize_email(email_value)
+    email_value = normalize_email_identity(email_value)
     if not touchpoint_id or not email_value:
         return None
     existing = db.execute(
@@ -13913,7 +13929,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
             processed += 1
             queue_id = int(row["id"])
             touchpoint_id = int(row["touchpoint_id"])
-            email_value = normalize_email(row["touchpoint_value"] or row["email_value"] or "")
+            email_value = normalize_email_identity(row["touchpoint_value"] or row["email_value"] or "")
             touch_status = (row["touchpoint_status"] or "").strip()
             touch_status_norm = touch_status.lower()
             if not email_value:
@@ -14089,7 +14105,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
 
 
 def emailoctopus_upsert_contact(api_key, list_id, email_address, contact_status="PENDING", tags=None):
-    email_address = normalize_email(email_address)
+    email_address = normalize_email_identity(email_address)
     if not api_key:
         raise ValueError("EmailOctopus API key is missing")
     if not list_id:
@@ -14175,7 +14191,7 @@ def emailoctopus_upsert_contact(api_key, list_id, email_address, contact_status=
 
 
 def emailoctopus_set_contact_status(api_key, list_id, email_address, status="UNSUBSCRIBED"):
-    email_address = normalize_email(email_address)
+    email_address = normalize_email_identity(email_address)
     if not api_key or not list_id or not email_address:
         return {"ok": False, "skipped": "missing_config_or_email"}
     member_id = _emailoctopus_member_id(email_address)
@@ -14253,7 +14269,7 @@ def upsert_email_campaign_sync_state(
     payload=None,
     synced_at="",
 ):
-    normalized_email = normalize_email(normalized_email)
+    normalized_email = normalize_email_identity(normalized_email)
     if not normalized_email:
         return False
     timestamp = format_db_time(datetime.utcnow())
@@ -14315,7 +14331,7 @@ def upsert_email_campaign_sync_state(
 
 
 def sync_validated_email_to_emailoctopus(db, touchpoint_id, person_id, email_value, source="email_validation", validation_status="valid", validation_result=None):
-    normalized_email = normalize_email(email_value)
+    normalized_email = normalize_email_identity(email_value)
     if not normalized_email:
         return {"ok": True, "skipped": "missing_email"}
     context = _email_campaign_person_context(db, person_id)
@@ -14489,7 +14505,7 @@ def backfill_valid_email_campaign_syncs(db, limit=500):
 
 
 def upsert_anonymous_email_campaign_registry(db, normalized_email, source="manual_import", source_identifier="", first_name="", last_name="", status="already_sent", notes=""):
-    normalized_email = normalize_email(normalized_email)
+    normalized_email = normalize_email_identity(normalized_email)
     if not normalized_email:
         return False
     timestamp = format_db_time(datetime.utcnow())
@@ -14717,11 +14733,11 @@ def _untitled_email_state_summaries(details):
 
 def _load_anonymous_email_registry_status_map(db):
     return {
-        normalize_email(row["normalized_email"]): str(row["status"] or "").strip() or "already_sent"
+        normalize_email_identity(row["normalized_email"]): str(row["status"] or "").strip() or "already_sent"
         for row in db.execute(
             "SELECT normalized_email, status FROM anonymous_email_campaign_registry"
         ).fetchall()
-        if normalize_email(row["normalized_email"])
+        if normalize_email_identity(row["normalized_email"])
     }
 
 

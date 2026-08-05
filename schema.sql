@@ -72,6 +72,32 @@ CREATE TABLE IF NOT EXISTS touchpoints (
     FOREIGN KEY(person_id) REFERENCES people(id)
 );
 
+CREATE TABLE IF NOT EXISTS email_campaign_syncs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    normalized_email TEXT NOT NULL UNIQUE,
+    touchpoint_id INTEGER,
+    person_id INTEGER,
+    property_id INTEGER,
+    source TEXT NOT NULL DEFAULT 'email_validation',
+    provider TEXT NOT NULL DEFAULT 'emailoctopus',
+    provider_list_id TEXT,
+    provider_contact_id TEXT,
+    sync_status TEXT NOT NULL DEFAULT 'queued',
+    validation_status TEXT,
+    last_error TEXT,
+    payload_json TEXT,
+    synced_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(touchpoint_id) REFERENCES touchpoints(id) ON DELETE SET NULL,
+    FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL,
+    FOREIGN KEY(property_id) REFERENCES properties(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_status ON email_campaign_syncs(sync_status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_person ON email_campaign_syncs(person_id);
+CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_property ON email_campaign_syncs(property_id);
+
 CREATE TABLE IF NOT EXISTS social_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     person_id INTEGER NOT NULL,

@@ -1806,6 +1806,34 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_email_validation_queue_due ON email_validation_queue(queue_status, run_after, id)")
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS email_campaign_syncs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            normalized_email TEXT NOT NULL UNIQUE,
+            touchpoint_id INTEGER,
+            person_id INTEGER,
+            property_id INTEGER,
+            source TEXT NOT NULL DEFAULT 'email_validation',
+            provider TEXT NOT NULL DEFAULT 'emailoctopus',
+            provider_list_id TEXT,
+            provider_contact_id TEXT,
+            sync_status TEXT NOT NULL DEFAULT 'queued',
+            validation_status TEXT,
+            last_error TEXT,
+            payload_json TEXT,
+            synced_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(touchpoint_id) REFERENCES touchpoints(id) ON DELETE SET NULL,
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL,
+            FOREIGN KEY(property_id) REFERENCES properties(id) ON DELETE SET NULL
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_status ON email_campaign_syncs(sync_status, updated_at DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_person ON email_campaign_syncs(person_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_property ON email_campaign_syncs(property_id)")
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS untitled_sheet_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             worksheet_name TEXT NOT NULL,
@@ -13892,8 +13920,18 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     """,
                     (now_stamp, queue_id),
                 )
+                commit_with_retry(db)
                 continue
             if touch_status_norm == "valid":
+                sync_validated_email_to_emailoctopus(
+                    db,
+                    touchpoint_id,
+                    row["person_id"],
+                    email_value,
+                    source=row["source"] or "email_validation_queue",
+                    validation_status="valid",
+                    validation_result={"source": "touchpoint_already_valid"},
+                )
                 db.execute(
                     """
                     UPDATE email_validation_queue
@@ -13906,6 +13944,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     """,
                     (now_stamp, queue_id),
                 )
+                commit_with_retry(db)
                 continue
             if touch_status_norm in BLOCKED_CONTACT_STATUSES:
                 db.execute(
@@ -13920,6 +13959,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     """,
                     (touch_status_norm or "blocked", now_stamp, queue_id),
                 )
+                commit_with_retry(db)
                 continue
             try:
                 validation_result = verify_email_with_emaillistverify(api_key, email_value)
@@ -13954,6 +13994,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                         queue_id,
                     ),
                 )
+                commit_with_retry(db)
                 continue
             if normalized_status == "valid":
                 new_touch_status = "Valid"
@@ -13989,6 +14030,17 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                 new_touch_status,
                 validation_result,
             )
+            if new_touch_status == "Valid":
+                commit_with_retry(db)
+                sync_validated_email_to_emailoctopus(
+                    db,
+                    touchpoint_id,
+                    row["person_id"],
+                    email_value,
+                    source=row["source"] or "email_validation_queue",
+                    validation_status="valid",
+                    validation_result=validation_result,
+                )
             db.execute(
                 """
                 UPDATE email_validation_queue
@@ -14008,7 +14060,8 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                 ),
             )
             updated += 1
-        db.commit()
+            commit_with_retry(db)
+        commit_with_retry(db)
         return {"ok": True, "attempted": processed, "updated": updated}
     except Exception as exc:
         db.rollback()
@@ -14121,6 +14174,291 @@ def emailoctopus_set_contact_status(api_key, list_id, email_address, status="UNS
     raise ValueError(
         f"EmailOctopus status update failed ({response.status_code}): {json.dumps(payload) if isinstance(payload, dict) else payload}"
     )
+
+
+def _email_campaign_sync_success(status):
+    status = str(status or "").strip().lower()
+    return status in {"synced", "already_synced", "already_sent_emailoctopus"} or status.startswith(("created_", "updated_"))
+
+
+def _email_campaign_tags(source):
+    source_key = str(source or "").strip().lower()
+    tags = ["DeepSift Verified Email"]
+    if "reisift_new_record" in source_key or "new_record" in source_key:
+        tags.append("ReiSIFT New Records")
+    if "skiptrace" in source_key or "skipsherpa" in source_key:
+        tags.append("SkipTrace")
+    if "submitted" in source_key or "lead" in source_key:
+        tags.append("Submitted Lead")
+    if source_key and len(tags) == 1:
+        tags.append(f"DeepSift {source_key.replace('_', ' ').title()[:40]}")
+    return list(dict.fromkeys(tags))
+
+
+def _email_campaign_person_context(db, person_id):
+    try:
+        person_id = int(person_id or 0)
+    except Exception:
+        person_id = 0
+    if not person_id:
+        return {"first_name": "", "last_name": "", "property_id": None}
+    person = db.execute("SELECT first_name, last_name FROM people WHERE id = ?", (person_id,)).fetchone()
+    return {
+        "first_name": str(person["first_name"] or "").strip() if person else "",
+        "last_name": str(person["last_name"] or "").strip() if person else "",
+        "property_id": find_property_id_for_person(db, person_id),
+    }
+
+
+def upsert_email_campaign_sync_state(
+    db,
+    normalized_email,
+    touchpoint_id=None,
+    person_id=None,
+    property_id=None,
+    source="email_validation",
+    provider="emailoctopus",
+    provider_list_id="",
+    provider_contact_id="",
+    sync_status="queued",
+    validation_status="",
+    last_error="",
+    payload=None,
+    synced_at="",
+):
+    normalized_email = normalize_email(normalized_email)
+    if not normalized_email:
+        return False
+    timestamp = format_db_time(datetime.utcnow())
+    payload_json = json.dumps(payload or {}, ensure_ascii=True, sort_keys=True) if payload is not None else ""
+    db.execute(
+        """
+        INSERT INTO email_campaign_syncs (
+            normalized_email, touchpoint_id, person_id, property_id, source, provider,
+            provider_list_id, provider_contact_id, sync_status, validation_status,
+            last_error, payload_json, synced_at, created_at, updated_at
+        )
+        VALUES (?, NULLIF(?, 0), NULLIF(?, 0), NULLIF(?, 0), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(normalized_email) DO UPDATE SET
+            touchpoint_id = COALESCE(excluded.touchpoint_id, email_campaign_syncs.touchpoint_id),
+            person_id = COALESCE(excluded.person_id, email_campaign_syncs.person_id),
+            property_id = COALESCE(excluded.property_id, email_campaign_syncs.property_id),
+            source = excluded.source,
+            provider = excluded.provider,
+            provider_list_id = CASE
+                WHEN COALESCE(excluded.provider_list_id, '') <> '' THEN excluded.provider_list_id
+                ELSE email_campaign_syncs.provider_list_id
+            END,
+            provider_contact_id = CASE
+                WHEN COALESCE(excluded.provider_contact_id, '') <> '' THEN excluded.provider_contact_id
+                ELSE email_campaign_syncs.provider_contact_id
+            END,
+            sync_status = excluded.sync_status,
+            validation_status = excluded.validation_status,
+            last_error = excluded.last_error,
+            payload_json = CASE
+                WHEN COALESCE(excluded.payload_json, '') <> '' THEN excluded.payload_json
+                ELSE email_campaign_syncs.payload_json
+            END,
+            synced_at = CASE
+                WHEN COALESCE(excluded.synced_at, '') <> '' THEN excluded.synced_at
+                ELSE email_campaign_syncs.synced_at
+            END,
+            updated_at = excluded.updated_at
+        """,
+        (
+            normalized_email,
+            int(touchpoint_id or 0),
+            int(person_id or 0),
+            int(property_id or 0),
+            (source or "email_validation").strip() or "email_validation",
+            (provider or "emailoctopus").strip() or "emailoctopus",
+            (provider_list_id or "").strip(),
+            (provider_contact_id or "").strip(),
+            (sync_status or "queued").strip() or "queued",
+            (validation_status or "").strip(),
+            (last_error or "").strip(),
+            payload_json,
+            (synced_at or "").strip(),
+            timestamp,
+            timestamp,
+        ),
+    )
+    return True
+
+
+def sync_validated_email_to_emailoctopus(db, touchpoint_id, person_id, email_value, source="email_validation", validation_status="valid", validation_result=None):
+    normalized_email = normalize_email(email_value)
+    if not normalized_email:
+        return {"ok": True, "skipped": "missing_email"}
+    context = _email_campaign_person_context(db, person_id)
+    property_id = context.get("property_id")
+    existing = db.execute(
+        """
+        SELECT sync_status
+        FROM email_campaign_syncs
+        WHERE normalized_email = ?
+        LIMIT 1
+        """,
+        (normalized_email,),
+    ).fetchone()
+    if existing and _email_campaign_sync_success(existing["sync_status"]):
+        return {"ok": True, "skipped": "already_synced", "email": normalized_email}
+
+    registry = db.execute(
+        """
+        SELECT status, source_identifier
+        FROM anonymous_email_campaign_registry
+        WHERE normalized_email = ?
+        LIMIT 1
+        """,
+        (normalized_email,),
+    ).fetchone()
+    registry_status = str(registry["status"] or "").strip().lower() if registry else ""
+    if registry_status == "already_sent":
+        upsert_email_campaign_sync_state(
+            db,
+            normalized_email,
+            touchpoint_id=touchpoint_id,
+            person_id=person_id,
+            property_id=property_id,
+            source=source,
+            provider_contact_id=str(registry["source_identifier"] or "") if registry else "",
+            sync_status="already_synced",
+            validation_status=validation_status,
+            payload={"registry_status": registry_status},
+            synced_at=format_db_time(datetime.utcnow()),
+        )
+        return {"ok": True, "skipped": "already_synced", "email": normalized_email}
+
+    settings = get_anonymous_email_marketing_settings(db)
+    list_id = settings.get("emailoctopus_list_id") or ""
+    if not settings.get("emailoctopus_api_key") or not list_id:
+        upsert_email_campaign_sync_state(
+            db,
+            normalized_email,
+            touchpoint_id=touchpoint_id,
+            person_id=person_id,
+            property_id=property_id,
+            source=source,
+            provider_list_id=list_id,
+            sync_status="awaiting_emailoctopus_config",
+            validation_status=validation_status,
+            payload=validation_result or {},
+        )
+        return {"ok": False, "skipped": "awaiting_emailoctopus_config", "email": normalized_email}
+
+    try:
+        sync_result = emailoctopus_upsert_contact(
+            settings["emailoctopus_api_key"],
+            list_id,
+            normalized_email,
+            contact_status=settings["emailoctopus_contact_status"],
+            tags=_email_campaign_tags(source),
+        )
+        synced_at = format_db_time(datetime.utcnow())
+        sync_status = f"{sync_result['action']}_{str(sync_result.get('status') or settings['emailoctopus_contact_status']).lower()}"
+        provider_contact_id = str(sync_result.get("contact_id") or "")
+        upsert_email_campaign_sync_state(
+            db,
+            normalized_email,
+            touchpoint_id=touchpoint_id,
+            person_id=person_id,
+            property_id=property_id,
+            source=source,
+            provider_list_id=list_id,
+            provider_contact_id=provider_contact_id,
+            sync_status=sync_status,
+            validation_status=validation_status,
+            payload={"emailoctopus": sync_result, "validation": validation_result or {}},
+            synced_at=synced_at,
+        )
+        upsert_anonymous_email_campaign_registry(
+            db,
+            normalized_email,
+            source="deepsift_validated_email",
+            source_identifier=provider_contact_id,
+            first_name=context.get("first_name") or "",
+            last_name=context.get("last_name") or "",
+            status="already_sent",
+            notes=f"Synced automatically after DeepSift email validation from {source or 'email_validation'}.",
+        )
+        return {"ok": True, "email": normalized_email, "sync_status": sync_status, "contact_id": provider_contact_id}
+    except Exception as exc:
+        upsert_email_campaign_sync_state(
+            db,
+            normalized_email,
+            touchpoint_id=touchpoint_id,
+            person_id=person_id,
+            property_id=property_id,
+            source=source,
+            provider_list_id=list_id,
+            sync_status="error",
+            validation_status=validation_status,
+            last_error=str(exc),
+            payload=validation_result or {},
+        )
+        log_app_error(
+            db,
+            source="email_campaign_sync",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="sync_validated_email_to_emailoctopus",
+            status_code=500,
+        )
+        return {"ok": False, "email": normalized_email, "error": str(exc)}
+
+
+def backfill_valid_email_campaign_syncs(db, limit=500):
+    try:
+        limit = max(1, min(2000, int(limit or 500)))
+    except Exception:
+        limit = 500
+    rows = db.execute(
+        """
+        SELECT t.id AS touchpoint_id,
+               t.person_id,
+               t.value AS email_value,
+               COALESCE(q.source, 'email_validation_backfill') AS source
+        FROM touchpoints t
+        LEFT JOIN email_validation_queue q ON q.touchpoint_id = t.id
+        LEFT JOIN email_campaign_syncs s
+               ON s.normalized_email = lower(trim(t.value))
+              AND (
+                    lower(COALESCE(s.sync_status, '')) IN ('synced', 'already_synced', 'already_sent_emailoctopus')
+                 OR lower(COALESCE(s.sync_status, '')) LIKE 'created_%'
+                 OR lower(COALESCE(s.sync_status, '')) LIKE 'updated_%'
+              )
+        WHERE lower(COALESCE(t.channel_type, '')) = 'email'
+          AND lower(COALESCE(t.status, '')) = 'valid'
+          AND COALESCE(trim(t.value), '') <> ''
+          AND s.id IS NULL
+        ORDER BY t.id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    synced = 0
+    skipped = 0
+    errors = 0
+    for row in rows:
+        result = sync_validated_email_to_emailoctopus(
+            db,
+            row["touchpoint_id"],
+            row["person_id"],
+            row["email_value"],
+            source=row["source"] or "email_validation_backfill",
+            validation_status="valid",
+            validation_result={"source": "backfill_valid_email_campaign_syncs"},
+        )
+        if result.get("ok") and not result.get("skipped"):
+            synced += 1
+        elif result.get("skipped"):
+            skipped += 1
+        else:
+            errors += 1
+        commit_with_retry(db)
+    return {"ok": True, "attempted": len(rows), "synced": synced, "skipped": skipped, "errors": errors}
 
 
 def upsert_anonymous_email_campaign_registry(db, normalized_email, source="manual_import", source_identifier="", first_name="", last_name="", status="already_sent", notes=""):

@@ -31809,7 +31809,7 @@ def _reisift_owner_has_meaningful_name(owner):
 def _is_reisift_placeholder_owner_name(first_name, last_name):
     first = normalize_whitespace(first_name).lower()
     last = normalize_whitespace(last_name).lower()
-    return first == "reisift" and last == "owner"
+    return (first, last) in {("reisift", "owner"), ("company", "owner"), ("unknown", "owner")}
 
 
 def _is_reisift_property_placeholder_person(db, person_id, property_uuid):
@@ -32185,8 +32185,8 @@ def repair_reisift_placeholder_owner_contacts(db, limit=10000):
                pe.last_name
         FROM touchpoints t
         JOIN people pe ON pe.id = t.person_id
-        WHERE lower(pe.first_name) = 'reisift'
-          AND lower(pe.last_name) = 'owner'
+        WHERE lower(pe.last_name) = 'owner'
+          AND lower(pe.first_name) IN ('reisift', 'company', 'unknown')
           AND lower(COALESCE(t.note, '')) LIKE '%imported from reisift new records refresh%'
           AND lower(COALESCE(t.note, '')) LIKE '%reisift uuid%'
         ORDER BY t.id ASC

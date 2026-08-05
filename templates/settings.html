@@ -348,6 +348,9 @@
                     <option value="UNSUBSCRIBED" {% if anonymous_email_settings.emailoctopus_contact_status == 'UNSUBSCRIBED' %}selected{% endif %}>UNSUBSCRIBED</option>
                 </select>
             </label>
+            <label class="span2">EmailOctopus Webhook Secret
+                <input name="emailoctopus_webhook_secret" value="{{ emailoctopus_webhook_secret }}" placeholder="Endpoint secret from EmailOctopus">
+            </label>
             <div class="inline-actions span2">
                 <button type="submit">Save Integration Settings</button>
                 <button type="submit" name="integration_action" value="test_slack">Save + Test Slack</button>
@@ -359,6 +362,8 @@
         <p class="muted-text">Sequence <code>MAIL</code> steps use the OpenLetterConnect API key above plus the sender/template values from Direct Mail Settings.</p>
         <p class="muted-text">OpenLetterConnect events webhook URL: <code>{{ openletterconnect_events_webhook_url or 'Set Public App Base URL to generate the OpenLetterConnect events webhook URL.' }}</code></p>
         <p class="muted-text">The webhook secret key above should match the secret/token configured in OpenLetterConnect for the new events webhook.</p>
+        <p class="muted-text">EmailOctopus events webhook URL: <code>{{ emailoctopus_events_webhook_url or 'Set Public App Base URL to generate the EmailOctopus events webhook URL.' }}</code></p>
+        <p class="muted-text">EmailOctopus sends batches of contact events here. Use its endpoint secret above so DeepSift can verify the <code>EmailOctopus-Signature</code> header.</p>
         <p class="muted-text">Sequence <code>VM_DROP</code> steps use the Slybroadcast credentials above. The step body should be the recording name for that drop. Callback URL: <code>{{ slybroadcast_settings.callback_url or 'Set Public App Base URL to generate the Slybroadcast callback URL.' }}</code></p>
         <p class="muted-text">RentCast is used for systematic sale-listing checks via <code>/v1/listings/sale</code>. If a matching listing returns <code>status=Active</code>, the referral is treated as on-market, and listing agent details are cached with the referral payload.</p>
         <p class="muted-text">Anonymous browse-stage leads are only validated/pushed when they remain outside <code>/step-2/</code> and <code>/thank-you/</code>. Imported EmailOctopus sent-email registry size: {{ anonymous_email_registry_count }}.</p>

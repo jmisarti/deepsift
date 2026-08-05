@@ -98,6 +98,54 @@ CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_status ON email_campaign_syn
 CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_person ON email_campaign_syncs(person_id);
 CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_property ON email_campaign_syncs(property_id);
 
+CREATE TABLE IF NOT EXISTS emailoctopus_webhook_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    event_action TEXT,
+    list_id TEXT,
+    contact_id TEXT,
+    contact_email TEXT,
+    campaign_id TEXT,
+    property_id INTEGER,
+    person_id INTEGER,
+    reisift_property_uuid TEXT,
+    verification_status TEXT NOT NULL DEFAULT 'unverified',
+    processing_status TEXT NOT NULL DEFAULT 'received',
+    error_text TEXT,
+    payload_json TEXT,
+    headers_json TEXT,
+    occurred_at TEXT,
+    received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processed_at TEXT,
+    FOREIGN KEY(property_id) REFERENCES properties(id) ON DELETE SET NULL,
+    FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_action ON emailoctopus_webhook_events(event_action, processing_status, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_contact ON emailoctopus_webhook_events(contact_email, contact_id);
+CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_property ON emailoctopus_webhook_events(property_id, event_action);
+
+CREATE TABLE IF NOT EXISTS emailoctopus_reisift_event_syncs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_id INTEGER NOT NULL,
+    reisift_property_uuid TEXT,
+    event_action TEXT NOT NULL,
+    tag_name TEXT NOT NULL,
+    emails_json TEXT NOT NULL DEFAULT '[]',
+    event_ids_json TEXT NOT NULL DEFAULT '[]',
+    sync_status TEXT NOT NULL DEFAULT 'pending',
+    tag_synced_at TEXT,
+    note_synced_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(property_id, event_action),
+    FOREIGN KEY(property_id) REFERENCES properties(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_emailoctopus_reisift_event_syncs_status ON emailoctopus_reisift_event_syncs(sync_status, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS social_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     person_id INTEGER NOT NULL,

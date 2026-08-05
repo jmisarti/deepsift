@@ -222,6 +222,7 @@ OPENLETTERCONNECT_BASE_URL = os.getenv("OPENLETTERCONNECT_BASE_URL", "https://ap
 OPENLETTERCONNECT_TEMPLATE_ID = int(os.getenv("OPENLETTERCONNECT_TEMPLATE_ID", "9256"))
 OPENLETTERCONNECT_API_KEY = os.getenv("OPENLETTERCONNECT_API_KEY", "").strip()
 OPENLETTERCONNECT_WEBHOOK_SECRET = os.getenv("OPENLETTERCONNECT_WEBHOOK_SECRET", "").strip()
+EMAILOCTOPUS_WEBHOOK_SECRET = os.getenv("EMAILOCTOPUS_WEBHOOK_SECRET", "").strip()
 CALL_RECORDING_WORKER_ENABLED = env_flag("CALL_RECORDING_WORKER_ENABLED", True)
 CALL_RECORDING_POLL_SECONDS = max(int((os.getenv("CALL_RECORDING_POLL_SECONDS") or "60").strip() or "60"), 15)
 SMS_ANALYSIS_WORKER_ENABLED = env_flag("SMS_ANALYSIS_WORKER_ENABLED", True)
@@ -1832,6 +1833,58 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_status ON email_campaign_syncs(sync_status, updated_at DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_person ON email_campaign_syncs(person_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_property ON email_campaign_syncs(property_id)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS emailoctopus_webhook_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL UNIQUE,
+            event_type TEXT NOT NULL,
+            event_action TEXT,
+            list_id TEXT,
+            contact_id TEXT,
+            contact_email TEXT,
+            campaign_id TEXT,
+            property_id INTEGER,
+            person_id INTEGER,
+            reisift_property_uuid TEXT,
+            verification_status TEXT NOT NULL DEFAULT 'unverified',
+            processing_status TEXT NOT NULL DEFAULT 'received',
+            error_text TEXT,
+            payload_json TEXT,
+            headers_json TEXT,
+            occurred_at TEXT,
+            received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TEXT,
+            FOREIGN KEY(property_id) REFERENCES properties(id) ON DELETE SET NULL,
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_action ON emailoctopus_webhook_events(event_action, processing_status, received_at DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_contact ON emailoctopus_webhook_events(contact_email, contact_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_property ON emailoctopus_webhook_events(property_id, event_action)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS emailoctopus_reisift_event_syncs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            property_id INTEGER NOT NULL,
+            reisift_property_uuid TEXT,
+            event_action TEXT NOT NULL,
+            tag_name TEXT NOT NULL,
+            emails_json TEXT NOT NULL DEFAULT '[]',
+            event_ids_json TEXT NOT NULL DEFAULT '[]',
+            sync_status TEXT NOT NULL DEFAULT 'pending',
+            tag_synced_at TEXT,
+            note_synced_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(property_id, event_action),
+            FOREIGN KEY(property_id) REFERENCES properties(id) ON DELETE CASCADE
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_reisift_event_syncs_status ON emailoctopus_reisift_event_syncs(sync_status, updated_at DESC)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS untitled_sheet_snapshots (
@@ -9654,6 +9707,7 @@ def get_anonymous_email_marketing_settings(db):
             get_setting(db, "emailoctopus_list_id", "")
             or os.getenv("EMAILOCTOPUS_LIST_ID", "")
         ).strip(),
+        "emailoctopus_webhook_secret": get_emailoctopus_webhook_secret(db),
         "emailoctopus_contact_status": contact_status,
     }
 
@@ -12590,6 +12644,24 @@ def get_openletterconnect_events_webhook_url(db=None):
     return f"{base_url.rstrip('/')}/webhooks/openletterconnect/events"
 
 
+def get_emailoctopus_webhook_secret(db=None):
+    if db is None:
+        try:
+            db = get_db()
+        except Exception:
+            db = None
+    if db is not None:
+        return (get_setting(db, "emailoctopus_webhook_secret", "") or EMAILOCTOPUS_WEBHOOK_SECRET).strip()
+    return EMAILOCTOPUS_WEBHOOK_SECRET
+
+
+def get_emailoctopus_events_webhook_url(db=None):
+    base_url = get_public_app_base_url(db)
+    if not base_url:
+        return ""
+    return f"{base_url.rstrip('/')}/webhooks/emailoctopus/events"
+
+
 def get_skipsherpa_api_key(db=None):
     if db is None:
         try:
@@ -14766,6 +14838,497 @@ def upsert_anonymous_email_campaign_registry(db, normalized_email, source="manua
         ),
     )
     return True
+
+
+EMAILOCTOPUS_REISIFT_EVENT_TAGS = {
+    "added": "EmailOctopus:Added",
+    "removed": "EmailOctopus:Removed",
+    "clicked": "EmailOctopus:Clicked",
+    "opened": "EmailOctopus:Opened",
+}
+
+
+def _emailoctopus_safe_header_map(req):
+    safe = {}
+    for key, value in req.headers.items():
+        key_text = str(key or "").strip()
+        if not key_text:
+            continue
+        if key_text.lower() in {"emailoctopus-signature", "authorization", "cookie"}:
+            safe[key_text] = "[redacted]"
+        else:
+            safe[key_text] = str(value or "")[:500]
+    return safe
+
+
+def _emailoctopus_signature_valid(raw_body, provided_signature, webhook_secret):
+    secret = str(webhook_secret or "").strip()
+    signature = str(provided_signature or "").strip()
+    if not secret or not signature:
+        return False
+    expected = "sha256=" + hmac.new(secret.encode("utf-8"), raw_body or b"", hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def _extract_emailoctopus_events(payload):
+    if isinstance(payload, list):
+        return [event for event in payload if isinstance(event, dict)]
+    if isinstance(payload, dict):
+        events = payload.get("events")
+        if isinstance(events, list):
+            return [event for event in events if isinstance(event, dict)]
+        return [payload]
+    return []
+
+
+def _emailoctopus_event_key(event):
+    event_id = str(event.get("id") or event.get("event_id") or "").strip()
+    if event_id:
+        return event_id
+    basis = json.dumps(event or {}, ensure_ascii=True, sort_keys=True, default=str)
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def _emailoctopus_event_action(event):
+    event_type = str(event.get("type") or event.get("event") or event.get("event_type") or "").strip().lower()
+    contact_status = str(event.get("contact_status") or event.get("status") or "").strip().upper()
+    if event_type == "contact.created":
+        return "added"
+    if event_type in {"contact.deleted", "contact.unsubscribed", "contact.bounced", "contact.complained"}:
+        return "removed"
+    if event_type == "contact.updated" and contact_status in {"UNSUBSCRIBED", "BOUNCED", "COMPLAINED"}:
+        return "removed"
+    if event_type == "contact.clicked":
+        return "clicked"
+    if event_type == "contact.opened":
+        return "opened"
+    return ""
+
+
+def _emailoctopus_event_fields(event):
+    event_type = str(event.get("type") or event.get("event") or event.get("event_type") or "").strip()
+    email_address = normalize_email_identity(
+        event.get("contact_email_address")
+        or event.get("email_address")
+        or event.get("email")
+        or event.get("contact_email")
+        or ""
+    )
+    return {
+        "event_key": _emailoctopus_event_key(event),
+        "event_type": event_type,
+        "event_action": _emailoctopus_event_action(event),
+        "list_id": str(event.get("list_id") or "").strip(),
+        "contact_id": str(event.get("contact_id") or "").strip(),
+        "contact_email": email_address,
+        "campaign_id": str(event.get("campaign_id") or "").strip(),
+        "occurred_at": str(event.get("occurred_at") or event.get("timestamp") or "").strip(),
+    }
+
+
+def _property_reisift_uuid(db, property_id):
+    try:
+        property_id = int(property_id or 0)
+    except Exception:
+        property_id = 0
+    if property_id <= 0:
+        return ""
+    row = db.execute(
+        """
+        SELECT COALESCE(NULLIF(p.reisift_property_uuid, ''), NULLIF(nr.property_uuid, '')) AS property_uuid
+        FROM properties p
+        LEFT JOIN reisift_new_records nr ON nr.local_property_id = p.id
+        WHERE p.id = ?
+        ORDER BY nr.id DESC
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    return str(row["property_uuid"] or "").strip() if row else ""
+
+
+def _emailoctopus_sync_row_score(row, list_id):
+    score = 0
+    if str(row["provider_list_id"] or "").strip() and str(row["provider_list_id"] or "").strip() == str(list_id or "").strip():
+        score += 10
+    if int(row["property_id"] or 0) > 0:
+        score += 5
+    if int(row["person_id"] or 0) > 0:
+        score += 2
+    return score
+
+
+def _resolve_emailoctopus_event_record(db, fields):
+    contact_email = normalize_email_identity(fields.get("contact_email") or "")
+    contact_id = str(fields.get("contact_id") or "").strip()
+    list_id = str(fields.get("list_id") or "").strip()
+    candidates = []
+    if contact_email or contact_id:
+        rows = db.execute(
+            """
+            SELECT *
+            FROM email_campaign_syncs
+            WHERE lower(COALESCE(provider, 'emailoctopus')) = 'emailoctopus'
+              AND (
+                    (? <> '' AND normalized_email = ?)
+                 OR (? <> '' AND provider_contact_id = ?)
+              )
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 25
+            """,
+            (contact_email, contact_email, contact_id, contact_id),
+        ).fetchall()
+        candidates.extend(rows)
+
+    if candidates:
+        best = sorted(candidates, key=lambda row: (_emailoctopus_sync_row_score(row, list_id), str(row["updated_at"] or ""), int(row["id"] or 0)), reverse=True)[0]
+        person_id = int(best["person_id"] or 0)
+        property_id = int(best["property_id"] or 0)
+        if property_id <= 0 and person_id > 0:
+            property_id = int(find_property_id_for_person(db, person_id) or 0)
+        return {
+            "sync_id": int(best["id"] or 0),
+            "touchpoint_id": int(best["touchpoint_id"] or 0),
+            "person_id": person_id,
+            "property_id": property_id,
+            "reisift_property_uuid": _property_reisift_uuid(db, property_id),
+            "match_source": "email_campaign_syncs",
+        }
+
+    if contact_email:
+        rows = db.execute(
+            """
+            SELECT t.id AS touchpoint_id, t.person_id, t.value
+            FROM touchpoints t
+            WHERE lower(COALESCE(t.channel_type, '')) = 'email'
+              AND COALESCE(t.value, '') <> ''
+            ORDER BY t.id DESC
+            LIMIT 5000
+            """
+        ).fetchall()
+        for row in rows:
+            if normalize_email_identity(row["value"] or "") != contact_email:
+                continue
+            person_id = int(row["person_id"] or 0)
+            property_id = int(find_property_id_for_person(db, person_id) or 0)
+            return {
+                "sync_id": 0,
+                "touchpoint_id": int(row["touchpoint_id"] or 0),
+                "person_id": person_id,
+                "property_id": property_id,
+                "reisift_property_uuid": _property_reisift_uuid(db, property_id),
+                "match_source": "touchpoints",
+            }
+    return {
+        "sync_id": 0,
+        "touchpoint_id": 0,
+        "person_id": 0,
+        "property_id": 0,
+        "reisift_property_uuid": "",
+        "match_source": "unmatched",
+    }
+
+
+def _json_list_append_unique(raw_json, values):
+    try:
+        current = json.loads(raw_json or "[]")
+    except Exception:
+        current = []
+    if not isinstance(current, list):
+        current = []
+    seen = {str(item).strip().lower() for item in current if str(item).strip()}
+    for value in values:
+        clean = str(value or "").strip()
+        if clean and clean.lower() not in seen:
+            current.append(clean)
+            seen.add(clean.lower())
+    return json.dumps(current, ensure_ascii=True)
+
+
+def _emailoctopus_reisift_note(action, emails, event_fields):
+    label = str(action or "").strip().title()
+    email_text = ", ".join([email for email in emails if email]) or "-"
+    lines = [
+        f"EmailOctopus {label}",
+        f"Email(s): {email_text}",
+        f"Event type: {event_fields.get('event_type') or '-'}",
+    ]
+    if event_fields.get("campaign_id"):
+        lines.append(f"Campaign ID: {event_fields['campaign_id']}")
+    if event_fields.get("occurred_at"):
+        lines.append(f"Occurred At: {event_fields['occurred_at']}")
+    return "\n".join(lines)
+
+
+def _sync_emailoctopus_event_to_reisift(db, event_db_id, fields, resolution):
+    action = str(fields.get("event_action") or "").strip().lower()
+    tag_name = EMAILOCTOPUS_REISIFT_EVENT_TAGS.get(action)
+    property_id = int(resolution.get("property_id") or 0)
+    if not tag_name or property_id <= 0:
+        return {"ok": True, "skipped": "no_reisift_action"}
+
+    email_address = normalize_email_identity(fields.get("contact_email") or "")
+    event_key = str(fields.get("event_key") or event_db_id or "").strip()
+    event_ids_json = json.dumps([event_key], ensure_ascii=True) if event_key else "[]"
+    emails_json = json.dumps([email_address], ensure_ascii=True) if email_address else "[]"
+    existing = db.execute(
+        """
+        SELECT *
+        FROM emailoctopus_reisift_event_syncs
+        WHERE property_id = ? AND event_action = ?
+        LIMIT 1
+        """,
+        (property_id, action),
+    ).fetchone()
+
+    if existing:
+        db.execute(
+            """
+            UPDATE emailoctopus_reisift_event_syncs
+            SET emails_json = ?,
+                event_ids_json = ?,
+                reisift_property_uuid = COALESCE(NULLIF(?, ''), reisift_property_uuid),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                _json_list_append_unique(existing["emails_json"], [email_address]),
+                _json_list_append_unique(existing["event_ids_json"], [event_key]),
+                str(resolution.get("reisift_property_uuid") or "").strip(),
+                int(existing["id"]),
+            ),
+        )
+        if existing["tag_synced_at"] and existing["note_synced_at"]:
+            return {"ok": True, "skipped": "already_synced_once_per_record"}
+        sync_row_id = int(existing["id"])
+        current_emails = json.loads(_json_list_append_unique(existing["emails_json"], [email_address]) or "[]")
+    else:
+        cur = db.execute(
+            """
+            INSERT INTO emailoctopus_reisift_event_syncs (
+                property_id, reisift_property_uuid, event_action, tag_name, emails_json,
+                event_ids_json, sync_status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (
+                property_id,
+                str(resolution.get("reisift_property_uuid") or "").strip(),
+                action,
+                tag_name,
+                emails_json,
+                event_ids_json,
+            ),
+        )
+        sync_row_id = int(cur.lastrowid or 0)
+        current_emails = [email_address] if email_address else []
+        try:
+            db.execute(
+                """
+                INSERT INTO activity_log (property_id, person_id, activity_type, outcome, note)
+                VALUES (?, NULLIF(?, 0), ?, ?, ?)
+                """,
+                (
+                    property_id,
+                    int(resolution.get("person_id") or 0),
+                    f"EmailOctopus {action.title()}",
+                    action.title(),
+                    _emailoctopus_reisift_note(action, current_emails, fields),
+                ),
+            )
+        except Exception:
+            pass
+
+    property_uuid = str(resolution.get("reisift_property_uuid") or "").strip() or _property_reisift_uuid(db, property_id)
+    if not property_uuid:
+        db.execute(
+            """
+            UPDATE emailoctopus_reisift_event_syncs
+            SET sync_status = 'skipped_missing_reisift_uuid',
+                last_error = 'No ReiSIFT property UUID available for this local record',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (sync_row_id,),
+        )
+        return {"ok": False, "skipped": "missing_reisift_property_uuid"}
+
+    try:
+        commit_with_retry(db)
+        token = reisift_get_access_token()
+        tag_result = reisift_append_property_tags(token, property_uuid, [tag_name])
+        note_result = reisift_append_property_note(token, property_uuid, _emailoctopus_reisift_note(action, current_emails, fields))
+        synced_at = format_db_time(datetime.utcnow())
+        db.execute(
+            """
+            UPDATE emailoctopus_reisift_event_syncs
+            SET reisift_property_uuid = ?,
+                sync_status = 'synced',
+                tag_synced_at = COALESCE(tag_synced_at, ?),
+                note_synced_at = COALESCE(note_synced_at, ?),
+                last_error = '',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (property_uuid, synced_at, synced_at, sync_row_id),
+        )
+        return {"ok": True, "tag": tag_result, "note": note_result}
+    except Exception as exc:
+        db.execute(
+            """
+            UPDATE emailoctopus_reisift_event_syncs
+            SET reisift_property_uuid = ?,
+                sync_status = 'reisift_error',
+                last_error = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (property_uuid, str(exc)[:500], sync_row_id),
+        )
+        raise
+
+
+def process_emailoctopus_event(db, event, safe_headers=None):
+    fields = _emailoctopus_event_fields(event)
+    safe_payload = _redact_clever_log_value("root", event)
+    existing = db.execute(
+        "SELECT id, processing_status FROM emailoctopus_webhook_events WHERE event_key = ? LIMIT 1",
+        (fields["event_key"],),
+    ).fetchone()
+    if existing and str(existing["processing_status"] or "").strip().lower() in {"processed", "ignored", "unmatched"}:
+        return {"ok": True, "duplicate": True, "event_id": int(existing["id"])}
+
+    if existing:
+        event_db_id = int(existing["id"])
+        db.execute(
+            """
+            UPDATE emailoctopus_webhook_events
+            SET event_type = ?, event_action = ?, list_id = ?, contact_id = ?, contact_email = ?,
+                campaign_id = ?, verification_status = 'verified', processing_status = 'received',
+                error_text = '', payload_json = ?, headers_json = ?, occurred_at = ?
+            WHERE id = ?
+            """,
+            (
+                fields["event_type"],
+                fields["event_action"],
+                fields["list_id"],
+                fields["contact_id"],
+                fields["contact_email"],
+                fields["campaign_id"],
+                json.dumps(safe_payload or {}, ensure_ascii=True, default=str),
+                json.dumps(safe_headers or {}, ensure_ascii=True, default=str),
+                fields["occurred_at"],
+                event_db_id,
+            ),
+        )
+    else:
+        cur = db.execute(
+            """
+            INSERT INTO emailoctopus_webhook_events (
+                event_key, event_type, event_action, list_id, contact_id, contact_email, campaign_id,
+                verification_status, processing_status, error_text, payload_json, headers_json, occurred_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'verified', 'received', '', ?, ?, ?)
+            """,
+            (
+                fields["event_key"],
+                fields["event_type"],
+                fields["event_action"],
+                fields["list_id"],
+                fields["contact_id"],
+                fields["contact_email"],
+                fields["campaign_id"],
+                json.dumps(safe_payload or {}, ensure_ascii=True, default=str),
+                json.dumps(safe_headers or {}, ensure_ascii=True, default=str),
+                fields["occurred_at"],
+            ),
+        )
+        event_db_id = int(cur.lastrowid or 0)
+
+    if not fields["event_action"]:
+        db.execute(
+            """
+            UPDATE emailoctopus_webhook_events
+            SET processing_status = 'ignored',
+                error_text = 'EmailOctopus event type is stored but not mapped to a DeepSift action',
+                processed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (event_db_id,),
+        )
+        return {"ok": True, "ignored": True, "event_id": event_db_id, "event_type": fields["event_type"]}
+
+    resolution = _resolve_emailoctopus_event_record(db, fields)
+    property_id = int(resolution.get("property_id") or 0)
+    person_id = int(resolution.get("person_id") or 0)
+    property_uuid = str(resolution.get("reisift_property_uuid") or "").strip()
+    if property_id <= 0:
+        db.execute(
+            """
+            UPDATE emailoctopus_webhook_events
+            SET property_id = NULL,
+                person_id = NULLIF(?, 0),
+                reisift_property_uuid = '',
+                processing_status = 'unmatched',
+                error_text = ?,
+                processed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                person_id,
+                f"No local DeepSift record matched {fields['contact_email'] or fields['contact_id'] or fields['event_key']}",
+                event_db_id,
+            ),
+        )
+        return {"ok": True, "unmatched": True, "event_id": event_db_id, "event_action": fields["event_action"]}
+
+    db.execute(
+        """
+        UPDATE emailoctopus_webhook_events
+        SET property_id = ?,
+            person_id = NULLIF(?, 0),
+            reisift_property_uuid = ?,
+            processing_status = 'matched',
+            error_text = ''
+        WHERE id = ?
+        """,
+        (property_id, person_id, property_uuid, event_db_id),
+    )
+    try:
+        sync_result = _sync_emailoctopus_event_to_reisift(db, event_db_id, fields, resolution)
+        final_status = "processed" if sync_result.get("ok") else "processed_reisift_pending"
+        error_text = str(sync_result.get("skipped") or "")
+    except Exception as exc:
+        final_status = "processed_reisift_error"
+        error_text = str(exc)[:500]
+        log_app_error(
+            db,
+            source="emailoctopus_webhook_reisift_sync",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/webhooks/emailoctopus/events",
+            status_code=500,
+        )
+    db.execute(
+        """
+        UPDATE emailoctopus_webhook_events
+        SET processing_status = ?,
+            error_text = ?,
+            processed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (final_status, error_text, event_db_id),
+    )
+    return {
+        "ok": True,
+        "event_id": event_db_id,
+        "event_action": fields["event_action"],
+        "property_id": property_id,
+        "person_id": person_id,
+        "reisift_property_uuid": property_uuid,
+        "processing_status": final_status,
+        "match_source": resolution.get("match_source"),
+    }
 
 
 def _import_emailoctopus_export_reader(db, reader, source="emailoctopus_export", source_label=""):
@@ -31477,6 +32040,26 @@ def local_call_counts_for_new_record(db, property_id):
     return counts
 
 
+def local_emailoctopus_open_count_for_property(db, property_id):
+    try:
+        clean_property_id = int(property_id or 0)
+    except Exception:
+        clean_property_id = 0
+    if clean_property_id <= 0:
+        return 0
+    row = db.execute(
+        """
+        SELECT COUNT(DISTINCT COALESCE(NULLIF(contact_email, ''), event_key)) AS opened_count
+        FROM emailoctopus_webhook_events
+        WHERE property_id = ?
+          AND lower(COALESCE(event_action, '')) = 'opened'
+          AND lower(COALESCE(processing_status, '')) NOT IN ('unauthorized', 'ignored', 'unmatched', 'error')
+        """,
+        (clean_property_id,),
+    ).fetchone()
+    return int((row["opened_count"] if row else 0) or 0)
+
+
 def property_activity_counts_for_new_record(db, property_id, new_record_row=None):
     nr = new_record_row if isinstance(new_record_row, dict) else {}
     empty = {
@@ -31518,6 +32101,7 @@ def property_activity_counts_for_new_record(db, property_id, new_record_row=None
         (clean_property_id,),
     ).fetchone()
     call_counts = local_call_counts_for_new_record(db, clean_property_id)
+    emailoctopus_opened = local_emailoctopus_open_count_for_property(db, clean_property_id)
     return {
         "mail_out": int((mail_row["mail_out"] if mail_row else 0) or 0),
         "call_out": max(call_counts["call_out"], int(nr.get("outbound_calls") or 0)),
@@ -31526,7 +32110,7 @@ def property_activity_counts_for_new_record(db, property_id, new_record_row=None
         "sms_in": max(int((row["sms_in"] if row else 0) or 0), int(nr.get("inbound_sms") or 0)),
         "email_out": max(int((row["email_out"] if row else 0) or 0), int(nr.get("outbound_email") or 0)),
         "email_in": max(int((row["email_in"] if row else 0) or 0), int(nr.get("inbound_email") or 0)),
-        "emails_opened": int((row["emails_opened"] if row else 0) or 0),
+        "emails_opened": max(int((row["emails_opened"] if row else 0) or 0), emailoctopus_opened),
     }
 
 
@@ -31568,6 +32152,7 @@ def bulk_property_activity_counts_for_new_records(db, rows):
         return counts
     comm_by_property = {}
     mail_by_property = {}
+    emailoctopus_open_by_property = {}
     call_rows = []
     for chunk in iter_query_chunks(property_ids):
         placeholders = ",".join(["?"] * len(chunk))
@@ -31596,6 +32181,19 @@ def bulk_property_activity_counts_for_new_records(db, rows):
             tuple(chunk),
         ).fetchall():
             mail_by_property[int(row["property_id"])] = int(row["mail_out"] or 0)
+        for row in db.execute(
+            f"""
+            SELECT property_id,
+                   COUNT(DISTINCT COALESCE(NULLIF(contact_email, ''), event_key)) AS opened_count
+            FROM emailoctopus_webhook_events
+            WHERE property_id IN ({placeholders})
+              AND lower(COALESCE(event_action, '')) = 'opened'
+              AND lower(COALESCE(processing_status, '')) NOT IN ('unauthorized', 'ignored', 'unmatched', 'error')
+            GROUP BY property_id
+            """,
+            tuple(chunk),
+        ).fetchall():
+            emailoctopus_open_by_property[int(row["property_id"])] = int(row["opened_count"] or 0)
         call_rows.extend(
             db.execute(
                 f"""
@@ -31636,7 +32234,10 @@ def bulk_property_activity_counts_for_new_records(db, rows):
         target["sms_in"] = max(int((comm["sms_in"] if comm else 0) or 0), int(item.get("inbound_sms") or 0))
         target["email_out"] = max(int((comm["email_out"] if comm else 0) or 0), int(item.get("outbound_email") or 0))
         target["email_in"] = max(int((comm["email_in"] if comm else 0) or 0), int(item.get("inbound_email") or 0))
-        target["emails_opened"] = int((comm["emails_opened"] if comm else 0) or 0)
+        target["emails_opened"] = max(
+            int((comm["emails_opened"] if comm else 0) or 0),
+            int(emailoctopus_open_by_property.get(property_id, 0) or 0),
+        )
         item.pop("_activity_property_id", None)
     return counts
 
@@ -41753,6 +42354,7 @@ def settings_page():
                     "emailoctopus_api_key": request.form.get("emailoctopus_api_key", ""),
                     "emailoctopus_list_id": request.form.get("emailoctopus_list_id", ""),
                     "emailoctopus_contact_status": request.form.get("emailoctopus_contact_status", "PENDING"),
+                    "emailoctopus_webhook_secret": request.form.get("emailoctopus_webhook_secret", ""),
                 }
                 for key, value in fields.items():
                     set_setting(db, key, value)
@@ -41892,6 +42494,8 @@ def settings_page():
     openletterconnect_api_key = get_openletterconnect_api_key(db)
     openletterconnect_webhook_secret = get_openletterconnect_webhook_secret(db)
     openletterconnect_events_webhook_url = get_openletterconnect_events_webhook_url(db)
+    emailoctopus_webhook_secret = get_emailoctopus_webhook_secret(db)
+    emailoctopus_events_webhook_url = get_emailoctopus_events_webhook_url(db)
     skipsherpa_api_key = get_skipsherpa_api_key(db)
     rentcast_api_key = get_rentcast_api_key(db)
     slybroadcast_settings = get_slybroadcast_settings(db)
@@ -41998,6 +42602,8 @@ def settings_page():
         openletterconnect_api_key=openletterconnect_api_key,
         openletterconnect_webhook_secret=openletterconnect_webhook_secret,
         openletterconnect_events_webhook_url=openletterconnect_events_webhook_url,
+        emailoctopus_webhook_secret=emailoctopus_webhook_secret,
+        emailoctopus_events_webhook_url=emailoctopus_events_webhook_url,
         skipsherpa_api_key=skipsherpa_api_key,
         rentcast_api_key=rentcast_api_key,
         slybroadcast_settings=slybroadcast_settings,
@@ -49532,6 +50138,110 @@ def email_open_tracking_pixel(token):
             "Expires": "0",
         },
     )
+
+
+@app.route("/webhooks/emailoctopus/events", methods=["POST"])
+def emailoctopus_events_webhook():
+    ensure_db()
+    db = get_db()
+    raw_body = request.get_data(cache=True) or b""
+    safe_headers = _emailoctopus_safe_header_map(request)
+    payload = request.get_json(silent=True)
+    events = _extract_emailoctopus_events(payload)
+    webhook_secret = get_emailoctopus_webhook_secret(db)
+    provided_signature = request.headers.get("EmailOctopus-Signature", "")
+
+    if not webhook_secret:
+        log_app_error(
+            db,
+            source="emailoctopus_events_webhook",
+            error_message="EmailOctopus webhook secret is not configured",
+            details="Set emailoctopus_webhook_secret in DeepSift Settings or EMAILOCTOPUS_WEBHOOK_SECRET in Railway.",
+            route="/webhooks/emailoctopus/events",
+            status_code=500,
+        )
+        commit_with_retry(db)
+        return jsonify({"ok": False, "error": "emailoctopus_webhook_secret_not_configured"}), 500
+
+    if not _emailoctopus_signature_valid(raw_body, provided_signature, webhook_secret):
+        event_key = hashlib.sha256(raw_body).hexdigest()
+        try:
+            db.execute(
+                """
+                INSERT INTO emailoctopus_webhook_events (
+                    event_key, event_type, verification_status, processing_status,
+                    error_text, payload_json, headers_json
+                )
+                VALUES (?, 'unauthorized', 'unauthorized', 'unauthorized', ?, ?, ?)
+                ON CONFLICT(event_key) DO UPDATE SET
+                    verification_status = 'unauthorized',
+                    processing_status = 'unauthorized',
+                    error_text = excluded.error_text,
+                    headers_json = excluded.headers_json
+                """,
+                (
+                    event_key,
+                    "Invalid EmailOctopus-Signature",
+                    json.dumps(_redact_clever_log_value("root", payload) if payload is not None else {}, ensure_ascii=True, default=str),
+                    json.dumps(safe_headers or {}, ensure_ascii=True, default=str),
+                ),
+            )
+            commit_with_retry(db)
+        except Exception:
+            db.rollback()
+        return jsonify({"ok": False, "error": "invalid_signature"}), 401
+
+    if not events:
+        event_key = hashlib.sha256(raw_body).hexdigest()
+        db.execute(
+            """
+            INSERT INTO emailoctopus_webhook_events (
+                event_key, event_type, verification_status, processing_status,
+                error_text, payload_json, headers_json
+            )
+            VALUES (?, 'empty_payload', 'verified', 'ignored', ?, ?, ?)
+            ON CONFLICT(event_key) DO NOTHING
+            """,
+            (
+                event_key,
+                "No EmailOctopus events found in request body",
+                json.dumps(_redact_clever_log_value("root", payload) if payload is not None else {}, ensure_ascii=True, default=str),
+                json.dumps(safe_headers or {}, ensure_ascii=True, default=str),
+            ),
+        )
+        commit_with_retry(db)
+        return jsonify({"ok": True, "ignored": True, "reason": "no_events"}), 200
+
+    results = []
+    counts = Counter()
+    try:
+        for event in events:
+            result = process_emailoctopus_event(db, event, safe_headers=safe_headers)
+            results.append(result)
+            if result.get("duplicate"):
+                counts["duplicate"] += 1
+            elif result.get("ignored"):
+                counts["ignored"] += 1
+            elif result.get("unmatched"):
+                counts["unmatched"] += 1
+            elif result.get("ok"):
+                counts["processed"] += 1
+            else:
+                counts["error"] += 1
+        commit_with_retry(db)
+        return jsonify({"ok": True, "events_seen": len(events), "counts": dict(counts), "results": results[:25]}), 200
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="emailoctopus_events_webhook",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/webhooks/emailoctopus/events",
+            status_code=500,
+        )
+        commit_with_retry(db)
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/webhooks/reisift/automation", methods=["POST"])

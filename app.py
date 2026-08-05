@@ -29570,6 +29570,9 @@ def reisift_added_at_dt(search_row, detail_payload):
     upload_dt = latest_reisift_upload_date_datetime(search_row, detail_payload)
     if upload_dt is not None:
         return upload_dt
+    source_dt = latest_reisift_source_date_datetime(search_row, detail_payload)
+    if source_dt is not None:
+        return source_dt
     candidates = []
     if isinstance(search_row, dict):
         candidates.extend([search_row.get("created"), search_row.get("created_at")])
@@ -29662,6 +29665,50 @@ def latest_reisift_upload_date_datetime(*payloads):
         if not isinstance(payload, dict):
             continue
         for value in iter_upload_date_candidate_values(payload):
+            parsed = parse_reisift_date_value(value)
+            if parsed is not None:
+                dates.append(parsed)
+    return max(dates) if dates else None
+
+
+def iter_reisift_source_date_candidate_values(value, depth=0):
+    if depth > 7:
+        return
+    source_date_keys = {
+        "last_obituary_date",
+        "obituary_date",
+        "probate_open_date",
+        "foreclosure_date",
+        "tax_auction_date",
+        "bankruptcy_recording_date",
+        "divorce_file_date",
+        "lien_recording_date",
+        "recording_date",
+        "source_date",
+    }
+    if isinstance(value, list):
+        for item in value:
+            yield from iter_reisift_source_date_candidate_values(item, depth + 1)
+        return
+    if not isinstance(value, dict):
+        return
+    for key, item in value.items():
+        key_text = normalize_whitespace(key).lower()
+        if key_text in source_date_keys or (
+            key_text.endswith("_date")
+            and any(token in key_text for token in ["obituary", "probate", "foreclosure", "auction", "bankruptcy", "divorce", "lien"])
+        ):
+            yield item
+        if isinstance(item, (dict, list)):
+            yield from iter_reisift_source_date_candidate_values(item, depth + 1)
+
+
+def latest_reisift_source_date_datetime(*payloads):
+    dates = []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for value in iter_reisift_source_date_candidate_values(payload):
             parsed = parse_reisift_date_value(value)
             if parsed is not None:
                 dates.append(parsed)
@@ -31673,7 +31720,7 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
 
 
 def _new_record_row_date(row):
-    for candidate in [row.get("added_at"), row.get("lp_added_at"), row.get("reisift_updated_at"), row.get("last_synced_at")]:
+    for candidate in [row.get("added_at"), row.get("lp_added_at")]:
         dt = parse_flexible_datetime(candidate)
         if dt is not None:
             return dt
@@ -32484,9 +32531,13 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
     for row in rows:
         item = dict(row)
         payload = _new_record_payload(item)
-        derived_added_dt = latest_lp_tag_datetime(payload) or latest_reisift_upload_date_datetime(payload)
+        derived_added_dt = (
+            latest_lp_tag_datetime(payload)
+            or latest_reisift_upload_date_datetime(payload)
+            or latest_reisift_source_date_datetime(payload)
+        )
         item["lp_added_at"] = format_db_time(derived_added_dt) if derived_added_dt else ""
-        if item["lp_added_at"] or not item.get("added_at"):
+        if item["lp_added_at"] and (not item.get("added_at") or parse_flexible_datetime(item.get("added_at")) is None):
             item["added_at"] = item["lp_added_at"]
         item["completeness"] = _new_record_completeness(payload)
         item["owner_type"] = _new_record_owner_type(payload)

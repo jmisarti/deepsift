@@ -29906,8 +29906,19 @@ def active_reisift_new_record_uuid_for_property(db, property_id):
 
 
 def stale_reisift_new_record_touchpoint_reason(db, property_id, touchpoint_id, active_property_uuid=None):
-    row = db.execute("SELECT note FROM touchpoints WHERE id = ? LIMIT 1", (int(touchpoint_id or 0),)).fetchone()
+    row = db.execute(
+        """
+        SELECT t.note, pe.first_name, pe.last_name
+        FROM touchpoints t
+        JOIN people pe ON pe.id = t.person_id
+        WHERE t.id = ?
+        LIMIT 1
+        """,
+        (int(touchpoint_id or 0),),
+    ).fetchone()
     if not row:
+        return ""
+    if not _is_reisift_placeholder_owner_name(row["first_name"], row["last_name"]):
         return ""
     note = str(row["note"] or "")
     if REISIFT_NEW_RECORD_TOUCHPOINT_SOURCE.lower() not in note.lower():
@@ -32291,6 +32302,49 @@ def repair_reisift_placeholder_owner_contacts(db, limit=10000):
             (target_person_id, row["touchpoint_id"], property_id),
         )
         touched_properties.add(property_id)
+    property_rows = db.execute(
+        """
+        SELECT p.id AS property_id,
+               COALESCE(NULLIF(n.property_uuid, ''), NULLIF(p.reisift_property_uuid, '')) AS property_uuid,
+               pe.id AS old_person_id
+        FROM properties p
+        JOIN people pe ON pe.id = p.owner_person_id
+        LEFT JOIN reisift_new_records n ON n.local_property_id = p.id
+        WHERE lower(pe.last_name) = 'owner'
+          AND lower(pe.first_name) IN ('reisift', 'company', 'unknown')
+          AND lower(COALESCE(pe.notes, '')) NOT LIKE '%property-scoped reisift placeholder owner%'
+        GROUP BY p.id, property_uuid, pe.id
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    for prop_row in property_rows:
+        property_id = int(prop_row["property_id"] or 0)
+        target_person_id = get_or_create_reisift_property_placeholder_owner(
+            db,
+            property_id,
+            prop_row["property_uuid"] or "",
+            source="ReiSift New Records repair",
+            owner_slot=0,
+        )
+        if target_person_id and target_person_id != int(prop_row["old_person_id"] or 0):
+            db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (target_person_id, property_id))
+            properties_reassigned += 1
+            touched_properties.add(property_id)
+    removed_non_placeholder_stale = db.execute(
+        """
+        DELETE FROM sms_automation_queue
+        WHERE status = 'Suppressed'
+          AND lower(COALESCE(suppression_reason, '')) LIKE 'stale reisift new record phone%'
+          AND touchpoint_id IN (
+                SELECT t.id
+                FROM touchpoints t
+                JOIN people pe ON pe.id = t.person_id
+                WHERE NOT (lower(pe.last_name) = 'owner' AND lower(pe.first_name) IN ('reisift', 'company', 'unknown'))
+          )
+        """
+    ).rowcount
+    queue_rows_removed += max(0, int(removed_non_placeholder_stale or 0))
     if touched_properties:
         suppress_duplicate_sms_automation_queue_items(db, property_ids=list(touched_properties))
         revalidate_sms_automation_queue(db, property_ids=list(touched_properties))

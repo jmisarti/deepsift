@@ -127,10 +127,11 @@
     {% if error %}
     <div class="error-banner">{{ error }}</div>
     {% endif %}
-    <div id="newRecordsBusy" class="busy-inline {% if refresh_state.status == 'running' or auto_refresh %}{% else %}hidden{% endif %}">
+    <div id="newRecordsBusy" class="busy-inline {% if refresh_state.status == 'running' %}{% else %}hidden{% endif %}">
         <span class="busy-spinner" aria-hidden="true"></span>
         <span id="newRecordsBusyText">{{ refresh_state.message or "Refreshing New Records from ReiSift..." }}</span>
     </div>
+    <div id="newRecordsStatusMessage" class="notice-banner hidden"></div>
     <div class="table-wrap new-records-table-wrap">
         <table class="new-records-table">
             <thead>
@@ -197,12 +198,31 @@
   function setBusy(message) {
     const busy = document.getElementById('newRecordsBusy');
     const busyText = document.getElementById('newRecordsBusyText');
+    const statusMessage = document.getElementById('newRecordsStatusMessage');
+    if (statusMessage) {
+      statusMessage.classList.add('hidden');
+      statusMessage.textContent = '';
+    }
     if (busy) busy.classList.remove('hidden');
     if (busyText) busyText.textContent = message || 'Refreshing New Records from ReiSift...';
   }
 
+  function hideBusy() {
+    const busy = document.getElementById('newRecordsBusy');
+    if (busy) busy.classList.add('hidden');
+  }
+
+  function setStatusMessage(message, isError = false) {
+    hideBusy();
+    const statusMessage = document.getElementById('newRecordsStatusMessage');
+    if (!statusMessage) return;
+    statusMessage.textContent = message || '';
+    statusMessage.classList.toggle('hidden', !message);
+    statusMessage.classList.toggle('error-banner', Boolean(isError));
+    statusMessage.classList.toggle('notice-banner', !isError);
+  }
+
   async function pollRefreshStatus() {
-    const busyText = document.getElementById('newRecordsBusyText');
     try {
       const res = await fetch('/api/new-records/refresh-status');
       const data = await res.json();
@@ -220,12 +240,12 @@
         return;
       }
       if (state.status === 'error') {
-        setBusy(`Refresh failed: ${state.message || 'Unknown error'}`);
+        setStatusMessage(`Refresh failed: ${state.message || 'Unknown error'}`, true);
         return;
       }
-      if (busyText && !busyText.textContent.trim()) busyText.textContent = 'Refresh status unavailable.';
+      hideBusy();
     } catch (err) {
-      setBusy(`Refresh status check failed: ${err}`);
+      setStatusMessage(`Refresh status check failed: ${err}`, true);
     }
   }
 
@@ -238,7 +258,7 @@
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
-        setBusy(`Refresh failed: ${(data && data.error) || 'Unknown error'}`);
+        setStatusMessage(`Refresh failed: ${(data && data.error) || 'Unknown error'}`, true);
         return;
       }
       const state = (data && data.state) || {};
@@ -246,7 +266,7 @@
       if (pollTimer) clearTimeout(pollTimer);
       pollTimer = setTimeout(pollRefreshStatus, 1000);
     } catch (err) {
-      setBusy(`Refresh failed: ${err}`);
+      setStatusMessage(`Refresh failed: ${err}`, true);
     }
   }
 
@@ -259,9 +279,14 @@
   }
 
   const autoRefresh = {{ 'true' if auto_refresh else 'false' }};
-  if (autoRefresh) refreshCacheAsync();
   const initialStatus = {{ refresh_state.status|tojson }};
-  if (initialStatus === 'running') pollRefreshStatus();
+  if (initialStatus === 'running') {
+    pollRefreshStatus();
+  } else if (autoRefresh) {
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.delete('refresh');
+    window.history.replaceState({}, '', nextUrl.toString());
+  }
 })();
 </script>
 {% endblock %}

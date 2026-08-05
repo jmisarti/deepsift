@@ -28620,6 +28620,16 @@ def normalize_county_name(value):
     return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
 
+def display_county_name(value):
+    county_key = normalize_county_name(value)
+    if not county_key:
+        return ""
+    for county in NJ_COUNTIES:
+        if normalize_county_name(county) == county_key:
+            return county
+    return normalize_whitespace(value).title()
+
+
 NEW_RECORD_COUNTY_CITY_MAP = {
     "Essex": {
         "belleville", "bloomfield", "caldwell", "cedar grove", "east orange", "essex fells",
@@ -30051,8 +30061,16 @@ def get_reisift_new_records_refresh_state(db):
     data = parse_json_object(raw or "{}", default={})
     if not isinstance(data, dict) or not data:
         return {"status": "idle", "message": "", "updated_at": "", "result": {}}
+    status = str(data.get("status") or "idle").strip() or "idle"
+    if status == "running" and not REISIFT_NEW_RECORDS_REFRESH_LOCK.locked():
+        return {
+            "status": "idle",
+            "message": "",
+            "updated_at": str(data.get("updated_at") or "").strip(),
+            "result": data.get("result") if isinstance(data.get("result"), dict) else {},
+        }
     return {
-        "status": str(data.get("status") or "idle").strip() or "idle",
+        "status": status,
         "message": str(data.get("message") or "").strip(),
         "updated_at": str(data.get("updated_at") or "").strip(),
         "result": data.get("result") if isinstance(data.get("result"), dict) else {},
@@ -30291,8 +30309,10 @@ def _new_record_matches_filters(row, filters):
         return False
 
     county_filter = normalize_county_name(filters.get("county") or "")
-    if county_filter and normalize_county_name(row.get("county") or "") != county_filter:
-        return False
+    if county_filter:
+        row_county = row.get("county") or infer_county_from_reisift_payload(_new_record_payload(row))
+        if normalize_county_name(row_county or "") != county_filter:
+            return False
 
     completeness_filter = normalize_whitespace(filters.get("completeness") or "").lower()
     if completeness_filter and normalize_whitespace(row.get("completeness") or "").lower() != completeness_filter:
@@ -30327,8 +30347,17 @@ def get_new_record_filter_options(db):
         """
     ).fetchall()
     statuses = sorted({normalize_whitespace(row["status"] or "") for row in rows if normalize_whitespace(row["status"] or "")})
-    counties = sorted({normalize_whitespace(row["county"] or "") for row in rows if normalize_whitespace(row["county"] or "")})
     payloads = [_new_record_payload(dict(row)) for row in rows]
+    counties = sorted(
+        {
+            county
+            for county in (
+                display_county_name(row["county"]) or display_county_name(infer_county_from_reisift_payload(payload))
+                for row, payload in zip(rows, payloads)
+            )
+            if county
+        }
+    )
     completeness = sorted({value for value in (_new_record_completeness(payload) for payload in payloads) if value})
     owner_types = sorted({value for value in (_new_record_owner_type(payload) for payload in payloads) if value})
     return {"statuses": statuses, "counties": counties, "completeness": completeness, "owner_types": owner_types}

@@ -268,11 +268,14 @@ body {
     display: grid;
     gap: 0.65rem;
     grid-template-columns: repeat(2, minmax(180px, 1fr));
-    min-width: min(520px, 88vw);
+    left: 0;
+    max-width: calc(100vw - 2rem);
+    min-width: 0;
     padding: 0.75rem;
     position: absolute;
-    right: 0;
+    right: auto;
     top: calc(100% + 0.45rem);
+    width: min(520px, calc(100vw - 2rem));
     z-index: 60;
 }
 

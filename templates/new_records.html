@@ -2,7 +2,7 @@
 {% block content %}
 <section class="cards page-summary-cards">
     <article>
-        <h3>New Records</h3>
+        <h3>Matching Records</h3>
         <p>{{ summary.record_count }}</p>
     </article>
     <article>
@@ -28,6 +28,10 @@
         ZIP5s: <strong>{{ target_zip5_count }}</strong>.
         Excluded statuses: <strong>{{ excluded_statuses_count }}</strong>.
         {% if last_refresh_at %}Last refresh: <strong>{{ last_refresh_at|fmt_est_datetime }}</strong>.{% endif %}
+    </p>
+    <p>
+        Showing <strong>{{ summary.record_count }}</strong> of <strong>{{ summary.total_active_count }}</strong> cached New Records.
+        {% if filters.lists %}Selected list filters require records to match <strong>all</strong> selected lists.{% endif %}
     </p>
     <div class="panel-actions">
         <form method="get" action="{{ url_for('new_records_page') }}" class="inline-form">
@@ -77,6 +81,7 @@
                             <option value="{{ list_name }}" {% if list_name in filters.lists %}selected{% endif %}>{{ list_name }}</option>
                             {% endfor %}
                         </select>
+                        <span class="help-text">Hold Ctrl/Cmd to select multiple. Records must match all selected lists.</span>
                     </label>
                     <label>Completeness
                         <select name="completeness">
@@ -90,7 +95,7 @@
                         <select name="owner_type">
                             <option value="">All</option>
                             {% for value in filter_options.owner_types %}
-                            <option value="{{ value }}" {% if filters.owner_type == value %}selected{% endif %}>{{ value }}</option>
+                            <option value="{{ value }}" {% if filters.owner_type == value or (filters.owner_type|lower == 'individual' and value == 'person') %}selected{% endif %}>{% if value == 'person' %}Individual{% else %}{{ value|title }}{% endif %}</option>
                             {% endfor %}
                         </select>
                     </label>

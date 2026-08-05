@@ -30360,6 +30360,13 @@ def _new_record_owner_type(payload):
     return normalize_whitespace(owner.get("type") or "")
 
 
+def normalize_new_record_owner_type(value):
+    text = normalize_whitespace(value).lower()
+    if text in {"individual", "person", "people", "owner"}:
+        return "person"
+    return text
+
+
 def _new_record_completeness(payload):
     return normalize_whitespace(payload.get("type") if isinstance(payload, dict) else "")
 
@@ -30529,15 +30536,15 @@ def _new_record_matches_filters(row, filters):
     if completeness_filter and normalize_whitespace(row.get("completeness") or "").lower() != completeness_filter:
         return False
 
-    owner_type_filter = normalize_whitespace(filters.get("owner_type") or "").lower()
-    if owner_type_filter and normalize_whitespace(row.get("owner_type") or "").lower() != owner_type_filter:
+    owner_type_filter = normalize_new_record_owner_type(filters.get("owner_type") or "")
+    if owner_type_filter and normalize_new_record_owner_type(row.get("owner_type") or "") != owner_type_filter:
         return False
 
     selected_lists = filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")
     selected_list_keys = {normalize_whitespace(item).lower() for item in selected_lists if normalize_whitespace(item)}
     if selected_list_keys:
         row_list_keys = {normalize_whitespace(item).lower() for item in (row.get("property_list_names") or []) if normalize_whitespace(item)}
-        if not row_list_keys.intersection(selected_list_keys):
+        if not selected_list_keys.issubset(row_list_keys):
             return False
 
     for filter_key, row_key in [
@@ -37358,6 +37365,10 @@ def new_records_page():
     error = (request.args.get("error") or "").strip()
     rows = get_cached_new_records(db, sort_dir=sort_order, filters=filters)
     filter_options = get_new_record_filter_options(db)
+    total_active_count = int(
+        (db.execute("SELECT COUNT(*) AS count FROM reisift_new_records WHERE COALESCE(is_active, 1) = 1").fetchone() or {"count": 0})["count"]
+        or 0
+    )
     county_counts = {}
     local_match_count = 0
     local_update_count = 0
@@ -37385,6 +37396,7 @@ def new_records_page():
         refresh_state=get_reisift_new_records_refresh_state(db),
         summary={
             "record_count": len(rows),
+            "total_active_count": total_active_count,
             "local_match_count": local_match_count,
             "local_update_count": local_update_count,
             "county_counts": county_counts,

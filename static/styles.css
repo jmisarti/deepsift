@@ -690,6 +690,13 @@ body {
     font-size: 0.66rem;
 }
 
+.help-text {
+    color: var(--muted);
+    display: block;
+    font-size: 0.78rem;
+    margin-top: 0.25rem;
+}
+
 .action-icon-link {
     align-items: center;
     display: inline-flex;

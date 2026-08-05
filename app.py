@@ -13746,6 +13746,15 @@ def _safe_response_payload(response):
         return (response.text or "").strip()
 
 
+def _emailoctopus_is_tag_limit_error(payload):
+    if not isinstance(payload, dict):
+        return False
+    error_payload = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+    code = str(error_payload.get("code") or error_payload.get("error") or "").strip().upper()
+    message = str(error_payload.get("message") or payload.get("message") or "").strip().lower()
+    return "TAG_LIMIT" in code or ("tag" in message and "limit" in message)
+
+
 def verify_email_with_emaillistverify(api_key, email_address):
     email_address = normalize_email(email_address)
     if not api_key:
@@ -14103,6 +14112,15 @@ def emailoctopus_upsert_contact(api_key, list_id, email_address, contact_status=
         timeout=20,
     )
     payload = _safe_response_payload(response)
+    if clean_tags and _emailoctopus_is_tag_limit_error(payload):
+        create_payload.pop("tags", None)
+        response = requests.post(
+            f"{base_url}/lists/{quote_plus(list_id)}/contacts",
+            headers={"Content-Type": "application/json"},
+            json=create_payload,
+            timeout=20,
+        )
+        payload = _safe_response_payload(response)
     if response.ok:
         payload_dict = payload if isinstance(payload, dict) else {}
         return {
@@ -14130,6 +14148,15 @@ def emailoctopus_upsert_contact(api_key, list_id, email_address, contact_status=
             timeout=20,
         )
         update_payload_body = _safe_response_payload(update_response)
+        if clean_tags and _emailoctopus_is_tag_limit_error(update_payload_body):
+            update_payload.pop("tags", None)
+            update_response = requests.put(
+                f"{base_url}/lists/{quote_plus(list_id)}/contacts/{member_id}",
+                headers={"Content-Type": "application/json"},
+                json=update_payload,
+                timeout=20,
+            )
+            update_payload_body = _safe_response_payload(update_response)
         if update_response.ok:
             update_dict = update_payload_body if isinstance(update_payload_body, dict) else {}
             return {

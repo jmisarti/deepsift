@@ -82,11 +82,19 @@ def load_env_file(path: Path):
 load_env_file(BASE_DIR / ".env")
 
 
+def sqlite_busy_timeout_ms():
+    try:
+        return max(1000, int(os.getenv("CRM_SQLITE_BUSY_TIMEOUT_MS", "60000") or 60000))
+    except Exception:
+        return 60000
+
+
 def open_sqlite_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    busy_timeout_ms = sqlite_busy_timeout_ms()
+    conn = sqlite3.connect(DB_PATH, timeout=busy_timeout_ms / 1000)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
     conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
@@ -21840,6 +21848,8 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
                 trigger_agent_pipeline_refresh(db, property_id=int(property_id), reason="call_no_recording")
             return {"job_id": job_id, "status": "no_recording_url", "call_outcome": outcome}
 
+    # Release any context/recording-url writes before slow provider/OpenAI calls.
+    commit_with_retry(db)
     if force_reanalyze and existing_transcript:
         transcription = {"transcript": existing_transcript, "raw": {"source": "existing_transcript"}}
         transcript = existing_transcript
@@ -22013,7 +22023,7 @@ def run_call_recording_analysis_once(limit=2, statuses=None, created_after=None,
                         route="run_call_recording_analysis_once",
                         status_code=500,
                     )
-            db.commit()
+            commit_with_retry(db)
             return {"ok": True, "processed": processed, "completed": completed, "failed": failed, "details": details}
     except TimeoutError:
         return {"ok": True, "skipped": "agent_pipeline_busy"}
@@ -22027,7 +22037,7 @@ def run_call_recording_analysis_once(limit=2, statuses=None, created_after=None,
             route="run_call_recording_analysis_once",
             status_code=500,
         )
-        db.commit()
+        commit_with_retry(db)
         return {"ok": False, "error": str(exc)}
     finally:
         db.close()
@@ -22946,6 +22956,7 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30, start_utc=None):
                     "UPDATE sms_thread_state SET last_message_at = ?, message_count = ?, updated_at = CURRENT_TIMESTAMP WHERE thread_key = ?",
                     (last_at, len(msgs), t["thread_key"]),
                 )
+                commit_with_retry(db)
                 details.append({"thread_key": t["thread_key"], "status": "unchanged"})
                 continue
             try:
@@ -23007,6 +23018,7 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30, start_utc=None):
                 """,
                 (t["thread_key"], t["property_id"], t["person_id"], t["counterpart"], last_at, len(msgs), transcript_hash),
             )
+            commit_with_retry(db)
         route_summary = route_new_agent_signals_once(db, limit=200)
         for pid in list(sorted(touched_property_ids))[:50]:
             enqueue_agent_refresh(
@@ -23015,7 +23027,7 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30, start_utc=None):
                 reason="sms_analysis_complete",
                 delay_seconds=SMS_DECISION_DELAY_SECONDS,
             )
-        db.commit()
+        commit_with_retry(db)
         return {"ok": True, "processed": processed, "analyzed": analyzed, "failed": failed, "routed": route_summary.get("routed", 0), "details": details[:50]}
     except Exception as exc:
         db.rollback()
@@ -23027,7 +23039,7 @@ def run_sms_analysis_once(lookback_days=14, limit_threads=30, start_utc=None):
             route="run_sms_analysis_once",
             status_code=500,
         )
-        db.commit()
+        commit_with_retry(db)
         return {"ok": False, "error": str(exc)}
     finally:
         if lock_acquired:
@@ -43828,10 +43840,12 @@ def skip_trace_person_route(property_id, person_id):
         or middle_name != (person["middle_name"] or "").strip()
         or last_name != (person["last_name"] or "").strip()
     ):
-        db.execute(
+        execute_with_retry(
+            db,
             "UPDATE people SET first_name = ?, middle_name = ?, last_name = ? WHERE id = ?",
             (first_name, middle_name, last_name, person_id),
         )
+        commit_with_retry(db)
     if not first_name or not last_name:
         return jsonify({"error": "first_name and last_name are required"}), 400
 
@@ -43849,7 +43863,8 @@ def skip_trace_person_route(property_id, person_id):
         lookup = lookup_pkg.get("response") if isinstance(lookup_pkg, dict) else {}
         req_payload = lookup_pkg.get("request") if isinstance(lookup_pkg, dict) else {}
         summary = import_skipsherpa_person_result(db, property_id, person_id, lookup)
-        db.execute(
+        execute_with_retry(
+            db,
             """
             INSERT INTO skiptrace_runs (provider, property_id, person_id, request_json, response_json, summary_json)
             VALUES ('SkipSherpa', ?, ?, ?, ?, ?)
@@ -43862,7 +43877,7 @@ def skip_trace_person_route(property_id, person_id):
                 json.dumps(summary),
             ),
         )
-        db.commit()
+        commit_with_retry(db)
         return jsonify({"ok": True, "summary": summary, "raw": lookup}), 200
     except Exception as exc:
         db.rollback()
@@ -43905,7 +43920,7 @@ def skip_trace_property_route(property_id):
             db=db,
         )
         summary = import_skipsherpa_property_result(db, property_id, lookup_pkg)
-        db.commit()
+        commit_with_retry(db)
         return jsonify({"ok": True, "summary": summary, "raw": lookup_pkg.get("response")}), 200
     except Exception as exc:
         db.rollback()

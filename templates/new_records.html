@@ -14,8 +14,8 @@
         <p>{{ summary.local_update_count }}</p>
     </article>
     <article>
-        <h3>Counties</h3>
-        <p>{{ target_counties|join(", ") }}</p>
+        <h3>ReiSIFT Filter</h3>
+        <p>{{ target_list_ids_count }} lists / {{ target_zip5_count }} zips</p>
     </article>
 </section>
 
@@ -23,7 +23,10 @@
     <h2>New Records (ReiSift)</h2>
     <p>
         Status: <strong>{{ status_slug }}</strong>.
-        Counties: <strong>{{ target_counties|join(", ") }}</strong>.
+        Requires phone: <strong>Yes</strong>.
+        Lists: <strong>{{ target_list_ids_count }}</strong>.
+        ZIP5s: <strong>{{ target_zip5_count }}</strong>.
+        Excluded statuses: <strong>{{ excluded_statuses_count }}</strong>.
         {% if last_refresh_at %}Last refresh: <strong>{{ last_refresh_at|fmt_est_datetime }}</strong>.{% endif %}
     </p>
     <div class="panel-actions">

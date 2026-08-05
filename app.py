@@ -139,6 +139,70 @@ REISIFT_NEW_RECORDS_COUNTIES = tuple(
     for item in (os.getenv("REISIFT_NEW_RECORDS_COUNTIES") or "Essex,Union,Bergen").split(",")
     if item.strip()
 )
+REISIFT_NEW_RECORDS_LIST_IDS = tuple(
+    item.strip()
+    for item in (
+        os.getenv("REISIFT_NEW_RECORDS_LIST_IDS")
+        or """
+        24a0e2a8-249e-11eb-891e-822ea3ed6c04
+        edd7864a-9514-47e9-ad58-bbe71fb5e77a
+        788263bd-3264-4427-89ac-74a5ae848a2e
+        55785ffb-e9f7-4825-80fc-063cfd1d502f
+        6d09d8b6-f640-4aaa-9a96-3c0d6dd99fdc
+        77fcc8c3-7122-465e-981c-3c3ed064a275
+        c73e6438-f4ba-4207-a016-254cabfa0445
+        a33afdeb-917c-46bf-be13-5af2bf7918e4
+        605a73f9-7d28-4ca6-9522-fed5769d2aa3
+        """
+    ).replace(",", "\n").split()
+    if item.strip()
+)
+REISIFT_NEW_RECORDS_ZIP5 = tuple(
+    item.strip()
+    for item in (
+        os.getenv("REISIFT_NEW_RECORDS_ZIP5")
+        or """
+        07003 07006 07009 07004 07017 07018 07021 07028 07039 07040 07044 07043
+        07041 07042 07050 07052 07068 07078 07079 07102 07106 07103 07104 07109
+        07107 07108 07105 07114 07110 07111 07112 07016 07023 07027 07033 07036
+        07060 07062 07063 07064 07065 07066 07076 07081 07088 07083 07090 07092
+        07201 07206 07208 07202 07205 07203 07204 07901 07922 07974 07010 07020
+        07024 07026 07022 07031 07057 07070 07072 07074 07071 07075 07073 07401
+        07407 07410 07417 07423 07430 07432 07436 07446 07450 07452 07458 07463
+        07481 07601 07603 07604 07605 07606 07607 07608 07621 07624 07626 07628
+        07627 07630 07632 07631 07640 07642 07643 07641 07647 07645 07646 07649
+        07644 07648 07650 07656 07657 07652 07660 07661 07663 07662 07666 07670
+        07676 07675 07677 08831 08901 08817 08820 08854 08861 08816 07080 08840
+        08902 07008 08882 08837 07067 07095 08857 08879 07305 07304 07307 07306
+        07002 07087 07047 07093 07029 07032 07501 07055 07011 07522 07013 07470
+        07503 07512 07508 07421 07442 07514 07728 07726 07724 07740 07731 07734
+        07735 07712 07753 07701 07719 07751 08753 08750 08755 08757 08759 08527
+        08742 08087 08005 08731 08046 08015 08016 08075 08053 08057 08060 08068
+        08088 08054 08055 08077 08065
+        """
+    ).replace(",", "\n").split()
+    if item.strip()
+)
+REISIFT_NEW_RECORDS_EXCLUDED_STATUSES = tuple(
+    item.strip()
+    for item in (
+        os.getenv("REISIFT_NEW_RECORDS_EXCLUDED_STATUSES")
+        or """
+        sold
+        not_interested
+        Not Interested  - weekly
+        Not Interested  - Biweekly
+        Not Interested  - Monthly
+        Not Interested  - Quarterly
+        dnc
+        opt_out
+        listed
+        buyer
+        Dead Leads
+        """
+    ).replace(",", "\n").splitlines()
+    if item.strip()
+)
 REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED = env_flag("REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED", True)
 REISIFT_NEW_RECORDS_REFRESH_HOUR_ET = max(
     0,
@@ -26637,17 +26701,25 @@ def reisift_search_referral_rows(token, status_slug):
     return rows, int(payload.get("count") or len(rows))
 
 
-def reisift_search_property_rows_by_status(token, status_slug, counties=None, max_rows=1000):
-    status_slug = (status_slug or "").strip()
-    if not status_slug:
+def build_reisift_new_records_search_query():
+    must_query = {
+        "phone": 1,
+        "any_lists": list(REISIFT_NEW_RECORDS_LIST_IDS),
+        "any_zip5": list(REISIFT_NEW_RECORDS_ZIP5),
+        "any_property_status": [REISIFT_NEW_RECORDS_STATUS],
+    }
+    query = {"must": must_query}
+    if REISIFT_NEW_RECORDS_EXCLUDED_STATUSES:
+        query["must_not"] = {"any_property_status": list(REISIFT_NEW_RECORDS_EXCLUDED_STATUSES)}
+    return query
+
+
+def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering="-list_count"):
+    if not isinstance(query, dict) or not query:
         return [], 0
     headers = reisift_auth_headers(token, {"x-http-method-override": "GET"})
     max_rows = max(1, min(5000, int(max_rows or 1000)))
-    county_values = [
-        normalize_whitespace(county)
-        for county in (counties or [])
-        if normalize_whitespace(county)
-    ]
+    query_body = copy.deepcopy(query.get("query") if isinstance(query.get("query"), dict) else query)
     offset = 0
     rows = []
     total = 0
@@ -26673,14 +26745,10 @@ def reisift_search_property_rows_by_status(token, status_slug, counties=None, ma
         raise last_exc or ValueError("ReiSift property search failed")
 
     while offset < max_rows:
-        must_query = {}
-        if county_values:
-            must_query["any_county"] = county_values
-        must_query["any_property_status"] = [status_slug]
         body = {
             "offset": offset,
-            "ordering": "-list_count",
-            "query": {"must": must_query},
+            "ordering": ordering,
+            "query": copy.deepcopy(query_body),
         }
         response = _post_search(body)
         payload = response.json()
@@ -26696,6 +26764,22 @@ def reisift_search_property_rows_by_status(token, status_slug, counties=None, ma
         if not dict_rows:
             break
     return rows[:max_rows], total or len(rows)
+
+
+def reisift_search_property_rows_by_status(token, status_slug, counties=None, max_rows=1000):
+    status_slug = (status_slug or "").strip()
+    if not status_slug:
+        return [], 0
+    county_values = [
+        normalize_whitespace(county)
+        for county in (counties or [])
+        if normalize_whitespace(county)
+    ]
+    must_query = {}
+    if county_values:
+        must_query["any_county"] = county_values
+    must_query["any_property_status"] = [status_slug]
+    return reisift_search_property_rows_by_query(token, {"must": must_query}, max_rows=max_rows)
 
 
 def fetch_reisift_property_payload(token, property_uuid):
@@ -29859,14 +29943,13 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
 def refresh_reisift_new_records_cache(db):
     token = reisift_get_access_token()
     status_slug = REISIFT_NEW_RECORDS_STATUS
-    target_counties = target_new_record_counties()
+    search_query = build_reisift_new_records_search_query()
     errors = []
     search_failed = False
     try:
-        rows, total = reisift_search_property_rows_by_status(
+        rows, total = reisift_search_property_rows_by_query(
             token,
-            status_slug,
-            counties=target_counties,
+            search_query,
             max_rows=2000,
         )
     except Exception as exc:
@@ -29900,10 +29983,6 @@ def refresh_reisift_new_records_cache(db):
                 sift_rollup = fetch_reisift_property_log_rollup(token, property_uuid, max_rows=120)
             except Exception as exc:
                 errors.append(f"{property_uuid} logs: {exc}")
-        county = infer_county_from_reisift_payload(details) or infer_county_from_reisift_payload(row)
-        if county and not is_target_new_record_county(county):
-            skipped_county += 1
-            continue
         try:
             local_sync = upsert_reisift_new_record(
                 db,
@@ -29935,7 +30014,10 @@ def refresh_reisift_new_records_cache(db):
     commit_with_retry(db)
     return {
         "status_slug": status_slug,
-        "target_counties": target_counties,
+        "target_counties": [],
+        "target_list_ids": len(REISIFT_NEW_RECORDS_LIST_IDS),
+        "target_zip5": len(REISIFT_NEW_RECORDS_ZIP5),
+        "excluded_statuses": list(REISIFT_NEW_RECORDS_EXCLUDED_STATUSES),
         "total": total,
         "scanned": scanned,
         "synced": synced,
@@ -36786,6 +36868,9 @@ def new_records_page():
         auto_refresh=(request.args.get("refresh") or "0") == "1",
         status_slug=REISIFT_NEW_RECORDS_STATUS,
         target_counties=target_new_record_counties(),
+        target_list_ids_count=len(REISIFT_NEW_RECORDS_LIST_IDS),
+        target_zip5_count=len(REISIFT_NEW_RECORDS_ZIP5),
+        excluded_statuses_count=len(REISIFT_NEW_RECORDS_EXCLUDED_STATUSES),
         last_refresh_at=get_setting(db, "reisift_new_records_last_refresh_at", ""),
         refresh_state=get_reisift_new_records_refresh_state(db),
         summary={

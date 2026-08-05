@@ -14224,6 +14224,223 @@ def _email_campaign_sync_success(status):
     return status in {"synced", "already_synced", "already_sent_emailoctopus"} or status.startswith(("created_", "updated_"))
 
 
+def _email_campaign_sync_unsubscribed(status):
+    return str(status or "").strip().lower().startswith("unsubscribed")
+
+
+def is_strict_new_record_status(value):
+    return _normalize_reisift_status(value) in {"new record", "new records"}
+
+
+def _property_email_identities(db, property_id):
+    try:
+        property_id = int(property_id or 0)
+    except Exception:
+        property_id = 0
+    if property_id <= 0:
+        return set()
+    prop = db.execute(
+        "SELECT id, owner_person_id, resident_person_id FROM properties WHERE id = ? LIMIT 1",
+        (property_id,),
+    ).fetchone()
+    if not prop:
+        return set()
+    network_ids, _ = build_property_network(db, prop)
+    if prop["owner_person_id"] and int(prop["owner_person_id"]) not in network_ids:
+        network_ids.insert(0, int(prop["owner_person_id"]))
+    if prop["resident_person_id"] and int(prop["resident_person_id"]) not in network_ids:
+        network_ids.append(int(prop["resident_person_id"]))
+    clean_ids = [int(pid) for pid in dict.fromkeys(network_ids) if int(pid or 0) > 0]
+    if not clean_ids:
+        return set()
+    placeholders = ",".join(["?"] * len(clean_ids))
+    rows = db.execute(
+        f"""
+        SELECT value
+        FROM touchpoints
+        WHERE lower(COALESCE(channel_type, '')) = 'email'
+          AND person_id IN ({placeholders})
+        """,
+        tuple(clean_ids),
+    ).fetchall()
+    return {normalize_email_identity(row["value"] or "") for row in rows if normalize_email_identity(row["value"] or "")}
+
+
+def collect_emailoctopus_syncs_for_property(db, property_id):
+    property_emails = _property_email_identities(db, property_id)
+    candidates = {}
+    for row in db.execute("SELECT * FROM email_campaign_syncs").fetchall():
+        email = normalize_email_identity(row["normalized_email"] or "")
+        if not email:
+            continue
+        status = str(row["sync_status"] or "").strip()
+        if _email_campaign_sync_unsubscribed(status) or not _email_campaign_sync_success(status):
+            continue
+        if int(row["property_id"] or 0) == int(property_id or 0) or email in property_emails:
+            candidates[email] = dict(row)
+    return candidates
+
+
+def email_identity_has_other_new_record_property(db, email_address, exclude_property_id):
+    email_identity = normalize_email_identity(email_address)
+    if not email_identity:
+        return False
+    rows = db.execute(
+        """
+        SELECT t.value, p.id AS property_id, p.status
+        FROM touchpoints t
+        JOIN properties p ON p.owner_person_id = t.person_id OR p.resident_person_id = t.person_id
+        WHERE lower(COALESCE(t.channel_type, '')) = 'email'
+          AND p.id <> ?
+        """,
+        (int(exclude_property_id or 0),),
+    ).fetchall()
+    for row in rows:
+        if normalize_email_identity(row["value"] or "") == email_identity and is_strict_new_record_status(row["status"] or ""):
+            return True
+    return False
+
+
+def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, before_status, after_status, source="property_status_transition"):
+    try:
+        property_id = int(property_id or 0)
+    except Exception:
+        property_id = 0
+    if property_id <= 0:
+        return {"ok": True, "skipped": "missing_property_id", "attempted": 0, "unsubscribed": 0, "errors": 0}
+    if not is_strict_new_record_status(before_status) or is_strict_new_record_status(after_status):
+        return {"ok": True, "skipped": "not_new_record_exit", "attempted": 0, "unsubscribed": 0, "errors": 0}
+    candidates = collect_emailoctopus_syncs_for_property(db, property_id)
+    if not candidates:
+        return {"ok": True, "skipped": "no_synced_emails", "attempted": 0, "unsubscribed": 0, "errors": 0}
+    settings = get_anonymous_email_marketing_settings(db)
+    api_key = settings.get("emailoctopus_api_key") or ""
+    list_id = settings.get("emailoctopus_list_id") or ""
+    if not api_key or not list_id:
+        return {"ok": False, "skipped": "awaiting_emailoctopus_config", "attempted": 0, "unsubscribed": 0, "errors": 0}
+
+    attempted = 0
+    unsubscribed = 0
+    skipped_active_elsewhere = 0
+    errors = 0
+    timestamp = format_db_time(datetime.utcnow())
+    commit_with_retry(db)
+    for email, sync_row in candidates.items():
+        if email_identity_has_other_new_record_property(db, email, property_id):
+            skipped_active_elsewhere += 1
+            continue
+        attempted += 1
+        try:
+            result = emailoctopus_set_contact_status(api_key, list_id, email, status="UNSUBSCRIBED")
+            db.execute(
+                """
+                UPDATE email_campaign_syncs
+                SET sync_status = ?,
+                    last_error = '',
+                    payload_json = ?,
+                    synced_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE normalized_email = ?
+                """,
+                (
+                    "unsubscribed_property_status_exit",
+                    json.dumps(
+                        {
+                            "emailoctopus": result,
+                            "property_id": property_id,
+                            "before_status": before_status,
+                            "after_status": after_status,
+                            "source": source,
+                        },
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                    email,
+                ),
+            )
+            upsert_anonymous_email_campaign_registry(
+                db,
+                email,
+                source="deepsift_property_status_exit",
+                source_identifier=str(sync_row.get("provider_contact_id") or ""),
+                status="unsubscribed_property_status_exit",
+                notes=f"Unsubscribed after property {property_id} changed from {before_status or '-'} to {after_status or '-'}.",
+            )
+            unsubscribed += 1
+        except Exception as exc:
+            errors += 1
+            db.execute(
+                """
+                UPDATE email_campaign_syncs
+                SET sync_status = 'unsubscribe_error',
+                    last_error = ?,
+                    payload_json = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE normalized_email = ?
+                """,
+                (
+                    str(exc),
+                    json.dumps(
+                        {
+                            "property_id": property_id,
+                            "before_status": before_status,
+                            "after_status": after_status,
+                            "source": source,
+                        },
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                    email,
+                ),
+            )
+            log_app_error(
+                db,
+                source="email_campaign_unsubscribe",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="unsubscribe_emailoctopus_emails_for_property_status_exit",
+                status_code=500,
+            )
+        commit_with_retry(db)
+    try:
+        db.execute(
+            """
+            INSERT INTO activity_log (property_id, activity_type, outcome, note)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                property_id,
+                "EmailOctopus Unsubscribe",
+                "Completed" if errors == 0 else "Partial",
+                json.dumps(
+                    {
+                        "before_status": before_status,
+                        "after_status": after_status,
+                        "source": source,
+                        "candidate_emails": len(candidates),
+                        "attempted": attempted,
+                        "unsubscribed": unsubscribed,
+                        "skipped_active_elsewhere": skipped_active_elsewhere,
+                        "errors": errors,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            ),
+        )
+    except Exception:
+        pass
+    return {
+        "ok": errors == 0,
+        "candidate_emails": len(candidates),
+        "attempted": attempted,
+        "unsubscribed": unsubscribed,
+        "skipped_active_elsewhere": skipped_active_elsewhere,
+        "errors": errors,
+    }
+
+
 def _email_campaign_tags(source):
     source_key = str(source or "").strip().lower()
     tags = ["DeepSift Verified Email"]
@@ -30388,6 +30605,7 @@ def sync_local_property_status_from_reisift_new_record(db, property_uuid, payloa
     local_property_id = int(row["id"])
     before = str(row["status"] or "").strip()
     after = normalize_whitespace(status or "") or before
+    unsubscribe_result = {}
     if after and before != after:
         db.execute("UPDATE properties SET status = ? WHERE id = ?", (after, local_property_id))
         try:
@@ -30405,7 +30623,14 @@ def sync_local_property_status_from_reisift_new_record(db, property_uuid, payloa
             )
         except Exception:
             pass
-    return {"local_property_id": local_property_id, "before": before, "after": after}
+        unsubscribe_result = unsubscribe_emailoctopus_emails_for_property_status_exit(
+            db,
+            local_property_id,
+            before,
+            after,
+            source="reisift_new_records_status_sync",
+        )
+    return {"local_property_id": local_property_id, "before": before, "after": after, "emailoctopus_unsubscribe": unsubscribe_result}
 
 
 def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_active=1, sift_rollup=None):
@@ -30568,7 +30793,16 @@ def refresh_reisift_new_records_cache(db):
         rows, total = [], 0
         search_failed = True
         errors.append(f"reisift_search: {exc}")
+    previous_active_rows = []
     if not search_failed:
+        previous_active_rows = db.execute(
+            """
+            SELECT property_uuid, local_property_id
+            FROM reisift_new_records
+            WHERE COALESCE(is_active, 1) = 1
+              AND COALESCE(property_uuid, '') <> ''
+            """
+        ).fetchall()
         execute_with_retry(db, "UPDATE reisift_new_records SET is_active = 0")
     scanned = 0
     synced = 0
@@ -30579,11 +30813,15 @@ def refresh_reisift_new_records_cache(db):
     updated_phones = 0
     suppressed_phones = 0
     imported_emails = 0
+    returned_property_uuids = set()
+    status_exit_checks = 0
+    status_exit_unsubscribed = 0
     for row in rows:
         scanned += 1
         property_uuid = normalize_uuid(row.get("uuid") or "")
         if not property_uuid:
             continue
+        returned_property_uuids.add(property_uuid)
         details = row
         try:
             details = fetch_reisift_property_payload(token, property_uuid)
@@ -30617,6 +30855,27 @@ def refresh_reisift_new_records_cache(db):
             synced += 1
         except Exception as exc:
             errors.append(f"{property_uuid}: {exc}")
+    if not search_failed and previous_active_rows:
+        for prior in previous_active_rows:
+            property_uuid = normalize_uuid(prior["property_uuid"] or "")
+            if not property_uuid or property_uuid in returned_property_uuids:
+                continue
+            try:
+                details = fetch_reisift_property_payload(token, property_uuid)
+                summary = summarize_reisift_property(details, fallback_payload={})
+                local_sync = sync_local_property_status_from_reisift_new_record(
+                    db,
+                    property_uuid,
+                    details,
+                    summary.get("status") or "",
+                )
+                status_exit_checks += 1
+                unsub = local_sync.get("emailoctopus_unsubscribe") if isinstance(local_sync.get("emailoctopus_unsubscribe"), dict) else {}
+                status_exit_unsubscribed += int(unsub.get("unsubscribed") or 0)
+                if local_sync.get("local_property_id") and local_sync.get("before") != local_sync.get("after"):
+                    local_updates += 1
+            except Exception as exc:
+                errors.append(f"{property_uuid}: status exit check failed ({exc})")
     sms_queue = {"created": 0, "updated": 0, "skipped": 0, "suppressed": 0}
     try:
         sms_queue = generate_sms_automation_queue_for_new_records(db, token=token)
@@ -30640,6 +30899,8 @@ def refresh_reisift_new_records_cache(db):
         "updated_phones": updated_phones,
         "suppressed_phones": suppressed_phones,
         "imported_emails": imported_emails,
+        "status_exit_checks": status_exit_checks,
+        "status_exit_unsubscribed": status_exit_unsubscribed,
         "sms_queue": sms_queue,
         "search_failed": search_failed,
         "log_rollup_enabled": REISIFT_NEW_RECORDS_LOG_ROLLUP_ENABLED,
@@ -44155,9 +44416,20 @@ def update_property_status(property_id):
     if not status:
         return jsonify({"error": "status is required"}), 400
 
+    row = db.execute("SELECT status FROM properties WHERE id = ? LIMIT 1", (property_id,)).fetchone()
+    if not row:
+        return jsonify({"error": "property not found"}), 404
+    before = str(row["status"] or "").strip()
     db.execute("UPDATE properties SET status = ? WHERE id = ?", (status, property_id))
+    unsubscribe_result = unsubscribe_emailoctopus_emails_for_property_status_exit(
+        db,
+        property_id,
+        before,
+        status,
+        source="local_property_status_api",
+    )
     db.commit()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "emailoctopus_unsubscribe": unsubscribe_result})
 
 
 @app.route("/api/properties/<int:property_id>/notes", methods=["PATCH"])

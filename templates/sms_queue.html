@@ -36,77 +36,105 @@
 
     <div class="panel-actions">
         <form method="get" action="{{ url_for('sms_queue_page') }}" class="inline-form">
-            <label>Numbers From
-                <input type="date" name="date_from" value="{{ filters.date_from }}">
-            </label>
-            <label>Numbers To
-                <input type="date" name="date_to" value="{{ filters.date_to }}">
-            </label>
-            <label>County
-                <select name="county">
-                    <option value="">All</option>
-                    {% for county in filter_options.counties %}
-                    <option value="{{ county }}" {% if filters.county == county %}selected{% endif %}>{{ county }}</option>
-                    {% endfor %}
-                </select>
-            </label>
-            <label>City
-                <select name="city">
-                    <option value="">All</option>
-                    {% for city in filter_options.cities %}
-                    <option value="{{ city }}" {% if filters.city == city %}selected{% endif %}>{{ city }}</option>
-                    {% endfor %}
-                </select>
-            </label>
-            <label>ReiSIFT Lists
-                <select name="lists" multiple size="6">
-                    {% for list_name in filter_options.lists %}
-                    <option value="{{ list_name }}" {% if list_name in filters.lists %}selected{% endif %}>{{ list_name }}</option>
-                    {% endfor %}
-                </select>
-                <span class="help-text">Hold Ctrl/Cmd to select multiple. Records must match all selected lists.</span>
-            </label>
-            <label>Completeness
-                <select name="completeness">
-                    <option value="">All</option>
-                    {% for value in filter_options.completeness %}
-                    <option value="{{ value }}" {% if filters.completeness == value %}selected{% endif %}>{{ value }}</option>
-                    {% endfor %}
-                </select>
-            </label>
-            <label>Owner
-                <select name="owner_type">
-                    <option value="">All</option>
-                    {% for value in filter_options.owner_types %}
-                    <option value="{{ value }}" {% if filters.owner_type == value or (filters.owner_type|lower == 'individual' and value == 'person') %}selected{% endif %}>{% if value == 'person' %}Individual{% else %}{{ value|title }}{% endif %}</option>
-                    {% endfor %}
-                </select>
-            </label>
-            <label>Status
-                <select name="status">
-                    <option value="">Review Queue</option>
-                    {% for status in ['Draft', 'Queued', 'Approved', 'Scheduled', 'Sending', 'Sent', 'Failed', 'Suppressed', 'Held'] %}
-                    <option value="{{ status }}" {% if filters.status == status %}selected{% endif %}>{{ status }}</option>
-                    {% endfor %}
-                </select>
-            </label>
-            <label>Bucket
-                <select name="bucket">
-                    <option value="">All</option>
-                    {% for bucket in ['Sheriff Sale', 'Probate', 'Foreclosure', 'General New Record'] %}
-                    <option value="{{ bucket }}" {% if filters.bucket == bucket %}selected{% endif %}>{{ bucket }}</option>
-                    {% endfor %}
-                </select>
-            </label>
-            <label>Role
-                <select name="contact_role">
-                    <option value="">All</option>
-                    <option value="owner" {% if filters.contact_role == 'owner' %}selected{% endif %}>Owner</option>
-                    <option value="relative" {% if filters.contact_role == 'relative' %}selected{% endif %}>Relative</option>
-                </select>
-            </label>
-            <button type="submit">Apply</button>
-            <a class="button-link secondary" href="{{ url_for('sms_queue_page') }}">Clear</a>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers or filters.status or filters.bucket or filters.contact_role %}open{% endif %}>
+                <summary>Filters</summary>
+                <div class="filter-dropdown-panel">
+                    <label>Numbers From
+                        <input type="date" name="date_from" value="{{ filters.date_from }}">
+                    </label>
+                    <label>Numbers To
+                        <input type="date" name="date_to" value="{{ filters.date_to }}">
+                    </label>
+                    <label>County
+                        <select name="county">
+                            <option value="">All</option>
+                            {% for county in filter_options.counties %}
+                            <option value="{{ county }}" {% if filters.county == county %}selected{% endif %}>{{ county }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>City
+                        <select name="city">
+                            <option value="">All</option>
+                            {% for city in filter_options.cities %}
+                            <option value="{{ city }}" {% if filters.city == city %}selected{% endif %}>{{ city }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>ReiSIFT Lists
+                        <select name="lists" multiple size="6">
+                            {% for list_name in filter_options.lists %}
+                            <option value="{{ list_name }}" {% if list_name in filters.lists %}selected{% endif %}>{{ list_name }}</option>
+                            {% endfor %}
+                        </select>
+                        <span class="help-text">Hold Ctrl/Cmd to select multiple. Records must match all selected lists.</span>
+                    </label>
+                    <label>Completeness
+                        <select name="completeness">
+                            <option value="">All</option>
+                            {% for value in filter_options.completeness %}
+                            <option value="{{ value }}" {% if filters.completeness == value %}selected{% endif %}>{{ value }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>Owner
+                        <select name="owner_type">
+                            <option value="">All</option>
+                            {% for value in filter_options.owner_types %}
+                            <option value="{{ value }}" {% if filters.owner_type == value or (filters.owner_type|lower == 'individual' and value == 'person') %}selected{% endif %}>{% if value == 'person' %}Individual{% else %}{{ value|title }}{% endif %}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>ReiSkipped?
+                        <select name="rei_skipped">
+                            <option value="">All</option>
+                            <option value="yes" {% if filters.rei_skipped == 'yes' %}selected{% endif %}>Yes</option>
+                            <option value="no" {% if filters.rei_skipped == 'no' %}selected{% endif %}>No</option>
+                        </select>
+                    </label>
+                    <label>DeepSkipped?
+                        <select name="deep_skipped">
+                            <option value="">All</option>
+                            <option value="yes" {% if filters.deep_skipped == 'yes' %}selected{% endif %}>Yes</option>
+                            <option value="no" {% if filters.deep_skipped == 'no' %}selected{% endif %}>No</option>
+                        </select>
+                    </label>
+                    <label>NoGoodNumbers
+                        <select name="no_good_numbers">
+                            <option value="">All</option>
+                            <option value="yes" {% if filters.no_good_numbers == 'yes' %}selected{% endif %}>Yes</option>
+                            <option value="no" {% if filters.no_good_numbers == 'no' %}selected{% endif %}>No</option>
+                        </select>
+                    </label>
+                    <label>Status
+                        <select name="status">
+                            <option value="">Review Queue</option>
+                            {% for status in ['Draft', 'Queued', 'Approved', 'Scheduled', 'Sending', 'Sent', 'Failed', 'Suppressed', 'Held'] %}
+                            <option value="{{ status }}" {% if filters.status == status %}selected{% endif %}>{{ status }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>Bucket
+                        <select name="bucket">
+                            <option value="">All</option>
+                            {% for bucket in ['Sheriff Sale', 'Probate', 'Foreclosure', 'General New Record'] %}
+                            <option value="{{ bucket }}" {% if filters.bucket == bucket %}selected{% endif %}>{{ bucket }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>Role
+                        <select name="contact_role">
+                            <option value="">All</option>
+                            <option value="owner" {% if filters.contact_role == 'owner' %}selected{% endif %}>Owner</option>
+                            <option value="relative" {% if filters.contact_role == 'relative' %}selected{% endif %}>Relative</option>
+                        </select>
+                    </label>
+                    <div class="filter-dropdown-actions">
+                        <button type="submit">Apply Filters</button>
+                        <a class="button-link secondary" href="{{ url_for('sms_queue_page') }}">Clear</a>
+                    </div>
+                </div>
+            </details>
         </form>
         <form method="post" action="{{ url_for('sms_queue_generate') }}">
             <button type="submit">Generate From New Records</button>

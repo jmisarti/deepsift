@@ -37823,6 +37823,9 @@ def get_sms_automation_queue_rows(db, filters=None):
                n.county AS property_county,
                n.full_address AS new_record_full_address,
                n.payload_json AS new_record_payload_json,
+               n.rei_skipped AS new_record_rei_skipped,
+               n.deep_skipped AS new_record_deep_skipped,
+               n.no_good_numbers AS new_record_no_good_numbers,
                COALESCE(NULLIF(t.created_at, ''), NULLIF(q.created_at, '')) AS number_pulled_at
         FROM sms_automation_queue q
         JOIN properties p ON p.id = q.property_id
@@ -37859,8 +37862,9 @@ def get_sms_automation_queue_rows(db, filters=None):
         tuple(params),
     ).fetchall()
     out = []
-    for r in rows:
-        d = dict(r)
+    raw_rows = [dict(r) for r in rows]
+    live_flags_by_property = bulk_new_record_local_contact_flags(db, [row.get("property_id") for row in raw_rows])
+    for d in raw_rows:
         new_record_row = {
             "county": d.get("property_county") or "",
             "full_address": d.get("new_record_full_address") or d.get("property_address") or "",
@@ -37872,6 +37876,14 @@ def get_sms_automation_queue_rows(db, filters=None):
         d["owner_type"] = _new_record_owner_type(payload)
         d["completeness"] = _new_record_completeness(payload)
         d["property_list_names"] = _new_record_list_names(payload)
+        try:
+            property_id = int(d.get("property_id") or 0)
+        except Exception:
+            property_id = 0
+        live_flags = live_flags_by_property.get(property_id, {})
+        d["rei_skipped"] = 1 if (int(d.get("new_record_rei_skipped") or 0) or _new_record_has_reisift_skiptrace(payload)) else 0
+        d["deep_skipped"] = 1 if (int(d.get("new_record_deep_skipped") or 0) or live_flags.get("deep_skipped")) else 0
+        d["no_good_numbers"] = 1 if (int(d.get("new_record_no_good_numbers") or 0) or live_flags.get("no_good_numbers")) else 0
         if not _sms_queue_matches_new_record_filters(d, filters):
             continue
         d["property_address"] = format_property_address_line(d.get("street"), d.get("city"), d.get("state"), d.get("postal_code"))
@@ -37918,6 +37930,17 @@ def _sms_queue_matches_new_record_filters(row, filters):
     if selected_list_keys:
         row_list_keys = {normalize_whitespace(item).lower() for item in (row.get("property_list_names") or []) if normalize_whitespace(item)}
         if not selected_list_keys.issubset(row_list_keys):
+            return False
+    for filter_key, row_key in [
+        ("rei_skipped", "rei_skipped"),
+        ("deep_skipped", "deep_skipped"),
+        ("no_good_numbers", "no_good_numbers"),
+    ]:
+        expected = _new_record_yes_no_filter_value(filters.get(filter_key) or "")
+        if expected is None:
+            continue
+        actual = bool(int(row.get(row_key) or 0))
+        if actual != expected:
             return False
     return True
 
@@ -38162,6 +38185,9 @@ def sms_queue_page():
         "lists": [normalize_whitespace(item) for item in request.args.getlist("lists") if normalize_whitespace(item)],
         "completeness": (request.args.get("completeness") or "").strip(),
         "owner_type": (request.args.get("owner_type") or "").strip(),
+        "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
+        "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
+        "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),
         "status": (request.args.get("status") or "").strip(),
         "bucket": (request.args.get("bucket") or "").strip(),
         "contact_role": (request.args.get("contact_role") or "").strip(),

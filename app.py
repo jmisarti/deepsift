@@ -6336,20 +6336,123 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
     primary_owner_id = prop["owner_person_id"] if prop else None
     owners_created = 0
     co_owner_links = 0
+    relatives_created = 0
     processed_owner_ids = set()
+    processed_contact_person_ids = set()
     now_stamp = datetime.now(EST_TZ).strftime("%Y-%m-%d %I:%M %p ET")
 
-    for idx, owner_entry in enumerate(property_payload.get("owners") or []):
-        person_payload = owner_entry.get("person") or {}
-        person_name = person_payload.get("person_name") or {}
+    def payload_name_parts(person_payload):
+        person_name = person_payload.get("person_name") if isinstance(person_payload.get("person_name"), dict) else {}
         first = (person_name.get("first_name") or "").strip()
+        middle = (person_name.get("middle_name") or "").strip()
         last = (person_name.get("last_name") or "").strip()
         full_name = _person_full_name_from_payload(person_payload)
         if not (first and last) and full_name:
             parts = [p for p in full_name.split() if p]
             if parts:
-                first = parts[0]
-                last = parts[-1] if len(parts) > 1 else "Unknown"
+                first = first or parts[0]
+                last = last or (parts[-1] if len(parts) > 1 else "Unknown")
+        return first, middle, last, full_name
+
+    def update_person_from_skipsherpa_payload(target_person_id, person_payload):
+        age_val = person_payload.get("age")
+        deceased_raw = person_payload.get("deceased")
+        deceased_val = bool(deceased_raw) if deceased_raw is not None else False
+        dob_my = (person_payload.get("date_of_birth_month_year") or "").strip()
+        birth_year = dob_my.split("-")[-1].strip() if dob_my and "-" in dob_my else ""
+        db.execute(
+            """
+            UPDATE people
+            SET age = COALESCE(?, age),
+                deceased = ?,
+                birth_year = COALESCE(NULLIF(?, ''), birth_year)
+            WHERE id = ?
+            """,
+            (age_val, 1 if deceased_val else 0, birth_year, target_person_id),
+        )
+
+    def import_person_payload_contacts(target_person_id, person_payload, email_note, email_source, address_label):
+        for addr_payload in person_payload.get("addresses") or []:
+            us = addr_payload.get("us_address") or {}
+            street = (us.get("street") or "").strip()
+            city = (us.get("city") or "").strip()
+            state = (us.get("state") or "").strip()
+            zipcode = (us.get("zipcode") or "").strip()
+            if not (street and city and state and zipcode):
+                continue
+            addr_metadata = _address_metadata_from_skipsherpa_payload(addr_payload)
+            ensure_person_address_link(
+                db,
+                target_person_id,
+                street,
+                city,
+                state,
+                zipcode,
+                label=address_label,
+                set_default=False,
+                is_verified_deliverable=addr_metadata["is_verified_deliverable"],
+                is_vacant=addr_metadata["is_vacant"],
+                attom_last_sold_date=addr_metadata["attom_last_sold_date"],
+                attom_last_sold_price=addr_metadata["attom_last_sold_price"],
+            )
+
+        for em in person_payload.get("emails") or []:
+            if isinstance(em, dict):
+                email = (em.get("email_address") or "").strip()
+            else:
+                email = str(em or "").strip()
+            if not email:
+                continue
+            upsert_email_touchpoint_and_queue_validation(
+                db,
+                target_person_id,
+                email,
+                note=email_note,
+                source=email_source,
+            )
+
+        for ph in person_payload.get("phone_numbers") or []:
+            number = (ph.get("e164_format") or ph.get("local_format") or "").strip()
+            if not number or touchpoint_exists(db, target_person_id, "Phone", number):
+                continue
+            ptype = (ph.get("type") or "").strip().lower()
+            label = {"mobile": "Mobile", "landline": "Landline", "voip": "VoIP"}.get(ptype, "Unknown")
+            note_meta = _build_skipsherpa_phone_touchpoint_note(ph)
+            db.execute(
+                """
+                INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
+                VALUES (?, 'Phone', ?, ?, 'Unknown', ?, ?)
+                """,
+                (target_person_id, label, number, json.dumps(note_meta), ""),
+            )
+
+    def ensure_property_network_relationship(subject_id, related_id, relationship_type, note):
+        if not subject_id or not related_id or int(subject_id) == int(related_id):
+            return False
+        clean_type = (relationship_type or "Relative").strip() or "Relative"
+        existing = db.execute(
+            """
+            SELECT id FROM person_relationships
+            WHERE subject_person_id = ? AND related_person_id = ?
+              AND lower(relationship_type) = lower(?)
+            LIMIT 1
+            """,
+            (subject_id, related_id, clean_type),
+        ).fetchone()
+        if existing:
+            return False
+        db.execute(
+            """
+            INSERT INTO person_relationships (subject_person_id, related_person_id, relationship_type, note)
+            VALUES (?, ?, ?, ?)
+            """,
+            (subject_id, related_id, clean_type, note),
+        )
+        return True
+
+    for idx, owner_entry in enumerate(property_payload.get("owners") or []):
+        person_payload = owner_entry.get("person") or {}
+        first, middle, last, full_name = payload_name_parts(person_payload)
         if not (first and last):
             continue
         owner_person_id = find_or_create_person_by_name_parts(
@@ -6371,46 +6474,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                 f"Owner imported with normalized name mapping: '{full_name}' -> first='{first}', last='{last}'.",
                 {"full_name": full_name, "first_name": first, "last_name": last, "property_id": property_id},
             )
-        rel_age = person_payload.get("age")
-        rel_deceased_raw = person_payload.get("deceased")
-        rel_deceased = bool(rel_deceased_raw) if rel_deceased_raw is not None else False
-        rel_dob_my = (person_payload.get("date_of_birth_month_year") or "").strip()
-        rel_birth_year = rel_dob_my.split("-")[-1].strip() if rel_dob_my and "-" in rel_dob_my else ""
-        db.execute(
-            """
-            UPDATE people
-            SET age = COALESCE(?, age),
-                deceased = ?,
-                birth_year = COALESCE(NULLIF(?, ''), birth_year)
-            WHERE id = ?
-            """,
-            (rel_age, 1 if rel_deceased else 0, rel_birth_year, owner_person_id),
-        )
-
-        # Persist owner addresses from property payload into person_addresses.
-        for addr_payload in person_payload.get("addresses") or []:
-            us = addr_payload.get("us_address") or {}
-            street = (us.get("street") or "").strip()
-            city = (us.get("city") or "").strip()
-            state = (us.get("state") or "").strip()
-            zipcode = (us.get("zipcode") or "").strip()
-            if not (street and city and state and zipcode):
-                continue
-            addr_metadata = _address_metadata_from_skipsherpa_payload(addr_payload)
-            ensure_person_address_link(
-                db,
-                owner_person_id,
-                street,
-                city,
-                state,
-                zipcode,
-                label="SkipSherpa Owner Address",
-                set_default=False,
-                is_verified_deliverable=addr_metadata["is_verified_deliverable"],
-                is_vacant=addr_metadata["is_vacant"],
-                attom_last_sold_date=addr_metadata["attom_last_sold_date"],
-                attom_last_sold_price=addr_metadata["attom_last_sold_price"],
-            )
+        update_person_from_skipsherpa_payload(owner_person_id, person_payload)
 
         # Rule: when the property lookup returns a golden tax mailing address, use that as the default
         # mailing address for every returned owner and co-owner on the property.
@@ -6427,41 +6491,13 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
             )
 
         # Persist owner emails/phones into touchpoints so mail/SMS workflows can use person data directly.
-        for em in person_payload.get("emails") or []:
-            if isinstance(em, dict):
-                email = (em.get("email_address") or "").strip()
-            else:
-                email = str(em or "").strip()
-            if not email:
-                continue
-            upsert_email_touchpoint_and_queue_validation(
-                db,
-                owner_person_id,
-                email,
-                note="Imported from SkipSherpa property owner payload",
-                source="skipsherpa_property_owner",
-            )
-
-        for ph in person_payload.get("phone_numbers") or []:
-            number = (ph.get("e164_format") or ph.get("local_format") or "").strip()
-            if not number or touchpoint_exists(db, owner_person_id, "Phone", number):
-                continue
-            ptype = (ph.get("type") or "").strip().lower()
-            label = {"mobile": "Mobile", "landline": "Landline", "voip": "VoIP"}.get(ptype, "Unknown")
-            note_meta = _build_skipsherpa_phone_touchpoint_note(ph)
-            db.execute(
-                """
-                INSERT INTO touchpoints (person_id, channel_type, channel_label, value, status, note, last_attempted)
-                VALUES (?, 'Phone', ?, ?, 'Unknown', ?, ?)
-                """,
-                (
-                    owner_person_id,
-                    label,
-                    number,
-                    json.dumps(note_meta),
-                    "",
-                ),
-            )
+        import_person_payload_contacts(
+            owner_person_id,
+            person_payload,
+            email_note="Imported from SkipSherpa property owner payload",
+            email_source="skipsherpa_property_owner",
+            address_label="SkipSherpa Owner Address",
+        )
 
         if primary_owner_id is None:
             db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (owner_person_id, property_id))
@@ -6491,6 +6527,73 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                 )
                 co_owner_links += 1
         owners_created += 1
+        processed_contact_person_ids.add(int(owner_person_id))
+
+        for rel_payload in person_payload.get("relatives") or []:
+            if not isinstance(rel_payload, dict):
+                continue
+            rel_first, rel_middle, rel_last, rel_full_name = payload_name_parts(rel_payload)
+            if not (rel_first and rel_last):
+                continue
+            rel_person_id = find_or_create_person_by_name_parts(
+                db,
+                rel_first,
+                rel_last,
+                notes=f"Imported from SkipSherpa property relative for property {property_id}",
+            )
+            processed_contact_person_ids.add(int(rel_person_id))
+            update_person_from_skipsherpa_payload(rel_person_id, rel_payload)
+            import_person_payload_contacts(
+                rel_person_id,
+                rel_payload,
+                email_note="Imported from SkipSherpa property relative payload",
+                email_source="skipsherpa_property_relative",
+                address_label="SkipSherpa Relative Address",
+            )
+            cleanup_person_contact_and_relationship_duplicates(db, rel_person_id)
+            relation_type = (rel_payload.get("relation_type") or "Relative").strip() or "Relative"
+            owner_label = full_name or " ".join(x for x in [first, middle, last] if x).strip() or f"person {owner_person_id}"
+            relationship_note = (
+                f"Imported from SkipSherpa property relative payload; returned as {relation_type} "
+                f"of {owner_label} for property {property_id}."
+            )
+            created_primary_rel = ensure_property_network_relationship(
+                primary_owner_id,
+                rel_person_id,
+                relation_type,
+                relationship_note,
+            )
+            if owner_person_id != primary_owner_id:
+                ensure_property_network_relationship(
+                    owner_person_id,
+                    rel_person_id,
+                    relation_type,
+                    relationship_note,
+                )
+            if created_primary_rel:
+                relatives_created += 1
+            if not (rel_payload.get("deceased") is True):
+                db.execute(
+                    """
+                    UPDATE people
+                    SET outreach_status = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM touchpoints
+                            WHERE person_id = ? AND lower(channel_type) IN ('phone', 'email')
+                        ) THEN 'Skipped'
+                        ELSE 'Not Skipped'
+                    END
+                    WHERE id = ?
+                    """,
+                    (rel_person_id, rel_person_id),
+                )
+            add_person_note(
+                db,
+                rel_person_id,
+                "SkipSherpa Property",
+                f"Property skip trace connected this person to Property {property_id} as {relation_type} of {owner_label}.",
+                {"source_owner_person_id": owner_person_id, "property_id": property_id, "payload": rel_payload},
+            )
 
     db.execute(
         """
@@ -6501,13 +6604,14 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
             property_id,
             primary_owner_id,
             "Skip Trace Property",
-            f"Owners processed: {owners_created}, Co-owner links: {co_owner_links}",
+            f"Owners processed: {owners_created}, Co-owner links: {co_owner_links}, Relatives connected: {relatives_created}",
             json.dumps(lookup_pkg),
         ),
     )
+    contact_person_ids_for_sync = sorted(processed_contact_person_ids or processed_owner_ids or ([primary_owner_id] if primary_owner_id else []))
     sync_phone_items, sync_email_items = collect_person_contact_items_for_reisift_sync(
         db,
-        sorted(processed_owner_ids or ([primary_owner_id] if primary_owner_id else [])),
+        contact_person_ids_for_sync,
         property_id=property_id,
     )
     skiptrace_sync = sync_skiptrace_contacts_to_reisift_owner(
@@ -6526,6 +6630,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
                 "summary": {
                     "owners_processed": owners_created,
                     "co_owner_links": co_owner_links,
+                    "relatives_connected": relatives_created,
                     "attom_last_sold_date": last_sold_date,
                     "attom_last_sold_price": last_sold_price,
                     "reisift_contact_sync": skiptrace_sync,
@@ -6538,6 +6643,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
     return {
         "owners_processed": owners_created,
         "co_owner_links": co_owner_links,
+        "relatives_connected": relatives_created,
         "attom_last_sold_date": last_sold_date,
         "attom_last_sold_price": last_sold_price,
         "reisift_contact_sync": skiptrace_sync,

@@ -38,7 +38,7 @@
                 </select>
             </label>
             <button type="submit">Apply</button>
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.completeness or filters.owner_type or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.lists or filters.completeness or filters.owner_type or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>From
@@ -60,6 +60,13 @@
                             <option value="">All</option>
                             {% for county in filter_options.counties %}
                             <option value="{{ county }}" {% if filters.county == county %}selected{% endif %}>{{ county }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>ReiSIFT Lists
+                        <select name="lists" multiple size="6">
+                            {% for list_name in filter_options.lists %}
+                            <option value="{{ list_name }}" {% if list_name in filters.lists %}selected{% endif %}>{{ list_name }}</option>
                             {% endfor %}
                         </select>
                     </label>
@@ -113,6 +120,9 @@
             <input type="hidden" name="date_to" value="{{ filters.date_to }}">
             <input type="hidden" name="status" value="{{ filters.status }}">
             <input type="hidden" name="county" value="{{ filters.county }}">
+            {% for list_name in filters.lists %}
+            <input type="hidden" name="lists" value="{{ list_name }}">
+            {% endfor %}
             <input type="hidden" name="completeness" value="{{ filters.completeness }}">
             <input type="hidden" name="owner_type" value="{{ filters.owner_type }}">
             <input type="hidden" name="rei_skipped" value="{{ filters.rei_skipped }}">

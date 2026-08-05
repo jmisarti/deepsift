@@ -30245,6 +30245,10 @@ def _new_record_completeness(payload):
     return normalize_whitespace(payload.get("type") if isinstance(payload, dict) else "")
 
 
+def _new_record_list_names(payload):
+    return extract_property_list_names(payload)
+
+
 def _new_record_yes_no_filter_value(value):
     text = normalize_whitespace(value).lower()
     if text in {"yes", "true", "1", "y"}:
@@ -30406,6 +30410,13 @@ def _new_record_matches_filters(row, filters):
     if owner_type_filter and normalize_whitespace(row.get("owner_type") or "").lower() != owner_type_filter:
         return False
 
+    selected_lists = filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")
+    selected_list_keys = {normalize_whitespace(item).lower() for item in selected_lists if normalize_whitespace(item)}
+    if selected_list_keys:
+        row_list_keys = {normalize_whitespace(item).lower() for item in (row.get("property_list_names") or []) if normalize_whitespace(item)}
+        if not row_list_keys.intersection(selected_list_keys):
+            return False
+
     for filter_key, row_key in [
         ("rei_skipped", "rei_skipped"),
         ("deep_skipped", "deep_skipped"),
@@ -30441,7 +30452,16 @@ def get_new_record_filter_options(db):
     counties = sorted(county_values)
     completeness = sorted({value for value in (_new_record_completeness(payload) for payload in payloads) if value})
     owner_types = sorted({value for value in (_new_record_owner_type(payload) for payload in payloads) if value})
-    return {"statuses": statuses, "counties": counties, "completeness": completeness, "owner_types": owner_types}
+    lists = sorted(
+        {
+            list_name
+            for payload in payloads
+            for list_name in _new_record_list_names(payload)
+            if normalize_whitespace(list_name)
+        },
+        key=lambda value: value.lower(),
+    )
+    return {"statuses": statuses, "counties": counties, "completeness": completeness, "owner_types": owner_types, "lists": lists}
 
 
 def _new_record_call_direction_from_job(db, row):
@@ -30559,6 +30579,232 @@ def property_activity_counts_for_new_record(db, property_id, new_record_row=None
     }
 
 
+def _new_record_default_activity_counts(row):
+    nr = row if isinstance(row, dict) else {}
+    return {
+        "mail_out": 0,
+        "call_out": int(nr.get("outbound_calls") or 0),
+        "call_in": int(nr.get("inbound_calls") or 0),
+        "sms_out": int(nr.get("outbound_sms") or 0),
+        "sms_in": int(nr.get("inbound_sms") or 0),
+        "email_out": int(nr.get("outbound_email") or 0),
+        "email_in": int(nr.get("inbound_email") or 0),
+        "emails_opened": 0,
+    }
+
+
+def iter_query_chunks(values, chunk_size=900):
+    items = list(values or [])
+    for index in range(0, len(items), max(1, int(chunk_size or 900))):
+        yield items[index:index + chunk_size]
+
+
+def bulk_property_activity_counts_for_new_records(db, rows):
+    items = [row for row in rows if isinstance(row, dict)]
+    counts = {}
+    property_ids = []
+    for item in items:
+        counts[id(item)] = _new_record_default_activity_counts(item)
+        try:
+            property_id = int(item.get("deep_dive_property_id") or item.get("local_property_id") or 0)
+        except Exception:
+            property_id = 0
+        if property_id > 0:
+            item["_activity_property_id"] = property_id
+            property_ids.append(property_id)
+    property_ids = sorted(set(property_ids))
+    if not property_ids:
+        return counts
+    comm_by_property = {}
+    mail_by_property = {}
+    call_rows = []
+    for chunk in iter_query_chunks(property_ids):
+        placeholders = ",".join(["?"] * len(chunk))
+        for row in db.execute(
+            f"""
+            SELECT property_id,
+                   SUM(CASE WHEN upper(channel)='SMS' AND lower(direction)='outbound' THEN 1 ELSE 0 END) AS sms_out,
+                   SUM(CASE WHEN upper(channel)='SMS' AND lower(direction)='inbound' THEN 1 ELSE 0 END) AS sms_in,
+                   SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='outbound' THEN 1 ELSE 0 END) AS email_out,
+                   SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='inbound' THEN 1 ELSE 0 END) AS email_in,
+                   SUM(CASE WHEN upper(channel)='EMAIL' AND lower(direction)='outbound' AND COALESCE(open_count, 0) > 0 THEN 1 ELSE 0 END) AS emails_opened
+            FROM communications
+            WHERE property_id IN ({placeholders})
+            GROUP BY property_id
+            """,
+            tuple(chunk),
+        ).fetchall():
+            comm_by_property[int(row["property_id"])] = row
+        for row in db.execute(
+            f"""
+            SELECT property_id, COUNT(*) AS mail_out
+            FROM mail_orders
+            WHERE property_id IN ({placeholders})
+            GROUP BY property_id
+            """,
+            tuple(chunk),
+        ).fetchall():
+            mail_by_property[int(row["property_id"])] = int(row["mail_out"] or 0)
+        call_rows.extend(
+            db.execute(
+                f"""
+                SELECT *
+                FROM call_recording_jobs
+                WHERE property_id IN ({placeholders})
+                """,
+                tuple(chunk),
+            ).fetchall()
+        )
+    call_by_property = {property_id: {"call_out": 0, "call_in": 0, "_seen": set()} for property_id in property_ids}
+    for row in call_rows:
+        property_id = int(row["property_id"] or 0)
+        if property_id <= 0:
+            continue
+        bucket = call_by_property.setdefault(property_id, {"call_out": 0, "call_in": 0, "_seen": set()})
+        dedupe_key = row["call_sid"] or f"{row['id']}:{row['from_number']}:{row['to_number']}"
+        if dedupe_key in bucket["_seen"]:
+            continue
+        bucket["_seen"].add(dedupe_key)
+        direction = _new_record_call_direction_from_job(db, row)
+        if direction == "inbound":
+            bucket["call_in"] += 1
+        elif direction == "outbound":
+            bucket["call_out"] += 1
+
+    for item in items:
+        property_id = int(item.get("_activity_property_id") or 0)
+        if property_id <= 0:
+            continue
+        target = counts[id(item)]
+        comm = comm_by_property.get(property_id)
+        calls = call_by_property.get(property_id) or {}
+        target["mail_out"] = int(mail_by_property.get(property_id, 0) or 0)
+        target["call_out"] = max(int(calls.get("call_out") or 0), int(item.get("outbound_calls") or 0))
+        target["call_in"] = max(int(calls.get("call_in") or 0), int(item.get("inbound_calls") or 0))
+        target["sms_out"] = max(int((comm["sms_out"] if comm else 0) or 0), int(item.get("outbound_sms") or 0))
+        target["sms_in"] = max(int((comm["sms_in"] if comm else 0) or 0), int(item.get("inbound_sms") or 0))
+        target["email_out"] = max(int((comm["email_out"] if comm else 0) or 0), int(item.get("outbound_email") or 0))
+        target["email_in"] = max(int((comm["email_in"] if comm else 0) or 0), int(item.get("inbound_email") or 0))
+        target["emails_opened"] = int((comm["emails_opened"] if comm else 0) or 0)
+        item.pop("_activity_property_id", None)
+    return counts
+
+
+def bulk_new_record_local_contact_flags(db, property_ids):
+    clean_property_ids = set()
+    for pid in property_ids:
+        try:
+            clean_pid = int(pid or 0)
+        except Exception:
+            clean_pid = 0
+        if clean_pid > 0:
+            clean_property_ids.add(clean_pid)
+    property_ids = sorted(clean_property_ids)
+    defaults = {property_id: {"deep_skipped": 0, "no_good_numbers": 0} for property_id in property_ids}
+    if not property_ids:
+        return defaults
+
+    deep_skipped_properties = set()
+    property_rows = []
+    for chunk in iter_query_chunks(property_ids):
+        placeholders = ",".join(["?"] * len(chunk))
+        for row in db.execute(
+            f"SELECT DISTINCT property_id FROM skiptrace_runs WHERE property_id IN ({placeholders})",
+            tuple(chunk),
+        ).fetchall():
+            deep_skipped_properties.add(int(row["property_id"]))
+        for row in db.execute(
+            f"""
+            SELECT DISTINCT property_id
+            FROM activity_log
+            WHERE property_id IN ({placeholders})
+              AND lower(COALESCE(activity_type, '')) LIKE '%skip trace%'
+            """,
+            tuple(chunk),
+        ).fetchall():
+            deep_skipped_properties.add(int(row["property_id"]))
+        property_rows.extend(
+            db.execute(
+                f"""
+                SELECT id, owner_person_id, resident_person_id
+                FROM properties
+                WHERE id IN ({placeholders})
+                """,
+                tuple(chunk),
+            ).fetchall()
+        )
+    base_by_property = {}
+    all_base_ids = set()
+    for row in property_rows:
+        base_ids = {int(pid) for pid in [row["owner_person_id"], row["resident_person_id"]] if pid is not None}
+        base_by_property[int(row["id"])] = base_ids
+        all_base_ids.update(base_ids)
+
+    network_by_property = {property_id: set(base_by_property.get(property_id, set())) for property_id in property_ids}
+    if all_base_ids:
+        relationship_rows = []
+        for chunk in iter_query_chunks(sorted(all_base_ids), chunk_size=450):
+            base_placeholders = ",".join(["?"] * len(chunk))
+            relationship_rows.extend(
+                db.execute(
+                    f"""
+                    SELECT subject_person_id, related_person_id
+                    FROM person_relationships
+                    WHERE subject_person_id IN ({base_placeholders}) OR related_person_id IN ({base_placeholders})
+                    """,
+                    tuple(chunk) + tuple(chunk),
+                ).fetchall()
+            )
+        for property_id, base_ids in base_by_property.items():
+            if not base_ids:
+                continue
+            for rel in relationship_rows:
+                subject_id = int(rel["subject_person_id"])
+                related_id = int(rel["related_person_id"])
+                if subject_id in base_ids or related_id in base_ids:
+                    network_by_property.setdefault(property_id, set()).update([subject_id, related_id])
+
+    all_network_ids = sorted({pid for ids in network_by_property.values() for pid in ids})
+    skipped_person_ids = set()
+    phone_statuses_by_person = {}
+    if all_network_ids:
+        for chunk in iter_query_chunks(all_network_ids):
+            network_placeholders = ",".join(["?"] * len(chunk))
+            for row in db.execute(
+                f"""
+                SELECT DISTINCT person_id
+                FROM person_notes
+                WHERE person_id IN ({network_placeholders})
+                  AND (
+                      lower(COALESCE(source, '')) LIKE 'skipsherpa%'
+                      OR lower(COALESCE(note_body, '')) LIKE '%skip trace completed%'
+                  )
+                """,
+                tuple(chunk),
+            ).fetchall():
+                skipped_person_ids.add(int(row["person_id"]))
+            for row in db.execute(
+                f"""
+                SELECT person_id, status
+                FROM touchpoints
+                WHERE person_id IN ({network_placeholders})
+                  AND lower(channel_type) = 'phone'
+                """,
+                tuple(chunk),
+            ).fetchall():
+                phone_statuses_by_person.setdefault(int(row["person_id"]), []).append(row["status"] or "")
+
+    for property_id in property_ids:
+        network_ids = network_by_property.get(property_id, set())
+        deep_skipped = property_id in deep_skipped_properties or bool(network_ids.intersection(skipped_person_ids))
+        statuses = []
+        for person_id in network_ids:
+            statuses.extend(phone_statuses_by_person.get(person_id, []))
+        no_good_numbers = bool(statuses) and all(_new_record_is_bad_phone_status(status) for status in statuses)
+        defaults[property_id] = {"deep_skipped": 1 if deep_skipped else 0, "no_good_numbers": 1 if no_good_numbers else 0}
+    return defaults
+
+
 def get_cached_new_records(db, sort_dir="desc", filters=None):
     sort_reverse = str(sort_dir).lower() != "asc"
     rows = db.execute(
@@ -30571,7 +30817,8 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
         WHERE n.is_active = 1
         """
     ).fetchall()
-    out = []
+    candidates = []
+    local_property_ids = []
     for row in rows:
         item = dict(row)
         payload = _new_record_payload(item)
@@ -30584,17 +30831,36 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
         item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
         item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
         item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
+        item["county"] = infer_county_from_new_record_row(item)
+        item["property_list_names"] = _new_record_list_names(payload)
+        item["property_lists"] = ", ".join(item["property_list_names"])
         for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
             item[flag_key] = 1 if int(item.get(flag_key) or 0) else 0
         live_property_id = item.get("deep_dive_property_id") or item.get("local_property_id")
-        live_flags = compute_new_record_contact_flags(db, live_property_id, payload)
-        item["rei_skipped"] = 1 if (item["rei_skipped"] or live_flags["rei_skipped"]) else 0
-        item["deep_skipped"] = 1 if live_flags["deep_skipped"] else 0
-        item["no_good_numbers"] = 1 if live_flags["no_good_numbers"] else 0
-        item.update(property_activity_counts_for_new_record(db, item.get("deep_dive_property_id"), item))
+        try:
+            live_property_id = int(live_property_id or 0)
+        except Exception:
+            live_property_id = 0
+        item["_live_property_id"] = live_property_id
+        if live_property_id > 0:
+            local_property_ids.append(live_property_id)
+        candidates.append((item, payload))
+
+    live_flags_by_property = bulk_new_record_local_contact_flags(db, local_property_ids)
+    out = []
+    for item, payload in candidates:
+        live_flags = live_flags_by_property.get(int(item.get("_live_property_id") or 0), {})
+        item["rei_skipped"] = 1 if (item["rei_skipped"] or _new_record_has_reisift_skiptrace(payload)) else 0
+        item["deep_skipped"] = 1 if live_flags.get("deep_skipped") else item["deep_skipped"]
+        item["no_good_numbers"] = 1 if live_flags.get("no_good_numbers") else item["no_good_numbers"]
         if not _new_record_matches_filters(item, filters):
             continue
         out.append(item)
+
+    activity_counts = bulk_property_activity_counts_for_new_records(db, out)
+    for item in out:
+        item.update(activity_counts.get(id(item), _new_record_default_activity_counts(item)))
+        item.pop("_live_property_id", None)
 
     out.sort(key=_new_record_row_date, reverse=sort_reverse)
     return out
@@ -30774,20 +31040,23 @@ def apply_referral_source_override(payload, override):
     return merged
 
 
-def extract_property_lists(payload):
+def extract_property_list_names(payload):
     lists = payload.get("lists") if isinstance(payload, dict) else []
     if not isinstance(lists, list):
-        return ""
+        return []
     names = []
     for item in lists:
         if isinstance(item, dict):
-            val = (item.get("title") or item.get("name") or "").strip()
+            val = (item.get("title") or item.get("name") or item.get("label") or item.get("id") or "").strip()
         else:
             val = str(item or "").strip()
         if val:
             names.append(val)
-    dedup = list(dict.fromkeys(names))
-    return ", ".join(dedup)
+    return list(dict.fromkeys(names))
+
+
+def extract_property_lists(payload):
+    return ", ".join(extract_property_list_names(payload))
 
 
 def _reisift_owner_name_parts(owner):
@@ -36947,6 +37216,7 @@ def new_records_page():
         "date_to": (request.args.get("date_to") or "").strip(),
         "status": (request.args.get("status") or "").strip(),
         "county": (request.args.get("county") or "").strip(),
+        "lists": [normalize_whitespace(item) for item in request.args.getlist("lists") if normalize_whitespace(item)],
         "completeness": (request.args.get("completeness") or "").strip(),
         "owner_type": (request.args.get("owner_type") or "").strip(),
         "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
@@ -36977,7 +37247,6 @@ def new_records_page():
         filter_options=filter_options,
         auto_refresh=(request.args.get("refresh") or "0") == "1",
         status_slug=REISIFT_NEW_RECORDS_STATUS,
-        target_counties=target_new_record_counties(),
         target_list_ids_count=len(REISIFT_NEW_RECORDS_LIST_IDS),
         target_zip5_count=len(REISIFT_NEW_RECORDS_ZIP5),
         excluded_statuses_count=len(REISIFT_NEW_RECORDS_EXCLUDED_STATUSES),
@@ -37005,6 +37274,7 @@ def new_records_refresh():
         "date_to": (request.form.get("date_to") or request.args.get("date_to") or "").strip(),
         "status": (request.form.get("status") or request.args.get("status") or "").strip(),
         "county": (request.form.get("county") or request.args.get("county") or "").strip(),
+        "lists": [normalize_whitespace(item) for item in (request.form.getlist("lists") or request.args.getlist("lists")) if normalize_whitespace(item)],
         "completeness": (request.form.get("completeness") or request.args.get("completeness") or "").strip(),
         "owner_type": (request.form.get("owner_type") or request.args.get("owner_type") or "").strip(),
         "rei_skipped": (request.form.get("rei_skipped") or request.args.get("rei_skipped") or "").strip(),

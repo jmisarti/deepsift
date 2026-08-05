@@ -26708,10 +26708,9 @@ def build_reisift_new_records_search_query():
         "any_zip5": list(REISIFT_NEW_RECORDS_ZIP5),
         "any_property_status": [REISIFT_NEW_RECORDS_STATUS],
     }
-    query = {"must": must_query}
     if REISIFT_NEW_RECORDS_EXCLUDED_STATUSES:
-        query["must_not"] = {"any_property_status": list(REISIFT_NEW_RECORDS_EXCLUDED_STATUSES)}
-    return query
+        must_query["must_not"] = {"any_property_status": list(REISIFT_NEW_RECORDS_EXCLUDED_STATUSES)}
+    return {"must": must_query}
 
 
 def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering="-list_count"):
@@ -26752,7 +26751,7 @@ def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering=
         }
         response = _post_search(body)
         payload = response.json()
-        page_rows = payload.get("results") or []
+        page_rows = payload.get("results") or payload.get("data") or []
         total = int(payload.get("count") or total or len(page_rows))
         if not page_rows:
             break
@@ -26997,6 +26996,15 @@ def extract_reisift_property_address(payload):
         city = normalize_whitespace(candidate.get("city") or "")
         state = normalize_state_code(candidate.get("state") or "")
         postal_code = normalize_postal_code(candidate.get("postal_code") or "")
+        if full_address and (not street or not city or not state or not postal_code):
+            try:
+                parsed = parse_freeform_property_address(full_address)
+                street = street or parsed.get("street") or ""
+                city = city or parsed.get("city") or ""
+                state = state or parsed.get("state") or ""
+                postal_code = postal_code or parsed.get("postal_code") or ""
+            except Exception:
+                pass
         if full_address or street or city:
             return {
                 "full_address": full_address,
@@ -28261,6 +28269,9 @@ def reisift_added_at_dt(search_row, detail_payload):
     lp_dt = latest_lp_tag_datetime(search_row, detail_payload)
     if lp_dt is not None:
         return lp_dt
+    upload_dt = latest_reisift_upload_date_datetime(search_row, detail_payload)
+    if upload_dt is not None:
+        return upload_dt
     candidates = []
     if isinstance(search_row, dict):
         candidates.extend([search_row.get("created"), search_row.get("created_at")])
@@ -28290,6 +28301,73 @@ def iter_lp_tag_candidate_strings(value, depth=0):
                 yield from iter_lp_tag_candidate_strings(item, depth + 1)
             elif isinstance(item, (dict, list)):
                 yield from iter_lp_tag_candidate_strings(item, depth + 1)
+
+
+def parse_reisift_date_value(value):
+    if value in (None, ""):
+        return None
+    parsed = parse_iso_datetime(value) or parse_flexible_datetime(value)
+    if parsed is not None:
+        return parsed
+    text = normalize_whitespace(value)
+    for pattern in [
+        r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b",
+        r"\b(\d{1,2}-\d{1,2}-\d{2,4})\b",
+        r"\b(\d{4}-\d{1,2}-\d{1,2})\b",
+    ]:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        candidate = match.group(1)
+        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(candidate, fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def iter_upload_date_candidate_values(value, depth=0):
+    if depth > 7:
+        return
+    if isinstance(value, str):
+        if re.search(r"\bupload\s+date\b|\bdate\s+uploaded\b", value, flags=re.IGNORECASE):
+            yield value
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from iter_upload_date_candidate_values(item, depth + 1)
+        return
+    if isinstance(value, dict):
+        label_text = normalize_whitespace(
+            value.get("label")
+            or value.get("name")
+            or value.get("title")
+            or value.get("key")
+            or value.get("field")
+            or ""
+        )
+        if re.search(r"\bupload\s+date\b|\bdate\s+uploaded\b|^upload_date$", label_text, flags=re.IGNORECASE):
+            for value_key in ["value", "date", "text", "display_value", "field_value"]:
+                if value_key in value:
+                    yield value.get(value_key)
+        for key, item in value.items():
+            key_text = normalize_whitespace(key)
+            if re.search(r"\bupload\s+date\b|\bdate\s+uploaded\b|^upload_date$|^uploaded_at$", key_text, flags=re.IGNORECASE):
+                yield item
+            yield from iter_upload_date_candidate_values(item, depth + 1)
+
+
+def latest_reisift_upload_date_datetime(*payloads):
+    dates = []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for value in iter_upload_date_candidate_values(payload):
+            parsed = parse_reisift_date_value(value)
+            if parsed is not None:
+                dates.append(parsed)
+    return max(dates) if dates else None
 
 
 def latest_lp_tag_datetime(*payloads):
@@ -30236,6 +30314,20 @@ def infer_county_from_new_record_row(row):
     return display_county_name(county_from_zip5(item.get("full_address") or ""))
 
 
+def infer_city_from_new_record_row(row):
+    item = row if isinstance(row, dict) else {}
+    payload = _new_record_payload(item)
+    address = extract_reisift_property_address(payload)
+    city = normalize_whitespace(address.get("city") or "")
+    if city:
+        return city
+    try:
+        parsed = parse_freeform_property_address(item.get("full_address") or "")
+        return normalize_whitespace(parsed.get("city") or "")
+    except Exception:
+        return ""
+
+
 def _new_record_owner_type(payload):
     owner = payload.get("owner") if isinstance(payload, dict) and isinstance(payload.get("owner"), dict) else {}
     return normalize_whitespace(owner.get("type") or "")
@@ -30402,6 +30494,10 @@ def _new_record_matches_filters(row, filters):
         if normalize_county_name(row_county or "") != county_filter:
             return False
 
+    city_filter = normalize_whitespace(filters.get("city") or "").lower()
+    if city_filter and normalize_whitespace(row.get("city") or infer_city_from_new_record_row(row)).lower() != city_filter:
+        return False
+
     completeness_filter = normalize_whitespace(filters.get("completeness") or "").lower()
     if completeness_filter and normalize_whitespace(row.get("completeness") or "").lower() != completeness_filter:
         return False
@@ -30450,6 +30546,12 @@ def get_new_record_filter_options(db):
         if county:
             county_values.add(county)
     counties = sorted(county_values)
+    city_values = set()
+    for row in rows:
+        city = infer_city_from_new_record_row(dict(row))
+        if city:
+            city_values.add(city)
+    cities = sorted(city_values, key=lambda value: value.lower())
     completeness = sorted({value for value in (_new_record_completeness(payload) for payload in payloads) if value})
     owner_types = sorted({value for value in (_new_record_owner_type(payload) for payload in payloads) if value})
     lists = sorted(
@@ -30461,7 +30563,7 @@ def get_new_record_filter_options(db):
         },
         key=lambda value: value.lower(),
     )
-    return {"statuses": statuses, "counties": counties, "completeness": completeness, "owner_types": owner_types, "lists": lists}
+    return {"statuses": statuses, "counties": counties, "cities": cities, "completeness": completeness, "owner_types": owner_types, "lists": lists}
 
 
 def _new_record_call_direction_from_job(db, row):
@@ -30822,9 +30924,9 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
     for row in rows:
         item = dict(row)
         payload = _new_record_payload(item)
-        lp_added_dt = latest_lp_tag_datetime(payload)
-        item["lp_added_at"] = format_db_time(lp_added_dt) if lp_added_dt else ""
-        if item["lp_added_at"]:
+        derived_added_dt = latest_lp_tag_datetime(payload) or latest_reisift_upload_date_datetime(payload)
+        item["lp_added_at"] = format_db_time(derived_added_dt) if derived_added_dt else ""
+        if item["lp_added_at"] or not item.get("added_at"):
             item["added_at"] = item["lp_added_at"]
         item["completeness"] = _new_record_completeness(payload)
         item["owner_type"] = _new_record_owner_type(payload)
@@ -30832,6 +30934,7 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
         item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
         item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
         item["county"] = infer_county_from_new_record_row(item)
+        item["city"] = infer_city_from_new_record_row(item)
         item["property_list_names"] = _new_record_list_names(payload)
         item["property_lists"] = ", ".join(item["property_list_names"])
         for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
@@ -37216,6 +37319,7 @@ def new_records_page():
         "date_to": (request.args.get("date_to") or "").strip(),
         "status": (request.args.get("status") or "").strip(),
         "county": (request.args.get("county") or "").strip(),
+        "city": (request.args.get("city") or "").strip(),
         "lists": [normalize_whitespace(item) for item in request.args.getlist("lists") if normalize_whitespace(item)],
         "completeness": (request.args.get("completeness") or "").strip(),
         "owner_type": (request.args.get("owner_type") or "").strip(),
@@ -37274,6 +37378,7 @@ def new_records_refresh():
         "date_to": (request.form.get("date_to") or request.args.get("date_to") or "").strip(),
         "status": (request.form.get("status") or request.args.get("status") or "").strip(),
         "county": (request.form.get("county") or request.args.get("county") or "").strip(),
+        "city": (request.form.get("city") or request.args.get("city") or "").strip(),
         "lists": [normalize_whitespace(item) for item in (request.form.getlist("lists") or request.args.getlist("lists")) if normalize_whitespace(item)],
         "completeness": (request.form.get("completeness") or request.args.get("completeness") or "").strip(),
         "owner_type": (request.form.get("owner_type") or request.args.get("owner_type") or "").strip(),

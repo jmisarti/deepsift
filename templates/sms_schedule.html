@@ -39,6 +39,7 @@
                 <tr>
                     <th>Next Send</th>
                     <th>Status</th>
+                    <th>Step</th>
                     <th>Readiness</th>
                     <th>Property</th>
                     <th>Person</th>
@@ -53,6 +54,16 @@
                 <tr>
                     <td>{{ row.projected_send_at|fmt_est_datetime }}</td>
                     <td><span class="pill sms-status-{{ row.status|lower|replace(' ', '-') }}">{{ row.status }}</span></td>
+                    <td>
+                        {% if row.step_order and row.step_order > 1 %}
+                            Follow-up {{ row.step_order - 1 }}
+                        {% else %}
+                            Initial
+                        {% endif %}
+                        {% if row.sequence_name %}
+                        <div class="sms-queue-reason">{{ row.sequence_name }}</div>
+                        {% endif %}
+                    </td>
                     <td>{{ row.send_readiness }}</td>
                     <td>
                         <div>{{ row.property_address or '-' }}</div>
@@ -81,7 +92,7 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="9">No pending SMS queue items are currently scheduled or awaiting action.</td>
+                    <td colspan="10">No pending SMS queue items are currently scheduled or awaiting action.</td>
                 </tr>
                 {% endfor %}
             </tbody>

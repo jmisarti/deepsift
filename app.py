@@ -255,6 +255,7 @@ SMS_AUTOMATION_AUTO_SEND_BATCH_LIMIT = max(
     int((os.getenv("SMS_AUTOMATION_AUTO_SEND_BATCH_LIMIT") or "5").strip() or "5"),
     1,
 )
+SMS_AUTOMATION_FOLLOWUP_COUNT = max(int((os.getenv("SMS_AUTOMATION_FOLLOWUP_COUNT") or "3").strip() or "3"), 0)
 SMS_AUTOMATION_REISIFT_SENT_TAG = "AutoSMS:Sent"
 WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or "600").strip() or "600"), 60)
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
@@ -1805,6 +1806,7 @@ def migrate_db(db):
         """
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_email_validation_queue_due ON email_validation_queue(queue_status, run_after, id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_email_validation_queue_email ON email_validation_queue(email_value, queue_status, id)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS email_campaign_syncs (
@@ -6755,14 +6757,14 @@ def upsert_email_touchpoint_and_queue_validation(db, person_id, email_value, not
             """,
             (email, merged_note, touchpoint_id),
         )
-        queue_touchpoint_email_validation(
+        queue_id = queue_touchpoint_email_validation(
             db,
             touchpoint_id,
             person_id,
             email,
             source=source,
         )
-        return {"touchpoint_id": touchpoint_id, "created": False, "queued": True}
+        return {"touchpoint_id": touchpoint_id, "created": False, "queued": bool(queue_id)}
 
     cur = db.execute(
         """
@@ -6772,14 +6774,14 @@ def upsert_email_touchpoint_and_queue_validation(db, person_id, email_value, not
         (person_id, email, note or "", ""),
     )
     touchpoint_id = int(cur.lastrowid or 0)
-    queue_touchpoint_email_validation(
+    queue_id = queue_touchpoint_email_validation(
         db,
         touchpoint_id,
         person_id,
         email,
         source=source,
     )
-    return {"touchpoint_id": touchpoint_id, "created": True, "queued": True}
+    return {"touchpoint_id": touchpoint_id, "created": True, "queued": bool(queue_id)}
 
 
 def _touchpoint_key(channel_type, value):
@@ -10011,16 +10013,47 @@ def get_sms_automation_settings(db):
     }
 
 
-def select_sms_automation_from_number(db, bucket="", contact_role=""):
+def _ordered_sms_automation_from_numbers(settings, bucket="", contact_role="", seed=""):
+    numbers = list(settings.get("from_numbers") or [])
+    if not numbers:
+        return []
+    strategy = settings.get("number_strategy")
+    if len(numbers) == 1 or strategy == "default":
+        return numbers[:1]
+    if strategy == "by_bucket":
+        seed_text = bucket or contact_role or seed or datetime.now(EST_TZ).strftime("%Y-%m-%d")
+    else:
+        seed_text = seed or f"{bucket or ''}|{contact_role or ''}|{datetime.now(EST_TZ).strftime('%Y-%m-%d')}"
+    idx = int(hashlib.sha1(str(seed_text).encode("utf-8", errors="ignore")).hexdigest()[:8], 16) % len(numbers)
+    return numbers[idx:] + numbers[:idx]
+
+
+def select_sms_automation_from_number(db, bucket="", contact_role="", seed=""):
     settings = get_sms_automation_settings(db)
-    numbers = settings.get("from_numbers") or []
+    numbers = _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed)
     if not numbers:
         return get_deep_dive_sms_number(db)
-    if len(numbers) == 1 or settings.get("number_strategy") == "default":
-        return numbers[0]
-    seed = f"{bucket or ''}|{contact_role or ''}|{datetime.now(EST_TZ).strftime('%Y-%m-%d')}"
-    idx = int(hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:8], 16) % len(numbers)
-    return numbers[idx]
+    return numbers[0]
+
+
+def select_sms_automation_send_from_number(db, preferred_from_number="", bucket="", contact_role="", seed=""):
+    settings = get_sms_automation_settings(db)
+    if settings.get("number_strategy") == "default":
+        candidates = [normalize_phone(preferred_from_number) or select_sms_automation_from_number(db, bucket, contact_role, seed=seed)]
+    else:
+        candidates = _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed)
+        preferred = normalize_phone(preferred_from_number)
+        if preferred and preferred not in candidates:
+            candidates.append(preferred)
+    if not candidates:
+        candidates = [normalize_phone(get_deep_dive_sms_number(db))]
+    last_reason = ""
+    for candidate in [num for num in candidates if num]:
+        reason = _sms_automation_rate_limit_reason(db, candidate)
+        if not reason:
+            return candidate, ""
+        last_reason = reason
+    return (candidates[0] if candidates else ""), last_reason
 
 
 def get_email_settings(db):
@@ -14260,6 +14293,129 @@ def verify_email_with_emaillistverify(api_key, email_address):
     }
 
 
+def _touchpoint_status_from_email_validation_status(validation_status):
+    status = str(validation_status or "").strip().lower()
+    if status == "valid":
+        return "Valid"
+    if status in {"invalid", "undeliverable"}:
+        return "Undeliverable"
+    if status == "unknown":
+        return "Unknown"
+    return ""
+
+
+def _find_existing_email_validation_decision(db, email_value, exclude_touchpoint_id=0):
+    email_value = normalize_email_identity(email_value)
+    if not email_value:
+        return None
+    try:
+        exclude_touchpoint_id = int(exclude_touchpoint_id or 0)
+    except Exception:
+        exclude_touchpoint_id = 0
+    sync_row = db.execute(
+        """
+        SELECT sync_status, validation_status
+        FROM email_campaign_syncs
+        WHERE normalized_email = ?
+        LIMIT 1
+        """,
+        (email_value,),
+    ).fetchone()
+    if sync_row and _email_campaign_sync_success(sync_row["sync_status"]):
+        return {
+            "kind": "emailoctopus_synced",
+            "validation_status": sync_row["validation_status"] or "valid",
+            "touchpoint_status": "Valid",
+            "queue_status": "Skipped",
+        }
+    registry_row = db.execute(
+        """
+        SELECT status
+        FROM anonymous_email_campaign_registry
+        WHERE normalized_email = ?
+        LIMIT 1
+        """,
+        (email_value,),
+    ).fetchone()
+    if registry_row and str(registry_row["status"] or "").strip().lower() == "already_sent":
+        return {
+            "kind": "email_campaign_registry",
+            "validation_status": "already_sent",
+            "touchpoint_status": "",
+            "queue_status": "Skipped",
+        }
+    completed_row = db.execute(
+        """
+        SELECT validation_status, validation_raw, processed_at
+        FROM email_validation_queue
+        WHERE email_value = ?
+          AND touchpoint_id <> ?
+          AND lower(COALESCE(queue_status, '')) = 'completed'
+          AND lower(COALESCE(validation_status, '')) IN ('valid', 'invalid', 'unknown', 'undeliverable')
+        ORDER BY processed_at DESC, id DESC
+        LIMIT 1
+        """,
+        (email_value, exclude_touchpoint_id),
+    ).fetchone()
+    if completed_row:
+        validation_status = str(completed_row["validation_status"] or "").strip().lower()
+        return {
+            "kind": "prior_validation",
+            "validation_status": validation_status,
+            "validation_raw": completed_row["validation_raw"] or "",
+            "processed_at": completed_row["processed_at"] or "",
+            "touchpoint_status": _touchpoint_status_from_email_validation_status(validation_status),
+            "queue_status": "Completed",
+        }
+    active_row = db.execute(
+        """
+        SELECT id, queue_status
+        FROM email_validation_queue
+        WHERE email_value = ?
+          AND touchpoint_id <> ?
+          AND lower(COALESCE(queue_status, 'queued')) IN ('queued', 'retry')
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (email_value, exclude_touchpoint_id),
+    ).fetchone()
+    if active_row:
+        return {
+            "kind": "already_queued",
+            "validation_status": "already_queued",
+            "touchpoint_status": "",
+            "queue_status": "Skipped",
+            "queue_id": int(active_row["id"] or 0),
+        }
+    return None
+
+
+def _apply_email_validation_decision_to_touchpoint(db, touchpoint_id, email_value, decision):
+    status = str((decision or {}).get("touchpoint_status") or "").strip()
+    if not status:
+        return
+    row = db.execute(
+        "SELECT status, note FROM touchpoints WHERE id = ? LIMIT 1",
+        (int(touchpoint_id or 0),),
+    ).fetchone()
+    if not row:
+        return
+    note = append_note_line(
+        row["note"] or "",
+        f"Email validation reused from {decision.get('kind') or 'existing database record'}; no new EmailListVerify lookup was sent.",
+    )
+    db.execute(
+        """
+        UPDATE touchpoints
+        SET status = ?,
+            note = ?,
+            value = ?
+        WHERE id = ?
+        """,
+        (status, note, normalize_email_identity(email_value), int(touchpoint_id or 0)),
+    )
+
+
 def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value, source="skiptrace"):
     try:
         touchpoint_id = int(touchpoint_id or 0)
@@ -14279,6 +14435,8 @@ def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value,
     ).fetchone()
     now_stamp = format_db_time(datetime.utcnow())
     if existing:
+        if str(existing["queue_status"] or "").strip().lower() in {"completed", "skipped"}:
+            return int(existing["id"])
         db.execute(
             """
             UPDATE email_validation_queue
@@ -14297,6 +14455,23 @@ def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value,
             (person_id, email_value, (source or "skiptrace").strip() or "skiptrace", now_stamp, existing["id"]),
         )
         return int(existing["id"])
+    decision = _find_existing_email_validation_decision(db, email_value, exclude_touchpoint_id=touchpoint_id)
+    if decision:
+        _apply_email_validation_decision_to_touchpoint(db, touchpoint_id, email_value, decision)
+        if decision.get("kind") == "prior_validation" and str(decision.get("validation_status") or "").lower() == "valid":
+            sync_validated_email_to_emailoctopus(
+                db,
+                touchpoint_id,
+                person_id,
+                email_value,
+                source=source,
+                validation_status="valid",
+                validation_result={
+                    "source": "reused_existing_email_validation",
+                    "prior_processed_at": decision.get("processed_at") or "",
+                },
+            )
+        return None
     cur = db.execute(
         """
         INSERT INTO email_validation_queue (touchpoint_id, person_id, email_value, source, queue_status, run_after)
@@ -14407,6 +14582,82 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     """,
                     (touch_status_norm or "blocked", now_stamp, queue_id),
                 )
+                commit_with_retry(db)
+                continue
+            existing_decision = _find_existing_email_validation_decision(
+                db,
+                email_value,
+                exclude_touchpoint_id=touchpoint_id,
+            )
+            if existing_decision:
+                _apply_email_validation_decision_to_touchpoint(db, touchpoint_id, email_value, existing_decision)
+                decision_kind = str(existing_decision.get("kind") or "existing_email").strip()
+                reused_status = str(existing_decision.get("validation_status") or decision_kind or "existing_email").strip().lower()
+                if decision_kind == "prior_validation":
+                    if reused_status == "valid":
+                        sync_validated_email_to_emailoctopus(
+                            db,
+                            touchpoint_id,
+                            row["person_id"],
+                            email_value,
+                            source=row["source"] or "email_validation_queue",
+                            validation_status="valid",
+                            validation_result={
+                                "source": "reused_existing_email_validation",
+                                "prior_processed_at": existing_decision.get("processed_at") or "",
+                            },
+                        )
+                    db.execute(
+                        """
+                        UPDATE email_validation_queue
+                        SET queue_status = 'Completed',
+                            validation_status = ?,
+                            validation_raw = ?,
+                            processed_at = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (
+                            reused_status,
+                            existing_decision.get("validation_raw") or json.dumps(
+                                {
+                                    "source": "reused_existing_email_validation",
+                                    "prior_processed_at": existing_decision.get("processed_at") or "",
+                                },
+                                ensure_ascii=True,
+                                sort_keys=True,
+                            ),
+                            now_stamp,
+                            queue_id,
+                        ),
+                    )
+                    updated += 1
+                else:
+                    db.execute(
+                        """
+                        UPDATE email_validation_queue
+                        SET queue_status = 'Skipped',
+                            validation_status = ?,
+                            validation_raw = ?,
+                            processed_at = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (
+                            reused_status,
+                            json.dumps(
+                                {
+                                    "source": "skipped_existing_email_validation",
+                                    "decision": decision_kind,
+                                    "queue_id": existing_decision.get("queue_id") or None,
+                                },
+                                ensure_ascii=True,
+                                sort_keys=True,
+                            ),
+                            now_stamp,
+                            queue_id,
+                        ),
+                    )
                 commit_with_retry(db)
                 continue
             try:
@@ -31118,7 +31369,7 @@ def revalidate_sms_automation_queue(db, property_ids=None):
             params.extend(ids)
     rows = db.execute(
         f"""
-        SELECT id, property_id, touchpoint_id
+        SELECT id, property_id, person_id, touchpoint_id, phone_number, queue_key, step_order, created_at
         FROM sms_automation_queue
         WHERE {' AND '.join(clauses)}
         """,
@@ -31131,6 +31382,8 @@ def revalidate_sms_automation_queue(db, property_ids=None):
             reason = stale_reisift_new_record_touchpoint_reason(db, row["property_id"], row["touchpoint_id"])
         if not reason:
             reason = sms_automation_touchpoint_suppression_reason(db, row["touchpoint_id"])
+        if not reason:
+            reason = sms_automation_inbound_reply_suppression_reason(db, row)
         if reason:
             db.execute(
                 """
@@ -31309,7 +31562,7 @@ def suppress_duplicate_sms_automation_queue_items(db, property_ids=None):
     where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
     rows = db.execute(
         f"""
-        SELECT id, property_id, phone_number, status
+        SELECT id, property_id, phone_number, status, step_order
         FROM sms_automation_queue
         {where_sql}
         ORDER BY property_id ASC, id ASC
@@ -31321,7 +31574,8 @@ def suppress_duplicate_sms_automation_queue_items(db, property_ids=None):
         phone_norm = normalize_phone(row["phone_number"])
         if not phone_norm:
             continue
-        groups.setdefault((int(row["property_id"] or 0), phone_norm), []).append(dict(row))
+        step_order = int(row["step_order"] or 1)
+        groups.setdefault((int(row["property_id"] or 0), phone_norm, step_order), []).append(dict(row))
 
     suppressed = 0
     for items in groups.values():
@@ -31350,6 +31604,204 @@ def suppress_duplicate_sms_automation_queue_items(db, property_ids=None):
     return suppressed
 
 
+def _sms_automation_is_followup_row(row):
+    if not row:
+        return False
+    try:
+        if int(row["step_order"] or 1) > 1:
+            return True
+    except Exception:
+        pass
+    return ":fu:" in str(row["queue_key"] or "").lower()
+
+
+def _next_business_day_et(et_dt):
+    candidate = et_dt + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _sms_automation_followup_scheduled_at_utc(sent_dt_utc, business_days_after, settings):
+    base_utc = sent_dt_utc or datetime.utcnow()
+    if base_utc.tzinfo is None:
+        base_utc = base_utc.replace(tzinfo=timezone.utc)
+    current_et = base_utc.astimezone(EST_TZ)
+    for _ in range(max(1, int(business_days_after or 1))):
+        current_et = _next_business_day_et(current_et)
+    candidate_utc = current_et.astimezone(timezone.utc).replace(tzinfo=None)
+    return _sms_automation_adjust_to_send_window_utc(candidate_utc, settings)
+
+
+def _sms_followup_templates_for_role(contact_role):
+    role = str(contact_role or "").strip().lower()
+    if role == "relative":
+        return [
+            "Hi {first_name}, just following up. I'm trying to reach the right person for {property_address}. Would you know who handles it?",
+            "Hi {first_name}, checking back on {property_address}. If you're not the right person, who would be best to speak with?",
+            "Hi {first_name}, last quick follow-up from me on {property_address}. Should I close the loop here, or is there someone better to contact?",
+        ]
+    return [
+        "Hi {first_name}, just following up on {property_address}. Just trying to help...",
+        "Hi {first_name}, checking back on {property_address}. Available whenever you are!",
+        "Hey {first_name}, sorry for the double text. Not trying to be annoying. Just lmk if you need help in any way.",
+    ]
+
+
+def _sms_automation_followup_message(parent_row, step_order):
+    try:
+        step_index = max(0, int(step_order or 2) - 2)
+    except Exception:
+        step_index = 0
+    templates = _sms_followup_templates_for_role(parent_row["contact_role"] if parent_row else "")
+    template = templates[min(step_index, len(templates) - 1)]
+    variables = parse_json_object(parent_row["rendered_variables_json"] if parent_row else "", default={})
+    if not variables:
+        variables = {}
+    variables.setdefault("first_name", "there")
+    variables.setdefault("property_address", "")
+    message = render_sms_automation_template(template, variables)
+    return normalize_whitespace(message)
+
+
+def sms_automation_inbound_reply_suppression_reason(db, row):
+    if not _sms_automation_is_followup_row(row):
+        return ""
+    phone_norm = normalize_phone(row["phone_number"] if row else "")
+    if not phone_norm:
+        return ""
+    created_at = parse_db_time(row["created_at"] if row else "") or datetime.utcnow() - timedelta(days=30)
+    inbound = db.execute(
+        """
+        SELECT id, sent_at, created_at
+        FROM communications
+        WHERE property_id = ?
+          AND upper(channel) = 'SMS'
+          AND lower(direction) = 'inbound'
+          AND replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+          AND datetime(COALESCE(NULLIF(sent_at, ''), NULLIF(created_at, ''))) >= datetime(?)
+        ORDER BY datetime(COALESCE(NULLIF(sent_at, ''), NULLIF(created_at, ''))) DESC, id DESC
+        LIMIT 1
+        """,
+        (
+            int(row["property_id"] or 0),
+            f"%{phone_norm}",
+            format_db_time(created_at - timedelta(minutes=5)),
+        ),
+    ).fetchone()
+    if inbound:
+        return "Inbound SMS received from this phone; follow-up sequence stopped."
+    return ""
+
+
+def suppress_sms_automation_followups_for_reply(db, property_id, phone_number, person_id=None, communication_id=None):
+    phone_norm = normalize_phone(phone_number)
+    if not phone_norm:
+        return 0
+    clauses = [
+        "status IN ('Draft', 'Queued', 'Approved', 'Scheduled')",
+        "(COALESCE(step_order, 1) > 1 OR lower(COALESCE(queue_key, '')) LIKE '%:fu:%')",
+        "replace(replace(replace(replace(replace(COALESCE(phone_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?",
+    ]
+    params = [f"%{phone_norm}"]
+    if int(property_id or 0) > 0:
+        clauses.append("property_id = ?")
+        params.append(int(property_id or 0))
+    if int(person_id or 0) > 0:
+        clauses.append("(person_id = ? OR COALESCE(person_id, 0) = 0)")
+        params.append(int(person_id or 0))
+    reason = "Inbound SMS received from this phone; follow-up sequence stopped."
+    if communication_id:
+        reason += f" Communication #{communication_id}."
+    cur = db.execute(
+        f"""
+        UPDATE sms_automation_queue
+        SET status = 'Suppressed',
+            suppression_reason = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE {' AND '.join(clauses)}
+        """,
+        tuple([reason] + params),
+    )
+    return int(cur.rowcount or 0)
+
+
+def ensure_sms_automation_followups_for_sent_row(db, sent_row, communication_id=None, sent_at=None):
+    if SMS_AUTOMATION_FOLLOWUP_COUNT <= 0 or not sent_row:
+        return {"created": 0, "skipped": "disabled"}
+    if _sms_automation_is_followup_row(sent_row):
+        return {"created": 0, "skipped": "followup_row"}
+    if _sms_route_role(sent_row["contact_role"]) != "owner":
+        return {"created": 0, "skipped": "phase_1_owner_followups_only"}
+    try:
+        parent_id = int(sent_row["id"] or 0)
+        property_id = int(sent_row["property_id"] or 0)
+    except Exception:
+        return {"created": 0, "skipped": "invalid_parent"}
+    phone_norm = normalize_phone(sent_row["phone_number"])
+    if not parent_id or not property_id or not phone_norm:
+        return {"created": 0, "skipped": "missing_parent_data"}
+    reason = sms_automation_property_suppression_reason(db, property_id)
+    if not reason:
+        reason = sms_automation_touchpoint_suppression_reason(db, sent_row["touchpoint_id"])
+    if reason:
+        return {"created": 0, "skipped": reason}
+    reply_reason = sms_automation_inbound_reply_suppression_reason(db, sent_row)
+    if reply_reason:
+        return {"created": 0, "skipped": reply_reason}
+
+    settings = get_sms_automation_settings(db)
+    sent_dt = parse_db_time(sent_at or sent_row["sent_at"] or "") or datetime.utcnow()
+    created = 0
+    for followup_index in range(1, SMS_AUTOMATION_FOLLOWUP_COUNT + 1):
+        step_order = followup_index + 1
+        queue_key = f"{sent_row['queue_key']}:fu:{step_order}"
+        if db.execute("SELECT id FROM sms_automation_queue WHERE queue_key = ? LIMIT 1", (queue_key,)).fetchone():
+            continue
+        scheduled_for = _sms_automation_followup_scheduled_at_utc(sent_dt, followup_index, settings)
+        source_info = parse_json_object(sent_row["source_info_json"] or "", default={})
+        source_info["followup"] = {
+            "parent_queue_id": parent_id,
+            "parent_communication_id": communication_id or sent_row["communication_id"] or None,
+            "business_days_after_initial": followup_index,
+        }
+        message = _sms_automation_followup_message(sent_row, step_order)
+        from_number = select_sms_automation_from_number(
+            db,
+            bucket=sent_row["bucket"],
+            contact_role=sent_row["contact_role"],
+            seed=queue_key,
+        )
+        db.execute(
+            """
+            INSERT INTO sms_automation_queue
+                (queue_key, property_id, person_id, touchpoint_id, phone_number, from_number, contact_role,
+                 bucket, rule_key, sequence_name, step_order, message_body, rendered_variables_json,
+                 source_info_json, status, scheduled_for)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Scheduled', ?)
+            """,
+            (
+                queue_key,
+                property_id,
+                sent_row["person_id"],
+                sent_row["touchpoint_id"],
+                phone_norm,
+                from_number,
+                sent_row["contact_role"],
+                sent_row["bucket"],
+                sent_row["rule_key"],
+                sent_row["sequence_name"] or _sms_sequence_name(sent_row["bucket"], sent_row["contact_role"]),
+                step_order,
+                message,
+                sent_row["rendered_variables_json"] or "",
+                json.dumps(source_info, ensure_ascii=True, sort_keys=True),
+                format_db_time(scheduled_for),
+            ),
+        )
+        created += 1
+    return {"created": created}
+
+
 def upsert_sms_automation_draft(db, property_id, target, route, source_info, payload):
     prop = _sms_automation_property_row(db, property_id)
     if not prop:
@@ -31374,7 +31826,7 @@ def upsert_sms_automation_draft(db, property_id, target, route, source_info, pay
     phone_norm = target.get("phone_norm") or normalize_phone(row["value"])
     rule_key = route.get("rule_key") or f"{re.sub(r'[^a-z0-9]+', '_', (bucket or 'general').lower()).strip('_')}:{'relative' if contact_role.lower() not in {'owner', 'co-owner', 'co owner'} else 'owner'}"
     queue_key = f"nr1:{property_id}:{row['person_id']}:{row['touchpoint_id']}:{phone_norm}:{rule_key}"
-    from_number = select_sms_automation_from_number(db, bucket=bucket, contact_role=contact_role)
+    from_number = select_sms_automation_from_number(db, bucket=bucket, contact_role=contact_role, seed=queue_key)
     review_flags = list(route.get("review_flags") or [])
     if (bucket or "").strip().lower() == "sheriff sale" and not has_sale_date:
         review_flags.append("sheriff_sale_date_not_parsed")
@@ -39696,10 +40148,15 @@ def _sms_automation_send_queue_item(db, queue_id):
         }
     to_number = row["phone_number"]
     body = row["message_body"]
-    from_number = row["from_number"] or select_sms_automation_from_number(db, row["bucket"], row["contact_role"])
-    rate_reason = _sms_automation_rate_limit_reason(db, from_number)
+    from_number, rate_reason = select_sms_automation_send_from_number(
+        db,
+        preferred_from_number=row["from_number"],
+        bucket=row["bucket"],
+        contact_role=row["contact_role"],
+        seed=row["queue_key"] or row["id"],
+    )
     if rate_reason:
-        return {"ok": False, "error": rate_reason}
+        return {"ok": False, "error": rate_reason, "rate_limited": True}
     claim = db.execute(
         """
         UPDATE sms_automation_queue
@@ -39733,6 +40190,7 @@ def _sms_automation_send_queue_item(db, queue_id):
         )
         if row["person_id"]:
             update_person_outreach_status_for_sms(db, row["person_id"], "outbound_success")
+        sent_at = format_db_time(datetime.utcnow())
         db.execute(
             """
             UPDATE sms_automation_queue
@@ -39744,7 +40202,13 @@ def _sms_automation_send_queue_item(db, queue_id):
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (format_db_time(datetime.utcnow()), external_id, cur.lastrowid, row["id"]),
+            (sent_at, external_id, cur.lastrowid, row["id"]),
+        )
+        followups = ensure_sms_automation_followups_for_sent_row(
+            db,
+            row,
+            communication_id=cur.lastrowid,
+            sent_at=sent_at,
         )
         tag_sync = None
         try:
@@ -39759,7 +40223,13 @@ def _sms_automation_send_queue_item(db, queue_id):
                 route="_sms_automation_send_queue_item",
                 status_code=500,
             )
-        return {"ok": True, "communication_id": cur.lastrowid, "external_id": external_id, "reisift_tag_sync": tag_sync}
+        return {
+            "ok": True,
+            "communication_id": cur.lastrowid,
+            "external_id": external_id,
+            "reisift_tag_sync": tag_sync,
+            "followups": followups,
+        }
     except Exception as exc:
         apply_touchpoint_status_inference(db, to_number, str(exc))
         db.execute(
@@ -39841,11 +40311,6 @@ def run_sms_automation_send_once(limit=None):
             (batch_limit,),
         ).fetchall()
         for row in rows:
-            from_number = row["from_number"] or select_sms_automation_from_number(db, row["bucket"], row["contact_role"])
-            rate_reason = _sms_automation_rate_limit_reason(db, from_number)
-            if rate_reason:
-                blocked_reason = rate_reason
-                break
             result = _sms_automation_send_queue_item(db, row["id"])
             if result.get("ok"):
                 sent += 1
@@ -39857,10 +40322,12 @@ def run_sms_automation_send_once(limit=None):
                 details.append({"id": row["id"], "status": "Suppressed", "error": result.get("error", "")})
                 db.commit()
                 continue
-            failed += 1
             blocked_reason = result.get("error") or "Unknown AutoSend error"
             details.append({"id": row["id"], "status": "Blocked", "error": blocked_reason})
             db.commit()
+            if result.get("rate_limited"):
+                break
+            failed += 1
             if "Daily cap reached" in blocked_reason or "Minimum gap not reached" in blocked_reason:
                 break
         return {
@@ -40240,7 +40707,14 @@ def get_sms_automation_schedule_rows(db):
         d["person_name"] = f"{d.get('first_name') or ''} {d.get('last_name') or ''}".strip()
         d["sift_url"] = _sift_record_url(d.get("reisift_property_uuid") or "")
         if d.get("status") == "Approved":
-            from_norm = normalize_phone(d.get("from_number")) or normalize_phone(select_sms_automation_from_number(db, d.get("bucket"), d.get("contact_role")))
+            from_norm, _ = select_sms_automation_send_from_number(
+                db,
+                preferred_from_number=d.get("from_number"),
+                bucket=d.get("bucket"),
+                contact_role=d.get("contact_role"),
+                seed=d.get("queue_key") or d.get("id"),
+            )
+            from_norm = normalize_phone(from_norm)
             candidate = max(now_utc, next_available_by_number.get(from_norm, now_utc))
             projected = _sms_automation_adjust_to_send_window_utc(candidate, settings)
             cap_blocked = False
@@ -40265,7 +40739,14 @@ def get_sms_automation_schedule_rows(db):
             else:
                 d["send_readiness"] = "Waiting for sender min-gap"
         elif d.get("status") == "Scheduled":
-            from_norm = normalize_phone(d.get("from_number")) or normalize_phone(select_sms_automation_from_number(db, d.get("bucket"), d.get("contact_role")))
+            from_norm, _ = select_sms_automation_send_from_number(
+                db,
+                preferred_from_number=d.get("from_number"),
+                bucket=d.get("bucket"),
+                contact_role=d.get("contact_role"),
+                seed=d.get("queue_key") or d.get("id"),
+            )
+            from_norm = normalize_phone(from_norm)
             scheduled_dt = parse_db_time(d.get("scheduled_for"))
             candidate = max(now_utc, scheduled_dt or now_utc, next_available_by_number.get(from_norm, now_utc))
             projected = _sms_automation_adjust_to_send_window_utc(candidate, settings)
@@ -47465,6 +47946,13 @@ def smrtphone_inbound_webhook(payload=None, db=None):
     if existing:
         if direction == "Inbound":
             update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+            suppress_sms_automation_followups_for_reply(
+                db,
+                property_id,
+                from_number,
+                person_id=person_id,
+                communication_id=existing["id"],
+            )
         else:
             update_person_outreach_status_for_sms(db, person_id, "outbound_success")
         log_smrtphone_webhook_event(
@@ -47505,6 +47993,13 @@ def smrtphone_inbound_webhook(payload=None, db=None):
     if recent:
         if direction == "Inbound":
             update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+            suppress_sms_automation_followups_for_reply(
+                db,
+                property_id,
+                from_number,
+                person_id=person_id,
+                communication_id=recent["id"],
+            )
         else:
             update_person_outreach_status_for_sms(db, person_id, "outbound_success")
         if sms_id and not (recent["external_id"] or "").strip():
@@ -47545,6 +48040,13 @@ def smrtphone_inbound_webhook(payload=None, db=None):
     )
     if direction == "Inbound":
         update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+        suppress_sms_automation_followups_for_reply(
+            db,
+            property_id,
+            from_number,
+            person_id=person_id,
+            communication_id=cur.lastrowid,
+        )
     else:
         update_person_outreach_status_for_sms(db, person_id, "outbound_success")
     log_smrtphone_webhook_event(

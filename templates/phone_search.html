@@ -1,0 +1,191 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Phone Search</h2>
+    <p class="muted-text">Search any phone number to find matching people, related properties, SMS queue status, and recent communications.</p>
+    <form method="get" action="{{ url_for('phone_search_page') }}" class="inline-form">
+        <input type="text" name="q" value="{{ q }}" placeholder="973-555-1212" autofocus>
+        <button type="submit">Search</button>
+        {% if q %}<a href="{{ url_for('phone_search_page') }}">Clear</a>{% endif %}
+    </form>
+    {% if result and not result.normalized %}
+    <p class="warn-line">Enter a valid phone number.</p>
+    {% endif %}
+    {% if result and result.normalized %}
+    <p class="muted-text">Normalized search: <strong>{{ result.normalized|fmt_phone }}</strong></p>
+    {% endif %}
+</section>
+
+{% if result and result.normalized %}
+<section class="cards page-summary-cards">
+    <article>
+        <h3>People</h3>
+        <p>{{ result.matches|length }}</p>
+    </article>
+    <article>
+        <h3>SMS Queue</h3>
+        <p>{{ result.queue_rows|length }}</p>
+    </article>
+    <article>
+        <h3>Recent Activity</h3>
+        <p>{{ result.communications|length }}</p>
+    </article>
+    <article>
+        <h3>Number</h3>
+        <p>{{ result.normalized|fmt_phone }}</p>
+    </article>
+</section>
+
+<section class="panel">
+    <h3>Local Phone Matches</h3>
+    {% if result.matches %}
+    <div class="table-wrap">
+        <table class="crm-table">
+            <thead>
+                <tr>
+                    <th>Person</th>
+                    <th>Phone</th>
+                    <th>Status</th>
+                    <th>Related Properties</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in result.matches %}
+                <tr>
+                    <td>
+                        <a href="{{ url_for('person_detail', person_id=row.person_id) }}">{{ row.person_name or 'Unknown' }}</a>
+                        {% if row.person_status %}<div class="muted-text">{{ row.person_status }}</div>{% endif %}
+                        {% if row.deceased %}<div class="warn-line">Deceased</div>{% endif %}
+                    </td>
+                    <td>
+                        {{ row.phone_value|fmt_phone }}
+                        <div class="muted-text">{{ row.phone_label or 'Unknown' }}</div>
+                    </td>
+                    <td><span class="pill">{{ row.phone_status or '-' }}</span></td>
+                    <td>
+                        {% if row.properties %}
+                            {% for prop in row.properties %}
+                            <div>
+                                <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=prop.id) }}">{{ prop.address or ('Property #' ~ prop.id) }}</a>
+                                <span class="muted-text">({{ prop.role }}{% if prop.status %}, {{ prop.status }}{% endif %})</span>
+                            </div>
+                            {% endfor %}
+                        {% else %}
+                            <span class="muted-text">No linked property found</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="muted-text">No local touchpoints matched this phone number.</p>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <h3>SMS Queue</h3>
+    {% if result.queue_rows %}
+    <div class="table-wrap">
+        <table class="crm-table">
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>Person</th>
+                    <th>Property</th>
+                    <th>Queue Detail</th>
+                    <th>Timing</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in result.queue_rows %}
+                <tr>
+                    <td><span class="pill sms-status-{{ row.status|lower|replace(' ', '-') }}">{{ row.status or '-' }}</span></td>
+                    <td>
+                        {% if row.person_id %}
+                            {% if row.property_id %}
+                            <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">{{ row.person_name or ('Person #' ~ row.person_id) }}</a>
+                            {% else %}
+                            <a href="{{ url_for('person_detail', person_id=row.person_id) }}">{{ row.person_name or ('Person #' ~ row.person_id) }}</a>
+                            {% endif %}
+                        {% else %}
+                        <span class="muted-text">-</span>
+                        {% endif %}
+                        {% if row.contact_role %}<div class="muted-text">{{ row.contact_role }}</div>{% endif %}
+                    </td>
+                    <td>
+                        {% if row.property_id %}
+                        <a href="{{ url_for('property_detail', property_id=row.property_id) }}">{{ row.property_address or ('Property #' ~ row.property_id) }}</a>
+                        {% else %}
+                        <span class="muted-text">-</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {{ row.bucket or '-' }}
+                        {% if row.suppression_reason %}<div class="warn-line">{{ row.suppression_reason }}</div>{% endif %}
+                    </td>
+                    <td>
+                        {% if row.sent_at %}<div>Sent: {{ row.sent_at|fmt_est_datetime }}</div>{% endif %}
+                        {% if row.scheduled_for %}<div>Scheduled: {{ row.scheduled_for|fmt_est_datetime }}</div>{% endif %}
+                        <div class="muted-text">Updated: {{ row.updated_at|fmt_est_datetime if row.updated_at else '-' }}</div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="muted-text">No SMS queue rows matched this number.</p>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <h3>Recent Communications</h3>
+    {% if result.communications %}
+    <div class="table-wrap">
+        <table class="crm-table">
+            <thead>
+                <tr>
+                    <th>When</th>
+                    <th>Type</th>
+                    <th>Person / Property</th>
+                    <th>Numbers</th>
+                    <th>Body</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in result.communications %}
+                <tr>
+                    <td>{{ row.sent_at|fmt_est_datetime }}</td>
+                    <td>{{ row.channel }} {{ row.direction }}<div class="muted-text">{{ row.status or '-' }}</div></td>
+                    <td>
+                        {% if row.person_id %}
+                            {% if row.property_id %}
+                            <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">{{ row.person_name or ('Person #' ~ row.person_id) }}</a>
+                            {% else %}
+                            <a href="{{ url_for('person_detail', person_id=row.person_id) }}">{{ row.person_name or ('Person #' ~ row.person_id) }}</a>
+                            {% endif %}
+                        {% else %}
+                        <span class="muted-text">No person</span>
+                        {% endif %}
+                        {% if row.property_id %}
+                        <div><a href="{{ url_for('property_detail', property_id=row.property_id) }}">{{ row.property_address or ('Property #' ~ row.property_id) }}</a></div>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <div>From: {{ row.from_number|fmt_phone if row.from_number else '-' }}</div>
+                        <div>To: {{ row.to_number|fmt_phone if row.to_number else '-' }}</div>
+                    </td>
+                    <td>{{ row.body or '-' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="muted-text">No recent communications matched this number.</p>
+    {% endif %}
+</section>
+{% endif %}
+{% endblock %}

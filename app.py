@@ -8014,6 +8014,200 @@ def find_property_id_for_person(db, person_id):
     return rel["id"] if rel else None
 
 
+def _phone_search_property_links_for_person(db, person_id):
+    try:
+        clean_person_id = int(person_id or 0)
+    except Exception:
+        clean_person_id = 0
+    if clean_person_id <= 0:
+        return []
+
+    links = []
+    seen = set()
+
+    def add_link(row, role):
+        if not row:
+            return
+        property_id = int(row["id"] or 0)
+        if property_id <= 0 or property_id in seen:
+            return
+        seen.add(property_id)
+        links.append(
+            {
+                "id": property_id,
+                "role": role,
+                "status": row["status"] or "",
+                "reisift_property_uuid": row["reisift_property_uuid"] or "",
+                "address": format_property_address_line(row["street"], row["city"], row["state"], row["postal_code"]),
+            }
+        )
+
+    direct_rows = db.execute(
+        """
+        SELECT p.id, p.status, p.reisift_property_uuid,
+               a.street, a.city, a.state, a.postal_code,
+               CASE
+                   WHEN p.owner_person_id = ? THEN 'Owner'
+                   WHEN p.resident_person_id = ? THEN 'Resident'
+                   ELSE 'Direct'
+               END AS role
+        FROM properties p
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.owner_person_id = ? OR p.resident_person_id = ?
+        ORDER BY p.id DESC
+        """,
+        (clean_person_id, clean_person_id, clean_person_id, clean_person_id),
+    ).fetchall()
+    for row in direct_rows:
+        add_link(row, row["role"] or "Direct")
+
+    related_rows = db.execute(
+        """
+        SELECT DISTINCT p.id, p.status, p.reisift_property_uuid,
+               a.street, a.city, a.state, a.postal_code,
+               r.relationship_type
+        FROM properties p
+        JOIN person_relationships r ON (
+            (r.related_person_id = ? AND (r.subject_person_id = p.owner_person_id OR r.subject_person_id = p.resident_person_id))
+            OR
+            (r.subject_person_id = ? AND (r.related_person_id = p.owner_person_id OR r.related_person_id = p.resident_person_id))
+        )
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        ORDER BY p.id DESC
+        """,
+        (clean_person_id, clean_person_id),
+    ).fetchall()
+    for row in related_rows:
+        add_link(row, row["relationship_type"] or "Relative")
+
+    return links
+
+
+def search_phone_number_context(db, phone_raw):
+    target = normalize_phone(phone_raw)
+    result = {
+        "query": phone_raw or "",
+        "normalized": target,
+        "matches": [],
+        "queue_rows": [],
+        "communications": [],
+    }
+    if not target:
+        return result
+
+    touchpoint_rows = db.execute(
+        """
+        SELECT t.id AS touchpoint_id, t.person_id, t.value, t.channel_label, t.status AS phone_status,
+               t.note, t.created_at AS touchpoint_created_at,
+               p.first_name, p.middle_name, p.last_name, p.outreach_status, p.deceased
+        FROM touchpoints t
+        JOIN people p ON p.id = t.person_id
+        WHERE lower(t.channel_type) = 'phone'
+        ORDER BY t.id DESC
+        """
+    ).fetchall()
+
+    touchpoint_ids = []
+    for row in touchpoint_rows:
+        if normalize_phone(row["value"] or "") != target:
+            continue
+        touchpoint_ids.append(int(row["touchpoint_id"]))
+        result["matches"].append(
+            {
+                "touchpoint_id": row["touchpoint_id"],
+                "person_id": row["person_id"],
+                "person_name": person_name(row),
+                "person_status": row["outreach_status"] or "",
+                "deceased": int(row["deceased"] or 0),
+                "phone_value": row["value"] or "",
+                "phone_label": row["channel_label"] or "",
+                "phone_status": row["phone_status"] or "",
+                "touchpoint_created_at": row["touchpoint_created_at"] or "",
+                "properties": _phone_search_property_links_for_person(db, row["person_id"]),
+            }
+        )
+
+    queue_candidates = db.execute(
+        """
+        SELECT q.id, q.property_id, q.person_id, q.touchpoint_id, q.phone_number, q.from_number,
+               q.status, q.contact_role, q.bucket, q.rule_key, q.suppression_reason,
+               q.scheduled_for, q.sent_at, q.created_at, q.updated_at,
+               pe.first_name, pe.middle_name, pe.last_name,
+               a.street, a.city, a.state, a.postal_code
+        FROM sms_automation_queue q
+        LEFT JOIN people pe ON pe.id = q.person_id
+        LEFT JOIN properties p ON p.id = q.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        ORDER BY q.id DESC
+        LIMIT 5000
+        """
+    ).fetchall()
+    for row in queue_candidates:
+        if normalize_phone(row["phone_number"] or "") != target and int(row["touchpoint_id"] or 0) not in touchpoint_ids:
+            continue
+        result["queue_rows"].append(
+            {
+                "id": row["id"],
+                "property_id": row["property_id"],
+                "person_id": row["person_id"],
+                "touchpoint_id": row["touchpoint_id"],
+                "phone_number": row["phone_number"] or target,
+                "from_number": row["from_number"] or "",
+                "status": row["status"] or "",
+                "contact_role": row["contact_role"] or "",
+                "bucket": row["bucket"] or "",
+                "rule_key": row["rule_key"] or "",
+                "suppression_reason": row["suppression_reason"] or "",
+                "scheduled_for": row["scheduled_for"] or "",
+                "sent_at": row["sent_at"] or "",
+                "created_at": row["created_at"] or "",
+                "updated_at": row["updated_at"] or "",
+                "person_name": person_name(row),
+                "property_address": format_property_address_line(row["street"], row["city"], row["state"], row["postal_code"]),
+            }
+        )
+
+    like = f"%{target}%"
+    comm_rows = db.execute(
+        """
+        SELECT c.id, c.property_id, c.person_id, c.channel, c.direction, c.from_number, c.to_number,
+               c.status, c.sent_at, c.created_at, c.body,
+               pe.first_name, pe.middle_name, pe.last_name,
+               a.street, a.city, a.state, a.postal_code
+        FROM communications c
+        LEFT JOIN people pe ON pe.id = c.person_id
+        LEFT JOIN properties p ON p.id = c.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE replace(replace(replace(replace(replace(COALESCE(c.from_number,''), '+', ''), '(', ''), ')', ''), '-', ''), ' ', '') LIKE ?
+           OR replace(replace(replace(replace(replace(COALESCE(c.to_number,''), '+', ''), '(', ''), ')', ''), '-', ''), ' ', '') LIKE ?
+        ORDER BY COALESCE(c.sent_at, c.created_at) DESC, c.id DESC
+        LIMIT 30
+        """,
+        (like, like),
+    ).fetchall()
+    for row in comm_rows:
+        if normalize_phone(row["from_number"] or "") != target and normalize_phone(row["to_number"] or "") != target:
+            continue
+        result["communications"].append(
+            {
+                "id": row["id"],
+                "property_id": row["property_id"],
+                "person_id": row["person_id"],
+                "channel": row["channel"] or "",
+                "direction": row["direction"] or "",
+                "from_number": row["from_number"] or "",
+                "to_number": row["to_number"] or "",
+                "status": row["status"] or "",
+                "sent_at": row["sent_at"] or row["created_at"] or "",
+                "body": _short_text(row["body"] or "", 160),
+                "person_name": person_name(row),
+                "property_address": format_property_address_line(row["street"], row["city"], row["state"], row["postal_code"]),
+            }
+        )
+
+    return result
+
+
 def find_person_id_by_recent_outbound_to_number(db, property_id, inbound_from_number):
     normalized = normalize_phone(inbound_from_number)
     if not normalized:
@@ -40179,6 +40373,15 @@ def sms_queue_page():
         filter_options=get_sms_automation_filter_options(db),
         settings=get_sms_automation_settings(db),
     )
+
+
+@app.route("/phone-search")
+def phone_search_page():
+    ensure_db()
+    db = get_db()
+    q = (request.args.get("q") or "").strip()
+    result = search_phone_number_context(db, q) if q else None
+    return render_template("phone_search.html", q=q, result=result)
 
 
 @app.route("/sms-queue/generate", methods=["POST"])

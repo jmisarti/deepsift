@@ -38,6 +38,7 @@
                 <div class="sidebar-group">
                     <p class="sidebar-group-title">Research</p>
                     <a class="sidebar-link {% if request.path == '/dashboard' or request.path.startswith('/property') or request.path.startswith('/person') or request.path.startswith('/authority') %}active{% endif %}" href="{{ url_for('dashboard') }}">Deep Dive</a>
+                    <a class="sidebar-link {% if request.path.startswith('/phone-search') %}active{% endif %}" href="{{ url_for('phone_search_page') }}">Phone Search</a>
                     <a class="sidebar-link {% if request.path.startswith('/tools/rentcast') %}active{% endif %}" href="{{ url_for('rentcast_tools_page') }}">RentCast</a>
                 </div>
 

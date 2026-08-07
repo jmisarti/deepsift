@@ -1194,11 +1194,80 @@ def migrate_db(db):
         ("sent_at", "sent_at TEXT"),
         ("external_id", "external_id TEXT"),
         ("communication_id", "communication_id INTEGER"),
+        ("delivery_status", "delivery_status TEXT"),
+        ("delivery_failure_bucket", "delivery_failure_bucket TEXT"),
+        ("delivery_failure_reason", "delivery_failure_reason TEXT"),
+        ("delivery_last_event_at", "delivery_last_event_at TEXT"),
         ("updated_at", "updated_at TEXT"),
     ]:
         ensure_column(db, "sms_automation_queue", col, ddl)
     db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_status ON sms_automation_queue(status, scheduled_for)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_property ON sms_automation_queue(property_id)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sms_delivery_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL UNIQUE,
+            sms_id TEXT,
+            communication_id INTEGER,
+            queue_id INTEGER,
+            from_number TEXT,
+            to_number TEXT,
+            provider_status TEXT,
+            failure_reason TEXT,
+            failure_bucket TEXT,
+            is_final INTEGER NOT NULL DEFAULT 0,
+            is_recipient_issue INTEGER NOT NULL DEFAULT 0,
+            is_sender_issue INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT,
+            received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(communication_id) REFERENCES communications(id),
+            FOREIGN KEY(queue_id) REFERENCES sms_automation_queue(id)
+        )
+        """
+    )
+    for col, ddl in [
+        ("event_key", "event_key TEXT"),
+        ("sms_id", "sms_id TEXT"),
+        ("communication_id", "communication_id INTEGER"),
+        ("queue_id", "queue_id INTEGER"),
+        ("from_number", "from_number TEXT"),
+        ("to_number", "to_number TEXT"),
+        ("provider_status", "provider_status TEXT"),
+        ("failure_reason", "failure_reason TEXT"),
+        ("failure_bucket", "failure_bucket TEXT"),
+        ("is_final", "is_final INTEGER NOT NULL DEFAULT 0"),
+        ("is_recipient_issue", "is_recipient_issue INTEGER NOT NULL DEFAULT 0"),
+        ("is_sender_issue", "is_sender_issue INTEGER NOT NULL DEFAULT 0"),
+        ("payload_json", "payload_json TEXT"),
+        ("received_at", "received_at TEXT"),
+        ("updated_at", "updated_at TEXT"),
+    ]:
+        ensure_column(db, "sms_delivery_events", col, ddl)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sms_delivery_events_sms ON sms_delivery_events(sms_id, provider_status)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sms_delivery_events_sender ON sms_delivery_events(from_number, received_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sms_delivery_events_to_number ON sms_delivery_events(to_number, received_at)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sms_sender_health_daily (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_number TEXT NOT NULL,
+            et_date TEXT NOT NULL,
+            sent_count INTEGER NOT NULL DEFAULT 0,
+            delivered_count INTEGER NOT NULL DEFAULT 0,
+            undelivered_count INTEGER NOT NULL DEFAULT 0,
+            recipient_issue_count INTEGER NOT NULL DEFAULT 0,
+            sender_issue_count INTEGER NOT NULL DEFAULT 0,
+            health_status TEXT NOT NULL DEFAULT 'ok',
+            last_issue_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(from_number, et_date)
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sms_sender_health_daily_number ON sms_sender_health_daily(from_number, et_date)")
     ensure_column(db, "mail_orders", "status_updated_at", "status_updated_at TEXT")
     ensure_column(db, "mail_orders", "last_event_type", "last_event_type TEXT")
     ensure_column(db, "mail_orders", "external_order_item_id", "external_order_item_id TEXT")
@@ -9282,7 +9351,7 @@ def infer_touchpoint_update_from_status(status_text):
         update["channel_label"] = "VoIP"
     if "fax" in s:
         update["channel_label"] = "Fax"
-    if any(x in s for x in ["undeliverable", "undelivered", "not deliver", "no route", "failed", "failure"]):
+    if any(x in s for x in ["undeliverable", "undelivered", "not deliver", "no route", "unable to receive", "unreachable carrier", "failed", "failure"]):
         update["status"] = "Undeliverable"
     if any(x in s for x in ["no longer in service", "not in service", "disconnected", "deactivated"]):
         update["status"] = "Not in service"
@@ -9297,6 +9366,62 @@ def infer_touchpoint_update_from_status(status_text):
         if update.get("status") in (None, "", "Unknown"):
             update["status"] = "Correct"
     return update
+
+
+def classify_sms_delivery_status(status_text, failure_reason=""):
+    status = normalize_whitespace(status_text).lower()
+    reason = normalize_whitespace(failure_reason)
+    blob = f"{status} {reason}".lower()
+    if not blob.strip():
+        return {
+            "provider_status": "",
+            "failure_reason": reason,
+            "failure_bucket": "",
+            "is_final": False,
+            "is_recipient_issue": False,
+            "is_sender_issue": False,
+        }
+    bucket = ""
+    is_recipient_issue = False
+    is_sender_issue = False
+    if any(token in blob for token in ["spam", "filtered", "filtering", "objectionable", "content policy", "carrier block"]):
+        bucket = "carrier_filter"
+        is_sender_issue = True
+    elif any(
+        token in blob
+        for token in [
+            "landline",
+            "unable to receive",
+            "unreachable carrier",
+            "no route",
+            "not in service",
+            "disconnected",
+            "deactivated",
+            "invalid",
+            "unknown destination",
+        ]
+    ):
+        bucket = "recipient_unreachable"
+        is_recipient_issue = True
+    elif any(token in blob for token in ["dnc", "do not call", "do not text", "opt out", "opt-out", "stop requested"]):
+        bucket = "recipient_opt_out"
+        is_recipient_issue = True
+    elif "undeliver" in blob or "failed" in blob or "failure" in blob:
+        bucket = "unknown_undelivered"
+        is_recipient_issue = False
+    elif "delivered" in blob:
+        bucket = "delivered"
+    elif "sent" in blob or "queued" in blob:
+        bucket = "pending"
+    is_final = bucket in {"delivered", "carrier_filter", "recipient_unreachable", "recipient_opt_out", "unknown_undelivered"}
+    return {
+        "provider_status": status,
+        "failure_reason": reason,
+        "failure_bucket": bucket,
+        "is_final": is_final,
+        "is_recipient_issue": is_recipient_issue,
+        "is_sender_issue": is_sender_issue,
+    }
 
 
 def apply_touchpoint_status_inference(db, phone_number, status_text):
@@ -9319,6 +9444,367 @@ def apply_touchpoint_status_inference(db, phone_number, status_text):
             "UPDATE touchpoints SET channel_label = ?, status = ? WHERE id = ?",
             (channel_label, status, row["id"]),
         )
+
+
+def _sms_delivery_event_key(sms_id, provider_status, failure_bucket, failure_reason):
+    basis = "|".join(
+        [
+            normalize_whitespace(sms_id),
+            normalize_whitespace(provider_status).lower(),
+            normalize_whitespace(failure_bucket).lower(),
+            normalize_whitespace(failure_reason).lower()[:240],
+        ]
+    )
+    return hashlib.sha1(basis.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _sms_delivery_context(db, sms_id="", communication_id=None, from_number="", to_number=""):
+    comm = None
+    queue = None
+    if communication_id:
+        comm = db.execute("SELECT * FROM communications WHERE id = ? LIMIT 1", (int(communication_id or 0),)).fetchone()
+    if not comm and sms_id:
+        comm = db.execute("SELECT * FROM communications WHERE external_id = ? LIMIT 1", (sms_id,)).fetchone()
+    if comm:
+        communication_id = int(comm["id"] or 0)
+        from_number = from_number or comm["from_number"] or ""
+        to_number = to_number or comm["to_number"] or ""
+    if communication_id:
+        queue = db.execute("SELECT * FROM sms_automation_queue WHERE communication_id = ? LIMIT 1", (communication_id,)).fetchone()
+    if not queue and sms_id:
+        queue = db.execute("SELECT * FROM sms_automation_queue WHERE external_id = ? LIMIT 1", (sms_id,)).fetchone()
+    if queue:
+        from_number = from_number or queue["from_number"] or ""
+        to_number = to_number or queue["phone_number"] or ""
+    return {
+        "communication": comm,
+        "queue": queue,
+        "communication_id": communication_id if communication_id else None,
+        "queue_id": int(queue["id"] or 0) if queue else None,
+        "from_number": normalize_phone(from_number) or normalize_whitespace(from_number),
+        "to_number": normalize_phone(to_number) or normalize_whitespace(to_number),
+    }
+
+
+def refresh_sms_sender_health_for_number_date(db, from_number, et_date_text):
+    from_norm = normalize_phone(from_number)
+    if not from_norm or not et_date_text:
+        return
+    try:
+        et_date = datetime.strptime(et_date_text, "%Y-%m-%d").date()
+    except Exception:
+        return
+    start_et = datetime(et_date.year, et_date.month, et_date.day, tzinfo=EST_TZ)
+    end_et = start_et + timedelta(days=1)
+    start_utc = start_et.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc = end_et.astimezone(timezone.utc).replace(tzinfo=None)
+    rows = db.execute(
+        """
+        SELECT sms_id, provider_status, failure_bucket, is_recipient_issue, is_sender_issue, received_at
+        FROM sms_delivery_events
+        WHERE replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+          AND received_at >= ?
+          AND received_at < ?
+          AND COALESCE(sms_id, '') != ''
+        ORDER BY id ASC
+        """,
+        (f"%{from_norm}", format_db_time(start_utc), format_db_time(end_utc)),
+    ).fetchall()
+    latest_by_sms = {}
+    for row in rows:
+        latest_by_sms[row["sms_id"]] = row
+    sent_count = len(latest_by_sms)
+    delivered_count = 0
+    undelivered_count = 0
+    recipient_issue_count = 0
+    sender_issue_count = 0
+    last_issue_at = ""
+    for row in latest_by_sms.values():
+        bucket = str(row["failure_bucket"] or "").lower()
+        if bucket == "delivered" or str(row["provider_status"] or "").lower() == "delivered":
+            delivered_count += 1
+        if bucket in {"carrier_filter", "recipient_unreachable", "recipient_opt_out", "unknown_undelivered"}:
+            undelivered_count += 1
+        if int(row["is_recipient_issue"] or 0):
+            recipient_issue_count += 1
+        if int(row["is_sender_issue"] or 0):
+            sender_issue_count += 1
+            last_issue_at = max(last_issue_at, str(row["received_at"] or ""))
+    health_status = "ok"
+    if sender_issue_count >= 2:
+        health_status = "cooldown"
+    elif sent_count >= 20 and sender_issue_count / max(sent_count, 1) >= 0.10:
+        health_status = "watch"
+    db.execute(
+        """
+        INSERT INTO sms_sender_health_daily
+            (from_number, et_date, sent_count, delivered_count, undelivered_count,
+             recipient_issue_count, sender_issue_count, health_status, last_issue_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(from_number, et_date) DO UPDATE SET
+            sent_count = excluded.sent_count,
+            delivered_count = excluded.delivered_count,
+            undelivered_count = excluded.undelivered_count,
+            recipient_issue_count = excluded.recipient_issue_count,
+            sender_issue_count = excluded.sender_issue_count,
+            health_status = excluded.health_status,
+            last_issue_at = excluded.last_issue_at,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            from_norm,
+            et_date_text,
+            sent_count,
+            delivered_count,
+            undelivered_count,
+            recipient_issue_count,
+            sender_issue_count,
+            health_status,
+            last_issue_at,
+        ),
+    )
+
+
+def sms_sender_health_suppression_reason(db, from_number, lookback_hours=48):
+    from_norm = normalize_phone(from_number)
+    if not from_norm:
+        return ""
+    cutoff = format_db_time(datetime.utcnow() - timedelta(hours=max(1, int(lookback_hours or 48))))
+    rows = db.execute(
+        """
+        SELECT sms_id, is_sender_issue, received_at
+        FROM sms_delivery_events
+        WHERE replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
+          AND received_at >= ?
+          AND COALESCE(sms_id, '') != ''
+        ORDER BY id ASC
+        """,
+        (f"%{from_norm}", cutoff),
+    ).fetchall()
+    latest_by_sms = {}
+    for row in rows:
+        latest_by_sms[row["sms_id"]] = row
+    attempts = len(latest_by_sms)
+    sender_issues = sum(1 for row in latest_by_sms.values() if int(row["is_sender_issue"] or 0))
+    if sender_issues >= 2:
+        return f"Sender {format_phone_display(from_norm)} is cooling down after {sender_issues} carrier/spam-filtered SMS in the last {lookback_hours}h."
+    if attempts >= 20 and sender_issues / max(attempts, 1) >= 0.10:
+        return f"Sender {format_phone_display(from_norm)} is on watch for carrier filtering ({sender_issues}/{attempts} recent SMS)."
+    return ""
+
+
+def suppress_sms_automation_followups_for_delivery_failure(db, property_id, phone_number, reason, person_id=None):
+    phone_norm = normalize_phone(phone_number)
+    if not phone_norm:
+        return 0
+    clauses = [
+        "status IN ('Draft', 'Queued', 'Approved', 'Scheduled')",
+        "(COALESCE(step_order, 1) > 1 OR lower(COALESCE(queue_key, '')) LIKE '%:fu:%')",
+        "replace(replace(replace(replace(replace(COALESCE(phone_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?",
+    ]
+    params = [f"%{phone_norm}"]
+    if int(property_id or 0) > 0:
+        clauses.append("property_id = ?")
+        params.append(int(property_id or 0))
+    if int(person_id or 0) > 0:
+        clauses.append("(person_id = ? OR COALESCE(person_id, 0) = 0)")
+        params.append(int(person_id or 0))
+    cur = db.execute(
+        f"""
+        UPDATE sms_automation_queue
+        SET status = 'Suppressed',
+            suppression_reason = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE {' AND '.join(clauses)}
+        """,
+        tuple([reason] + params),
+    )
+    return int(cur.rowcount or 0)
+
+
+def record_sms_delivery_status(db, payload, sms_id="", status="", from_number="", to_number="", communication_id=None):
+    status_text = normalize_whitespace(status or payload.get("status") or "")
+    failure_reason = normalize_whitespace(
+        payload.get("failure_reason")
+        or payload.get("status_text")
+        or payload.get("statusMessage")
+        or payload.get("status_message")
+        or payload.get("message")
+        or payload.get("error")
+        or payload.get("error_message")
+        or payload.get("reason")
+        or payload.get("description")
+        or ""
+    )
+    delivery = classify_sms_delivery_status(status_text, failure_reason)
+    context = _sms_delivery_context(
+        db,
+        sms_id=sms_id,
+        communication_id=communication_id,
+        from_number=from_number,
+        to_number=to_number,
+    )
+    received_at = format_db_time(datetime.utcnow())
+    event_key = _sms_delivery_event_key(sms_id, delivery["provider_status"], delivery["failure_bucket"], delivery["failure_reason"])
+    db.execute(
+        """
+        INSERT INTO sms_delivery_events
+            (event_key, sms_id, communication_id, queue_id, from_number, to_number, provider_status,
+             failure_reason, failure_bucket, is_final, is_recipient_issue, is_sender_issue, payload_json, received_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(event_key) DO UPDATE SET
+            communication_id = COALESCE(excluded.communication_id, sms_delivery_events.communication_id),
+            queue_id = COALESCE(excluded.queue_id, sms_delivery_events.queue_id),
+            from_number = COALESCE(NULLIF(excluded.from_number, ''), sms_delivery_events.from_number),
+            to_number = COALESCE(NULLIF(excluded.to_number, ''), sms_delivery_events.to_number),
+            payload_json = excluded.payload_json,
+            received_at = excluded.received_at,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            event_key,
+            sms_id,
+            context["communication_id"],
+            context["queue_id"],
+            context["from_number"],
+            context["to_number"],
+            delivery["provider_status"],
+            delivery["failure_reason"],
+            delivery["failure_bucket"],
+            1 if delivery["is_final"] else 0,
+            1 if delivery["is_recipient_issue"] else 0,
+            1 if delivery["is_sender_issue"] else 0,
+            json.dumps(payload or {}, ensure_ascii=True, sort_keys=True),
+            received_at,
+        ),
+    )
+    if context["communication_id"]:
+        db.execute(
+            """
+            UPDATE communications
+            SET status = ?,
+                to_number = COALESCE(NULLIF(?, ''), to_number),
+                from_number = COALESCE(NULLIF(?, ''), from_number)
+            WHERE id = ?
+            """,
+            (
+                status_text.title() if status_text else "Sent",
+                context["to_number"],
+                context["from_number"],
+                context["communication_id"],
+            ),
+        )
+    if sms_id or context["communication_id"]:
+        db.execute(
+            """
+            UPDATE sms_automation_queue
+            SET delivery_status = ?,
+                delivery_failure_bucket = ?,
+                delivery_failure_reason = ?,
+                delivery_last_event_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE (? != '' AND external_id = ?)
+               OR (? IS NOT NULL AND communication_id = ?)
+            """,
+            (
+                status_text.lower(),
+                delivery["failure_bucket"],
+                delivery["failure_reason"],
+                received_at,
+                sms_id,
+                sms_id,
+                context["communication_id"],
+                context["communication_id"],
+            ),
+        )
+    if context["from_number"]:
+        received_dt = parse_db_time(received_at) or datetime.utcnow()
+        et_date = received_dt.replace(tzinfo=timezone.utc).astimezone(EST_TZ).date().isoformat()
+        refresh_sms_sender_health_for_number_date(db, context["from_number"], et_date)
+    if delivery["is_recipient_issue"] and context["to_number"]:
+        apply_touchpoint_status_inference(db, context["to_number"], failure_reason or status_text)
+        property_id = None
+        person_id = None
+        if context["communication"]:
+            property_id = context["communication"]["property_id"]
+            person_id = context["communication"]["person_id"]
+        elif context["queue"]:
+            property_id = context["queue"]["property_id"]
+            person_id = context["queue"]["person_id"]
+        suppress_sms_automation_followups_for_delivery_failure(
+            db,
+            property_id,
+            context["to_number"],
+            f"Prior SMS to this phone was undelivered ({delivery['failure_bucket']}); follow-up sequence stopped.",
+            person_id=person_id,
+        )
+    return {
+        "ok": True,
+        **delivery,
+        "communication_id": context["communication_id"],
+        "queue_id": context["queue_id"],
+        "from_number": context["from_number"],
+        "to_number": context["to_number"],
+    }
+
+
+def reconcile_orphan_smrtphone_status_events(db, lookback_hours=72, limit=500):
+    cutoff = format_db_time(datetime.utcnow() - timedelta(hours=max(1, int(lookback_hours or 72))))
+    rows = db.execute(
+        """
+        SELECT id, sms_id, payload_json
+        FROM smrtphone_webhook_events
+        WHERE event_type = 'status'
+          AND processing_status = 'orphan'
+          AND COALESCE(sms_id, '') != ''
+          AND received_at >= ?
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (cutoff, max(1, min(int(limit or 500), 2000))),
+    ).fetchall()
+    reconciled = 0
+    for row in rows:
+        comm = db.execute("SELECT id FROM communications WHERE external_id = ? LIMIT 1", (row["sms_id"],)).fetchone()
+        if not comm:
+            continue
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except Exception:
+            payload = {}
+        result = record_sms_delivery_status(db, payload, sms_id=row["sms_id"], communication_id=comm["id"])
+        db.execute(
+            """
+            UPDATE smrtphone_webhook_events
+            SET processing_status = 'reconciled',
+                communication_id = ?,
+                error_text = ''
+            WHERE id = ?
+            """,
+            (comm["id"], row["id"]),
+        )
+        if result.get("ok"):
+            reconciled += 1
+    return reconciled
+
+
+def mark_stale_sms_delivery_pending(db, pending_hours=24):
+    cutoff = format_db_time(datetime.utcnow() - timedelta(hours=max(1, int(pending_hours or 24))))
+    cur = db.execute(
+        """
+        UPDATE sms_automation_queue
+        SET delivery_status = 'pending_timeout',
+            delivery_failure_bucket = 'pending_timeout',
+            delivery_failure_reason = 'No final smrtPhone delivery callback received within the pending timeout.',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'Sent'
+          AND COALESCE(delivery_status, '') IN ('', 'sent', 'queued', 'pending')
+          AND COALESCE(sent_at, '') != ''
+          AND sent_at < ?
+        """,
+        (cutoff,),
+    )
+    return int(cur.rowcount or 0)
 
 
 def find_recent_inbound_match(db, property_id, person_id, from_number, to_number, message, seconds=120):
@@ -10049,6 +10535,10 @@ def select_sms_automation_send_from_number(db, preferred_from_number="", bucket=
         candidates = [normalize_phone(get_deep_dive_sms_number(db))]
     last_reason = ""
     for candidate in [num for num in candidates if num]:
+        reason = sms_sender_health_suppression_reason(db, candidate)
+        if reason:
+            last_reason = reason
+            continue
         reason = _sms_automation_rate_limit_reason(db, candidate)
         if not reason:
             return candidate, ""
@@ -31637,14 +32127,38 @@ def _sms_followup_templates_for_role(contact_role):
     role = str(contact_role or "").strip().lower()
     if role == "relative":
         return [
-            "Hi {first_name}, just following up. I'm trying to reach the right person for {property_address}. Would you know who handles it?",
-            "Hi {first_name}, checking back on {property_address}. If you're not the right person, who would be best to speak with?",
-            "Hi {first_name}, last quick follow-up from me on {property_address}. Should I close the loop here, or is there someone better to contact?",
+            [
+                "Hi {first_name}, just following up. I'm trying to reach the right person for {property_address}. Would you know who handles it?",
+                "Hi {first_name}, quick follow-up on {property_address}. Do you know who would be best to speak with?",
+                "Hi {first_name}, circling back on {property_address}. If you are not the right person, can you point me in the right direction?",
+            ],
+            [
+                "Hi {first_name}, checking back on {property_address}. If you're not the right person, who would be best to speak with?",
+                "Hi {first_name}, wanted to check back. Do you know who handles {property_address}?",
+                "Hi {first_name}, one more quick check on {property_address}. Is there someone better for me to reach?",
+            ],
+            [
+                "Hi {first_name}, last quick follow-up from me on {property_address}. Should I close the loop here, or is there someone better to contact?",
+                "Hi {first_name}, final note from me on {property_address}. Should I stop reaching out, or is there a better contact?",
+                "Hi {first_name}, I do not want to keep bugging you. Is there someone else I should contact about {property_address}?",
+            ],
         ]
     return [
-        "Hi {first_name}, just following up on {property_address}. Just trying to help...",
-        "Hi {first_name}, checking back on {property_address}. Available whenever you are!",
-        "Hey {first_name}, sorry for the double text. Not trying to be annoying. Just lmk if you need help in any way.",
+        [
+            "Hi {first_name}, just following up on {property_address}. Just trying to help...",
+            "Hi {first_name}, quick follow-up on {property_address}. Just trying to help if options would be useful.",
+            "Hi {first_name}, circling back about {property_address}. Just trying to help...",
+        ],
+        [
+            "Hi {first_name}, checking back on {property_address}. Available whenever you are!",
+            "Hi {first_name}, wanted to check back on {property_address}. Available whenever you are!",
+            "Hi {first_name}, following up again on {property_address}. I am available whenever you are.",
+        ],
+        [
+            "Hey {first_name}, sorry for the double text. Not trying to be annoying. Just lmk if you need help in any way.",
+            "Hey {first_name}, last note from me. Not trying to be annoying, just lmk if you need help in any way.",
+            "Hey {first_name}, sorry to keep nudging. If help with {property_address} would be useful, just lmk.",
+        ],
     ]
 
 
@@ -31653,8 +32167,15 @@ def _sms_automation_followup_message(parent_row, step_order):
         step_index = max(0, int(step_order or 2) - 2)
     except Exception:
         step_index = 0
-    templates = _sms_followup_templates_for_role(parent_row["contact_role"] if parent_row else "")
-    template = templates[min(step_index, len(templates) - 1)]
+    template_groups = _sms_followup_templates_for_role(parent_row["contact_role"] if parent_row else "")
+    group = template_groups[min(step_index, len(template_groups) - 1)]
+    if isinstance(group, str):
+        variants = [group]
+    else:
+        variants = [str(item) for item in group if str(item or "").strip()]
+    seed = f"{parent_row['queue_key'] if parent_row else ''}|fu|{step_order}"
+    idx = int(hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:8], 16) % max(len(variants), 1)
+    template = variants[idx] if variants else ""
     variables = parse_json_object(parent_row["rendered_variables_json"] if parent_row else "", default={})
     if not variables:
         variables = {}
@@ -40273,6 +40794,9 @@ def run_sms_automation_send_once(limit=None):
     blocked_reason = ""
     details = []
     try:
+        reconciled_delivery = reconcile_orphan_smrtphone_status_events(db, lookback_hours=72, limit=500)
+        stale_delivery = mark_stale_sms_delivery_pending(db, pending_hours=24)
+        db.commit()
         within, start, end = _sms_automation_within_send_window(db)
         if not within:
             return {
@@ -40282,6 +40806,8 @@ def run_sms_automation_send_once(limit=None):
                 "sent": 0,
                 "suppressed": 0,
                 "failed": 0,
+                "delivery_reconciled": reconciled_delivery,
+                "delivery_stale_marked": stale_delivery,
             }
         recovered = recover_stale_sms_automation_sending_rows(db)
         revalidate_sms_automation_queue(db, property_ids=None)
@@ -40337,6 +40863,8 @@ def run_sms_automation_send_once(limit=None):
             "failed": failed,
             "blocked_reason": blocked_reason,
             "recovered": recovered,
+            "delivery_reconciled": reconciled_delivery,
+            "delivery_stale_marked": stale_delivery,
             "details": details,
         }
     except Exception as exc:
@@ -40620,6 +41148,62 @@ def get_sms_automation_filter_options(db):
     }
 
 
+def get_sms_sender_health_rows(db, days=2):
+    settings = get_sms_automation_settings(db)
+    numbers = [normalize_phone(n) for n in settings.get("from_numbers") or [] if normalize_phone(n)]
+    now_et = datetime.now(EST_TZ).date()
+    since_et = now_et - timedelta(days=max(0, int(days or 2) - 1))
+    rows = db.execute(
+        """
+        SELECT from_number,
+               SUM(sent_count) AS sent_count,
+               SUM(delivered_count) AS delivered_count,
+               SUM(undelivered_count) AS undelivered_count,
+               SUM(recipient_issue_count) AS recipient_issue_count,
+               SUM(sender_issue_count) AS sender_issue_count,
+               MAX(last_issue_at) AS last_issue_at,
+               MAX(updated_at) AS updated_at
+        FROM sms_sender_health_daily
+        WHERE et_date >= ?
+        GROUP BY from_number
+        """,
+        (since_et.isoformat(),),
+    ).fetchall()
+    by_number = {normalize_phone(row["from_number"]): row for row in rows}
+    out = []
+    for number in numbers:
+        row = by_number.get(number)
+        sent_count = int((row["sent_count"] if row else 0) or 0)
+        delivered_count = int((row["delivered_count"] if row else 0) or 0)
+        undelivered_count = int((row["undelivered_count"] if row else 0) or 0)
+        recipient_issue_count = int((row["recipient_issue_count"] if row else 0) or 0)
+        sender_issue_count = int((row["sender_issue_count"] if row else 0) or 0)
+        health_reason = sms_sender_health_suppression_reason(db, number)
+        if health_reason:
+            health_status = "cooldown"
+        elif sender_issue_count > 0:
+            health_status = "watch"
+        else:
+            health_status = "ok"
+        delivered_rate = round((delivered_count / sent_count) * 100, 1) if sent_count else 0
+        out.append(
+            {
+                "from_number": number,
+                "sent_count": sent_count,
+                "delivered_count": delivered_count,
+                "undelivered_count": undelivered_count,
+                "recipient_issue_count": recipient_issue_count,
+                "sender_issue_count": sender_issue_count,
+                "delivered_rate": delivered_rate,
+                "health_status": health_status,
+                "health_reason": health_reason,
+                "last_issue_at": row["last_issue_at"] if row else "",
+                "updated_at": row["updated_at"] if row else "",
+            }
+        )
+    return out
+
+
 def get_sms_automation_schedule_rows(db):
     settings = get_sms_automation_settings(db)
     rows = db.execute(
@@ -40805,6 +41389,7 @@ def sms_queue_schedule_page():
         rows=get_sms_automation_schedule_rows(db),
         summary={r["status"]: int(r["c"] or 0) for r in summary_rows},
         settings=get_sms_automation_settings(db),
+        sender_health=get_sms_sender_health_rows(db),
     )
 
 
@@ -43501,6 +44086,7 @@ def settings_page():
         slybroadcast_settings=slybroadcast_settings,
         sms_automation_settings=sms_automation_settings,
         sms_automation_rules=sms_automation_rules,
+        sms_sender_health=get_sms_sender_health_rows(db),
         active_tab=active_tab,
         deep_dive_smrtphone_from=deep_dive_smrtphone_from,
         referral_smrtphone_from=referral_smrtphone_from,
@@ -48115,12 +48701,15 @@ def smrtphone_status_webhook(payload=None, db=None):
 
     row = db.execute("SELECT id FROM communications WHERE external_id = ?", (sms_id,)).fetchone()
     if row:
-        db.execute(
-            "UPDATE communications SET status = ?, to_number = COALESCE(NULLIF(?, ''), to_number), from_number = COALESCE(NULLIF(?, ''), from_number) WHERE id = ?",
-            (status, to_number, from_number, row["id"]),
+        delivery_result = record_sms_delivery_status(
+            db,
+            payload,
+            sms_id=sms_id,
+            status=status,
+            from_number=from_number,
+            to_number=to_number,
+            communication_id=row["id"],
         )
-        if to_number:
-            apply_touchpoint_status_inference(db, to_number, status_detail_text or status)
         log_smrtphone_webhook_event(
             db,
             "status",
@@ -48132,7 +48721,7 @@ def smrtphone_status_webhook(payload=None, db=None):
             communication_id=row["id"],
         )
         db.commit()
-        return jsonify({"ok": True, "communication_id": row["id"]})
+        return jsonify({"ok": True, "communication_id": row["id"], "delivery": delivery_result})
 
     # Backfill case: sent row exists without external_id, then provider status arrives with smsId.
     body = str(payload.get("message") or payload.get("body") or "").strip()
@@ -48152,16 +48741,16 @@ def smrtphone_status_webhook(payload=None, db=None):
         (to_number, body, body, format_db_time(datetime.utcnow() - timedelta(minutes=30))),
     ).fetchone()
     if recent_outbound:
-        db.execute(
-            """
-            UPDATE communications
-            SET external_id = ?, status = ?, to_number = COALESCE(NULLIF(?, ''), to_number), from_number = COALESCE(NULLIF(?, ''), from_number)
-            WHERE id = ?
-            """,
-            (sms_id, status, to_number, from_number, recent_outbound["id"]),
+        db.execute("UPDATE communications SET external_id = ? WHERE id = ?", (sms_id, recent_outbound["id"]))
+        delivery_result = record_sms_delivery_status(
+            db,
+            payload,
+            sms_id=sms_id,
+            status=status,
+            from_number=from_number,
+            to_number=to_number,
+            communication_id=recent_outbound["id"],
         )
-        if to_number:
-            apply_touchpoint_status_inference(db, to_number, status_detail_text or status)
         log_smrtphone_webhook_event(
             db,
             "status",
@@ -48173,7 +48762,7 @@ def smrtphone_status_webhook(payload=None, db=None):
             communication_id=recent_outbound["id"],
         )
         db.commit()
-        return jsonify({"ok": True, "communication_id": recent_outbound["id"], "backfilled": True})
+        return jsonify({"ok": True, "communication_id": recent_outbound["id"], "backfilled": True, "delivery": delivery_result})
 
     cached_ctx = get_cached_contact_context(db, to_number) or get_cached_contact_context(db, from_number)
     if str(payload.get("property_id", "")).isdigit():
@@ -48181,6 +48770,7 @@ def smrtphone_status_webhook(payload=None, db=None):
     elif cached_ctx and cached_ctx["property_id"]:
         property_id = int(cached_ctx["property_id"])
     else:
+        record_sms_delivery_status(db, payload, sms_id=sms_id, status=status, from_number=from_number, to_number=to_number)
         log_smrtphone_webhook_event(
             db,
             "status",
@@ -48228,8 +48818,15 @@ def smrtphone_status_webhook(payload=None, db=None):
             sms_id,
         ),
     )
-    if to_number:
-        apply_touchpoint_status_inference(db, to_number, status_detail_text or status)
+    delivery_result = record_sms_delivery_status(
+        db,
+        payload,
+        sms_id=sms_id,
+        status=status,
+        from_number=from_number,
+        to_number=to_number,
+        communication_id=cur.lastrowid,
+    )
     log_smrtphone_webhook_event(
         db,
         "status",
@@ -48241,7 +48838,7 @@ def smrtphone_status_webhook(payload=None, db=None):
         communication_id=cur.lastrowid,
     )
     db.commit()
-    return jsonify({"ok": True, "communication_id": cur.lastrowid}), 201
+    return jsonify({"ok": True, "communication_id": cur.lastrowid, "delivery": delivery_result}), 201
 
 
 @app.route("/webhooks/smrtphone/call-completed", methods=["POST"])

@@ -33,6 +33,45 @@
         </form>
     </div>
 
+    <h3>Sender Health</h3>
+    <div class="table-wrap">
+        <table class="crm-table">
+            <thead>
+                <tr>
+                    <th>Number</th>
+                    <th>Health</th>
+                    <th>Sent</th>
+                    <th>Delivered</th>
+                    <th>Undelivered</th>
+                    <th>Recipient Issue</th>
+                    <th>Sender/Filter Issue</th>
+                    <th>Delivered %</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in sender_health %}
+                <tr>
+                    <td>{{ item.from_number|fmt_phone }}</td>
+                    <td>
+                        <span class="pill sms-status-{{ item.health_status }}">{{ item.health_status|title }}</span>
+                        {% if item.health_reason %}
+                        <div class="sms-queue-reason">{{ item.health_reason }}</div>
+                        {% endif %}
+                    </td>
+                    <td>{{ item.sent_count }}</td>
+                    <td>{{ item.delivered_count }}</td>
+                    <td>{{ item.undelivered_count }}</td>
+                    <td>{{ item.recipient_issue_count }}</td>
+                    <td>{{ item.sender_issue_count }}</td>
+                    <td>{{ item.delivered_rate }}%</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="8">No sender health data yet.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
     <div class="table-wrap sms-queue-table-wrap">
         <table class="crm-table sms-queue-table">
             <thead>

@@ -105,6 +105,41 @@
                 <a class="button-link secondary" href="{{ url_for('sms_queue_page') }}">Open SMS Queue</a>
             </div>
         </form>
+        <h3>Sender Health</h3>
+        <p class="muted-text">Carrier/content filtering cools a sender down. Recipient-side failures suppress that recipient phone from future follow-ups.</p>
+        <div class="table-wrap">
+            <table class="crm-table">
+                <thead>
+                    <tr>
+                        <th>Number</th>
+                        <th>Health</th>
+                        <th>Sent</th>
+                        <th>Delivered</th>
+                        <th>Undelivered</th>
+                        <th>Sender/Filter</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in sms_sender_health %}
+                    <tr>
+                        <td>{{ item.from_number|fmt_phone }}</td>
+                        <td>
+                            <span class="pill sms-status-{{ item.health_status }}">{{ item.health_status|title }}</span>
+                            {% if item.health_reason %}
+                            <div class="sms-queue-reason">{{ item.health_reason }}</div>
+                            {% endif %}
+                        </td>
+                        <td>{{ item.sent_count }}</td>
+                        <td>{{ item.delivered_count }}</td>
+                        <td>{{ item.undelivered_count }}</td>
+                        <td>{{ item.sender_issue_count }}</td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="6">No sender health data yet.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
         <h3>Routing Rules</h3>
         <p class="muted-text">Rules are evaluated by priority. The highest-priority matching list/source and contact role determines the draft text. Multi-list records are flagged in the SMS Queue.</p>
         <div class="table-wrap">

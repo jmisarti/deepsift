@@ -1067,6 +1067,24 @@ tbody tr:hover td { background: #fbfdff; }
     font-size: 0.8rem;
 }
 
+.sms-status-ok {
+    background: #e8f7ed;
+    border-color: #a8dfb8;
+    color: #25653b;
+}
+
+.sms-status-watch {
+    background: #fff5d8;
+    border-color: #f1d078;
+    color: #7a5600;
+}
+
+.sms-status-cooldown {
+    background: #ffe7e2;
+    border-color: #f0a79a;
+    color: #8a2e22;
+}
+
 .phone-value-stack {
     display: flex;
     flex-direction: column;

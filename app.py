@@ -13711,6 +13711,18 @@ def _extract_openai_response_text(data):
     return ""
 
 
+def _raise_openai_response_error(response, context="OpenAI request"):
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = ""
+        try:
+            detail = response.text
+        except Exception:
+            detail = ""
+        raise ValueError(f"{context} failed ({response.status_code}): {detail or exc}") from exc
+
+
 def _comping_output_dir():
     target = Path(os.getenv("COMPING_OUTPUT_DIR", "") or (DB_PATH.parent / "comping_reports")).expanduser()
     target.mkdir(parents=True, exist_ok=True)
@@ -14045,7 +14057,13 @@ def run_manual_comping_skill_analysis(address, property_context=None, requested_
         f"DeepSift context JSON: {json.dumps(property_context or {}, ensure_ascii=True)}\n\n"
         "Return only the structured JSON requested by the schema."
     )
-    response = requests.post(
+    research_prompt = (
+        prompt
+        + "\n\nFor this first pass, use web search and return a detailed research memo, not JSON. "
+        "Include source URLs, comp candidates, active/pending listings, rejected comps, market notes, "
+        "and any uncertainty. Do not fabricate missing sale prices or facts."
+    )
+    research_response = requests.post(
         "https://api.openai.com/v1/responses",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
@@ -14060,9 +14078,41 @@ def run_manual_comping_skill_analysis(address, property_context=None, requested_
                         }
                     ],
                 },
-                {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+                {"role": "user", "content": [{"type": "input_text", "text": research_prompt}]},
             ],
             "tools": [{"type": "web_search_preview"}],
+            "max_output_tokens": 20000,
+        },
+        timeout=240,
+    )
+    _raise_openai_response_error(research_response, context="OpenAI comp research")
+    research_text = _extract_openai_response_text(research_response.json())
+    if not research_text:
+        raise ValueError("No comping research returned by OpenAI.")
+    structure_prompt = (
+        "Convert the research memo into the structured JSON requested by the schema.\n"
+        "Use only the facts and URLs in the memo and provided DeepSift context. "
+        "If a numeric field is not supportable, use null. Keep caveats explicit.\n\n"
+        f"Original request:\n{prompt}\n\n"
+        f"Research memo:\n{research_text}"
+    )
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "You convert real estate comp research into strict workbook JSON. Do not browse or add new facts.",
+                        }
+                    ],
+                },
+                {"role": "user", "content": [{"type": "input_text", "text": structure_prompt}]},
+            ],
             "max_output_tokens": 20000,
             "text": {
                 "format": {
@@ -14073,9 +14123,9 @@ def run_manual_comping_skill_analysis(address, property_context=None, requested_
                 }
             },
         },
-        timeout=240,
+        timeout=180,
     )
-    response.raise_for_status()
+    _raise_openai_response_error(response, context="OpenAI comp structuring")
     output_text = _extract_openai_response_text(response.json())
     if not output_text:
         raise ValueError("No comping analysis returned by OpenAI.")
@@ -14330,14 +14380,50 @@ def slack_upload_file_external(db, channel_id, file_path, title="", initial_comm
     size = path.stat().st_size
     filename = path.name
     headers = {"Authorization": f"Bearer {token}"}
-    prep = requests.post(
-        "https://slack.com/api/files.getUploadURLExternal",
-        headers=headers,
-        data={"filename": filename, "length": str(size)},
-        timeout=30,
+
+    def _slack_api_post(method, data, timeout=30):
+        response = requests.post(
+            f"https://slack.com/api/{method}",
+            headers=headers,
+            data=data,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _complete_upload():
+        return _slack_api_post(
+            "files.completeUploadExternal",
+            {
+                "files": json.dumps([{"id": file_id, "title": title or filename}]),
+                "channel_id": channel,
+                "initial_comment": initial_comment or "",
+            },
+        )
+
+    def _join_channel_if_possible():
+        join_data = _slack_api_post("conversations.join", {"channel": channel})
+        if join_data.get("ok") or (join_data.get("error") or "").strip() == "already_in_channel":
+            return True, ""
+        join_error = (join_data.get("error") or "").strip()
+        if join_error in {"method_not_supported_for_channel_type", "channel_not_found"}:
+            return (
+                False,
+                "Slack bot could not access the destination conversation. "
+                "If this slash command was run in a private channel, invite the app to that channel first.",
+            )
+        if join_error == "missing_scope":
+            return (
+                False,
+                "Slack bot is missing the scope needed to join the destination channel automatically. "
+                "Add the required Slack scope and reinstall the app, or invite the bot to the channel manually.",
+            )
+        return False, f"Slack channel join failed: {join_error or join_data}"
+
+    prep_data = _slack_api_post(
+        "files.getUploadURLExternal",
+        {"filename": filename, "length": str(size)},
     )
-    prep.raise_for_status()
-    prep_data = prep.json()
     if not prep_data.get("ok"):
         raise ValueError(f"Slack upload URL failed: {prep_data.get('error') or prep_data}")
     upload_url = prep_data.get("upload_url")
@@ -14351,20 +14437,19 @@ def slack_upload_file_external(db, channel_id, file_path, title="", initial_comm
         )
     if not upload.ok:
         raise ValueError(f"Slack file binary upload failed ({upload.status_code}): {upload.text}")
-    complete = requests.post(
-        "https://slack.com/api/files.completeUploadExternal",
-        headers=headers,
-        data={
-            "files": json.dumps([{"id": file_id, "title": title or filename}]),
-            "channel_id": channel,
-            "initial_comment": initial_comment or "",
-        },
-        timeout=30,
-    )
-    complete.raise_for_status()
-    complete_data = complete.json()
+    complete_data = _complete_upload()
     if not complete_data.get("ok"):
-        raise ValueError(f"Slack complete upload failed: {complete_data.get('error') or complete_data}")
+        complete_error = (complete_data.get("error") or "").strip()
+        if complete_error in {"channel_not_found", "not_in_channel"}:
+            joined, join_error = _join_channel_if_possible()
+            if joined:
+                retry_data = _complete_upload()
+                if retry_data.get("ok"):
+                    return {"ok": True, "file_id": file_id, "response": retry_data}
+                retry_error = (retry_data.get("error") or "").strip()
+                raise ValueError(f"Slack complete upload failed after join retry: {retry_error or retry_data}")
+            raise ValueError(join_error)
+        raise ValueError(f"Slack complete upload failed: {complete_error or complete_data}")
     return {"ok": True, "file_id": file_id, "response": complete_data}
 
 

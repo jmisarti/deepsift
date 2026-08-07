@@ -15838,6 +15838,13 @@ def sync_validated_email_to_emailoctopus(db, touchpoint_id, person_id, email_val
     ).fetchone()
     if existing and _email_campaign_sync_success(existing["sync_status"]):
         return {"ok": True, "skipped": "already_synced", "email": normalized_email}
+    if existing and _email_campaign_sync_unsubscribed(existing["sync_status"]):
+        target_status = ""
+        if property_id:
+            prop = db.execute("SELECT status FROM properties WHERE id = ?", (int(property_id),)).fetchone()
+            target_status = prop["status"] if prop else ""
+        if not is_strict_new_record_status(target_status):
+            return {"ok": True, "skipped": "already_unsubscribed", "email": normalized_email}
 
     registry = db.execute(
         """
@@ -15962,6 +15969,7 @@ def backfill_valid_email_campaign_syncs(db, limit=500):
                     lower(COALESCE(s.sync_status, '')) IN ('synced', 'already_synced', 'already_sent_emailoctopus')
                  OR lower(COALESCE(s.sync_status, '')) LIKE 'created_%'
                  OR lower(COALESCE(s.sync_status, '')) LIKE 'updated_%'
+                 OR lower(COALESCE(s.sync_status, '')) LIKE 'unsubscribed%'
               )
         WHERE lower(COALESCE(t.channel_type, '')) = 'email'
           AND lower(COALESCE(t.status, '')) = 'valid'
@@ -24323,6 +24331,8 @@ def process_single_call_recording_job(db, job_row, force_reanalyze=False):
 
 
 def run_call_recording_analysis_once(limit=2, statuses=None, created_after=None, force_reanalyze=False):
+    if not CALL_RECORDING_WORKER_ENABLED:
+        return {"ok": True, "skipped": "call_recording_analysis_disabled", "processed": 0, "completed": 0, "failed": 0}
     ensure_db()
     db = open_sqlite_connection()
     try:
@@ -24444,6 +24454,8 @@ def start_call_recording_worker():
 
 
 def rerun_call_analysis_for_today(db, limit=600):
+    if not CALL_RECORDING_WORKER_ENABLED:
+        return {"ok": True, "skipped": "call_recording_analysis_disabled", "processed": 0, "completed": 0, "failed": 0}
     cutoff = format_db_time(est_yesterday_start_utc())
     rows = db.execute(
         """
@@ -25262,6 +25274,8 @@ def analyze_sms_thread_with_openai(messages, property_id=None, person_id=None, c
 
 
 def run_sms_analysis_once(lookback_days=14, limit_threads=30, start_utc=None):
+    if not SMS_ANALYSIS_WORKER_ENABLED:
+        return {"ok": True, "skipped": "sms_analysis_disabled", "processed": 0, "analyzed": 0, "failed": 0, "routed": 0}
     ensure_db()
     db = open_sqlite_connection()
     lock_acquired = False

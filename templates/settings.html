@@ -104,6 +104,22 @@
                 <button type="submit">Save SMS Automation Settings</button>
                 <a class="button-link secondary" href="{{ url_for('sms_queue_page') }}">Open SMS Queue</a>
             </div>
+            <div class="span2 sms-variation-settings">
+                <h3>Initial Message Variations</h3>
+                <p class="muted-text">
+                    One variation per line. These are applied when you approve drafts for AutoSend.
+                    Available variables: <code>{first_name}</code>, <code>{property_address}</code>, and sheriff sale date routes can also use <code>{sheriff_sale_date}</code>.
+                </p>
+                <div class="sms-variation-grid">
+                    {% for item in sms_initial_variation_settings %}
+                    <label>
+                        <span>{{ item.label }}</span>
+                        <textarea name="sms_initial_variants__{{ item.key }}" rows="4">{{ item.value }}</textarea>
+                        <small>{{ item.help }}</small>
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
         </form>
         <h3>Sender Health</h3>
         <p class="muted-text">Carrier/content filtering cools a sender down. Recipient-side failures suppress that recipient phone from future follow-ups.</p>

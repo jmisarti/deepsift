@@ -31394,6 +31394,7 @@ SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES = {
 
 SMS_AUTOMATION_LOCKED_QUEUE_STATUSES = {"Approved", "Sending", "Sent", "Held"}
 REISIFT_NEW_RECORD_TOUCHPOINT_SOURCE = "ReiSift New Records refresh"
+SMS_AUTOMATION_INITIAL_VARIATIONS_SETTING = "sms_automation_initial_message_variants_json"
 
 SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES = {"new record", "new records"}
 
@@ -32009,7 +32010,99 @@ def render_sms_automation_template(template, variables):
     return normalize_whitespace(text)
 
 
-def _sms_initial_variation_templates(bucket, contact_role, has_sale_date=False):
+def _sms_initial_variation_setting_key(bucket, contact_role, has_sale_date=False):
+    bucket_key = re.sub(r"[^a-z0-9]+", "_", (bucket or "general_new_record").strip().lower()).strip("_") or "general_new_record"
+    role_key = _sms_route_role(contact_role)
+    suffix = "_no_date" if bucket_key == "sheriff_sale" and not has_sale_date else ""
+    return f"{bucket_key}_{role_key}{suffix}"
+
+
+def _sms_initial_variation_labels():
+    return [
+        {
+            "key": "sheriff_sale_owner",
+            "label": "Sheriff Sale - Owner",
+            "bucket": "Sheriff Sale",
+            "contact_role": "owner",
+            "has_sale_date": True,
+            "help": "Use {sheriff_sale_date} when the date parsed successfully.",
+        },
+        {
+            "key": "sheriff_sale_owner_no_date",
+            "label": "Sheriff Sale - Owner, Date Missing",
+            "bucket": "Sheriff Sale",
+            "contact_role": "owner",
+            "has_sale_date": False,
+            "help": "Fallback copy when the sale date could not be parsed.",
+        },
+        {
+            "key": "probate_owner",
+            "label": "Probate - Owner",
+            "bucket": "Probate",
+            "contact_role": "owner",
+            "has_sale_date": False,
+            "help": "General probate/obituary owner outreach.",
+        },
+        {
+            "key": "foreclosure_owner",
+            "label": "Foreclosure - Owner",
+            "bucket": "Foreclosure",
+            "contact_role": "owner",
+            "has_sale_date": False,
+            "help": "Foreclosure or lis pendens owner outreach.",
+        },
+        {
+            "key": "general_new_record_owner",
+            "label": "General New Record - Owner",
+            "bucket": "General New Record",
+            "contact_role": "owner",
+            "has_sale_date": False,
+            "help": "Fallback owner outreach when no specific list route wins.",
+        },
+        {
+            "key": "sheriff_sale_relative",
+            "label": "Sheriff Sale - Relative",
+            "bucket": "Sheriff Sale",
+            "contact_role": "relative",
+            "has_sale_date": True,
+            "help": "Relative/nested contact copy. Phase 1 may still focus on owners.",
+        },
+        {
+            "key": "sheriff_sale_relative_no_date",
+            "label": "Sheriff Sale - Relative, Date Missing",
+            "bucket": "Sheriff Sale",
+            "contact_role": "relative",
+            "has_sale_date": False,
+            "help": "Relative fallback copy when the sale date could not be parsed.",
+        },
+        {
+            "key": "probate_relative",
+            "label": "Probate - Relative",
+            "bucket": "Probate",
+            "contact_role": "relative",
+            "has_sale_date": False,
+            "help": "Relative copy for probate/obituary routes.",
+        },
+        {
+            "key": "foreclosure_relative",
+            "label": "Foreclosure - Relative",
+            "bucket": "Foreclosure",
+            "contact_role": "relative",
+            "has_sale_date": False,
+            "help": "Relative copy for foreclosure/lis pendens routes.",
+        },
+        {
+            "key": "general_new_record_relative",
+            "label": "General New Record - Relative",
+            "bucket": "General New Record",
+            "contact_role": "relative",
+            "has_sale_date": False,
+            "help": "Fallback relative outreach when no specific list route wins.",
+        },
+    ]
+
+
+def _builtin_sms_initial_variation_templates(bucket, contact_role, has_sale_date=False):
     bucket_key = (bucket or "").strip().lower()
     role_key = _sms_route_role(contact_role)
     is_relative = role_key != "owner"
@@ -32072,6 +32165,73 @@ def _sms_initial_variation_templates(bucket, contact_role, has_sale_date=False):
     return out
 
 
+def _parse_sms_variation_text(raw):
+    out = []
+    for line in str(raw or "").splitlines():
+        text = normalize_whitespace(line)
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def get_sms_automation_initial_variation_config(db):
+    saved = parse_json_object(get_setting(db, SMS_AUTOMATION_INITIAL_VARIATIONS_SETTING, "{}"), default={})
+    saved = saved if isinstance(saved, dict) else {}
+    config = {}
+    for entry in _sms_initial_variation_labels():
+        key = entry["key"]
+        values = saved.get(key)
+        if isinstance(values, str):
+            values = _parse_sms_variation_text(values)
+        elif isinstance(values, list):
+            values = [normalize_whitespace(item) for item in values if normalize_whitespace(item)]
+        else:
+            values = []
+        if not values:
+            values = _builtin_sms_initial_variation_templates(
+                entry["bucket"],
+                entry["contact_role"],
+                has_sale_date=entry["has_sale_date"],
+            )
+        config[key] = list(dict.fromkeys(values))
+    return config
+
+
+def sms_automation_initial_variation_settings_for_form(db):
+    config = get_sms_automation_initial_variation_config(db)
+    entries = []
+    for entry in _sms_initial_variation_labels():
+        item = dict(entry)
+        item["value"] = "\n".join(config.get(entry["key"]) or [])
+        entries.append(item)
+    return entries
+
+
+def save_sms_automation_initial_variation_settings(db, form):
+    config = {}
+    for entry in _sms_initial_variation_labels():
+        field_name = f"sms_initial_variants__{entry['key']}"
+        values = _parse_sms_variation_text(form.get(field_name) or "")
+        if not values:
+            values = _builtin_sms_initial_variation_templates(
+                entry["bucket"],
+                entry["contact_role"],
+                has_sale_date=entry["has_sale_date"],
+            )
+        config[entry["key"]] = values
+    set_setting(db, SMS_AUTOMATION_INITIAL_VARIATIONS_SETTING, json.dumps(config, ensure_ascii=True, sort_keys=True))
+    return config
+
+
+def _sms_initial_variation_templates(db, bucket, contact_role, has_sale_date=False):
+    key = _sms_initial_variation_setting_key(bucket, contact_role, has_sale_date=has_sale_date)
+    config = get_sms_automation_initial_variation_config(db) if db is not None else {}
+    variants = config.get(key) or []
+    if variants:
+        return variants
+    return _builtin_sms_initial_variation_templates(bucket, contact_role, has_sale_date=has_sale_date)
+
+
 def _deterministic_sms_variation_index(seed, count):
     if count <= 1:
         return 0
@@ -32079,7 +32239,7 @@ def _deterministic_sms_variation_index(seed, count):
     return int(digest[:8], 16) % count
 
 
-def sms_automation_initial_message_for_approval(row):
+def sms_automation_initial_message_for_approval(db, row):
     if not row or int(row["step_order"] or 1) != 1:
         return normalize_whitespace(row["message_body"] if row else "")
     variables = parse_json_object(row["rendered_variables_json"] or "{}", default={})
@@ -32090,7 +32250,7 @@ def sms_automation_initial_message_for_approval(row):
     if not isinstance(source_info, dict):
         source_info = {}
     has_sale_date = bool(variables.get("sheriff_sale_date") or source_info.get("sheriff_sale_date"))
-    templates = _sms_initial_variation_templates(row["bucket"], row["contact_role"], has_sale_date=has_sale_date)
+    templates = _sms_initial_variation_templates(db, row["bucket"], row["contact_role"], has_sale_date=has_sale_date)
     rendered_options = [render_sms_automation_template(template, variables) for template in templates]
     rendered_options = [message for message in rendered_options if message]
     current_message = normalize_whitespace(row["message_body"] or "")
@@ -32175,7 +32335,7 @@ def approve_sms_automation_queue_items(db, queue_ids):
             result["suppressed"] += 1
             result["suppressed_ids"].append(queue_id)
             continue
-        message_body = sms_automation_initial_message_for_approval(row)
+        message_body = sms_automation_initial_message_for_approval(db, row)
         db.execute(
             """
             UPDATE sms_automation_queue
@@ -44013,6 +44173,7 @@ def settings_page():
             }
             for key, value in fields.items():
                 set_setting(db, key, value)
+            save_sms_automation_initial_variation_settings(db, request.form)
             notice = "SMS automation settings saved."
         elif active_tab == "email":
             fields = {
@@ -44388,6 +44549,7 @@ def settings_page():
         slybroadcast_settings=slybroadcast_settings,
         sms_automation_settings=sms_automation_settings,
         sms_automation_rules=sms_automation_rules,
+        sms_initial_variation_settings=sms_automation_initial_variation_settings_for_form(db),
         sms_sender_health=get_sms_sender_health_rows(db),
         active_tab=active_tab,
         deep_dive_smrtphone_from=deep_dive_smrtphone_from,

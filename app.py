@@ -740,6 +740,16 @@ def format_short_date(value):
     return dt.strftime("%m/%d/%y")
 
 
+def format_sms_natural_date(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    dt = parse_flexible_datetime(text)
+    if dt is None:
+        return text
+    return f"{dt.strftime('%b')} {dt.day}"
+
+
 def format_est_datetime(value):
     dt = parse_flexible_datetime(value)
     if dt is None:
@@ -31986,6 +31996,7 @@ def _sms_automation_template_variables(person, prop, bucket, contact_role, sourc
     person_last = proper_case_name((person["last_name"] if person else "") or "")
     property_full_address = format_property_address_line(prop["street"], prop["city"], prop["state"], prop["postal_code"]) if prop else ""
     property_address = normalize_whitespace(prop["street"] if prop else "") or property_full_address
+    sheriff_sale_date_raw = (source_info or {}).get("sheriff_sale_date") or ""
     return {
         "first_name": person_first,
         "last_name": person_last,
@@ -31997,7 +32008,8 @@ def _sms_automation_template_variables(person, prop, bucket, contact_role, sourc
         "property_state": (prop["state"] if prop else "") or "",
         "property_zip": (prop["postal_code"] if prop else "") or "",
         "list_name": lists_text or bucket,
-        "sheriff_sale_date": (source_info or {}).get("sheriff_sale_date") or "",
+        "sheriff_sale_date": format_sms_natural_date(sheriff_sale_date_raw),
+        "sheriff_sale_date_raw": sheriff_sale_date_raw,
         "source_info_bucket": (source_info or {}).get("source_info_bucket") or "",
         "county": "",
         "contact_role": contact_role or "",

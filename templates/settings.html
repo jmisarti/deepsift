@@ -108,7 +108,7 @@
                 <h3>Initial Message Variations</h3>
                 <p class="muted-text">
                     One variation per line. These are applied when you approve drafts for AutoSend.
-                    Available variables: <code>{first_name}</code>, <code>{property_address}</code>, and sheriff sale date routes can also use <code>{sheriff_sale_date}</code>.
+                    Available variables: <code>{first_name}</code>, <code>{property_address}</code>, and sheriff sale date routes can also use <code>{sheriff_sale_date}</code> for a natural date like <code>Aug 7</code>. Use <code>{sheriff_sale_date_raw}</code> only if you need the exact stored date.
                 </p>
                 <div class="sms-variation-grid">
                     {% for item in sms_initial_variation_settings %}

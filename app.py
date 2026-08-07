@@ -1045,6 +1045,10 @@ def migrate_db(db):
             full_address TEXT,
             owner_names TEXT,
             county TEXT,
+            city TEXT,
+            completeness TEXT,
+            owner_type TEXT,
+            owner_out_of_state INTEGER,
             added_at TEXT,
             reisift_updated_at TEXT,
             local_property_id INTEGER,
@@ -1058,6 +1062,10 @@ def migrate_db(db):
         """
     )
     ensure_column(db, "reisift_new_records", "county", "county TEXT")
+    ensure_column(db, "reisift_new_records", "city", "city TEXT")
+    ensure_column(db, "reisift_new_records", "completeness", "completeness TEXT")
+    ensure_column(db, "reisift_new_records", "owner_type", "owner_type TEXT")
+    ensure_column(db, "reisift_new_records", "owner_out_of_state", "owner_out_of_state INTEGER")
     ensure_column(db, "reisift_new_records", "reisift_updated_at", "reisift_updated_at TEXT")
     ensure_column(db, "reisift_new_records", "local_property_id", "local_property_id INTEGER")
     ensure_column(db, "reisift_new_records", "local_status_before", "local_status_before TEXT")
@@ -1076,6 +1084,15 @@ def migrate_db(db):
     ensure_column(db, "reisift_new_records", "no_good_numbers", "no_good_numbers INTEGER NOT NULL DEFAULT 0")
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_county ON reisift_new_records(is_active, county, added_at)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_added ON reisift_new_records(is_active, added_at)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_city ON reisift_new_records(is_active, city, added_at)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_owner ON reisift_new_records(is_active, owner_type, completeness, owner_out_of_state)"
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_local_property ON reisift_new_records(local_property_id)"
@@ -33162,7 +33179,12 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
         or infer_county_from_reisift_payload(search_row)
         or county_from_zip5(summary.get("full_address") or "")
     )
-    added_dt = reisift_added_at_dt(search_row, payload)
+    cached_fields = derive_reisift_new_record_cached_fields(
+        payload,
+        fallback_payload=search_row,
+        summary=summary,
+        county=county,
+    )
     updated_at = (
         str(payload.get("updated") or payload.get("updated_at") or payload.get("owner_updated") or "").strip()
         or str(search_row.get("updated") or search_row.get("updated_at") or search_row.get("owner_updated") or "").strip()
@@ -33204,18 +33226,23 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
         db,
         """
         INSERT INTO reisift_new_records
-            (property_uuid, status, full_address, owner_names, county, added_at, reisift_updated_at,
+            (property_uuid, status, full_address, owner_names, county, city, completeness, owner_type, owner_out_of_state,
+             added_at, reisift_updated_at,
              local_property_id, local_status_before, local_status_after,
              outbound_calls, inbound_calls, outbound_sms, inbound_sms, outbound_email, inbound_email,
              inbound_responses, events_json, tasks_json,
              rei_skipped, deep_skipped, no_good_numbers,
              payload_json, is_active, last_synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(property_uuid) DO UPDATE SET
             status = excluded.status,
             full_address = excluded.full_address,
             owner_names = excluded.owner_names,
             county = excluded.county,
+            city = excluded.city,
+            completeness = excluded.completeness,
+            owner_type = excluded.owner_type,
+            owner_out_of_state = excluded.owner_out_of_state,
             added_at = excluded.added_at,
             reisift_updated_at = excluded.reisift_updated_at,
             local_property_id = excluded.local_property_id,
@@ -33242,8 +33269,12 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
             summary["status"],
             summary["full_address"],
             summary["owner_names"],
-            county,
-            format_db_time(added_dt) if added_dt else None,
+            cached_fields["county"],
+            cached_fields["city"],
+            cached_fields["completeness"],
+            cached_fields["owner_type"],
+            cached_fields["owner_out_of_state"],
+            cached_fields["added_at"],
             updated_at,
             local_sync["local_property_id"],
             local_sync["before"],
@@ -33525,6 +33556,9 @@ def infer_county_from_new_record_row(row):
 
 def infer_city_from_new_record_row(row):
     item = row if isinstance(row, dict) else {}
+    city = normalize_whitespace(item.get("city") or "")
+    if city:
+        return city
     payload = _new_record_payload(item)
     address = extract_reisift_property_address(payload)
     city = normalize_whitespace(address.get("city") or "")
@@ -33588,6 +33622,44 @@ def _new_record_owner_out_of_state(payload):
     if not states:
         return None
     return any(state != "NJ" for state in states)
+
+
+def derive_reisift_new_record_cached_fields(payload, fallback_payload=None, summary=None, county=""):
+    payload = payload if isinstance(payload, dict) else {}
+    fallback_payload = fallback_payload if isinstance(fallback_payload, dict) else {}
+    summary = summary if isinstance(summary, dict) else {}
+    field_payload = payload or fallback_payload
+    derived_added_dt = (
+        reisift_added_at_dt(fallback_payload, payload)
+        or latest_lp_tag_datetime(payload, fallback_payload)
+        or latest_reisift_upload_date_datetime(payload, fallback_payload)
+        or latest_reisift_source_date_datetime(payload, fallback_payload)
+    )
+    full_address = normalize_whitespace(summary.get("full_address") or "")
+    cached_county = (
+        display_county_name(county or "")
+        or display_county_name(infer_county_from_reisift_payload(payload))
+        or display_county_name(infer_county_from_reisift_payload(fallback_payload))
+        or display_county_name(county_from_zip5(full_address))
+    )
+    city = ""
+    address = extract_reisift_property_address(field_payload)
+    if address:
+        city = normalize_whitespace(address.get("city") or "")
+    if not city and full_address:
+        try:
+            city = normalize_whitespace(parse_freeform_property_address(full_address).get("city") or "")
+        except Exception:
+            city = ""
+    owner_out = _new_record_owner_out_of_state(field_payload)
+    return {
+        "county": cached_county,
+        "city": city,
+        "completeness": _new_record_completeness(field_payload),
+        "owner_type": _new_record_owner_type(field_payload),
+        "owner_out_of_state": None if owner_out is None else (1 if owner_out else 0),
+        "added_at": format_db_time(derived_added_dt) if derived_added_dt else None,
+    }
 
 
 def _new_record_yes_no_filter_value(value):
@@ -33770,6 +33842,61 @@ def backfill_reisift_new_record_lists(db, only_missing=False):
     return {"properties": properties, "list_rows": list_rows}
 
 
+def backfill_reisift_new_record_cached_fields(db, only_missing=False):
+    where_sql = "WHERE COALESCE(payload_json, '') <> ''"
+    if only_missing:
+        where_sql += """
+          AND (
+                COALESCE(city, '') = ''
+             OR COALESCE(completeness, '') = ''
+             OR COALESCE(owner_type, '') = ''
+             OR added_at IS NULL
+             OR COALESCE(added_at, '') = ''
+          )
+        """
+    rows = db.execute(
+        f"""
+        SELECT property_uuid, payload_json, full_address, county
+        FROM reisift_new_records
+        {where_sql}
+        """
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        payload = parse_json_object(row["payload_json"] or "{}", default={})
+        summary = summarize_reisift_property(payload, fallback_payload={"full_address": row["full_address"] or ""})
+        fields = derive_reisift_new_record_cached_fields(
+            payload,
+            fallback_payload=payload,
+            summary=summary,
+            county=row["county"] or "",
+        )
+        execute_with_retry(
+            db,
+            """
+            UPDATE reisift_new_records
+            SET county = COALESCE(NULLIF(?, ''), county),
+                city = ?,
+                completeness = ?,
+                owner_type = ?,
+                owner_out_of_state = ?,
+                added_at = COALESCE(NULLIF(?, ''), added_at)
+            WHERE property_uuid = ?
+            """,
+            (
+                fields["county"],
+                fields["city"],
+                fields["completeness"],
+                fields["owner_type"],
+                fields["owner_out_of_state"],
+                fields["added_at"] or "",
+                row["property_uuid"],
+            ),
+        )
+        updated += 1
+    return {"properties": updated}
+
+
 def reisift_new_record_list_names_for_properties(db, property_uuids):
     clean_uuids = []
     for value in property_uuids or []:
@@ -33827,8 +33954,8 @@ def _new_record_matches_filters(row, filters):
     if completeness_filter and normalize_whitespace(row.get("completeness") or "").lower() != completeness_filter:
         return False
 
-    owner_type_filter = normalize_new_record_owner_type(filters.get("owner_type") or "")
-    if owner_type_filter and normalize_new_record_owner_type(row.get("owner_type") or "") != owner_type_filter:
+    owner_type_filter = normalize_whitespace(filters.get("owner_type") or "")
+    if owner_type_filter and normalize_whitespace(row.get("owner_type") or "").lower() != owner_type_filter.lower():
         return False
 
     owner_out_of_state_filter = _new_record_yes_no_filter_value(filters.get("owner_out_of_state") or "")
@@ -33865,28 +33992,18 @@ def get_new_record_filter_options(db):
         """
         SELECT n.status,
                n.county,
-               n.full_address,
-               n.payload_json
+               n.city,
+               n.completeness,
+               n.owner_type
         FROM reisift_new_records n
         WHERE n.is_active = 1
         """
     ).fetchall()
     statuses = sorted({normalize_whitespace(row["status"] or "") for row in rows if normalize_whitespace(row["status"] or "")})
-    payloads = [_new_record_payload(dict(row)) for row in rows]
-    county_values = set()
-    for row in rows:
-        county = infer_county_from_new_record_row(dict(row))
-        if county:
-            county_values.add(county)
-    counties = sorted(county_values)
-    city_values = set()
-    for row in rows:
-        city = infer_city_from_new_record_row(dict(row))
-        if city:
-            city_values.add(city)
-    cities = sorted(city_values, key=lambda value: value.lower())
-    completeness = sorted({value for value in (_new_record_completeness(payload) for payload in payloads) if value})
-    owner_types = sorted({value for value in (_new_record_owner_type(payload) for payload in payloads) if value})
+    counties = sorted({display_county_name(row["county"] or "") for row in rows if display_county_name(row["county"] or "")})
+    cities = sorted({normalize_whitespace(row["city"] or "") for row in rows if normalize_whitespace(row["city"] or "")}, key=lambda value: value.lower())
+    completeness = sorted({normalize_whitespace(row["completeness"] or "") for row in rows if normalize_whitespace(row["completeness"] or "")})
+    owner_types = sorted({normalize_whitespace(row["owner_type"] or "") for row in rows if normalize_whitespace(row["owner_type"] or "")})
     list_rows = db.execute(
         """
         SELECT DISTINCT l.list_name
@@ -33898,16 +34015,6 @@ def get_new_record_filter_options(db):
         """
     ).fetchall()
     lists = [row["list_name"] for row in list_rows]
-    if not lists:
-        lists = sorted(
-            {
-                list_name
-                for payload in payloads
-                for list_name in _new_record_list_names(payload)
-                if normalize_whitespace(list_name)
-            },
-            key=lambda value: value.lower(),
-        )
     return {"statuses": statuses, "counties": counties, "cities": cities, "completeness": completeness, "owner_types": owner_types, "lists": lists}
 
 
@@ -34291,69 +34398,69 @@ def bulk_new_record_local_contact_flags(db, property_ids):
 
 
 def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=None):
-    sort_reverse = str(sort_dir).lower() != "asc"
-    rows = db.execute(
-        """
-        SELECT n.*,
-               p.id AS deep_dive_property_id,
-               p.status AS deep_dive_status
-        FROM reisift_new_records n
-        LEFT JOIN properties p ON p.id = n.local_property_id
-        WHERE n.is_active = 1
-        """
-    ).fetchall()
-    list_names_by_uuid = reisift_new_record_list_names_for_properties(
-        db,
-        [row["property_uuid"] for row in rows],
-    )
-    candidates = []
-    local_property_ids = []
-    for row in rows:
-        item = dict(row)
-        payload = _new_record_payload(item)
-        derived_added_dt = (
-            latest_lp_tag_datetime(payload)
-            or latest_reisift_upload_date_datetime(payload)
-            or latest_reisift_source_date_datetime(payload)
-        )
-        item["lp_added_at"] = format_db_time(derived_added_dt) if derived_added_dt else ""
-        if item["lp_added_at"] and (not item.get("added_at") or parse_flexible_datetime(item.get("added_at")) is None):
-            item["added_at"] = item["lp_added_at"]
-        item["completeness"] = _new_record_completeness(payload)
-        item["owner_type"] = _new_record_owner_type(payload)
-        item["owner_out_of_state"] = _new_record_owner_out_of_state(payload)
-        item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
-        item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
-        item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
-        item["county"] = infer_county_from_new_record_row(item)
-        item["city"] = infer_city_from_new_record_row(item)
-        item["property_list_names"] = list_names_by_uuid.get(item.get("property_uuid") or "") or _new_record_list_names(payload)
-        item["property_lists"] = ", ".join(item["property_list_names"])
-        for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
-            item[flag_key] = 1 if int(item.get(flag_key) or 0) else 0
-        live_property_id = item.get("deep_dive_property_id") or item.get("local_property_id")
-        try:
-            live_property_id = int(live_property_id or 0)
-        except Exception:
-            live_property_id = 0
-        item["_live_property_id"] = live_property_id
-        if live_property_id > 0:
-            local_property_ids.append(live_property_id)
-        candidates.append((item, payload))
-
-    live_flags_by_property = bulk_new_record_local_contact_flags(db, local_property_ids)
-    out = []
-    for item, payload in candidates:
-        live_flags = live_flags_by_property.get(int(item.get("_live_property_id") or 0), {})
-        item["rei_skipped"] = 1 if (item["rei_skipped"] or _new_record_has_reisift_skiptrace(payload)) else 0
-        item["deep_skipped"] = 1 if live_flags.get("deep_skipped") else item["deep_skipped"]
-        item["no_good_numbers"] = 1 if live_flags.get("no_good_numbers") else item["no_good_numbers"]
-        if not _new_record_matches_filters(item, filters):
+    filters = filters if isinstance(filters, dict) else {}
+    clauses = ["n.is_active = 1"]
+    params = []
+    date_from = _parse_iso_date_only(filters.get("date_from") or "")
+    date_to = _parse_iso_date_only(filters.get("date_to") or "")
+    if date_from:
+        clauses.append("date(n.added_at) >= date(?)")
+        params.append(date_from.isoformat())
+    if date_to:
+        clauses.append("date(n.added_at) <= date(?)")
+        params.append(date_to.isoformat())
+    status_filter = normalize_whitespace(filters.get("status") or "")
+    if status_filter:
+        clauses.append("lower(trim(COALESCE(n.status, ''))) = lower(trim(?))")
+        params.append(status_filter)
+    county_filter = display_county_name(filters.get("county") or "")
+    if county_filter:
+        clauses.append("lower(trim(COALESCE(n.county, ''))) = lower(trim(?))")
+        params.append(county_filter)
+    city_filter = normalize_whitespace(filters.get("city") or "")
+    if city_filter:
+        clauses.append("lower(trim(COALESCE(n.city, ''))) = lower(trim(?))")
+        params.append(city_filter)
+    completeness_filter = normalize_whitespace(filters.get("completeness") or "")
+    if completeness_filter:
+        clauses.append("lower(trim(COALESCE(n.completeness, ''))) = lower(trim(?))")
+        params.append(completeness_filter)
+    owner_type_filter = normalize_whitespace(filters.get("owner_type") or "")
+    if owner_type_filter:
+        clauses.append("lower(trim(COALESCE(n.owner_type, ''))) = lower(trim(?))")
+        params.append(owner_type_filter)
+    owner_out_of_state_filter = _new_record_yes_no_filter_value(filters.get("owner_out_of_state") or "")
+    if owner_out_of_state_filter is not None:
+        clauses.append("COALESCE(n.owner_out_of_state, 0) = ?")
+        params.append(1 if owner_out_of_state_filter else 0)
+    for filter_key, column in [
+        ("rei_skipped", "rei_skipped"),
+        ("deep_skipped", "deep_skipped"),
+        ("no_good_numbers", "no_good_numbers"),
+    ]:
+        expected = _new_record_yes_no_filter_value(filters.get(filter_key) or "")
+        if expected is None:
             continue
-        out.append(item)
+        clauses.append(f"COALESCE(n.{column}, 0) = ?")
+        params.append(1 if expected else 0)
+    selected_lists = filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")
+    for selected_list in selected_lists:
+        list_name = normalize_whitespace(selected_list)
+        if not list_name:
+            continue
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM reisift_new_record_lists l
+                WHERE l.property_uuid = n.property_uuid
+                  AND lower(trim(l.list_name)) = lower(trim(?))
+            )
+            """
+        )
+        params.append(list_name)
 
-    out.sort(key=_new_record_row_date, reverse=sort_reverse)
-    total_count = len(out)
+    where_sql = "WHERE " + " AND ".join(clauses)
     try:
         offset = max(0, int(offset or 0))
     except Exception:
@@ -34362,22 +34469,87 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
         clean_limit = int(limit) if limit is not None else 0
     except Exception:
         clean_limit = 0
-    page_rows = out
+    order_dir = "ASC" if str(sort_dir).lower() == "asc" else "DESC"
+    total_count = int(
+        (
+            db.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM reisift_new_records n
+                LEFT JOIN properties p ON p.id = n.local_property_id
+                {where_sql}
+                """,
+                tuple(params),
+            ).fetchone()
+            or {"count": 0}
+        )["count"]
+        or 0
+    )
+    summary_rows = db.execute(
+        f"""
+        SELECT COALESCE(NULLIF(n.county, ''), 'Unknown') AS county,
+               COUNT(*) AS count,
+               SUM(CASE WHEN p.id IS NOT NULL THEN 1 ELSE 0 END) AS local_match_count,
+               SUM(CASE WHEN lower(trim(COALESCE(p.status, ''))) = 'new records' THEN 1 ELSE 0 END) AS local_update_count
+        FROM reisift_new_records n
+        LEFT JOIN properties p ON p.id = n.local_property_id
+        {where_sql}
+        GROUP BY COALESCE(NULLIF(n.county, ''), 'Unknown')
+        """,
+        tuple(params),
+    ).fetchall()
+    page_sql = f"""
+        SELECT n.*,
+               p.id AS deep_dive_property_id,
+               p.status AS deep_dive_status
+        FROM reisift_new_records n
+        LEFT JOIN properties p ON p.id = n.local_property_id
+        {where_sql}
+        ORDER BY COALESCE(NULLIF(n.added_at, ''), '0001-01-01 00:00:00') {order_dir}, n.id {order_dir}
+    """
+    page_params = list(params)
     if clean_limit > 0:
-        page_rows = out[offset:offset + clean_limit]
+        page_sql += " LIMIT ? OFFSET ?"
+        page_params.extend([clean_limit, offset])
+    page_rows = [dict(row) for row in db.execute(page_sql, tuple(page_params)).fetchall()]
+    list_names_by_uuid = reisift_new_record_list_names_for_properties(
+        db,
+        [row["property_uuid"] for row in page_rows],
+    )
+    for item in page_rows:
+        item["lp_added_at"] = item.get("added_at") or ""
+        item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
+        item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
+        item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
+        item["county"] = display_county_name(item.get("county") or "") or "Unknown"
+        item["city"] = normalize_whitespace(item.get("city") or "")
+        item["property_list_names"] = list_names_by_uuid.get(item.get("property_uuid") or "") or []
+        item["property_lists"] = ", ".join(item["property_list_names"])
+        for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
+            item[flag_key] = 1 if int(item.get(flag_key) or 0) else 0
 
     activity_counts = bulk_property_activity_counts_for_new_records(db, page_rows)
     for item in page_rows:
         item.update(activity_counts.get(id(item), _new_record_default_activity_counts(item)))
-        item.pop("_live_property_id", None)
-    for item in out:
-        item.pop("_live_property_id", None)
+    county_counts = {}
+    local_match_count = 0
+    local_update_count = 0
+    for row in summary_rows:
+        county = display_county_name(row["county"] or "") or "Unknown"
+        county_counts[county] = int(row["count"] or 0)
+        local_match_count += int(row["local_match_count"] or 0)
+        local_update_count += int(row["local_update_count"] or 0)
     return {
         "rows": page_rows,
-        "all_rows": out,
+        "all_rows": [],
         "total_count": total_count,
         "offset": offset,
         "limit": clean_limit if clean_limit > 0 else total_count,
+        "summary_counts": {
+            "county_counts": county_counts,
+            "local_match_count": local_match_count,
+            "local_update_count": local_update_count,
+        },
     }
 
 
@@ -41049,7 +41221,6 @@ def new_records_page():
     offset = (page - 1) * per_page
     record_result = get_cached_new_records(db, sort_dir=sort_order, filters=filters, offset=offset, limit=per_page)
     rows = record_result["rows"]
-    all_filtered_rows = record_result["all_rows"]
     filtered_count = int(record_result["total_count"] or 0)
     total_pages = max(1, math.ceil(filtered_count / per_page)) if filtered_count else 1
     if page > total_pages:
@@ -41057,23 +41228,16 @@ def new_records_page():
         offset = (page - 1) * per_page
         record_result = get_cached_new_records(db, sort_dir=sort_order, filters=filters, offset=offset, limit=per_page)
         rows = record_result["rows"]
-        all_filtered_rows = record_result["all_rows"]
         filtered_count = int(record_result["total_count"] or 0)
+    summary_counts = record_result.get("summary_counts") or {}
     filter_options = get_new_record_filter_options(db)
     total_active_count = int(
         (db.execute("SELECT COUNT(*) AS count FROM reisift_new_records WHERE COALESCE(is_active, 1) = 1").fetchone() or {"count": 0})["count"]
         or 0
     )
-    county_counts = {}
-    local_match_count = 0
-    local_update_count = 0
-    for row in all_filtered_rows:
-        county = str(row["county"] or "Unknown").strip() or "Unknown"
-        county_counts[county] = int(county_counts.get(county, 0)) + 1
-        if row["deep_dive_property_id"]:
-            local_match_count += 1
-        if row["deep_dive_property_id"] and normalize_whitespace(row["deep_dive_status"] or "") == "New Records":
-            local_update_count += 1
+    county_counts = summary_counts.get("county_counts") or {}
+    local_match_count = int(summary_counts.get("local_match_count") or 0)
+    local_update_count = int(summary_counts.get("local_update_count") or 0)
     base_page_args = request.args.to_dict(flat=False)
 
     def _new_records_page_url(target_page):
@@ -41432,7 +41596,27 @@ def run_sms_automation_send_once(limit=None):
                 "delivery_stale_marked": stale_delivery,
             }
         recovered = recover_stale_sms_automation_sending_rows(db)
-        revalidate_sms_automation_queue(db, property_ids=None)
+        candidate_property_rows = db.execute(
+            """
+            SELECT property_id, MAX(updated_at) AS last_updated_at, MAX(id) AS last_id
+            FROM sms_automation_queue
+            WHERE status = 'Approved'
+               OR (
+                    status = 'Scheduled'
+                    AND (
+                        COALESCE(scheduled_for, '') = ''
+                        OR datetime(scheduled_for) <= datetime('now')
+                    )
+                  )
+            GROUP BY property_id
+            ORDER BY last_updated_at DESC, last_id DESC
+            LIMIT ?
+            """,
+            (max(batch_limit * 5, 25),),
+        ).fetchall()
+        revalidated_property_ids = [int(row["property_id"] or 0) for row in candidate_property_rows if int(row["property_id"] or 0) > 0]
+        if revalidated_property_ids:
+            revalidate_sms_automation_queue(db, property_ids=revalidated_property_ids)
         db.commit()
         rows = db.execute(
             """
@@ -41541,7 +41725,42 @@ def get_sms_automation_queue_rows(db, filters=None):
         clauses.append(f"{number_pulled_expr} <= date(?)")
         params.append(date_to)
     # County/city can be inferred from the linked New Records payload, so apply
-    # them after enrichment instead of filtering on potentially blank SQL fields.
+    # them from cached New Records fields.
+    county_filter = display_county_name(filters.get("county") or "")
+    if county_filter:
+        clauses.append("lower(trim(COALESCE(n.county, ''))) = lower(trim(?))")
+        params.append(county_filter)
+    city_filter = normalize_whitespace(filters.get("city") or "")
+    if city_filter:
+        clauses.append("lower(trim(COALESCE(n.city, a.city, ''))) = lower(trim(?))")
+        params.append(city_filter)
+    completeness_filter = normalize_whitespace(filters.get("completeness") or "")
+    if completeness_filter:
+        clauses.append("lower(trim(COALESCE(n.completeness, ''))) = lower(trim(?))")
+        params.append(completeness_filter)
+    owner_type_filter = normalize_whitespace(filters.get("owner_type") or "")
+    if owner_type_filter:
+        clauses.append("lower(trim(COALESCE(n.owner_type, ''))) = lower(trim(?))")
+        params.append(owner_type_filter)
+    owner_out_of_state_filter = _new_record_yes_no_filter_value(filters.get("owner_out_of_state") or "")
+    if owner_out_of_state_filter is not None:
+        clauses.append("COALESCE(n.owner_out_of_state, 0) = ?")
+        params.append(1 if owner_out_of_state_filter else 0)
+    for selected_list in (filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")):
+        list_name = normalize_whitespace(selected_list)
+        if not list_name:
+            continue
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM reisift_new_record_lists l
+                WHERE l.property_uuid = n.property_uuid
+                  AND lower(trim(l.list_name)) = lower(trim(?))
+            )
+            """
+        )
+        params.append(list_name)
     status = (filters.get("status") or "").strip()
     if status:
         clauses.append("q.status = ?")
@@ -41565,9 +41784,12 @@ def get_sms_automation_queue_rows(db, filters=None):
                a.street, a.city, a.state, a.postal_code,
                pe.first_name, pe.last_name, t.channel_label, t.status AS phone_status,
                n.county AS property_county,
+               n.city AS new_record_city,
+               n.completeness AS new_record_completeness,
+               n.owner_type AS new_record_owner_type,
+               n.owner_out_of_state AS new_record_owner_out_of_state,
                n.property_uuid AS new_record_property_uuid,
                n.full_address AS new_record_full_address,
-               n.payload_json AS new_record_payload_json,
                n.rei_skipped AS new_record_rei_skipped,
                n.deep_skipped AS new_record_deep_skipped,
                n.no_good_numbers AS new_record_no_good_numbers,
@@ -41614,24 +41836,19 @@ def get_sms_automation_queue_rows(db, filters=None):
     )
     live_flags_by_property = bulk_new_record_local_contact_flags(db, [row.get("property_id") for row in raw_rows])
     for d in raw_rows:
-        new_record_row = {
-            "county": d.get("property_county") or "",
-            "full_address": d.get("new_record_full_address") or d.get("property_address") or "",
-            "payload_json": d.get("new_record_payload_json") or "{}",
-        }
-        payload = _new_record_payload(new_record_row)
-        d["property_county"] = infer_county_from_new_record_row(new_record_row) or d.get("property_county") or ""
-        d["property_city"] = infer_city_from_new_record_row(new_record_row) or d.get("city") or ""
-        d["owner_type"] = _new_record_owner_type(payload)
-        d["owner_out_of_state"] = _new_record_owner_out_of_state(payload)
-        d["completeness"] = _new_record_completeness(payload)
-        d["property_list_names"] = list_names_by_uuid.get(d.get("new_record_property_uuid") or "") or _new_record_list_names(payload)
+        d["property_county"] = display_county_name(d.get("property_county") or "") or ""
+        d["property_city"] = normalize_whitespace(d.get("new_record_city") or d.get("city") or "")
+        d["owner_type"] = normalize_whitespace(d.get("new_record_owner_type") or "")
+        owner_out = d.get("new_record_owner_out_of_state")
+        d["owner_out_of_state"] = None if owner_out is None else bool(int(owner_out or 0))
+        d["completeness"] = normalize_whitespace(d.get("new_record_completeness") or "")
+        d["property_list_names"] = list_names_by_uuid.get(d.get("new_record_property_uuid") or "") or []
         try:
             property_id = int(d.get("property_id") or 0)
         except Exception:
             property_id = 0
         live_flags = live_flags_by_property.get(property_id, {})
-        d["rei_skipped"] = 1 if (int(d.get("new_record_rei_skipped") or 0) or _new_record_has_reisift_skiptrace(payload)) else 0
+        d["rei_skipped"] = 1 if int(d.get("new_record_rei_skipped") or 0) else 0
         d["deep_skipped"] = 1 if (int(d.get("new_record_deep_skipped") or 0) or live_flags.get("deep_skipped")) else 0
         d["no_good_numbers"] = 1 if (int(d.get("new_record_no_good_numbers") or 0) or live_flags.get("no_good_numbers")) else 0
         if not _sms_queue_matches_new_record_filters(d, filters):
@@ -41672,8 +41889,8 @@ def _sms_queue_matches_new_record_filters(row, filters):
     completeness_filter = normalize_whitespace(filters.get("completeness") or "").lower()
     if completeness_filter and normalize_whitespace(row.get("completeness") or "").lower() != completeness_filter:
         return False
-    owner_type_filter = normalize_new_record_owner_type(filters.get("owner_type") or "")
-    if owner_type_filter and normalize_new_record_owner_type(row.get("owner_type") or "") != owner_type_filter:
+    owner_type_filter = normalize_whitespace(filters.get("owner_type") or "")
+    if owner_type_filter and normalize_whitespace(row.get("owner_type") or "").lower() != owner_type_filter.lower():
         return False
     owner_out_of_state_filter = _new_record_yes_no_filter_value(filters.get("owner_out_of_state") or "")
     if owner_out_of_state_filter is not None:
@@ -41705,7 +41922,7 @@ def _sms_queue_matches_new_record_filters(row, filters):
 def get_sms_automation_filter_options(db):
     rows = db.execute(
         """
-        SELECT n.property_uuid, n.county, n.full_address, n.payload_json,
+        SELECT n.property_uuid, n.county, n.city, n.completeness, n.owner_type,
                a.city AS local_city
         FROM sms_automation_queue q
         JOIN properties p ON p.id = q.property_id
@@ -41723,7 +41940,6 @@ def get_sms_automation_filter_options(db):
         )
         """
     ).fetchall()
-    payloads = []
     list_names_by_uuid = reisift_new_record_list_names_for_properties(
         db,
         [row["property_uuid"] for row in rows],
@@ -41732,16 +41948,14 @@ def get_sms_automation_filter_options(db):
     cities = set()
     for row in rows:
         item = dict(row)
-        payload = _new_record_payload(item)
-        payloads.append(payload)
-        county = infer_county_from_new_record_row(item)
+        county = display_county_name(item.get("county") or "")
         if county:
             counties.add(county)
-        city = infer_city_from_new_record_row(item) or normalize_whitespace(item.get("local_city") or "")
+        city = normalize_whitespace(item.get("city") or item.get("local_city") or "")
         if city:
             cities.add(city)
-    completeness = sorted({value for value in (_new_record_completeness(payload) for payload in payloads) if value})
-    owner_types = sorted({value for value in (_new_record_owner_type(payload) for payload in payloads) if value})
+    completeness = sorted({normalize_whitespace(row["completeness"] or "") for row in rows if normalize_whitespace(row["completeness"] or "")})
+    owner_types = sorted({normalize_whitespace(row["owner_type"] or "") for row in rows if normalize_whitespace(row["owner_type"] or "")})
     lists = sorted(
         {
             list_name
@@ -41751,16 +41965,6 @@ def get_sms_automation_filter_options(db):
         },
         key=lambda value: value.lower(),
     )
-    if not lists:
-        lists = sorted(
-            {
-                list_name
-                for payload in payloads
-                for list_name in _new_record_list_names(payload)
-                if normalize_whitespace(list_name)
-            },
-            key=lambda value: value.lower(),
-        )
     return {
         "counties": sorted(counties),
         "cities": sorted(cities, key=lambda value: value.lower()),

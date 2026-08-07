@@ -579,6 +579,10 @@ CREATE TABLE IF NOT EXISTS reisift_new_records (
     full_address TEXT,
     owner_names TEXT,
     county TEXT,
+    city TEXT,
+    completeness TEXT,
+    owner_type TEXT,
+    owner_out_of_state INTEGER,
     added_at TEXT,
     reisift_updated_at TEXT,
     local_property_id INTEGER,
@@ -603,6 +607,9 @@ CREATE TABLE IF NOT EXISTS reisift_new_records (
 );
 
 CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_county ON reisift_new_records(is_active, county, added_at);
+CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_added ON reisift_new_records(is_active, added_at);
+CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_city ON reisift_new_records(is_active, city, added_at);
+CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_owner ON reisift_new_records(is_active, owner_type, completeness, owner_out_of_state);
 CREATE INDEX IF NOT EXISTS idx_reisift_new_records_local_property ON reisift_new_records(local_property_id);
 
 CREATE TABLE IF NOT EXISTS reisift_new_record_lists (

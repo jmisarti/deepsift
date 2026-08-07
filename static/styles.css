@@ -664,6 +664,25 @@ body {
     align-items: center;
 }
 
+.pagination-controls {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    margin: 0.75rem 0;
+}
+
+.pagination-status {
+    color: var(--muted);
+    font-size: 0.86rem;
+}
+
+.pagination-controls .disabled {
+    cursor: default;
+    opacity: 0.45;
+    pointer-events: none;
+}
+
 .json-block {
     margin: 0;
     max-height: 65vh;

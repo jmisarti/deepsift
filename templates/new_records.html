@@ -30,15 +30,24 @@
         {% if last_refresh_at %}Last refresh: <strong>{{ last_refresh_at|fmt_est_datetime }}</strong>.{% endif %}
     </p>
     <p>
-        Showing <strong>{{ summary.record_count }}</strong> of <strong>{{ summary.total_active_count }}</strong> cached New Records.
+        Showing <strong>{{ pagination.start }}-{{ pagination.end }}</strong> of <strong>{{ pagination.total_count }}</strong> matching records
+        from <strong>{{ summary.total_active_count }}</strong> cached New Records.
         {% if filters.lists %}Selected list filters require records to match <strong>all</strong> selected lists.{% endif %}
     </p>
     <div class="panel-actions">
         <form method="get" action="{{ url_for('new_records_page') }}" class="inline-form">
+            <input type="hidden" name="page" value="1">
             <label>Sort
                 <select name="sort">
                     <option value="desc" {% if sort_order == "desc" %}selected{% endif %}>Newest First</option>
                     <option value="asc" {% if sort_order == "asc" %}selected{% endif %}>Oldest First</option>
+                </select>
+            </label>
+            <label>Rows
+                <select name="per_page">
+                    {% for value in [100, 200, 300, 500] %}
+                    <option value="{{ value }}" {% if pagination.per_page == value %}selected{% endif %}>{{ value }}</option>
+                    {% endfor %}
                 </select>
             </label>
             <button type="submit">Apply</button>
@@ -150,6 +159,8 @@
             <input type="hidden" name="rei_skipped" value="{{ filters.rei_skipped }}">
             <input type="hidden" name="deep_skipped" value="{{ filters.deep_skipped }}">
             <input type="hidden" name="no_good_numbers" value="{{ filters.no_good_numbers }}">
+            <input type="hidden" name="page" value="{{ pagination.page }}">
+            <input type="hidden" name="per_page" value="{{ pagination.per_page }}">
             <button type="submit">Refresh New Records</button>
         </form>
     </div>
@@ -164,6 +175,23 @@
         <span id="newRecordsBusyText">{{ refresh_state.message or "Refreshing New Records from ReiSift..." }}</span>
     </div>
     <div id="newRecordsStatusMessage" class="notice-banner hidden"></div>
+    <nav class="pagination-controls" aria-label="New Records pages">
+        {% if pagination.has_prev %}
+        <a class="button-link secondary" href="{{ pagination.first_url }}">First</a>
+        <a class="button-link secondary" href="{{ pagination.prev_url }}">Previous</a>
+        {% else %}
+        <span class="button-link secondary disabled">First</span>
+        <span class="button-link secondary disabled">Previous</span>
+        {% endif %}
+        <span class="pagination-status">Page {{ pagination.page }} of {{ pagination.total_pages }} · {{ pagination.page_count }} shown</span>
+        {% if pagination.has_next %}
+        <a class="button-link secondary" href="{{ pagination.next_url }}">Next</a>
+        <a class="button-link secondary" href="{{ pagination.last_url }}">Last</a>
+        {% else %}
+        <span class="button-link secondary disabled">Next</span>
+        <span class="button-link secondary disabled">Last</span>
+        {% endif %}
+    </nav>
     <div class="table-wrap new-records-table-wrap">
         <table class="new-records-table">
             <thead>
@@ -222,6 +250,23 @@
             </tbody>
         </table>
     </div>
+    <nav class="pagination-controls" aria-label="New Records pages">
+        {% if pagination.has_prev %}
+        <a class="button-link secondary" href="{{ pagination.first_url }}">First</a>
+        <a class="button-link secondary" href="{{ pagination.prev_url }}">Previous</a>
+        {% else %}
+        <span class="button-link secondary disabled">First</span>
+        <span class="button-link secondary disabled">Previous</span>
+        {% endif %}
+        <span class="pagination-status">Page {{ pagination.page }} of {{ pagination.total_pages }}</span>
+        {% if pagination.has_next %}
+        <a class="button-link secondary" href="{{ pagination.next_url }}">Next</a>
+        <a class="button-link secondary" href="{{ pagination.last_url }}">Last</a>
+        {% else %}
+        <span class="button-link secondary disabled">Next</span>
+        <span class="button-link secondary disabled">Last</span>
+        {% endif %}
+    </nav>
 </section>
 <script>
 (() => {

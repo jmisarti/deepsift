@@ -34290,7 +34290,7 @@ def bulk_new_record_local_contact_flags(db, property_ids):
     return defaults
 
 
-def get_cached_new_records(db, sort_dir="desc", filters=None):
+def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=None):
     sort_reverse = str(sort_dir).lower() != "asc"
     rows = db.execute(
         """
@@ -34352,13 +34352,33 @@ def get_cached_new_records(db, sort_dir="desc", filters=None):
             continue
         out.append(item)
 
-    activity_counts = bulk_property_activity_counts_for_new_records(db, out)
-    for item in out:
+    out.sort(key=_new_record_row_date, reverse=sort_reverse)
+    total_count = len(out)
+    try:
+        offset = max(0, int(offset or 0))
+    except Exception:
+        offset = 0
+    try:
+        clean_limit = int(limit) if limit is not None else 0
+    except Exception:
+        clean_limit = 0
+    page_rows = out
+    if clean_limit > 0:
+        page_rows = out[offset:offset + clean_limit]
+
+    activity_counts = bulk_property_activity_counts_for_new_records(db, page_rows)
+    for item in page_rows:
         item.update(activity_counts.get(id(item), _new_record_default_activity_counts(item)))
         item.pop("_live_property_id", None)
-
-    out.sort(key=_new_record_row_date, reverse=sort_reverse)
-    return out
+    for item in out:
+        item.pop("_live_property_id", None)
+    return {
+        "rows": page_rows,
+        "all_rows": out,
+        "total_count": total_count,
+        "offset": offset,
+        "limit": clean_limit if clean_limit > 0 else total_count,
+    }
 
 
 def parse_followup_json_list(raw_value):
@@ -41024,7 +41044,21 @@ def new_records_page():
     }
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()
-    rows = get_cached_new_records(db, sort_dir=sort_order, filters=filters)
+    page = max(1, _safe_int(request.args.get("page"), 1))
+    per_page = max(25, min(500, _safe_int(request.args.get("per_page"), 200)))
+    offset = (page - 1) * per_page
+    record_result = get_cached_new_records(db, sort_dir=sort_order, filters=filters, offset=offset, limit=per_page)
+    rows = record_result["rows"]
+    all_filtered_rows = record_result["all_rows"]
+    filtered_count = int(record_result["total_count"] or 0)
+    total_pages = max(1, math.ceil(filtered_count / per_page)) if filtered_count else 1
+    if page > total_pages:
+        page = total_pages
+        offset = (page - 1) * per_page
+        record_result = get_cached_new_records(db, sort_dir=sort_order, filters=filters, offset=offset, limit=per_page)
+        rows = record_result["rows"]
+        all_filtered_rows = record_result["all_rows"]
+        filtered_count = int(record_result["total_count"] or 0)
     filter_options = get_new_record_filter_options(db)
     total_active_count = int(
         (db.execute("SELECT COUNT(*) AS count FROM reisift_new_records WHERE COALESCE(is_active, 1) = 1").fetchone() or {"count": 0})["count"]
@@ -41033,13 +41067,21 @@ def new_records_page():
     county_counts = {}
     local_match_count = 0
     local_update_count = 0
-    for row in rows:
+    for row in all_filtered_rows:
         county = str(row["county"] or "Unknown").strip() or "Unknown"
         county_counts[county] = int(county_counts.get(county, 0)) + 1
         if row["deep_dive_property_id"]:
             local_match_count += 1
         if row["deep_dive_property_id"] and normalize_whitespace(row["deep_dive_status"] or "") == "New Records":
             local_update_count += 1
+    base_page_args = request.args.to_dict(flat=False)
+
+    def _new_records_page_url(target_page):
+        args = {key: list(value) for key, value in base_page_args.items() if key != "refresh"}
+        args["page"] = [str(max(1, int(target_page or 1)))]
+        args["per_page"] = [str(per_page)]
+        return url_for("new_records_page") + ("?" + urlencode(args, doseq=True) if args else "")
+
     return render_template(
         "new_records.html",
         rows=rows,
@@ -41055,8 +41097,24 @@ def new_records_page():
         excluded_statuses_count=len(REISIFT_NEW_RECORDS_EXCLUDED_STATUSES),
         last_refresh_at=get_setting(db, "reisift_new_records_last_refresh_at", ""),
         refresh_state=get_reisift_new_records_refresh_state(db),
+        pagination={
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "total_count": filtered_count,
+            "page_count": len(rows),
+            "start": offset + 1 if rows else 0,
+            "end": offset + len(rows) if rows else 0,
+            "has_prev": page > 1,
+            "has_next": page < total_pages,
+            "prev_url": _new_records_page_url(page - 1) if page > 1 else "",
+            "next_url": _new_records_page_url(page + 1) if page < total_pages else "",
+            "first_url": _new_records_page_url(1),
+            "last_url": _new_records_page_url(total_pages),
+        },
         summary={
-            "record_count": len(rows),
+            "record_count": filtered_count,
+            "page_count": len(rows),
             "total_active_count": total_active_count,
             "local_match_count": local_match_count,
             "local_update_count": local_update_count,
@@ -41086,6 +41144,8 @@ def new_records_refresh():
         "rei_skipped": (request.form.get("rei_skipped") or request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.form.get("deep_skipped") or request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.form.get("no_good_numbers") or request.args.get("no_good_numbers") or "").strip(),
+        "page": (request.form.get("page") or request.args.get("page") or "1").strip(),
+        "per_page": (request.form.get("per_page") or request.args.get("per_page") or "200").strip(),
     }
     try:
         data = start_reisift_new_records_refresh_job(triggered_by="manual_button")

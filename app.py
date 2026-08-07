@@ -32221,7 +32221,17 @@ def sms_automation_initial_variation_settings_for_form(db):
     return entries
 
 
+def _form_has_key_prefix(form, prefix):
+    try:
+        keys = form.keys()
+    except Exception:
+        keys = []
+    return any(str(key).startswith(prefix) for key in keys)
+
+
 def save_sms_automation_initial_variation_settings(db, form):
+    if not _form_has_key_prefix(form, "sms_initial_variants__"):
+        return {}
     config = {}
     for entry in _sms_initial_variation_labels():
         field_name = f"sms_initial_variants__{entry['key']}"
@@ -32662,6 +32672,8 @@ def sms_automation_followup_variation_settings_for_form(db):
 
 
 def save_sms_automation_followup_variation_settings(db, form):
+    if not _form_has_key_prefix(form, "sms_followup_variants__"):
+        return {}
     config = {}
     for entry in _sms_followup_variation_labels():
         field_name = f"sms_followup_variants__{entry['key']}"

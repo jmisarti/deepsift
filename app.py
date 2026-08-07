@@ -9622,7 +9622,7 @@ def suppress_sms_automation_followups_for_delivery_failure(db, property_id, phon
     return int(cur.rowcount or 0)
 
 
-def record_sms_delivery_status(db, payload, sms_id="", status="", from_number="", to_number="", communication_id=None):
+def record_sms_delivery_status(db, payload, sms_id="", status="", from_number="", to_number="", communication_id=None, received_at=None):
     status_text = normalize_whitespace(status or payload.get("status") or "")
     failure_reason = normalize_whitespace(
         payload.get("failure_reason")
@@ -9644,7 +9644,7 @@ def record_sms_delivery_status(db, payload, sms_id="", status="", from_number=""
         from_number=from_number,
         to_number=to_number,
     )
-    received_at = format_db_time(datetime.utcnow())
+    received_at = format_db_time(parse_db_time(received_at) or datetime.utcnow())
     event_key = _sms_delivery_event_key(sms_id, delivery["provider_status"], delivery["failure_bucket"], delivery["failure_reason"])
     db.execute(
         """
@@ -9752,7 +9752,7 @@ def reconcile_orphan_smrtphone_status_events(db, lookback_hours=72, limit=500):
     cutoff = format_db_time(datetime.utcnow() - timedelta(hours=max(1, int(lookback_hours or 72))))
     rows = db.execute(
         """
-        SELECT id, sms_id, payload_json
+        SELECT id, sms_id, payload_json, received_at
         FROM smrtphone_webhook_events
         WHERE event_type = 'status'
           AND processing_status = 'orphan'
@@ -9772,7 +9772,13 @@ def reconcile_orphan_smrtphone_status_events(db, lookback_hours=72, limit=500):
             payload = json.loads(row["payload_json"] or "{}")
         except Exception:
             payload = {}
-        result = record_sms_delivery_status(db, payload, sms_id=row["sms_id"], communication_id=comm["id"])
+        result = record_sms_delivery_status(
+            db,
+            payload,
+            sms_id=row["sms_id"],
+            communication_id=comm["id"],
+            received_at=row["received_at"],
+        )
         db.execute(
             """
             UPDATE smrtphone_webhook_events

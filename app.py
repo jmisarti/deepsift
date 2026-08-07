@@ -227,9 +227,9 @@ OPENLETTERCONNECT_TEMPLATE_ID = int(os.getenv("OPENLETTERCONNECT_TEMPLATE_ID", "
 OPENLETTERCONNECT_API_KEY = os.getenv("OPENLETTERCONNECT_API_KEY", "").strip()
 OPENLETTERCONNECT_WEBHOOK_SECRET = os.getenv("OPENLETTERCONNECT_WEBHOOK_SECRET", "").strip()
 EMAILOCTOPUS_WEBHOOK_SECRET = os.getenv("EMAILOCTOPUS_WEBHOOK_SECRET", "").strip()
-CALL_RECORDING_WORKER_ENABLED = env_flag("CALL_RECORDING_WORKER_ENABLED", True)
+CALL_RECORDING_WORKER_ENABLED = env_flag("CALL_RECORDING_WORKER_ENABLED", False)
 CALL_RECORDING_POLL_SECONDS = max(int((os.getenv("CALL_RECORDING_POLL_SECONDS") or "60").strip() or "60"), 15)
-SMS_ANALYSIS_WORKER_ENABLED = env_flag("SMS_ANALYSIS_WORKER_ENABLED", True)
+SMS_ANALYSIS_WORKER_ENABLED = env_flag("SMS_ANALYSIS_WORKER_ENABLED", False)
 SMS_ANALYSIS_POLL_SECONDS = max(int((os.getenv("SMS_ANALYSIS_POLL_SECONDS") or "180").strip() or "180"), 30)
 AGENT_REFRESH_WORKER_ENABLED = env_flag("AGENT_REFRESH_WORKER_ENABLED", True)
 AGENT_REFRESH_POLL_SECONDS = max(int((os.getenv("AGENT_REFRESH_POLL_SECONDS") or "30").strip() or "30"), 10)
@@ -14823,6 +14823,14 @@ def _emailoctopus_is_tag_limit_error(payload):
     return "TAG_LIMIT" in code or ("tag" in message and "limit" in message)
 
 
+
+def _emailoctopus_error_code(payload):
+    if not isinstance(payload, dict):
+        return ""
+    error_payload = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+    return str(error_payload.get("code") or error_payload.get("error") or "").strip().upper()
+
+
 def verify_email_with_emaillistverify(api_key, email_address):
     email_address = normalize_email_identity(email_address)
     if not api_key:
@@ -15416,9 +15424,7 @@ def emailoctopus_upsert_contact(api_key, list_id, email_address, contact_status=
             "contact_id": str(payload_dict.get("id") or payload_dict.get("contact_id") or _emailoctopus_member_id(email_address)),
             "response": payload,
         }
-    error_code = ""
-    if isinstance(payload, dict):
-        error_code = str(payload.get("code") or payload.get("error") or "").strip().upper()
+    error_code = _emailoctopus_error_code(payload)
     if error_code == "MEMBER_EXISTS_WITH_EMAIL_ADDRESS" or response.status_code == 409:
         update_payload = {
             "api_key": api_key,
@@ -15480,10 +15486,8 @@ def emailoctopus_set_contact_status(api_key, list_id, email_address, status="UNS
             "contact_id": str(payload_dict.get("id") or payload_dict.get("contact_id") or member_id),
             "response": payload,
         }
-    if isinstance(payload, dict):
-        error_code = str(payload.get("code") or payload.get("error") or "").strip().upper()
-        if error_code in {"MEMBER_NOT_FOUND", "CONTACT_NOT_FOUND"}:
-            return {"ok": True, "status": "UNSUBSCRIBED", "contact_id": member_id, "response": payload}
+    if _emailoctopus_error_code(payload) in {"MEMBER_NOT_FOUND", "CONTACT_NOT_FOUND"}:
+        return {"ok": True, "status": "UNSUBSCRIBED", "contact_id": member_id, "response": payload}
     raise ValueError(
         f"EmailOctopus status update failed ({response.status_code}): {json.dumps(payload) if isinstance(payload, dict) else payload}"
     )

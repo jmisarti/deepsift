@@ -120,6 +120,22 @@
                     {% endfor %}
                 </div>
             </div>
+            <div class="span2 sms-variation-settings">
+                <h3>Follow-Up Message Variations</h3>
+                <p class="muted-text">
+                    One variation per line. These are used for the scheduled business-day follow-up sequence after the first outbound SMS.
+                    Available variables: <code>{first_name}</code> and <code>{property_address}</code>.
+                </p>
+                <div class="sms-variation-grid">
+                    {% for item in sms_followup_variation_settings %}
+                    <label>
+                        <span>{{ item.label }}</span>
+                        <textarea name="sms_followup_variants__{{ item.key }}" rows="4">{{ item.value }}</textarea>
+                        <small>{{ item.help }}</small>
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
         </form>
         <h3>Sender Health</h3>
         <p class="muted-text">Carrier/content filtering cools a sender down. Recipient-side failures suppress that recipient phone from future follow-ups.</p>

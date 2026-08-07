@@ -31395,6 +31395,7 @@ SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES = {
 SMS_AUTOMATION_LOCKED_QUEUE_STATUSES = {"Approved", "Sending", "Sent", "Held"}
 REISIFT_NEW_RECORD_TOUCHPOINT_SOURCE = "ReiSift New Records refresh"
 SMS_AUTOMATION_INITIAL_VARIATIONS_SETTING = "sms_automation_initial_message_variants_json"
+SMS_AUTOMATION_FOLLOWUP_VARIATIONS_SETTING = "sms_automation_followup_message_variants_json"
 
 SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES = {"new record", "new records"}
 
@@ -32559,7 +32560,7 @@ def _sms_automation_followup_scheduled_at_utc(sent_dt_utc, business_days_after, 
     return _sms_automation_adjust_to_send_window_utc(candidate_utc, settings)
 
 
-def _sms_followup_templates_for_role(contact_role):
+def _builtin_sms_followup_templates_for_role(contact_role):
     role = str(contact_role or "").strip().lower()
     if role == "relative":
         return [
@@ -32598,17 +32599,94 @@ def _sms_followup_templates_for_role(contact_role):
     ]
 
 
-def _sms_automation_followup_message(parent_row, step_order):
+def _sms_followup_variation_labels():
+    entries = []
+    for role in ["owner", "relative"]:
+        groups = _builtin_sms_followup_templates_for_role(role)
+        for idx in range(max(3, SMS_AUTOMATION_FOLLOWUP_COUNT)):
+            followup_number = idx + 1
+            entries.append(
+                {
+                    "key": f"{role}_{followup_number}",
+                    "label": f"{role.title()} Follow-Up {followup_number}",
+                    "contact_role": role,
+                    "followup_number": followup_number,
+                    "help": "One variation per line. Uses {first_name} and {property_address}.",
+                    "builtin": groups[min(idx, len(groups) - 1)] if groups else [],
+                }
+            )
+    return entries
+
+
+def get_sms_automation_followup_variation_config(db):
+    saved = parse_json_object(get_setting(db, SMS_AUTOMATION_FOLLOWUP_VARIATIONS_SETTING, "{}"), default={})
+    saved = saved if isinstance(saved, dict) else {}
+    config = {}
+    for entry in _sms_followup_variation_labels():
+        key = entry["key"]
+        values = saved.get(key)
+        if isinstance(values, str):
+            values = _parse_sms_variation_text(values)
+        elif isinstance(values, list):
+            values = [normalize_whitespace(item) for item in values if normalize_whitespace(item)]
+        else:
+            values = []
+        if not values:
+            values = [normalize_whitespace(item) for item in entry["builtin"] if normalize_whitespace(item)]
+        config[key] = list(dict.fromkeys(values))
+    return config
+
+
+def sms_automation_followup_variation_settings_for_form(db):
+    config = get_sms_automation_followup_variation_config(db)
+    entries = []
+    for entry in _sms_followup_variation_labels():
+        item = dict(entry)
+        item.pop("builtin", None)
+        item["value"] = "\n".join(config.get(entry["key"]) or [])
+        entries.append(item)
+    return entries
+
+
+def save_sms_automation_followup_variation_settings(db, form):
+    config = {}
+    for entry in _sms_followup_variation_labels():
+        field_name = f"sms_followup_variants__{entry['key']}"
+        values = _parse_sms_variation_text(form.get(field_name) or "")
+        if not values:
+            values = [normalize_whitespace(item) for item in entry["builtin"] if normalize_whitespace(item)]
+        config[entry["key"]] = values
+    set_setting(db, SMS_AUTOMATION_FOLLOWUP_VARIATIONS_SETTING, json.dumps(config, ensure_ascii=True, sort_keys=True))
+    return config
+
+
+def _sms_followup_templates_for_role(db, contact_role):
+    role = _sms_route_role(contact_role)
+    config = get_sms_automation_followup_variation_config(db) if db is not None else {}
+    groups = []
+    builtin = _builtin_sms_followup_templates_for_role(role)
+    for idx in range(max(3, SMS_AUTOMATION_FOLLOWUP_COUNT)):
+        followup_number = idx + 1
+        key = f"{role}_{followup_number}"
+        variants = config.get(key) or []
+        if not variants:
+            fallback = builtin[min(idx, len(builtin) - 1)] if builtin else []
+            variants = [normalize_whitespace(item) for item in fallback if normalize_whitespace(item)]
+        groups.append(variants)
+    return groups
+
+
+def _sms_automation_followup_message(db, parent_row, step_order):
     try:
         step_index = max(0, int(step_order or 2) - 2)
     except Exception:
         step_index = 0
-    template_groups = _sms_followup_templates_for_role(parent_row["contact_role"] if parent_row else "")
+    template_groups = _sms_followup_templates_for_role(db, parent_row["contact_role"] if parent_row else "")
     group = template_groups[min(step_index, len(template_groups) - 1)]
     if isinstance(group, str):
         variants = [group]
     else:
-        variants = [str(item) for item in group if str(item or "").strip()]
+        variants = [normalize_whitespace(item) for item in group if normalize_whitespace(item)]
     seed = f"{parent_row['queue_key'] if parent_row else ''}|fu|{step_order}"
     idx = int(hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:8], 16) % max(len(variants), 1)
     template = variants[idx] if variants else ""
@@ -32722,7 +32800,7 @@ def ensure_sms_automation_followups_for_sent_row(db, sent_row, communication_id=
             "parent_communication_id": communication_id or sent_row["communication_id"] or None,
             "business_days_after_initial": followup_index,
         }
-        message = _sms_automation_followup_message(sent_row, step_order)
+        message = _sms_automation_followup_message(db, sent_row, step_order)
         from_number = select_sms_automation_from_number(
             db,
             bucket=sent_row["bucket"],
@@ -44174,6 +44252,7 @@ def settings_page():
             for key, value in fields.items():
                 set_setting(db, key, value)
             save_sms_automation_initial_variation_settings(db, request.form)
+            save_sms_automation_followup_variation_settings(db, request.form)
             notice = "SMS automation settings saved."
         elif active_tab == "email":
             fields = {
@@ -44550,6 +44629,7 @@ def settings_page():
         sms_automation_settings=sms_automation_settings,
         sms_automation_rules=sms_automation_rules,
         sms_initial_variation_settings=sms_automation_initial_variation_settings_for_form(db),
+        sms_followup_variation_settings=sms_automation_followup_variation_settings_for_form(db),
         sms_sender_health=get_sms_sender_health_rows(db),
         active_tab=active_tab,
         deep_dive_smrtphone_from=deep_dive_smrtphone_from,

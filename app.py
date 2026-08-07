@@ -211,7 +211,11 @@ REISIFT_NEW_RECORDS_EXCLUDED_STATUSES = tuple(
     ).replace(",", "\n").splitlines()
     if item.strip()
 )
-REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED = env_flag("REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED", True)
+REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED = env_flag("REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED", False)
+REISIFT_NEW_RECORDS_MAX_ROWS = max(
+    1,
+    int((os.getenv("REISIFT_NEW_RECORDS_MAX_ROWS") or "10000").strip() or "10000"),
+)
 REISIFT_NEW_RECORDS_REFRESH_HOUR_ET = max(
     0,
     min(23, int((os.getenv("REISIFT_NEW_RECORDS_REFRESH_HOUR_ET") or "6").strip() or "6")),
@@ -29103,7 +29107,7 @@ def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering=
     if not isinstance(query, dict) or not query:
         return [], 0
     headers = reisift_auth_headers(token, {"x-http-method-override": "GET"})
-    max_rows = max(1, min(5000, int(max_rows or 1000)))
+    max_rows = max(1, min(50000, int(max_rows or 1000)))
     query_body = copy.deepcopy(query.get("query") if isinstance(query.get("query"), dict) else query)
     offset = 0
     rows = []
@@ -33260,7 +33264,7 @@ def refresh_reisift_new_records_cache(db):
         rows, total = reisift_search_property_rows_by_query(
             token,
             search_query,
-            max_rows=2000,
+            max_rows=REISIFT_NEW_RECORDS_MAX_ROWS,
         )
     except Exception as exc:
         rows, total = [], 0
@@ -33362,6 +33366,7 @@ def refresh_reisift_new_records_cache(db):
         "target_list_ids": len(REISIFT_NEW_RECORDS_LIST_IDS),
         "target_zip5": len(REISIFT_NEW_RECORDS_ZIP5),
         "excluded_statuses": list(REISIFT_NEW_RECORDS_EXCLUDED_STATUSES),
+        "max_rows": REISIFT_NEW_RECORDS_MAX_ROWS,
         "total": total,
         "scanned": scanned,
         "synced": synced,

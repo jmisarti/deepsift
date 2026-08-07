@@ -41777,23 +41777,18 @@ def get_sms_automation_queue_rows(db, filters=None):
             clauses.append("lower(COALESCE(q.contact_role, '')) NOT IN ('owner', 'co-owner', 'co owner')")
         else:
             clauses.append("lower(COALESCE(q.contact_role, '')) IN ('owner', 'co-owner', 'co owner')")
+    for filter_key, column in [
+        ("rei_skipped", "rei_skipped"),
+        ("deep_skipped", "deep_skipped"),
+        ("no_good_numbers", "no_good_numbers"),
+    ]:
+        expected = _new_record_yes_no_filter_value(filters.get(filter_key) or "")
+        if expected is None:
+            continue
+        clauses.append(f"COALESCE(n.{column}, 0) = ?")
+        params.append(1 if expected else 0)
     where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
-    rows = db.execute(
-        f"""
-        SELECT q.*, p.status AS property_status, p.reisift_property_uuid,
-               a.street, a.city, a.state, a.postal_code,
-               pe.first_name, pe.last_name, t.channel_label, t.status AS phone_status,
-               n.county AS property_county,
-               n.city AS new_record_city,
-               n.completeness AS new_record_completeness,
-               n.owner_type AS new_record_owner_type,
-               n.owner_out_of_state AS new_record_owner_out_of_state,
-               n.property_uuid AS new_record_property_uuid,
-               n.full_address AS new_record_full_address,
-               n.rei_skipped AS new_record_rei_skipped,
-               n.deep_skipped AS new_record_deep_skipped,
-               n.no_good_numbers AS new_record_no_good_numbers,
-               COALESCE(NULLIF(t.created_at, ''), NULLIF(q.created_at, '')) AS number_pulled_at
+    from_sql = """
         FROM sms_automation_queue q
         JOIN properties p ON p.id = q.property_id
         LEFT JOIN addresses a ON a.id = p.property_address_id
@@ -41810,6 +41805,33 @@ def get_sms_automation_queue_rows(db, filters=None):
             ORDER BY nr.id DESC
             LIMIT 1
         )
+    """
+    total_row = db.execute(
+        f"""
+        SELECT COUNT(*) AS total,
+               COUNT(DISTINCT q.property_id) AS property_total
+        {from_sql}
+        {where_sql}
+        """,
+        tuple(params),
+    ).fetchone()
+    rows = db.execute(
+        f"""
+        SELECT q.*, p.status AS property_status, p.reisift_property_uuid,
+               a.street, a.city, a.state, a.postal_code,
+               pe.first_name, pe.last_name, t.channel_label, t.status AS phone_status,
+               n.county AS property_county,
+               n.city AS new_record_city,
+               n.completeness AS new_record_completeness,
+               n.owner_type AS new_record_owner_type,
+               n.owner_out_of_state AS new_record_owner_out_of_state,
+               n.property_uuid AS new_record_property_uuid,
+               n.full_address AS new_record_full_address,
+               n.rei_skipped AS new_record_rei_skipped,
+               n.deep_skipped AS new_record_deep_skipped,
+               n.no_good_numbers AS new_record_no_good_numbers,
+               COALESCE(NULLIF(t.created_at, ''), NULLIF(q.created_at, '')) AS number_pulled_at
+        {from_sql}
         {where_sql}
         ORDER BY
             CASE q.status
@@ -41825,8 +41847,9 @@ def get_sms_automation_queue_rows(db, filters=None):
             END,
             q.updated_at DESC,
             q.id DESC
+        LIMIT ?
         """,
-        tuple(params),
+        tuple(params) + (display_limit,),
     ).fetchall()
     out = []
     raw_rows = [dict(r) for r in rows]
@@ -41834,7 +41857,6 @@ def get_sms_automation_queue_rows(db, filters=None):
         db,
         [row.get("new_record_property_uuid") for row in raw_rows],
     )
-    live_flags_by_property = bulk_new_record_local_contact_flags(db, [row.get("property_id") for row in raw_rows])
     for d in raw_rows:
         d["property_county"] = display_county_name(d.get("property_county") or "") or ""
         d["property_city"] = normalize_whitespace(d.get("new_record_city") or d.get("city") or "")
@@ -41843,16 +41865,9 @@ def get_sms_automation_queue_rows(db, filters=None):
         d["owner_out_of_state"] = None if owner_out is None else bool(int(owner_out or 0))
         d["completeness"] = normalize_whitespace(d.get("new_record_completeness") or "")
         d["property_list_names"] = list_names_by_uuid.get(d.get("new_record_property_uuid") or "") or []
-        try:
-            property_id = int(d.get("property_id") or 0)
-        except Exception:
-            property_id = 0
-        live_flags = live_flags_by_property.get(property_id, {})
         d["rei_skipped"] = 1 if int(d.get("new_record_rei_skipped") or 0) else 0
-        d["deep_skipped"] = 1 if (int(d.get("new_record_deep_skipped") or 0) or live_flags.get("deep_skipped")) else 0
-        d["no_good_numbers"] = 1 if (int(d.get("new_record_no_good_numbers") or 0) or live_flags.get("no_good_numbers")) else 0
-        if not _sms_queue_matches_new_record_filters(d, filters):
-            continue
+        d["deep_skipped"] = 1 if int(d.get("new_record_deep_skipped") or 0) else 0
+        d["no_good_numbers"] = 1 if int(d.get("new_record_no_good_numbers") or 0) else 0
         d["property_address"] = format_property_address_line(d.get("street"), d.get("city"), d.get("state"), d.get("postal_code"))
         d["person_name"] = f"{d.get('first_name') or ''} {d.get('last_name') or ''}".strip()
         d["sift_url"] = _sift_record_url(d.get("reisift_property_uuid") or "")
@@ -41862,18 +41877,10 @@ def get_sms_automation_queue_rows(db, filters=None):
         d["routing_rule_name"] = str(routing.get("rule_name") or "").strip()
         d["matched_buckets"] = routing.get("matched_buckets") if isinstance(routing.get("matched_buckets"), list) else []
         out.append(d)
-    property_ids = set()
-    for row in out:
-        try:
-            property_id = int(row.get("property_id") or 0)
-        except Exception:
-            property_id = 0
-        if property_id > 0:
-            property_ids.add(property_id)
     return {
-        "rows": out[:display_limit],
-        "total": len(out),
-        "property_total": len(property_ids),
+        "rows": out,
+        "total": int((total_row["total"] if total_row else 0) or 0),
+        "property_total": int((total_row["property_total"] if total_row else 0) or 0),
         "display_limit": display_limit,
     }
 

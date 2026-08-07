@@ -10154,7 +10154,8 @@ def get_setting(db, key, default=""):
 
 def set_setting(db, key, value):
     key = (key or "").strip()
-    db.execute(
+    execute_with_retry(
+        db,
         """
         INSERT INTO app_settings (key, value, updated_at)
         VALUES (?, ?, ?)
@@ -44497,7 +44498,7 @@ def settings_page():
                         route="/settings",
                         status_code=500,
                     )
-        db.commit()
+        commit_with_retry(db)
 
     settings = get_direct_mail_settings(db)
     email_settings = get_email_settings(db)

@@ -871,7 +871,9 @@ def start_background_workers_async():
             # Worker startup should never be part of a user's page-load latency.
             pass
 
-    threading.Thread(target=bootstrap, daemon=True).start()
+    timer = threading.Timer(5.0, bootstrap)
+    timer.daemon = True
+    timer.start()
 
 
 @app.before_request

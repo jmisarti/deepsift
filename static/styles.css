@@ -93,6 +93,19 @@ body {
     vertical-align: top;
 }
 
+.sms-select-col {
+    text-align: center;
+    width: 34px;
+}
+
+.sms-select-col input[type="checkbox"] {
+    cursor: pointer;
+}
+
+.sms-select-col input[type="checkbox"]:disabled {
+    cursor: not-allowed;
+}
+
 .sms-message-form {
     display: grid;
     gap: 0.35rem;

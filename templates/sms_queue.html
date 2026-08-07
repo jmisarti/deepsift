@@ -149,6 +149,9 @@
         <form method="post" action="{{ url_for('sms_queue_revalidate') }}">
             <button type="submit">Revalidate + Find New Numbers</button>
         </form>
+        <form id="smsBulkActionForm" method="post" action="{{ url_for('sms_queue_bulk_action') }}" class="inline-form sms-bulk-form">
+            <button type="submit" name="sms_action" value="approve_selected" data-loading-label="Approving selected..." disabled>Approve Selected AutoSend</button>
+        </form>
         <a class="button-link secondary" href="{{ url_for('sms_queue_schedule_page') }}">Open SMS Schedule</a>
     </div>
 
@@ -165,6 +168,9 @@
         <table class="crm-table sms-queue-table">
             <thead>
                 <tr>
+                    <th class="sms-select-col">
+                        <input type="checkbox" id="smsQueueSelectAll" aria-label="Select all visible SMS drafts">
+                    </th>
                     <th>Number Pulled</th>
                     <th>Status</th>
                     <th>Property</th>
@@ -180,6 +186,9 @@
             <tbody>
                 {% for row in rows %}
                 <tr data-sms-queue-row="{{ row.id }}">
+                    <td class="sms-select-col">
+                        <input type="checkbox" name="queue_ids" value="{{ row.id }}" form="smsBulkActionForm" class="sms-queue-select" aria-label="Select SMS draft #{{ row.id }}" {% if row.status in ['Approved', 'Scheduled', 'Sending', 'Sent', 'Suppressed', 'Held'] %}disabled{% endif %}>
+                    </td>
                     <td>{{ row.number_pulled_at|fmt_short_date }}</td>
                     <td>
                         <span class="pill sms-status-{{ row.status|lower|replace(' ', '-') }}">{{ row.status }}</span>
@@ -242,7 +251,7 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="10">No SMS queue items match these filters. Generate from New Records to create drafts.</td>
+                    <td colspan="11">No SMS queue items match these filters. Generate from New Records to create drafts.</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -263,6 +272,105 @@
     function hideMessages() {
         showMessage(notice, '');
         showMessage(error, '');
+    }
+
+    const bulkForm = document.getElementById('smsBulkActionForm');
+    const selectAll = document.getElementById('smsQueueSelectAll');
+    const bulkButton = bulkForm ? bulkForm.querySelector('button[type="submit"]') : null;
+
+    function selectableBoxes() {
+        return Array.from(document.querySelectorAll('.sms-queue-select:not(:disabled)'));
+    }
+
+    function selectedBoxes() {
+        return selectableBoxes().filter((box) => box.checked);
+    }
+
+    function updateBulkControls() {
+        const boxes = selectableBoxes();
+        const selected = selectedBoxes();
+        if (bulkButton) {
+            bulkButton.disabled = selected.length === 0;
+            bulkButton.textContent = selected.length > 0
+                ? `Approve Selected AutoSend (${selected.length})`
+                : 'Approve Selected AutoSend';
+        }
+        if (selectAll) {
+            selectAll.disabled = boxes.length === 0;
+            selectAll.checked = boxes.length > 0 && selected.length === boxes.length;
+            selectAll.indeterminate = selected.length > 0 && selected.length < boxes.length;
+        }
+    }
+
+    document.querySelectorAll('.sms-queue-select').forEach((box) => {
+        box.addEventListener('change', updateBulkControls);
+    });
+
+    if (selectAll) {
+        selectAll.addEventListener('change', () => {
+            selectableBoxes().forEach((box) => {
+                box.checked = selectAll.checked;
+            });
+            updateBulkControls();
+        });
+    }
+
+    if (bulkForm) {
+        bulkForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const submitter = event.submitter || bulkButton;
+            if (!submitter || submitter.disabled) return;
+            hideMessages();
+            if (window.startBusyButton) window.startBusyButton(submitter, submitter.dataset.loadingLabel || 'Working...');
+            try {
+                const body = new FormData(bulkForm);
+                if (submitter.name && submitter.value) body.set(submitter.name, submitter.value);
+                const response = await fetch(bulkForm.getAttribute('action') || window.location.href, {
+                    method: 'POST',
+                    body,
+                    credentials: 'same-origin',
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    }
+                });
+                const contentType = response.headers.get('content-type') || '';
+                let data;
+                if (contentType.includes('application/json')) {
+                    data = await response.json();
+                } else {
+                    const text = await response.text();
+                    const shortText = text.replace(/\s+/g, ' ').trim().slice(0, 180);
+                    data = {
+                        ok: false,
+                        message: response.redirected
+                            ? 'The action was redirected, likely because your session expired. Please refresh/sign in and try again.'
+                            : `Unexpected server response (${response.status}). ${shortText || 'Please refresh and try again.'}`
+                    };
+                }
+                if (!response.ok || !data.ok) {
+                    showMessage(error, data.message || 'Bulk SMS action failed.');
+                    return;
+                }
+                showMessage(notice, data.message || 'Bulk SMS action completed.');
+                (data.row_ids_removed || []).forEach((rowId) => {
+                    const row = document.querySelector(`tr[data-sms-queue-row="${rowId}"]`);
+                    if (!row) return;
+                    row.style.opacity = '0';
+                    row.style.transition = 'opacity 160ms ease';
+                    window.setTimeout(() => {
+                        row.remove();
+                        updateBulkControls();
+                    }, 170);
+                });
+                updateBulkControls();
+            } catch (err) {
+                showMessage(error, err && err.message ? err.message : 'Bulk SMS action failed.');
+            } finally {
+                if (window.stopBusyButton) window.stopBusyButton(submitter);
+                updateBulkControls();
+            }
+        });
     }
 
     document.querySelectorAll('.sms-queue-actions').forEach((form) => {
@@ -312,7 +420,10 @@
                 if (data.row_removed && row) {
                     row.style.opacity = '0';
                     row.style.transition = 'opacity 160ms ease';
-                    window.setTimeout(() => row.remove(), 170);
+                    window.setTimeout(() => {
+                        row.remove();
+                        updateBulkControls();
+                    }, 170);
                 }
             } catch (err) {
                 showMessage(error, err && err.message ? err.message : 'SMS action failed.');
@@ -324,6 +435,7 @@
             }
         });
     });
+    updateBulkControls();
 })();
 </script>
 {% endblock %}

@@ -31924,6 +31924,191 @@ def render_sms_automation_template(template, variables):
     return normalize_whitespace(text)
 
 
+def _sms_initial_variation_templates(bucket, contact_role, has_sale_date=False):
+    bucket_key = (bucket or "").strip().lower()
+    role_key = _sms_route_role(contact_role)
+    is_relative = role_key != "owner"
+    base = _sms_template_for_bucket(bucket, contact_role, has_sale_date=has_sale_date)
+    variants = [base]
+    if bucket_key == "sheriff sale":
+        if is_relative:
+            variants.extend([
+                "Hi {first_name}, this is Laura. I am trying to reach the owner of {property_address}. I saw a sheriff sale may be coming up. Are you connected to them?",
+                "Hi {first_name}, Laura here. I am trying to find the right person for {property_address}. Do you know who handles the property?",
+            ])
+        elif has_sale_date:
+            variants.extend([
+                "Hi {first_name}, this is Laura. I am checking in about {property_address}. I saw a sheriff sale may be scheduled for {sheriff_sale_date}. Are you still looking at options?",
+                "Hi {first_name}, Laura here. I am reaching out about {property_address}. I saw the sheriff sale may be {sheriff_sale_date}. Do you want to talk through options before then?",
+            ])
+        else:
+            variants.extend([
+                "Hi {first_name}, this is Laura. I am checking in about {property_address}. I saw there may be a sheriff sale issue. Are you still looking at options?",
+                "Hi {first_name}, Laura here. I am reaching out about {property_address}. I saw it may be tied to a sheriff sale. Do you want to talk through options?",
+            ])
+    elif bucket_key == "probate":
+        if is_relative:
+            variants.extend([
+                "Hi {first_name}, this is Laura. I am trying to reach the right person for {property_address}. Do you know who is handling it?",
+                "Hi {first_name}, Laura here. I am checking who handles {property_address}. Are you connected to the property?",
+            ])
+        else:
+            variants.extend([
+                "Hi {first_name}, this is Laura. I am checking in about {property_address}. Curious to know what the plans are with the property?",
+                "Hi {first_name}, Laura here. I am reaching out about {property_address}. Curious to know what the plans are with the property?",
+            ])
+    elif bucket_key == "foreclosure":
+        if is_relative:
+            variants.extend([
+                "Hi {first_name}, this is Laura. I am trying to reach the owner of {property_address}. I saw there may be a foreclosure issue. Are you connected to them?",
+                "Hi {first_name}, Laura here. I am trying to find the right person for {property_address}. Do you know who handles it?",
+            ])
+        else:
+            variants.extend([
+                "Hi {first_name}, this is Laura. I am checking in about {property_address}. I saw there may be a foreclosure issue. Are you looking at options?",
+                "Hi {first_name}, Laura here. I am reaching out about {property_address}. I saw there may be a foreclosure issue. Do you want to talk through options?",
+            ])
+    else:
+        if is_relative:
+            variants.extend([
+                "Hi {first_name}, this is Laura. I am trying to reach the right person for {property_address}. Are you connected to the owner?",
+                "Hi {first_name}, Laura here. I am checking who handles {property_address}. Would that be you or someone else?",
+            ])
+        else:
+            variants.extend([
+                "Hi {first_name}, this is Laura. I am checking in about {property_address}. Are you the owner, or the right person to speak with?",
+                "Hi {first_name}, Laura here. I am reaching out about {property_address}. Are you the right person to talk with?",
+            ])
+    out = []
+    for template in variants:
+        normalized = normalize_whitespace(template)
+        if normalized and normalized not in out:
+            out.append(normalized)
+    return out
+
+
+def _deterministic_sms_variation_index(seed, count):
+    if count <= 1:
+        return 0
+    digest = hashlib.sha1(str(seed or "").encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % count
+
+
+def sms_automation_initial_message_for_approval(row):
+    if not row or int(row["step_order"] or 1) != 1:
+        return normalize_whitespace(row["message_body"] if row else "")
+    variables = parse_json_object(row["rendered_variables_json"] or "{}", default={})
+    if not isinstance(variables, dict):
+        variables = {}
+    source_json = parse_json_object(row["source_info_json"] or "{}", default={})
+    source_info = source_json.get("source_info") if isinstance(source_json, dict) else {}
+    if not isinstance(source_info, dict):
+        source_info = {}
+    has_sale_date = bool(variables.get("sheriff_sale_date") or source_info.get("sheriff_sale_date"))
+    templates = _sms_initial_variation_templates(row["bucket"], row["contact_role"], has_sale_date=has_sale_date)
+    rendered_options = [render_sms_automation_template(template, variables) for template in templates]
+    rendered_options = [message for message in rendered_options if message]
+    current_message = normalize_whitespace(row["message_body"] or "")
+    if not rendered_options:
+        return current_message
+    if current_message and current_message not in rendered_options:
+        return current_message
+    seed = row["queue_key"] or row["id"] or f"{row['property_id']}:{row['touchpoint_id']}"
+    return rendered_options[_deterministic_sms_variation_index(seed, len(rendered_options))]
+
+
+def approve_sms_automation_queue_items(db, queue_ids):
+    ids = []
+    seen = set()
+    for raw_id in queue_ids or []:
+        try:
+            queue_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if queue_id <= 0 or queue_id in seen:
+            continue
+        ids.append(queue_id)
+        seen.add(queue_id)
+    result = {
+        "requested": len(ids),
+        "approved": 0,
+        "suppressed": 0,
+        "skipped": 0,
+        "missing": 0,
+        "approved_ids": [],
+        "suppressed_ids": [],
+        "skipped_ids": [],
+        "missing_ids": [],
+    }
+    if not ids:
+        return result
+    placeholders = ",".join(["?"] * len(ids))
+    initial_rows = db.execute(
+        f"SELECT id, property_id FROM sms_automation_queue WHERE id IN ({placeholders})",
+        tuple(ids),
+    ).fetchall()
+    found_ids = {int(row["id"]) for row in initial_rows}
+    for queue_id in ids:
+        if queue_id not in found_ids:
+            result["missing"] += 1
+            result["missing_ids"].append(queue_id)
+    property_ids = sorted({int(row["property_id"] or 0) for row in initial_rows if int(row["property_id"] or 0) > 0})
+    if property_ids:
+        revalidate_sms_automation_queue(db, property_ids=property_ids)
+    rows = db.execute(
+        f"SELECT * FROM sms_automation_queue WHERE id IN ({placeholders}) ORDER BY id ASC",
+        tuple(ids),
+    ).fetchall()
+    now_text = format_db_time(datetime.utcnow())
+    for row in rows:
+        queue_id = int(row["id"])
+        status = str(row["status"] or "").strip()
+        if status == "Suppressed":
+            result["suppressed"] += 1
+            result["suppressed_ids"].append(queue_id)
+            continue
+        if status in SMS_AUTOMATION_LOCKED_QUEUE_STATUSES or status in {"Scheduled"}:
+            result["skipped"] += 1
+            result["skipped_ids"].append(queue_id)
+            continue
+        reason = sms_automation_property_suppression_reason(db, row["property_id"])
+        if not reason:
+            reason = stale_reisift_new_record_touchpoint_reason(db, row["property_id"], row["touchpoint_id"])
+        if not reason:
+            reason = sms_automation_touchpoint_suppression_reason(db, row["touchpoint_id"])
+        if not reason:
+            reason = sms_automation_inbound_reply_suppression_reason(db, row)
+        if reason:
+            db.execute(
+                """
+                UPDATE sms_automation_queue
+                SET status = 'Suppressed', suppression_reason = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (reason, queue_id),
+            )
+            result["suppressed"] += 1
+            result["suppressed_ids"].append(queue_id)
+            continue
+        message_body = sms_automation_initial_message_for_approval(row)
+        db.execute(
+            """
+            UPDATE sms_automation_queue
+            SET status = 'Approved',
+                approved_at = ?,
+                scheduled_for = NULL,
+                suppression_reason = '',
+                message_body = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (now_text, message_body, queue_id),
+        )
+        result["approved"] += 1
+        result["approved_ids"].append(queue_id)
+    return result
+
+
 def normalize_unsent_sms_queue_addresses(db):
     rows = db.execute(
         """
@@ -41533,9 +41718,11 @@ def sms_queue_item_action(queue_id):
             db.commit()
             return _sms_queue_action_response(True, f"Held SMS draft #{queue_id}.", row_removed=True, status="Held")
         if action == "approve":
-            reason = revalidate_sms_automation_queue(db, property_ids=[])
-            row = db.execute("SELECT status FROM sms_automation_queue WHERE id = ?", (queue_id,)).fetchone()
-            if row and row["status"] == "Suppressed":
+            result = approve_sms_automation_queue_items(db, [queue_id])
+            if result["missing"]:
+                db.rollback()
+                return _sms_queue_action_response(False, f"SMS draft #{queue_id} was not found.", status_code=404)
+            if result["suppressed_ids"]:
                 db.commit()
                 if _sms_queue_wants_json():
                     return _sms_queue_action_response(
@@ -41545,18 +41732,9 @@ def sms_queue_item_action(queue_id):
                         status="Suppressed",
                     )
                 return redirect(url_for("sms_queue_page", error=f"Draft #{queue_id} is suppressed and cannot be approved."))
-            db.execute(
-                """
-                UPDATE sms_automation_queue
-                SET status = 'Approved',
-                    approved_at = ?,
-                    scheduled_for = NULL,
-                    suppression_reason = '',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (format_db_time(datetime.utcnow()), queue_id),
-            )
+            if result["skipped_ids"]:
+                db.rollback()
+                return _sms_queue_action_response(False, f"Draft #{queue_id} is locked or already scheduled.", status_code=400)
             db.commit()
             return _sms_queue_action_response(
                 True,
@@ -41575,6 +41753,39 @@ def sms_queue_item_action(queue_id):
     except Exception as exc:
         db.rollback()
         return _sms_queue_action_response(False, f"SMS queue action failed: {exc}", status_code=500)
+
+
+@app.route("/sms-queue/bulk-action", methods=["POST"])
+def sms_queue_bulk_action():
+    ensure_db()
+    db = get_db()
+    action = (request.form.get("sms_action") or request.form.get("action") or "").strip().lower()
+    queue_ids = request.form.getlist("queue_ids")
+    try:
+        if action != "approve_selected":
+            return _sms_queue_action_response(False, "Unknown SMS queue bulk action.", status_code=400)
+        result = approve_sms_automation_queue_items(db, queue_ids)
+        if result["requested"] <= 0:
+            return _sms_queue_action_response(False, "Select at least one SMS draft first.", status_code=400)
+        db.commit()
+        removed_ids = result["approved_ids"] + result["suppressed_ids"]
+        parts = [f"approved {result['approved']}"]
+        if result["suppressed"]:
+            parts.append(f"suppressed {result['suppressed']}")
+        if result["skipped"]:
+            parts.append(f"skipped {result['skipped']} locked")
+        if result["missing"]:
+            parts.append(f"missing {result['missing']}")
+        message = "Bulk AutoSend approval complete: " + ", ".join(parts) + "."
+        return _sms_queue_action_response(
+            True,
+            message,
+            row_ids_removed=removed_ids,
+            result=result,
+        )
+    except Exception as exc:
+        db.rollback()
+        return _sms_queue_action_response(False, f"SMS queue bulk action failed: {exc}", status_code=500)
 
 
 @app.route("/submitted-leads")

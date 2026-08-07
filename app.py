@@ -842,6 +842,8 @@ def inject_auth_state():
 
 @app.before_request
 def require_login_if_enabled():
+    if request.path.startswith("/static/") or request.path == "/healthz":
+        return None
     if RUN_BACKGROUND_WORKERS:
         # Start idempotent worker threads when running under Gunicorn.
         start_bulk_sms_worker()
@@ -883,8 +885,6 @@ def require_login_if_enabled():
             pass
     endpoint = request.endpoint or ""
     if endpoint in {"login", "logout", "static"}:
-        return None
-    if request.path.startswith("/static/") or request.path == "/healthz":
         return None
     # Third-party callbacks must stay unauthenticated.
     if request.path.startswith("/webhooks/"):

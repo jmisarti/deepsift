@@ -311,6 +311,8 @@ WEBSITE_LEADS_HOLD_WORKER_STARTED = False
 AGENT_REFRESH_WORKER_STARTED = False
 UNTITLED_LEADS_WORKER_STARTED = False
 EMAIL_VALIDATION_QUEUE_WORKER_STARTED = False
+BACKGROUND_WORKERS_BOOTSTRAP_STARTED = False
+BACKGROUND_WORKERS_BOOTSTRAP_LOCK = threading.Lock()
 PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTES") or "60").strip() or "60"), 5)
 PROVIDER_ALERT_SOURCE_PREFIX = "provider_"
 ADS_DEFAULT_LOOKBACK_DAYS = max(int((os.getenv("ADS_DEFAULT_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
@@ -840,26 +842,43 @@ def inject_auth_state():
     }
 
 
+def start_background_workers_async():
+    global BACKGROUND_WORKERS_BOOTSTRAP_STARTED
+    if not RUN_BACKGROUND_WORKERS:
+        return
+    with BACKGROUND_WORKERS_BOOTSTRAP_LOCK:
+        if BACKGROUND_WORKERS_BOOTSTRAP_STARTED:
+            return
+        BACKGROUND_WORKERS_BOOTSTRAP_STARTED = True
+
+    def bootstrap():
+        try:
+            start_bulk_sms_worker()
+            start_email_validation_queue_worker()
+            start_email_poll_worker()
+            start_clever_leads_worker()
+            start_untitled_leads_worker()
+            start_website_leads_hold_worker()
+            start_ads_dashboard_worker()
+            if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
+                start_referral_on_market_worker()
+            start_reisift_new_records_worker()
+            start_call_recording_worker()
+            start_sms_analysis_worker()
+            start_sms_automation_send_worker()
+            start_agent_refresh_worker()
+        except Exception:
+            # Worker startup should never be part of a user's page-load latency.
+            pass
+
+    threading.Thread(target=bootstrap, daemon=True).start()
+
+
 @app.before_request
 def require_login_if_enabled():
     if request.path.startswith("/static/") or request.path == "/healthz":
         return None
-    if RUN_BACKGROUND_WORKERS:
-        # Start idempotent worker threads when running under Gunicorn.
-        start_bulk_sms_worker()
-        start_email_validation_queue_worker()
-        start_email_poll_worker()
-        start_clever_leads_worker()
-        start_untitled_leads_worker()
-        start_website_leads_hold_worker()
-        start_ads_dashboard_worker()
-        if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
-            start_referral_on_market_worker()
-        start_reisift_new_records_worker()
-        start_call_recording_worker()
-        start_sms_analysis_worker()
-        start_sms_automation_send_worker()
-        start_agent_refresh_worker()
+    start_background_workers_async()
     if not APP_AUTH_ENABLED:
         return None
     integration_api_allowlist = {

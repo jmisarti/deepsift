@@ -32988,9 +32988,9 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
         FROM reisift_new_records n
         WHERE {' AND '.join(clauses)}
         ORDER BY COALESCE(n.added_at, n.last_synced_at) DESC, n.id DESC
-        LIMIT 2000
+        LIMIT ?
         """,
-        tuple(params),
+        tuple(params + [REISIFT_NEW_RECORDS_MAX_ROWS]),
     ).fetchall()
     created = updated = skipped = suppressed = duplicates_suppressed = 0
     touched_property_ids = set()

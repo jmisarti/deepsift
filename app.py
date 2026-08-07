@@ -15753,6 +15753,21 @@ def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, be
     }
 
 
+def unsubscribe_emailoctopus_emails_for_new_record_segment_exit(db, property_id, prior_status="", current_status="", source="reisift_new_records_segment_exit"):
+    """Unsubscribe when a property leaves the DeepSift New Records segment."""
+    before_status = prior_status if is_strict_new_record_status(prior_status) else REISIFT_NEW_RECORDS_STATUS
+    after_status = normalize_whitespace(current_status or "")
+    if is_strict_new_record_status(after_status):
+        after_status = "removed_from_deepsift_new_records_segment"
+    return unsubscribe_emailoctopus_emails_for_property_status_exit(
+        db,
+        property_id,
+        before_status,
+        after_status or "removed_from_deepsift_new_records_segment",
+        source=source,
+    )
+
+
 def _email_campaign_tags(source):
     source_key = str(source or "").strip().lower()
     tags = ["DeepSift Verified Email"]
@@ -32340,8 +32355,6 @@ def sms_automation_initial_message_for_approval(db, row):
     current_message = normalize_whitespace(row["message_body"] or "")
     if not rendered_options:
         return current_message
-    if current_message and current_message not in rendered_options:
-        return current_message
     seed = row["queue_key"] or row["id"] or f"{row['property_id']}:{row['touchpoint_id']}"
     return rendered_options[_deterministic_sms_variation_index(seed, len(rendered_options))]
 
@@ -33344,7 +33357,7 @@ def refresh_reisift_new_records_cache(db):
     if not search_failed:
         previous_active_rows = db.execute(
             """
-            SELECT property_uuid, local_property_id
+            SELECT property_uuid, local_property_id, status
             FROM reisift_new_records
             WHERE COALESCE(is_active, 1) = 1
               AND COALESCE(property_uuid, '') <> ''
@@ -33418,6 +33431,16 @@ def refresh_reisift_new_records_cache(db):
                 )
                 status_exit_checks += 1
                 unsub = local_sync.get("emailoctopus_unsubscribe") if isinstance(local_sync.get("emailoctopus_unsubscribe"), dict) else {}
+                if int(unsub.get("attempted") or 0) == 0:
+                    segment_property_id = int((local_sync.get("local_property_id") or prior["local_property_id"] or 0))
+                    if segment_property_id > 0:
+                        unsub = unsubscribe_emailoctopus_emails_for_new_record_segment_exit(
+                            db,
+                            segment_property_id,
+                            prior_status=prior["status"] or REISIFT_NEW_RECORDS_STATUS,
+                            current_status=summary.get("status") or "",
+                            source="reisift_new_records_segment_exit",
+                        )
                 status_exit_unsubscribed += int(unsub.get("unsubscribed") or 0)
                 if local_sync.get("local_property_id") and local_sync.get("before") != local_sync.get("after"):
                     local_updates += 1
@@ -41897,6 +41920,8 @@ def get_sms_automation_queue_rows(db, filters=None):
         routing = src.get("routing") if isinstance(src.get("routing"), dict) else {}
         d["routing_rule_name"] = str(routing.get("rule_name") or "").strip()
         d["matched_buckets"] = routing.get("matched_buckets") if isinstance(routing.get("matched_buckets"), list) else []
+        if str(d.get("status") or "").strip() in {"Draft", "Queued"} and int(d.get("step_order") or 1) == 1:
+            d["message_body"] = sms_automation_initial_message_for_approval(db, d)
         out.append(d)
     return {
         "rows": out,

@@ -1942,6 +1942,51 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_email_validation_queue_email ON email_validation_queue(email_value, queue_status, id)")
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS email_validation_registry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            normalized_email TEXT NOT NULL UNIQUE,
+            provider TEXT NOT NULL DEFAULT 'emaillistverify',
+            queue_status TEXT NOT NULL DEFAULT 'Queued',
+            validation_status TEXT,
+            provider_status TEXT,
+            validation_raw TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            first_source TEXT,
+            last_source TEXT,
+            first_touchpoint_id INTEGER,
+            last_touchpoint_id INTEGER,
+            run_after TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            requested_at TEXT,
+            processed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_email_validation_registry_status ON email_validation_registry(queue_status, run_after, id)"
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS email_validation_registry_touchpoints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            registry_id INTEGER NOT NULL,
+            touchpoint_id INTEGER NOT NULL UNIQUE,
+            person_id INTEGER,
+            source TEXT NOT NULL DEFAULT 'email_validation',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(registry_id) REFERENCES email_validation_registry(id) ON DELETE CASCADE,
+            FOREIGN KEY(touchpoint_id) REFERENCES touchpoints(id) ON DELETE CASCADE,
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_email_validation_registry_touchpoints_registry ON email_validation_registry_touchpoints(registry_id)"
+    )
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS email_campaign_syncs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             normalized_email TEXT NOT NULL UNIQUE,
@@ -2379,6 +2424,7 @@ def init_db():
     normalize_people_name_data(db)
     ensure_default_sequence_campaign(db)
     ensure_default_sms_automation_routing_rules(db)
+    backfill_email_validation_registry_from_queue(db)
     normalize_unsent_sms_queue_addresses(db)
 
     has_properties = db.execute("SELECT COUNT(*) AS c FROM properties").fetchone()["c"]
@@ -2400,6 +2446,7 @@ def ensure_db():
     backfill_openletterconnect_mail_orders(db)
     ensure_default_sequence_campaign(db)
     ensure_default_sms_automation_routing_rules(db)
+    backfill_email_validation_registry_from_queue(db)
     normalize_unsent_sms_queue_addresses(db)
     db.commit()
     db.close()
@@ -15011,6 +15058,321 @@ def _touchpoint_status_from_email_validation_status(validation_status):
     return ""
 
 
+EMAIL_VALIDATION_COMPLETED_STATUSES = {"valid", "invalid", "unknown", "undeliverable"}
+EMAIL_VALIDATION_REGISTRY_ACTIVE_STATUSES = {"queued", "retry", "inflight", "in_flight", "held"}
+EMAIL_VALIDATION_REGISTRY_BACKFILL_SETTING = "email_validation_registry_backfilled_at"
+
+
+def _email_validation_registry_row(db, email_value):
+    normalized_email = normalize_email_identity(email_value)
+    if not normalized_email:
+        return None
+    return db.execute(
+        """
+        SELECT *
+        FROM email_validation_registry
+        WHERE normalized_email = ?
+        LIMIT 1
+        """,
+        (normalized_email,),
+    ).fetchone()
+
+
+def _email_validation_registry_decision(row, exclude_touchpoint_id=0):
+    if not row:
+        return None
+    try:
+        exclude_touchpoint_id = int(exclude_touchpoint_id or 0)
+    except Exception:
+        exclude_touchpoint_id = 0
+    queue_status = str(row["queue_status"] or "").strip().lower()
+    validation_status = str(row["validation_status"] or "").strip().lower()
+    if queue_status == "completed" and validation_status in EMAIL_VALIDATION_COMPLETED_STATUSES:
+        return {
+            "kind": "email_validation_registry",
+            "registry_id": int(row["id"] or 0),
+            "validation_status": validation_status,
+            "validation_raw": row["validation_raw"] or "",
+            "processed_at": row["processed_at"] or "",
+            "touchpoint_status": _touchpoint_status_from_email_validation_status(validation_status),
+            "queue_status": "Completed",
+        }
+    first_touchpoint_id = int((row["first_touchpoint_id"] or 0) if "first_touchpoint_id" in row.keys() else 0)
+    if queue_status in EMAIL_VALIDATION_REGISTRY_ACTIVE_STATUSES and first_touchpoint_id != exclude_touchpoint_id:
+        return {
+            "kind": "email_validation_registry_pending",
+            "registry_id": int(row["id"] or 0),
+            "validation_status": queue_status,
+            "touchpoint_status": "",
+            "queue_status": "Skipped",
+        }
+    return None
+
+
+def _attach_email_validation_touchpoint(db, registry_id, touchpoint_id, person_id, source):
+    try:
+        registry_id = int(registry_id or 0)
+        touchpoint_id = int(touchpoint_id or 0)
+    except Exception:
+        return
+    if registry_id <= 0 or touchpoint_id <= 0:
+        return
+    db.execute(
+        """
+        INSERT INTO email_validation_registry_touchpoints (registry_id, touchpoint_id, person_id, source)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(touchpoint_id) DO UPDATE SET
+            registry_id = excluded.registry_id,
+            person_id = COALESCE(excluded.person_id, person_id),
+            source = excluded.source,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (registry_id, touchpoint_id, person_id, source or "email_validation"),
+    )
+
+
+def _ensure_email_validation_registry(db, email_value, touchpoint_id=0, person_id=None, source="email_validation", hold_reason=""):
+    normalized_email = normalize_email_identity(email_value)
+    if not normalized_email:
+        return None
+    now_stamp = format_db_time(datetime.utcnow())
+    source_value = (source or "email_validation").strip() or "email_validation"
+    row = _email_validation_registry_row(db, normalized_email)
+    if row:
+        registry_id = int(row["id"] or 0)
+        queue_status = str(row["queue_status"] or "").strip().lower()
+        if hold_reason and queue_status not in {"completed"}:
+            db.execute(
+                """
+                UPDATE email_validation_registry
+                SET last_source = ?,
+                    last_touchpoint_id = ?,
+                    validation_status = CASE
+                        WHEN lower(COALESCE(queue_status, '')) = 'held' THEN validation_status
+                        ELSE validation_status
+                    END,
+                    validation_raw = CASE
+                        WHEN lower(COALESCE(queue_status, '')) = 'held' THEN validation_raw
+                        ELSE validation_raw
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (source_value, int(touchpoint_id or 0), registry_id),
+            )
+        elif queue_status == "held":
+            db.execute(
+                """
+                UPDATE email_validation_registry
+                SET queue_status = 'Queued',
+                    validation_status = '',
+                    validation_raw = '',
+                    run_after = ?,
+                    requested_at = COALESCE(requested_at, ?),
+                    last_source = ?,
+                    last_touchpoint_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (now_stamp, now_stamp, source_value, int(touchpoint_id or 0), registry_id),
+            )
+        else:
+            db.execute(
+                """
+                UPDATE email_validation_registry
+                SET last_source = ?,
+                    last_touchpoint_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (source_value, int(touchpoint_id or 0), registry_id),
+            )
+        _attach_email_validation_touchpoint(db, registry_id, touchpoint_id, person_id, source_value)
+        return _email_validation_registry_row(db, normalized_email)
+
+    queue_status = "Held" if hold_reason else "Queued"
+    validation_status = HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS if hold_reason else ""
+    validation_raw = held_email_validation_payload(source_value, hold_reason) if hold_reason else ""
+    cur = db.execute(
+        """
+        INSERT INTO email_validation_registry (
+            normalized_email, provider, queue_status, validation_status, validation_raw,
+            first_source, last_source, first_touchpoint_id, last_touchpoint_id,
+            run_after, requested_at
+        )
+        VALUES (?, 'emaillistverify', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            normalized_email,
+            queue_status,
+            validation_status,
+            validation_raw,
+            source_value,
+            source_value,
+            int(touchpoint_id or 0),
+            int(touchpoint_id or 0),
+            now_stamp,
+            None if hold_reason else now_stamp,
+        ),
+    )
+    registry_id = int(cur.lastrowid or 0)
+    _attach_email_validation_touchpoint(db, registry_id, touchpoint_id, person_id, source_value)
+    return _email_validation_registry_row(db, normalized_email)
+
+
+def _update_email_validation_registry_from_result(db, email_value, queue_status, validation_status, validation_result, source="", touchpoint_id=0, run_after=""):
+    normalized_email = normalize_email_identity(email_value)
+    if not normalized_email:
+        return None
+    now_stamp = format_db_time(datetime.utcnow())
+    row = _ensure_email_validation_registry(
+        db,
+        normalized_email,
+        touchpoint_id=touchpoint_id,
+        person_id=None,
+        source=source or "email_validation_queue",
+    )
+    if not row:
+        return None
+    provider_status = ""
+    provider_call_made = True
+    if isinstance(validation_result, dict):
+        provider_status = str(validation_result.get("provider_status") or validation_result.get("normalized_status") or "").strip()
+        provider_call_made = validation_result.get("provider_call_made") is not False
+    raw = json.dumps(validation_result, ensure_ascii=True, sort_keys=True) if isinstance(validation_result, dict) else str(validation_result or "")
+    processed_at = now_stamp if str(queue_status or "").strip().lower() == "completed" else None
+    db.execute(
+        """
+        UPDATE email_validation_registry
+        SET queue_status = ?,
+            validation_status = ?,
+            provider_status = ?,
+            validation_raw = ?,
+            attempts = COALESCE(attempts, 0) + ?,
+            run_after = COALESCE(NULLIF(?, ''), run_after),
+            processed_at = COALESCE(?, processed_at),
+            last_source = ?,
+            last_touchpoint_id = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            queue_status,
+            validation_status,
+            provider_status,
+            raw,
+            1 if provider_call_made else 0,
+            run_after or "",
+            processed_at,
+            source or "email_validation_queue",
+            int(touchpoint_id or 0),
+            int(row["id"] or 0),
+        ),
+    )
+    return _email_validation_registry_row(db, normalized_email)
+
+
+def _mark_email_validation_registry_inflight(db, email_value, source="", touchpoint_id=0):
+    normalized_email = normalize_email_identity(email_value)
+    if not normalized_email:
+        return
+    row = _ensure_email_validation_registry(
+        db,
+        normalized_email,
+        touchpoint_id=touchpoint_id,
+        person_id=None,
+        source=source or "email_validation_queue",
+    )
+    if not row:
+        return
+    db.execute(
+        """
+        UPDATE email_validation_registry
+        SET queue_status = 'InFlight',
+            requested_at = COALESCE(requested_at, ?),
+            last_source = ?,
+            last_touchpoint_id = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND lower(COALESCE(queue_status, 'queued')) IN ('queued', 'retry')
+        """,
+        (
+            format_db_time(datetime.utcnow()),
+            source or "email_validation_queue",
+            int(touchpoint_id or 0),
+            int(row["id"] or 0),
+        ),
+    )
+
+
+def apply_email_validation_registry_to_attached_touchpoints(db, registry_row):
+    if not registry_row:
+        return {"updated": 0, "emailoctopus_synced": 0}
+    validation_status = str(registry_row["validation_status"] or "").strip().lower()
+    touch_status = _touchpoint_status_from_email_validation_status(validation_status)
+    if not touch_status:
+        return {"updated": 0, "emailoctopus_synced": 0}
+    normalized_email = normalize_email_identity(registry_row["normalized_email"] or "")
+    processed_at = registry_row["processed_at"] or format_db_time(datetime.utcnow())
+    validation_raw = registry_row["validation_raw"] or ""
+    rows = db.execute(
+        """
+        SELECT rt.touchpoint_id, rt.person_id, rt.source,
+               t.note AS touchpoint_note,
+               q.id AS queue_id
+        FROM email_validation_registry_touchpoints rt
+        JOIN touchpoints t ON t.id = rt.touchpoint_id
+        LEFT JOIN email_validation_queue q ON q.touchpoint_id = rt.touchpoint_id
+        WHERE rt.registry_id = ?
+        """,
+        (int(registry_row["id"] or 0),),
+    ).fetchall()
+    updated = 0
+    emailoctopus_synced = 0
+    for row in rows:
+        note = append_note_line(
+            row["touchpoint_note"] or "",
+            f"Email validation reused from registry for {normalized_email}; no duplicate EmailListVerify lookup was sent.",
+        )
+        db.execute(
+            """
+            UPDATE touchpoints
+            SET status = ?,
+                note = ?,
+                value = ?
+            WHERE id = ?
+            """,
+            (touch_status, note, normalized_email, row["touchpoint_id"]),
+        )
+        if row["queue_id"]:
+            db.execute(
+                """
+                UPDATE email_validation_queue
+                SET queue_status = 'Completed',
+                    validation_status = ?,
+                    validation_raw = ?,
+                    processed_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (validation_status, validation_raw, processed_at, row["queue_id"]),
+            )
+        if touch_status == "Valid":
+            sync_validated_email_to_emailoctopus(
+                db,
+                row["touchpoint_id"],
+                row["person_id"],
+                normalized_email,
+                source=row["source"] or "email_validation_registry",
+                validation_status="valid",
+                validation_result=parse_json_object(validation_raw or "{}", default={})
+                or {"source": "email_validation_registry"},
+            )
+            emailoctopus_synced += 1
+        updated += 1
+    return {"updated": updated, "emailoctopus_synced": emailoctopus_synced}
+
+
 def _find_existing_email_validation_decision(db, email_value, exclude_touchpoint_id=0):
     email_value = normalize_email_identity(email_value)
     if not email_value:
@@ -15019,6 +15381,12 @@ def _find_existing_email_validation_decision(db, email_value, exclude_touchpoint
         exclude_touchpoint_id = int(exclude_touchpoint_id or 0)
     except Exception:
         exclude_touchpoint_id = 0
+    registry_decision = _email_validation_registry_decision(
+        _email_validation_registry_row(db, email_value),
+        exclude_touchpoint_id=exclude_touchpoint_id,
+    )
+    if registry_decision:
+        return registry_decision
     sync_row = db.execute(
         """
         SELECT sync_status, validation_status
@@ -15151,6 +15519,78 @@ def held_email_validation_payload(source, reason):
     )
 
 
+def _upsert_email_validation_queue_row(
+    db,
+    touchpoint_id,
+    person_id,
+    email_value,
+    source,
+    queue_status,
+    run_after,
+    validation_status="",
+    validation_raw="",
+    processed_at=None,
+):
+    existing = db.execute(
+        """
+        SELECT id, queue_status
+        FROM email_validation_queue
+        WHERE touchpoint_id = ?
+        LIMIT 1
+        """,
+        (int(touchpoint_id or 0),),
+    ).fetchone()
+    if existing:
+        db.execute(
+            """
+            UPDATE email_validation_queue
+            SET person_id = ?,
+                email_value = ?,
+                source = ?,
+                queue_status = ?,
+                validation_status = ?,
+                validation_raw = ?,
+                run_after = ?,
+                processed_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                person_id,
+                email_value,
+                source,
+                queue_status,
+                validation_status or "",
+                validation_raw or "",
+                run_after,
+                processed_at,
+                existing["id"],
+            ),
+        )
+        return int(existing["id"] or 0)
+    cur = db.execute(
+        """
+        INSERT INTO email_validation_queue (
+            touchpoint_id, person_id, email_value, source, queue_status,
+            run_after, validation_status, validation_raw, processed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(touchpoint_id or 0),
+            person_id,
+            email_value,
+            source,
+            queue_status,
+            run_after,
+            validation_status or "",
+            validation_raw or "",
+            processed_at,
+        ),
+    )
+    return int(cur.lastrowid or 0)
+
+
 def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value, source="skiptrace"):
     try:
         touchpoint_id = int(touchpoint_id or 0)
@@ -15161,108 +15601,136 @@ def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value,
         return None
     source_value = (source or "skiptrace").strip() or "skiptrace"
     hold_reason = email_validation_source_hold_reason(source_value)
-    existing = db.execute(
-        """
-        SELECT id, queue_status
-        FROM email_validation_queue
-        WHERE touchpoint_id = ?
-        LIMIT 1
-        """,
-        (touchpoint_id,),
-    ).fetchone()
     now_stamp = format_db_time(datetime.utcnow())
-    if existing:
-        if hold_reason:
-            db.execute(
-                """
-                UPDATE email_validation_queue
-                SET person_id = ?,
-                    email_value = ?,
-                    source = ?,
-                    queue_status = 'Held',
-                    validation_status = ?,
-                    validation_raw = ?,
-                    run_after = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                  AND lower(COALESCE(queue_status, '')) NOT IN ('completed', 'skipped')
-                """,
-                (
+    registry_row = _ensure_email_validation_registry(
+        db,
+        email_value,
+        touchpoint_id=touchpoint_id,
+        person_id=person_id,
+        source=source_value,
+        hold_reason=hold_reason,
+    )
+    registry_decision = _email_validation_registry_decision(
+        registry_row,
+        exclude_touchpoint_id=touchpoint_id,
+    )
+    if registry_decision:
+        decision_kind = str(registry_decision.get("kind") or "").strip()
+        if decision_kind == "email_validation_registry":
+            _apply_email_validation_decision_to_touchpoint(db, touchpoint_id, email_value, registry_decision)
+            validation_status = str(registry_decision.get("validation_status") or "").strip().lower()
+            if validation_status == "valid":
+                sync_validated_email_to_emailoctopus(
+                    db,
+                    touchpoint_id,
                     person_id,
                     email_value,
-                    source_value,
-                    HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS,
-                    held_email_validation_payload(source_value, hold_reason),
-                    now_stamp,
-                    existing["id"],
-                ),
+                    source=source_value,
+                    validation_status="valid",
+                    validation_result=parse_json_object(registry_decision.get("validation_raw") or "{}", default={})
+                    or {"source": "email_validation_registry"},
+                )
+            return _upsert_email_validation_queue_row(
+                db,
+                touchpoint_id,
+                person_id,
+                email_value,
+                source_value,
+                "Completed",
+                now_stamp,
+                validation_status=validation_status,
+                validation_raw=registry_decision.get("validation_raw") or "",
+                processed_at=registry_decision.get("processed_at") or now_stamp,
             )
-            return int(existing["id"])
-        if str(existing["queue_status"] or "").strip().lower() in {"completed", "skipped"}:
-            return int(existing["id"])
-        db.execute(
-            """
-            UPDATE email_validation_queue
-            SET person_id = ?,
-                email_value = ?,
-                source = ?,
-                run_after = ?,
-                updated_at = CURRENT_TIMESTAMP,
-                queue_status = CASE
-                    WHEN lower(COALESCE(queue_status, '')) IN ('completed', 'skipped')
-                        THEN queue_status
-                    ELSE 'Queued'
-                END
-            WHERE id = ?
-            """,
-            (person_id, email_value, source_value, now_stamp, existing["id"]),
+        return _upsert_email_validation_queue_row(
+            db,
+            touchpoint_id,
+            person_id,
+            email_value,
+            source_value,
+            "Skipped",
+            now_stamp,
+            validation_status="already_queued",
+            validation_raw=json.dumps(
+                {
+                    "source": "email_validation_registry_pending",
+                    "registry_id": registry_decision.get("registry_id") or None,
+                    "status": registry_decision.get("validation_status") or "",
+                    "provider_call_made": False,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            processed_at=now_stamp,
         )
-        return int(existing["id"])
     decision = _find_existing_email_validation_decision(db, email_value, exclude_touchpoint_id=touchpoint_id)
     if decision:
         _apply_email_validation_decision_to_touchpoint(db, touchpoint_id, email_value, decision)
-        if decision.get("kind") == "prior_validation" and str(decision.get("validation_status") or "").lower() == "valid":
+        validation_status = str(decision.get("validation_status") or "").strip().lower()
+        if validation_status in EMAIL_VALIDATION_COMPLETED_STATUSES:
+            _update_email_validation_registry_from_result(
+                db,
+                email_value,
+                "Completed",
+                validation_status,
+                parse_json_object(decision.get("validation_raw") or "{}", default={})
+                or {
+                    "source": decision.get("kind") or "existing_email_validation",
+                    "provider_call_made": False,
+                },
+                source=source_value,
+                touchpoint_id=touchpoint_id,
+            )
+        if validation_status == "valid":
             sync_validated_email_to_emailoctopus(
                 db,
                 touchpoint_id,
                 person_id,
                 email_value,
-                source=source,
+                source=source_value,
                 validation_status="valid",
                 validation_result={
                     "source": "reused_existing_email_validation",
                     "prior_processed_at": decision.get("processed_at") or "",
                 },
-        )
-        return None
-    if hold_reason:
-        cur = db.execute(
-            """
-            INSERT INTO email_validation_queue (
-                touchpoint_id, person_id, email_value, source, queue_status,
-                run_after, validation_status, validation_raw
             )
-            VALUES (?, ?, ?, ?, 'Held', ?, ?, ?)
-            """,
-            (
-                touchpoint_id,
-                person_id,
-                email_value,
-                source_value,
-                now_stamp,
-                HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS,
-                held_email_validation_payload(source_value, hold_reason),
+        return _upsert_email_validation_queue_row(
+            db,
+            touchpoint_id,
+            person_id,
+            email_value,
+            source_value,
+            decision.get("queue_status") or "Skipped",
+            now_stamp,
+            validation_status=validation_status,
+            validation_raw=decision.get("validation_raw") or json.dumps(
+                {"source": decision.get("kind") or "existing_email_validation", "provider_call_made": False},
+                ensure_ascii=True,
+                sort_keys=True,
             ),
+            processed_at=decision.get("processed_at") or now_stamp,
         )
-        return int(cur.lastrowid or 0)
-    cur = db.execute(
-        """
-        INSERT INTO email_validation_queue (touchpoint_id, person_id, email_value, source, queue_status, run_after)
-        VALUES (?, ?, ?, ?, 'Queued', ?)
-        """,
-        (touchpoint_id, person_id, email_value, source_value, now_stamp),
+    if hold_reason:
+        return _upsert_email_validation_queue_row(
+            db,
+            touchpoint_id,
+            person_id,
+            email_value,
+            source_value,
+            "Held",
+            now_stamp,
+            validation_status=HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS,
+            validation_raw=held_email_validation_payload(source_value, hold_reason),
+        )
+    return _upsert_email_validation_queue_row(
+        db,
+        touchpoint_id,
+        person_id,
+        email_value,
+        source_value,
+        "Queued",
+        now_stamp,
     )
-    return int(cur.lastrowid or 0)
 
 
 def _append_touchpoint_note(existing_note, extra_line):
@@ -15329,6 +15797,15 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                 commit_with_retry(db)
                 continue
             if touch_status_norm == "valid":
+                registry_row = _update_email_validation_registry_from_result(
+                    db,
+                    email_value,
+                    "Completed",
+                    "valid",
+                    {"source": "touchpoint_already_valid", "provider_call_made": False},
+                    source=row["source"] or "email_validation_queue",
+                    touchpoint_id=touchpoint_id,
+                )
                 sync_validated_email_to_emailoctopus(
                     db,
                     touchpoint_id,
@@ -15350,6 +15827,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     """,
                     (now_stamp, queue_id),
                 )
+                apply_email_validation_registry_to_attached_touchpoints(db, registry_row)
                 commit_with_retry(db)
                 continue
             if touch_status_norm in BLOCKED_CONTACT_STATUSES:
@@ -15376,7 +15854,23 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                 _apply_email_validation_decision_to_touchpoint(db, touchpoint_id, email_value, existing_decision)
                 decision_kind = str(existing_decision.get("kind") or "existing_email").strip()
                 reused_status = str(existing_decision.get("validation_status") or decision_kind or "existing_email").strip().lower()
-                if decision_kind == "prior_validation":
+                if reused_status in EMAIL_VALIDATION_COMPLETED_STATUSES:
+                    registry_row = None
+                    registry_row = _update_email_validation_registry_from_result(
+                        db,
+                        email_value,
+                        "Completed",
+                        reused_status,
+                        parse_json_object(existing_decision.get("validation_raw") or "{}", default={})
+                        or {
+                            "source": "reused_existing_email_validation",
+                            "decision": decision_kind,
+                            "prior_processed_at": existing_decision.get("processed_at") or "",
+                            "provider_call_made": False,
+                        },
+                        source=row["source"] or "email_validation_queue",
+                        touchpoint_id=touchpoint_id,
+                    )
                     if reused_status == "valid":
                         sync_validated_email_to_emailoctopus(
                             db,
@@ -15415,6 +15909,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                         ),
                     )
                     updated += 1
+                    apply_email_validation_registry_to_attached_touchpoints(db, registry_row)
                 else:
                     db.execute(
                         """
@@ -15445,6 +15940,14 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                 continue
             hold_reason = email_validation_source_hold_reason(row["source"] or "")
             if hold_reason:
+                _ensure_email_validation_registry(
+                    db,
+                    email_value,
+                    touchpoint_id=touchpoint_id,
+                    person_id=row["person_id"],
+                    source=row["source"] or "email_validation_queue",
+                    hold_reason=hold_reason,
+                )
                 db.execute(
                     """
                     UPDATE email_validation_queue
@@ -15462,6 +15965,12 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                 )
                 commit_with_retry(db)
                 continue
+            _mark_email_validation_registry_inflight(
+                db,
+                email_value,
+                source=row["source"] or "email_validation_queue",
+                touchpoint_id=touchpoint_id,
+            )
             try:
                 validation_result = verify_email_with_emaillistverify(api_key, email_value)
             except Exception as exc:
@@ -15477,6 +15986,17 @@ def run_touchpoint_email_validation_queue_once(limit=10):
             normalized_status = (validation_result.get("normalized_status") or "").strip().lower()
             if normalized_status in {"awaiting_emaillistverify_config", "awaiting_emaillistverify_provider_attention", "error"}:
                 retry_minutes = 15 if normalized_status == "awaiting_emaillistverify_config" else 60
+                retry_after = format_db_time(datetime.utcnow() + timedelta(minutes=retry_minutes))
+                _update_email_validation_registry_from_result(
+                    db,
+                    email_value,
+                    "Retry",
+                    normalized_status,
+                    validation_result,
+                    source=row["source"] or "email_validation_queue",
+                    touchpoint_id=touchpoint_id,
+                    run_after=retry_after,
+                )
                 db.execute(
                     """
                     UPDATE email_validation_queue
@@ -15491,7 +16011,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     (
                         normalized_status,
                         json.dumps(validation_result, ensure_ascii=True, sort_keys=True),
-                        format_db_time(datetime.utcnow() + timedelta(minutes=retry_minutes)),
+                        retry_after,
                         queue_id,
                     ),
                 )
@@ -15542,6 +16062,15 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     validation_status="valid",
                     validation_result=validation_result,
                 )
+            registry_row = _update_email_validation_registry_from_result(
+                db,
+                email_value,
+                "Completed",
+                normalized_status or ("valid" if new_touch_status == "Valid" else "error"),
+                validation_result,
+                source=row["source"] or "email_validation_queue",
+                touchpoint_id=touchpoint_id,
+            )
             db.execute(
                 """
                 UPDATE email_validation_queue
@@ -15560,6 +16089,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     queue_id,
                 ),
             )
+            apply_email_validation_registry_to_attached_touchpoints(db, registry_row)
             updated += 1
             commit_with_retry(db)
         commit_with_retry(db)
@@ -15578,6 +16108,166 @@ def run_touchpoint_email_validation_queue_once(limit=10):
         return {"ok": False, "error": str(exc), "attempted": processed, "updated": updated}
     finally:
         db.close()
+
+
+def _email_validation_registry_backfill_payload(row, normalized_status):
+    raw = str(row["validation_raw"] or "").strip()
+    if raw:
+        return raw
+    return json.dumps(
+        {
+            "source": "email_validation_queue_backfill",
+            "queue_id": int(row["id"] or 0),
+            "validation_status": normalized_status,
+            "provider_call_made": str(row["queue_status"] or "").strip().lower() == "completed",
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+
+
+def _email_validation_registry_backfill_state(row):
+    queue_status = str(row["queue_status"] or "").strip().lower()
+    validation_status = str(row["validation_status"] or "").strip().lower()
+    if queue_status == "completed" and validation_status in EMAIL_VALIDATION_COMPLETED_STATUSES:
+        return "Completed", validation_status
+    if queue_status == "retry":
+        return "Retry", validation_status or "retry"
+    if queue_status == "queued":
+        return "Queued", validation_status or ""
+    if queue_status == "held":
+        return "Held", validation_status or HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS
+    if validation_status in EMAIL_VALIDATION_COMPLETED_STATUSES:
+        return "Completed", validation_status
+    return "Skipped", validation_status or queue_status or "skipped"
+
+
+def backfill_email_validation_registry_from_queue(db, force=False, limit=200000):
+    try:
+        already = db.execute(
+            "SELECT value FROM app_settings WHERE key = ? LIMIT 1",
+            (EMAIL_VALIDATION_REGISTRY_BACKFILL_SETTING,),
+        ).fetchone()
+        if already and not force:
+            return {"ok": True, "skipped": "already_backfilled", "at": already["value"]}
+    except Exception:
+        if not force:
+            return {"ok": False, "error": "app_settings_unavailable"}
+    try:
+        limit = max(1, min(500000, int(limit or 200000)))
+    except Exception:
+        limit = 200000
+    rows = db.execute(
+        """
+        SELECT q.id, q.touchpoint_id, q.person_id, q.email_value, q.source, q.queue_status,
+               q.validation_status, q.validation_raw, q.attempts, q.run_after, q.processed_at, q.created_at,
+               t.value AS touchpoint_value
+        FROM email_validation_queue q
+        LEFT JOIN touchpoints t ON t.id = q.touchpoint_id
+        WHERE COALESCE(q.email_value, '') <> ''
+           OR COALESCE(t.value, '') <> ''
+        ORDER BY q.id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    registry_created = 0
+    registry_updated = 0
+    attached = 0
+    for row in rows:
+        normalized_email = normalize_email_identity(row["touchpoint_value"] or row["email_value"] or "")
+        if not normalized_email:
+            continue
+        queue_status, validation_status = _email_validation_registry_backfill_state(row)
+        raw = _email_validation_registry_backfill_payload(row, validation_status)
+        source = str(row["source"] or "email_validation_queue_backfill").strip() or "email_validation_queue_backfill"
+        existing = _email_validation_registry_row(db, normalized_email)
+        if not existing:
+            db.execute(
+                """
+                INSERT INTO email_validation_registry (
+                    normalized_email, provider, queue_status, validation_status, provider_status, validation_raw,
+                    attempts, first_source, last_source, first_touchpoint_id, last_touchpoint_id,
+                    run_after, requested_at, processed_at, created_at, updated_at
+                )
+                VALUES (?, 'emaillistverify', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                (
+                    normalized_email,
+                    queue_status,
+                    validation_status,
+                    validation_status,
+                    raw,
+                    int(row["attempts"] or 0),
+                    source,
+                    source,
+                    int(row["touchpoint_id"] or 0),
+                    int(row["touchpoint_id"] or 0),
+                    row["run_after"] or row["created_at"] or format_db_time(datetime.utcnow()),
+                    row["created_at"] or None,
+                    row["processed_at"] if queue_status == "Completed" else None,
+                ),
+            )
+            registry_created += 1
+            existing = _email_validation_registry_row(db, normalized_email)
+        else:
+            existing_status = str(existing["queue_status"] or "").strip().lower()
+            should_promote = (
+                queue_status == "Completed" and existing_status != "completed"
+            ) or (
+                queue_status == "Completed"
+                and existing_status == "completed"
+                and str(row["processed_at"] or "") > str(existing["processed_at"] or "")
+            )
+            if should_promote:
+                db.execute(
+                    """
+                    UPDATE email_validation_registry
+                    SET queue_status = 'Completed',
+                        validation_status = ?,
+                        provider_status = ?,
+                        validation_raw = ?,
+                        attempts = MAX(COALESCE(attempts, 0), ?),
+                        processed_at = ?,
+                        last_source = ?,
+                        last_touchpoint_id = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        validation_status,
+                        validation_status,
+                        raw,
+                        int(row["attempts"] or 0),
+                        row["processed_at"] or format_db_time(datetime.utcnow()),
+                        source,
+                        int(row["touchpoint_id"] or 0),
+                        int(existing["id"] or 0),
+                    ),
+                )
+                registry_updated += 1
+                existing = _email_validation_registry_row(db, normalized_email)
+        if existing and int(row["touchpoint_id"] or 0) > 0:
+            _attach_email_validation_touchpoint(
+                db,
+                int(existing["id"] or 0),
+                int(row["touchpoint_id"] or 0),
+                row["person_id"],
+                source,
+            )
+            attached += 1
+    stamp = format_db_time(datetime.utcnow())
+    db.execute(
+        """
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at
+        """,
+        (EMAIL_VALIDATION_REGISTRY_BACKFILL_SETTING, stamp),
+    )
+    return {"ok": True, "created": registry_created, "updated": registry_updated, "attached": attached, "at": stamp}
 
 
 EMAILOCTOPUS_CATEGORY_TAGS = ["foreclosure", "sheriff sale", "probate", "general"]

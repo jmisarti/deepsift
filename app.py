@@ -236,6 +236,7 @@ AGENT_REFRESH_WORKER_ENABLED = env_flag("AGENT_REFRESH_WORKER_ENABLED", True)
 AGENT_REFRESH_POLL_SECONDS = max(int((os.getenv("AGENT_REFRESH_POLL_SECONDS") or "30").strip() or "30"), 10)
 EMAIL_VALIDATION_QUEUE_WORKER_ENABLED = env_flag("EMAIL_VALIDATION_QUEUE_WORKER_ENABLED", True)
 EMAIL_VALIDATION_QUEUE_POLL_SECONDS = max(int((os.getenv("EMAIL_VALIDATION_QUEUE_POLL_SECONDS") or "30").strip() or "30"), 5)
+REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED = env_flag("REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED", False)
 GMAIL_WATCH_RENEWAL_WORKER_ENABLED = env_flag("GMAIL_WATCH_RENEWAL_WORKER_ENABLED", True)
 GMAIL_WATCH_RENEWAL_POLL_SECONDS = max(int((os.getenv("GMAIL_WATCH_RENEWAL_POLL_SECONDS") or "86400").strip() or "86400"), 3600)
 GMAIL_PUBSUB_TOPIC_NAME = (os.getenv("GMAIL_PUBSUB_TOPIC_NAME") or "").strip()
@@ -15112,6 +15113,30 @@ def _apply_email_validation_decision_to_touchpoint(db, touchpoint_id, email_valu
     )
 
 
+REISIFT_NEW_RECORD_EMAIL_VALIDATION_SOURCES = {"reisift_new_record", "reisift_new_record_repair"}
+HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS = "held_reisift_new_record_manual_review"
+
+
+def email_validation_source_hold_reason(source):
+    source_key = str(source or "").strip().lower()
+    if source_key in REISIFT_NEW_RECORD_EMAIL_VALIDATION_SOURCES and not REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED:
+        return "ReiSIFT New Records bulk email validation is held for manual approval."
+    return ""
+
+
+def held_email_validation_payload(source, reason):
+    return json.dumps(
+        {
+            "source": source or "",
+            "reason": reason,
+            "provider": "emaillistverify",
+            "provider_call_made": False,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+
+
 def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value, source="skiptrace"):
     try:
         touchpoint_id = int(touchpoint_id or 0)
@@ -15120,6 +15145,8 @@ def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value,
     email_value = normalize_email_identity(email_value)
     if not touchpoint_id or not email_value:
         return None
+    source_value = (source or "skiptrace").strip() or "skiptrace"
+    hold_reason = email_validation_source_hold_reason(source_value)
     existing = db.execute(
         """
         SELECT id, queue_status
@@ -15131,6 +15158,32 @@ def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value,
     ).fetchone()
     now_stamp = format_db_time(datetime.utcnow())
     if existing:
+        if hold_reason:
+            db.execute(
+                """
+                UPDATE email_validation_queue
+                SET person_id = ?,
+                    email_value = ?,
+                    source = ?,
+                    queue_status = 'Held',
+                    validation_status = ?,
+                    validation_raw = ?,
+                    run_after = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND lower(COALESCE(queue_status, '')) NOT IN ('completed', 'skipped')
+                """,
+                (
+                    person_id,
+                    email_value,
+                    source_value,
+                    HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS,
+                    held_email_validation_payload(source_value, hold_reason),
+                    now_stamp,
+                    existing["id"],
+                ),
+            )
+            return int(existing["id"])
         if str(existing["queue_status"] or "").strip().lower() in {"completed", "skipped"}:
             return int(existing["id"])
         db.execute(
@@ -15148,7 +15201,7 @@ def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value,
                 END
             WHERE id = ?
             """,
-            (person_id, email_value, (source or "skiptrace").strip() or "skiptrace", now_stamp, existing["id"]),
+            (person_id, email_value, source_value, now_stamp, existing["id"]),
         )
         return int(existing["id"])
     decision = _find_existing_email_validation_decision(db, email_value, exclude_touchpoint_id=touchpoint_id)
@@ -15166,14 +15219,34 @@ def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value,
                     "source": "reused_existing_email_validation",
                     "prior_processed_at": decision.get("processed_at") or "",
                 },
-            )
+        )
         return None
+    if hold_reason:
+        cur = db.execute(
+            """
+            INSERT INTO email_validation_queue (
+                touchpoint_id, person_id, email_value, source, queue_status,
+                run_after, validation_status, validation_raw
+            )
+            VALUES (?, ?, ?, ?, 'Held', ?, ?, ?)
+            """,
+            (
+                touchpoint_id,
+                person_id,
+                email_value,
+                source_value,
+                now_stamp,
+                HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS,
+                held_email_validation_payload(source_value, hold_reason),
+            ),
+        )
+        return int(cur.lastrowid or 0)
     cur = db.execute(
         """
         INSERT INTO email_validation_queue (touchpoint_id, person_id, email_value, source, queue_status, run_after)
         VALUES (?, ?, ?, ?, 'Queued', ?)
         """,
-        (touchpoint_id, person_id, email_value, (source or "skiptrace").strip() or "skiptrace", now_stamp),
+        (touchpoint_id, person_id, email_value, source_value, now_stamp),
     )
     return int(cur.lastrowid or 0)
 
@@ -15354,6 +15427,25 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                             queue_id,
                         ),
                     )
+                commit_with_retry(db)
+                continue
+            hold_reason = email_validation_source_hold_reason(row["source"] or "")
+            if hold_reason:
+                db.execute(
+                    """
+                    UPDATE email_validation_queue
+                    SET queue_status = 'Held',
+                        validation_status = ?,
+                        validation_raw = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS,
+                        held_email_validation_payload(row["source"] or "", hold_reason),
+                        queue_id,
+                    ),
+                )
                 commit_with_retry(db)
                 continue
             try:

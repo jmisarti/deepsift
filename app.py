@@ -2424,7 +2424,6 @@ def init_db():
     normalize_people_name_data(db)
     ensure_default_sequence_campaign(db)
     ensure_default_sms_automation_routing_rules(db)
-    backfill_email_validation_registry_from_queue(db)
     normalize_unsent_sms_queue_addresses(db)
 
     has_properties = db.execute("SELECT COUNT(*) AS c FROM properties").fetchone()["c"]
@@ -2446,7 +2445,6 @@ def ensure_db():
     backfill_openletterconnect_mail_orders(db)
     ensure_default_sequence_campaign(db)
     ensure_default_sms_automation_routing_rules(db)
-    backfill_email_validation_registry_from_queue(db)
     normalize_unsent_sms_queue_addresses(db)
     db.commit()
     db.close()

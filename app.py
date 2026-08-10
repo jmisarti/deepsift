@@ -240,6 +240,9 @@ AGENT_REFRESH_WORKER_ENABLED = env_flag("AGENT_REFRESH_WORKER_ENABLED", True)
 AGENT_REFRESH_POLL_SECONDS = max(int((os.getenv("AGENT_REFRESH_POLL_SECONDS") or "30").strip() or "30"), 10)
 EMAIL_VALIDATION_QUEUE_WORKER_ENABLED = env_flag("EMAIL_VALIDATION_QUEUE_WORKER_ENABLED", True)
 EMAIL_VALIDATION_QUEUE_POLL_SECONDS = max(int((os.getenv("EMAIL_VALIDATION_QUEUE_POLL_SECONDS") or "30").strip() or "30"), 5)
+EMAILOCTOPUS_SYNC_QUEUE_WORKER_ENABLED = env_flag("EMAILOCTOPUS_SYNC_QUEUE_WORKER_ENABLED", True)
+EMAILOCTOPUS_SYNC_QUEUE_POLL_SECONDS = max(int((os.getenv("EMAILOCTOPUS_SYNC_QUEUE_POLL_SECONDS") or "60").strip() or "60"), 15)
+EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT = max(int((os.getenv("EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT") or "20").strip() or "20"), 1)
 REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED = env_flag("REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED", False)
 GMAIL_WATCH_RENEWAL_WORKER_ENABLED = env_flag("GMAIL_WATCH_RENEWAL_WORKER_ENABLED", True)
 GMAIL_WATCH_RENEWAL_POLL_SECONDS = max(int((os.getenv("GMAIL_WATCH_RENEWAL_POLL_SECONDS") or "86400").strip() or "86400"), 3600)
@@ -317,6 +320,7 @@ WEBSITE_LEADS_HOLD_WORKER_STARTED = False
 AGENT_REFRESH_WORKER_STARTED = False
 UNTITLED_LEADS_WORKER_STARTED = False
 EMAIL_VALIDATION_QUEUE_WORKER_STARTED = False
+EMAILOCTOPUS_SYNC_QUEUE_WORKER_STARTED = False
 BACKGROUND_WORKERS_BOOTSTRAP_STARTED = False
 BACKGROUND_WORKERS_BOOTSTRAP_LOCK = threading.Lock()
 PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTES") or "60").strip() or "60"), 5)
@@ -861,6 +865,7 @@ def start_background_workers_async():
         try:
             start_bulk_sms_worker()
             start_email_validation_queue_worker()
+            start_emailoctopus_sync_queue_worker()
             start_email_poll_worker()
             start_clever_leads_worker()
             start_untitled_leads_worker()
@@ -1968,6 +1973,41 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_status ON email_campaign_syncs(sync_status, updated_at DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_person ON email_campaign_syncs(person_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_email_campaign_syncs_property ON email_campaign_syncs(property_id)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS emailoctopus_sync_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            queue_key TEXT NOT NULL UNIQUE,
+            action TEXT NOT NULL,
+            normalized_email TEXT NOT NULL,
+            touchpoint_id INTEGER,
+            person_id INTEGER,
+            property_id INTEGER,
+            source TEXT,
+            provider_list_id TEXT,
+            provider_contact_id TEXT,
+            contact_status TEXT,
+            validation_status TEXT,
+            tags_json TEXT,
+            fields_json TEXT,
+            tags_remove_json TEXT,
+            payload_json TEXT,
+            queue_status TEXT NOT NULL DEFAULT 'Queued',
+            priority INTEGER NOT NULL DEFAULT 10,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            run_after TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_error TEXT,
+            processed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(touchpoint_id) REFERENCES touchpoints(id) ON DELETE SET NULL,
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL,
+            FOREIGN KEY(property_id) REFERENCES properties(id) ON DELETE SET NULL
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_sync_queue_due ON emailoctopus_sync_queue(queue_status, run_after, priority, id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_sync_queue_email ON emailoctopus_sync_queue(normalized_email, action, queue_status)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS emailoctopus_webhook_events (
@@ -15807,6 +15847,10 @@ def _email_campaign_sync_success(status):
     return status in {"synced", "already_synced", "already_sent_emailoctopus"} or status.startswith(("created_", "updated_"))
 
 
+def _email_campaign_sync_queued(status):
+    return str(status or "").strip().lower().startswith("queued_emailoctopus")
+
+
 def _email_campaign_sync_unsubscribed(status):
     return str(status or "").strip().lower().startswith("unsubscribed")
 
@@ -15857,7 +15901,9 @@ def collect_emailoctopus_syncs_for_property(db, property_id):
         if not email:
             continue
         status = str(row["sync_status"] or "").strip()
-        if _email_campaign_sync_unsubscribed(status) or not _email_campaign_sync_success(status):
+        if _email_campaign_sync_unsubscribed(status) or (
+            not _email_campaign_sync_success(status) and not _email_campaign_sync_queued(status)
+        ):
             continue
         if int(row["property_id"] or 0) == int(property_id or 0) or email in property_emails:
             candidates[email] = dict(row)
@@ -15897,24 +15943,43 @@ def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, be
     if not candidates:
         return {"ok": True, "skipped": "no_synced_emails", "attempted": 0, "unsubscribed": 0, "errors": 0}
     settings = get_anonymous_email_marketing_settings(db)
-    api_key = settings.get("emailoctopus_api_key") or ""
     list_id = settings.get("emailoctopus_list_id") or ""
-    if not api_key or not list_id:
+    if not settings.get("emailoctopus_api_key") or not list_id:
         return {"ok": False, "skipped": "awaiting_emailoctopus_config", "attempted": 0, "unsubscribed": 0, "errors": 0}
 
     attempted = 0
-    unsubscribed = 0
+    queued = 0
     skipped_active_elsewhere = 0
     errors = 0
     timestamp = format_db_time(datetime.utcnow())
-    commit_with_retry(db)
     for email, sync_row in candidates.items():
         if email_identity_has_other_new_record_property(db, email, property_id):
             skipped_active_elsewhere += 1
             continue
         attempted += 1
         try:
-            result = emailoctopus_set_contact_status(api_key, list_id, email, status="UNSUBSCRIBED")
+            queue_result = enqueue_emailoctopus_sync(
+                db,
+                "unsubscribe",
+                email,
+                touchpoint_id=sync_row.get("touchpoint_id"),
+                person_id=sync_row.get("person_id"),
+                property_id=property_id,
+                source=source,
+                provider_list_id=list_id,
+                contact_status="UNSUBSCRIBED",
+                validation_status=sync_row.get("validation_status") or "",
+                payload={
+                    "property_id": property_id,
+                    "before_status": before_status,
+                    "after_status": after_status,
+                    "source": source,
+                },
+                priority=0,
+            )
+            if queue_result.get("skipped"):
+                skipped_active_elsewhere += 1 if queue_result.get("skipped") == "active_new_record_elsewhere" else 0
+                continue
             db.execute(
                 """
                 UPDATE email_campaign_syncs
@@ -15926,10 +15991,10 @@ def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, be
                 WHERE normalized_email = ?
                 """,
                 (
-                    "unsubscribed_property_status_exit",
+                    "queued_emailoctopus_unsubscribe",
                     json.dumps(
                         {
-                            "emailoctopus": result,
+                            "emailoctopus_queue": queue_result,
                             "property_id": property_id,
                             "before_status": before_status,
                             "after_status": after_status,
@@ -15947,10 +16012,10 @@ def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, be
                 email,
                 source="deepsift_property_status_exit",
                 source_identifier=str(sync_row.get("provider_contact_id") or ""),
-                status="unsubscribed_property_status_exit",
-                notes=f"Unsubscribed after property {property_id} changed from {before_status or '-'} to {after_status or '-'}.",
+                status="queued_emailoctopus_unsubscribe",
+                notes=f"Queued unsubscribe after property {property_id} changed from {before_status or '-'} to {after_status or '-'}.",
             )
-            unsubscribed += 1
+            queued += 1
         except Exception as exc:
             errors += 1
             db.execute(
@@ -15985,7 +16050,7 @@ def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, be
                 route="unsubscribe_emailoctopus_emails_for_property_status_exit",
                 status_code=500,
             )
-        commit_with_retry(db)
+        db.commit()
     try:
         db.execute(
             """
@@ -15995,7 +16060,7 @@ def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, be
             (
                 property_id,
                 "EmailOctopus Unsubscribe",
-                "Completed" if errors == 0 else "Partial",
+                "Queued" if errors == 0 else "Partial",
                 json.dumps(
                     {
                         "before_status": before_status,
@@ -16003,7 +16068,7 @@ def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, be
                         "source": source,
                         "candidate_emails": len(candidates),
                         "attempted": attempted,
-                        "unsubscribed": unsubscribed,
+                        "queued": queued,
                         "skipped_active_elsewhere": skipped_active_elsewhere,
                         "errors": errors,
                     },
@@ -16018,7 +16083,8 @@ def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, be
         "ok": errors == 0,
         "candidate_emails": len(candidates),
         "attempted": attempted,
-        "unsubscribed": unsubscribed,
+        "queued": queued,
+        "unsubscribed": 0,
         "skipped_active_elsewhere": skipped_active_elsewhere,
         "errors": errors,
     }
@@ -16273,6 +16339,391 @@ def upsert_email_campaign_sync_state(
     return True
 
 
+def _emailoctopus_queue_key(action, normalized_email, property_id=0):
+    action_key = normalize_whitespace(action or "").lower() or "subscribe"
+    email_key = normalize_email_identity(normalized_email)
+    if action_key == "unsubscribe":
+        return f"unsubscribe:{email_key}:{int(property_id or 0)}"
+    return f"subscribe:{email_key}"
+
+
+def _emailoctopus_queue_payload(action, payload=None, contact_profile=None, validation_result=None, reason=""):
+    body = payload.copy() if isinstance(payload, dict) else {}
+    if contact_profile is not None:
+        body["contact_profile"] = contact_profile if isinstance(contact_profile, dict) else {}
+    if validation_result is not None:
+        body["validation"] = validation_result if isinstance(validation_result, dict) else validation_result
+    if reason:
+        body["reason"] = reason
+    body["action"] = action
+    return body
+
+
+def enqueue_emailoctopus_sync(
+    db,
+    action,
+    normalized_email,
+    touchpoint_id=None,
+    person_id=None,
+    property_id=None,
+    source="email_validation",
+    provider_list_id="",
+    contact_status="",
+    validation_status="",
+    contact_profile=None,
+    payload=None,
+    priority=None,
+):
+    action = normalize_whitespace(action or "").lower()
+    if action not in {"subscribe", "unsubscribe"}:
+        return {"ok": False, "skipped": "invalid_action"}
+    normalized_email = normalize_email_identity(normalized_email)
+    if not normalized_email:
+        return {"ok": True, "skipped": "missing_email"}
+    try:
+        property_id = int(property_id or 0)
+    except Exception:
+        property_id = 0
+    if action == "unsubscribe" and property_id and email_identity_has_other_new_record_property(db, normalized_email, property_id):
+        return {"ok": True, "skipped": "active_new_record_elsewhere", "email": normalized_email}
+    if action == "unsubscribe":
+        db.execute(
+            """
+            UPDATE emailoctopus_sync_queue
+            SET queue_status = 'Skipped',
+                last_error = 'superseded_by_unsubscribe',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE action = 'subscribe'
+              AND normalized_email = ?
+              AND lower(COALESCE(queue_status, 'queued')) IN ('queued', 'retry')
+            """,
+            (normalized_email,),
+        )
+    profile = contact_profile if isinstance(contact_profile, dict) else {}
+    tags = profile.get("tags") or []
+    fields = profile.get("fields") or {}
+    tags_remove = profile.get("tags_remove") or []
+    queue_payload = _emailoctopus_queue_payload(
+        action,
+        payload=payload,
+        contact_profile=profile,
+        validation_result=(payload or {}).get("validation") if isinstance(payload, dict) else None,
+    )
+    queue_key = _emailoctopus_queue_key(action, normalized_email, property_id=property_id)
+    queue_priority = int(priority if priority is not None else (0 if action == "unsubscribe" else 10))
+    db.execute(
+        """
+        INSERT INTO emailoctopus_sync_queue (
+            queue_key, action, normalized_email, touchpoint_id, person_id, property_id, source,
+            provider_list_id, contact_status, validation_status, tags_json, fields_json,
+            tags_remove_json, payload_json, queue_status, priority, run_after, last_error,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, NULLIF(?, 0), NULLIF(?, 0), NULLIF(?, 0), ?, ?, ?, ?, ?, ?, ?, ?, 'Queued', ?, CURRENT_TIMESTAMP, '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(queue_key) DO UPDATE SET
+            touchpoint_id = COALESCE(excluded.touchpoint_id, emailoctopus_sync_queue.touchpoint_id),
+            person_id = COALESCE(excluded.person_id, emailoctopus_sync_queue.person_id),
+            property_id = COALESCE(excluded.property_id, emailoctopus_sync_queue.property_id),
+            source = excluded.source,
+            provider_list_id = COALESCE(NULLIF(excluded.provider_list_id, ''), emailoctopus_sync_queue.provider_list_id),
+            contact_status = COALESCE(NULLIF(excluded.contact_status, ''), emailoctopus_sync_queue.contact_status),
+            validation_status = COALESCE(NULLIF(excluded.validation_status, ''), emailoctopus_sync_queue.validation_status),
+            tags_json = COALESCE(NULLIF(excluded.tags_json, ''), emailoctopus_sync_queue.tags_json),
+            fields_json = COALESCE(NULLIF(excluded.fields_json, ''), emailoctopus_sync_queue.fields_json),
+            tags_remove_json = COALESCE(NULLIF(excluded.tags_remove_json, ''), emailoctopus_sync_queue.tags_remove_json),
+            payload_json = COALESCE(NULLIF(excluded.payload_json, ''), emailoctopus_sync_queue.payload_json),
+            queue_status = CASE
+                WHEN lower(COALESCE(emailoctopus_sync_queue.queue_status, '')) = 'inflight' THEN emailoctopus_sync_queue.queue_status
+                ELSE 'Queued'
+            END,
+            priority = MIN(emailoctopus_sync_queue.priority, excluded.priority),
+            run_after = CURRENT_TIMESTAMP,
+            last_error = '',
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            queue_key,
+            action,
+            normalized_email,
+            int(touchpoint_id or 0),
+            int(person_id or 0),
+            property_id,
+            (source or "email_validation").strip() or "email_validation",
+            (provider_list_id or "").strip(),
+            (contact_status or "").strip(),
+            (validation_status or "").strip(),
+            json.dumps(list(dict.fromkeys([str(tag).strip() for tag in tags if str(tag).strip()])), ensure_ascii=True),
+            json.dumps(fields if isinstance(fields, dict) else {}, ensure_ascii=True, sort_keys=True),
+            json.dumps(list(dict.fromkeys([str(tag).strip() for tag in tags_remove if str(tag).strip()])), ensure_ascii=True),
+            json.dumps(queue_payload, ensure_ascii=True, sort_keys=True, default=str),
+            queue_priority,
+        ),
+    )
+    return {"ok": True, "queued": True, "queue_key": queue_key, "email": normalized_email, "action": action}
+
+
+def _emailoctopus_queue_should_skip_subscribe(db, row):
+    source = normalize_whitespace(row["source"] or "").lower()
+    if "new_record" not in source and "reisift_new" not in source:
+        return ""
+    property_id = int(row["property_id"] or 0)
+    if property_id <= 0:
+        return ""
+    prop = db.execute("SELECT status FROM properties WHERE id = ?", (property_id,)).fetchone()
+    status = prop["status"] if prop else ""
+    if not is_strict_new_record_status(status):
+        return f"property_status_is_{normalize_whitespace(status or 'not_new_record')}"
+    return ""
+
+
+def _mark_emailoctopus_queue_item(db, row_id, queue_status, last_error="", processed=False):
+    db.execute(
+        """
+        UPDATE emailoctopus_sync_queue
+        SET queue_status = ?,
+            last_error = ?,
+            processed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE processed_at END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (queue_status, last_error or "", 1 if processed else 0, int(row_id or 0)),
+    )
+
+
+def _schedule_emailoctopus_queue_retry(db, row_id, error_text, attempts):
+    retry_minutes = min(240, max(5, int(attempts or 1) * 15))
+    db.execute(
+        """
+        UPDATE emailoctopus_sync_queue
+        SET queue_status = 'Retry',
+            last_error = ?,
+            run_after = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            error_text or "EmailOctopus sync failed",
+            format_db_time(datetime.utcnow() + timedelta(minutes=retry_minutes)),
+            int(row_id or 0),
+        ),
+    )
+
+
+def process_emailoctopus_sync_queue_row(db, row, settings=None):
+    settings = settings or get_anonymous_email_marketing_settings(db)
+    api_key = settings.get("emailoctopus_api_key") or ""
+    list_id = settings.get("emailoctopus_list_id") or row["provider_list_id"] or ""
+    if not api_key or not list_id:
+        _schedule_emailoctopus_queue_retry(db, row["id"], "awaiting_emailoctopus_config", int(row["attempts"] or 0) + 1)
+        return {"ok": False, "retry": True, "error": "awaiting_emailoctopus_config"}
+    action = normalize_whitespace(row["action"] or "").lower()
+    normalized_email = normalize_email_identity(row["normalized_email"] or "")
+    if not normalized_email:
+        _mark_emailoctopus_queue_item(db, row["id"], "Skipped", "missing_email", processed=True)
+        return {"ok": True, "skipped": "missing_email"}
+    attempts = int(row["attempts"] or 0) + 1
+    db.execute(
+        """
+        UPDATE emailoctopus_sync_queue
+        SET queue_status = 'InFlight',
+            attempts = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (attempts, row["id"]),
+    )
+    commit_with_retry(db)
+    try:
+        if action == "unsubscribe":
+            property_id = int(row["property_id"] or 0)
+            if property_id and email_identity_has_other_new_record_property(db, normalized_email, property_id):
+                _mark_emailoctopus_queue_item(db, row["id"], "Skipped", "active_new_record_elsewhere", processed=True)
+                return {"ok": True, "skipped": "active_new_record_elsewhere"}
+            result = emailoctopus_set_contact_status(api_key, list_id, normalized_email, status="UNSUBSCRIBED")
+            timestamp = format_db_time(datetime.utcnow())
+            db.execute(
+                """
+                UPDATE email_campaign_syncs
+                SET sync_status = ?,
+                    last_error = '',
+                    payload_json = ?,
+                    synced_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE normalized_email = ?
+                """,
+                (
+                    "unsubscribed_property_status_exit",
+                    json.dumps({"emailoctopus": result, "queue_id": int(row["id"] or 0)}, ensure_ascii=True, sort_keys=True),
+                    timestamp,
+                    normalized_email,
+                ),
+            )
+            upsert_anonymous_email_campaign_registry(
+                db,
+                normalized_email,
+                source="deepsift_property_status_exit",
+                source_identifier=str(result.get("contact_id") or row["provider_contact_id"] or ""),
+                status="unsubscribed_property_status_exit",
+                notes=f"Unsubscribed by queued EmailOctopus sync item #{int(row['id'] or 0)}.",
+            )
+            _mark_emailoctopus_queue_item(db, row["id"], "Completed", "", processed=True)
+            return {"ok": True, "action": action, "email": normalized_email, "result": result}
+
+        if action != "subscribe":
+            _mark_emailoctopus_queue_item(db, row["id"], "Skipped", "invalid_action", processed=True)
+            return {"ok": True, "skipped": "invalid_action"}
+        skip_reason = _emailoctopus_queue_should_skip_subscribe(db, row)
+        if skip_reason:
+            _mark_emailoctopus_queue_item(db, row["id"], "Skipped", skip_reason, processed=True)
+            upsert_email_campaign_sync_state(
+                db,
+                normalized_email,
+                touchpoint_id=row["touchpoint_id"],
+                person_id=row["person_id"],
+                property_id=row["property_id"],
+                source=row["source"] or "email_validation",
+                provider_list_id=list_id,
+                sync_status=f"skipped_{skip_reason}",
+                validation_status=row["validation_status"] or "valid",
+                payload=parse_json_object(row["payload_json"] or "{}", default={}),
+            )
+            return {"ok": True, "skipped": skip_reason, "email": normalized_email}
+        contact_profile = parse_json_object(row["payload_json"] or "{}", default={}).get("contact_profile")
+        if not isinstance(contact_profile, dict):
+            contact_profile = build_emailoctopus_contact_profile(
+                db,
+                int(row["person_id"] or 0),
+                property_id=int(row["property_id"] or 0) or None,
+                source=row["source"] or "email_validation",
+            )
+        tags = parse_json_object(row["tags_json"] or "[]", default=[]) or contact_profile.get("tags") or _email_campaign_tags(row["source"])
+        fields = parse_json_object(row["fields_json"] or "{}", default={}) or contact_profile.get("fields") or {}
+        tags_remove = parse_json_object(row["tags_remove_json"] or "[]", default=[]) or contact_profile.get("tags_remove") or []
+        contact_status = row["contact_status"] or settings["emailoctopus_contact_status"]
+        sync_result = emailoctopus_upsert_contact(
+            api_key,
+            list_id,
+            normalized_email,
+            contact_status=contact_status,
+            tags=tags,
+            fields=fields,
+            tags_remove=tags_remove,
+        )
+        synced_at = format_db_time(datetime.utcnow())
+        sync_status = f"{sync_result['action']}_{str(sync_result.get('status') or contact_status).lower()}"
+        provider_contact_id = str(sync_result.get("contact_id") or "")
+        validation_payload = parse_json_object(row["payload_json"] or "{}", default={})
+        upsert_email_campaign_sync_state(
+            db,
+            normalized_email,
+            touchpoint_id=row["touchpoint_id"],
+            person_id=row["person_id"],
+            property_id=row["property_id"],
+            source=row["source"] or "email_validation",
+            provider_list_id=list_id,
+            provider_contact_id=provider_contact_id,
+            sync_status=sync_status,
+            validation_status=row["validation_status"] or "valid",
+            payload={
+                "emailoctopus": sync_result,
+                "validation": validation_payload.get("validation") or {},
+                "contact_profile": contact_profile,
+                "queue_id": int(row["id"] or 0),
+            },
+            synced_at=synced_at,
+        )
+        upsert_anonymous_email_campaign_registry(
+            db,
+            normalized_email,
+            source="deepsift_validated_email",
+            source_identifier=provider_contact_id,
+            first_name=contact_profile.get("first_name") or "",
+            last_name=contact_profile.get("last_name") or "",
+            status="already_sent",
+            notes=f"Synced automatically by queued EmailOctopus sync item #{int(row['id'] or 0)}.",
+        )
+        db.execute(
+            """
+            UPDATE emailoctopus_sync_queue
+            SET provider_contact_id = ?,
+                queue_status = 'Completed',
+                last_error = '',
+                processed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (provider_contact_id, row["id"]),
+        )
+        return {"ok": True, "action": action, "email": normalized_email, "sync_status": sync_status, "contact_id": provider_contact_id}
+    except Exception as exc:
+        _schedule_emailoctopus_queue_retry(db, row["id"], str(exc), attempts)
+        log_app_error(
+            db,
+            source="emailoctopus_sync_queue",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="process_emailoctopus_sync_queue_row",
+            status_code=500,
+        )
+        return {"ok": False, "error": str(exc), "retry": True}
+
+
+def run_emailoctopus_sync_queue_once(limit=None):
+    ensure_db()
+    db = open_sqlite_connection()
+    attempted = 0
+    completed = 0
+    skipped = 0
+    errors = 0
+    try:
+        try:
+            limit = max(1, min(100, int(limit or EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT)))
+        except Exception:
+            limit = EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT
+        now_stamp = format_db_time(datetime.utcnow())
+        rows = db.execute(
+            """
+            SELECT *
+            FROM emailoctopus_sync_queue
+            WHERE lower(COALESCE(queue_status, 'queued')) IN ('queued', 'retry')
+              AND COALESCE(run_after, '') <= ?
+            ORDER BY priority ASC, id ASC
+            LIMIT ?
+            """,
+            (now_stamp, limit),
+        ).fetchall()
+        settings = get_anonymous_email_marketing_settings(db)
+        for row in rows:
+            attempted += 1
+            result = process_emailoctopus_sync_queue_row(db, row, settings=settings)
+            if result.get("ok") and result.get("skipped"):
+                skipped += 1
+            elif result.get("ok"):
+                completed += 1
+            else:
+                errors += 1
+            commit_with_retry(db)
+        remaining = db.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM emailoctopus_sync_queue
+            WHERE lower(COALESCE(queue_status, 'queued')) IN ('queued', 'retry')
+              AND COALESCE(run_after, '') <= ?
+            """,
+            (format_db_time(datetime.utcnow()),),
+        ).fetchone()
+        return {
+            "ok": errors == 0,
+            "attempted": attempted,
+            "completed": completed,
+            "skipped": skipped,
+            "errors": errors,
+            "remaining_due": int(remaining["c"] if remaining else 0),
+        }
+    finally:
+        db.close()
+
+
 def sync_validated_email_to_emailoctopus(
     db,
     touchpoint_id,
@@ -16300,6 +16751,8 @@ def sync_validated_email_to_emailoctopus(
     ).fetchone()
     if existing and _email_campaign_sync_success(existing["sync_status"]) and not force_update:
         return {"ok": True, "skipped": "already_synced", "email": normalized_email}
+    if existing and _email_campaign_sync_queued(existing["sync_status"]) and not force_update:
+        return {"ok": True, "skipped": "already_queued", "email": normalized_email}
     if existing and _email_campaign_sync_unsubscribed(existing["sync_status"]):
         target_status = ""
         if property_id:
@@ -16327,18 +16780,25 @@ def sync_validated_email_to_emailoctopus(
 
     try:
         contact_profile = build_emailoctopus_contact_profile(db, person_id, property_id=property_id, source=source)
-        sync_result = emailoctopus_upsert_contact(
-            settings["emailoctopus_api_key"],
-            list_id,
+        queue_result = enqueue_emailoctopus_sync(
+            db,
+            "subscribe",
             normalized_email,
+            touchpoint_id=touchpoint_id,
+            person_id=person_id,
+            property_id=property_id,
+            source=source,
+            provider_list_id=list_id,
             contact_status=settings["emailoctopus_contact_status"],
-            tags=contact_profile.get("tags") or _email_campaign_tags(source),
-            fields=contact_profile.get("fields") or {},
-            tags_remove=contact_profile.get("tags_remove") or [],
+            validation_status=validation_status,
+            contact_profile=contact_profile,
+            payload={
+                "validation": validation_result or {},
+                "source": source,
+            },
+            priority=10 if not force_update else 20,
         )
-        synced_at = format_db_time(datetime.utcnow())
-        sync_status = f"{sync_result['action']}_{str(sync_result.get('status') or settings['emailoctopus_contact_status']).lower()}"
-        provider_contact_id = str(sync_result.get("contact_id") or "")
+        sync_status = "queued_emailoctopus_update" if force_update else "queued_emailoctopus_sync"
         upsert_email_campaign_sync_state(
             db,
             normalized_email,
@@ -16347,31 +16807,30 @@ def sync_validated_email_to_emailoctopus(
             property_id=property_id,
             source=source,
             provider_list_id=list_id,
-            provider_contact_id=provider_contact_id,
             sync_status=sync_status,
             validation_status=validation_status,
             payload={
-                "emailoctopus": sync_result,
+                "emailoctopus_queue": queue_result,
                 "validation": validation_result or {},
                 "contact_profile": contact_profile,
             },
-            synced_at=synced_at,
         )
         upsert_anonymous_email_campaign_registry(
             db,
             normalized_email,
             source="deepsift_validated_email",
-            source_identifier=provider_contact_id,
+            source_identifier=queue_result.get("queue_key") or "",
             first_name=contact_profile.get("first_name") or context.get("first_name") or "",
             last_name=contact_profile.get("last_name") or context.get("last_name") or "",
-            status="already_sent",
-            notes=f"Synced automatically after DeepSift email validation from {source or 'email_validation'}.",
+            status="queued_emailoctopus_sync",
+            notes=f"Queued automatically after DeepSift email validation from {source or 'email_validation'}.",
         )
         return {
             "ok": True,
+            "queued": True,
             "email": normalized_email,
             "sync_status": sync_status,
-            "contact_id": provider_contact_id,
+            "queue": queue_result,
             "contact_profile": contact_profile,
         }
     except Exception as exc:
@@ -16418,6 +16877,7 @@ def backfill_valid_email_campaign_syncs(db, limit=500):
                     lower(COALESCE(s.sync_status, '')) IN ('synced', 'already_synced', 'already_sent_emailoctopus')
                  OR lower(COALESCE(s.sync_status, '')) LIKE 'created_%'
                  OR lower(COALESCE(s.sync_status, '')) LIKE 'updated_%'
+                 OR lower(COALESCE(s.sync_status, '')) LIKE 'queued_emailoctopus%'
                  OR lower(COALESCE(s.sync_status, '')) LIKE 'unsubscribed%'
               )
         WHERE lower(COALESCE(t.channel_type, '')) = 'email'
@@ -23928,6 +24388,24 @@ def start_email_validation_queue_worker():
             except Exception:
                 pass
             time.sleep(EMAIL_VALIDATION_QUEUE_POLL_SECONDS)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
+def start_emailoctopus_sync_queue_worker():
+    global EMAILOCTOPUS_SYNC_QUEUE_WORKER_STARTED
+    if EMAILOCTOPUS_SYNC_QUEUE_WORKER_STARTED or not EMAILOCTOPUS_SYNC_QUEUE_WORKER_ENABLED:
+        return
+    EMAILOCTOPUS_SYNC_QUEUE_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                run_emailoctopus_sync_queue_once(limit=EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT)
+            except Exception:
+                pass
+            time.sleep(EMAILOCTOPUS_SYNC_QUEUE_POLL_SECONDS)
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
@@ -53716,6 +54194,97 @@ def run_reisift_webhook_pending_processor_once(limit=25, include_side_effects=Tr
         db.close()
 
 
+def queue_deferred_reisift_webhook_emailoctopus_side_effects(limit=100):
+    ensure_db()
+    try:
+        limit = max(1, min(500, int(limit or 100)))
+    except Exception:
+        limit = 100
+    db = open_sqlite_connection()
+    processed = 0
+    queued = 0
+    skipped = 0
+    errors = 0
+    try:
+        rows = db.execute(
+            """
+            SELECT id, property_id, result_json
+            FROM reisift_webhook_events
+            WHERE verification_status = 'verified'
+              AND processing_status = 'processed'
+              AND COALESCE(result_json, '') LIKE '%"emailoctopus_unsubscribe"%'
+              AND COALESCE(result_json, '') LIKE '%"deferred": true%'
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        for row in rows:
+            result = parse_json_object(row["result_json"] or "{}", default={})
+            property_id = int(row["property_id"] or result.get("property_id") or 0)
+            if property_id <= 0:
+                skipped += 1
+                result["emailoctopus_unsubscribe"] = {"ok": True, "skipped": "missing_property_id"}
+            else:
+                try:
+                    unsubscribe_result = unsubscribe_emailoctopus_emails_for_new_record_segment_exit(
+                        db,
+                        property_id,
+                        prior_status=result.get("local_status_before") or REISIFT_NEW_RECORDS_STATUS,
+                        current_status=result.get("local_status_after") or result.get("new_status") or "default",
+                        source="reisift_deferred_emailoctopus_side_effect",
+                    )
+                    result["emailoctopus_unsubscribe"] = unsubscribe_result
+                    if unsubscribe_result.get("queued"):
+                        queued += int(unsubscribe_result.get("queued") or 0)
+                    elif unsubscribe_result.get("skipped"):
+                        skipped += 1
+                    if not unsubscribe_result.get("ok"):
+                        errors += 1
+                except Exception as exc:
+                    errors += 1
+                    result["emailoctopus_unsubscribe"] = {"ok": False, "error": str(exc)}
+                    log_app_error(
+                        db,
+                        source="reisift_deferred_emailoctopus_side_effect",
+                        error_message=str(exc),
+                        details=traceback.format_exc(),
+                        route="queue_deferred_reisift_webhook_emailoctopus_side_effects",
+                        status_code=500,
+                    )
+            db.execute(
+                """
+                UPDATE reisift_webhook_events
+                SET result_json = ?,
+                    processed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (json.dumps(result, ensure_ascii=True, default=str, sort_keys=True), row["id"]),
+            )
+            processed += 1
+            commit_with_retry(db)
+        remaining = db.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM reisift_webhook_events
+            WHERE verification_status = 'verified'
+              AND processing_status = 'processed'
+              AND COALESCE(result_json, '') LIKE '%"emailoctopus_unsubscribe"%'
+              AND COALESCE(result_json, '') LIKE '%"deferred": true%'
+            """
+        ).fetchone()
+        return {
+            "ok": errors == 0,
+            "processed": processed,
+            "queued": queued,
+            "skipped": skipped,
+            "errors": errors,
+            "remaining": int(remaining["c"] if remaining else 0),
+        }
+    finally:
+        db.close()
+
+
 def _verify_reisift_webhook_request(db, payload):
     expected = get_reisift_webhook_token(db)
     if not expected:
@@ -54388,6 +54957,7 @@ if __name__ == "__main__":
     if (not debug_mode) or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         start_bulk_sms_worker()
         start_email_validation_queue_worker()
+        start_emailoctopus_sync_queue_worker()
         start_email_poll_worker()
         start_clever_leads_worker()
         start_untitled_leads_worker()

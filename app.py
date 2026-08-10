@@ -53104,12 +53104,15 @@ def process_reisift_webhook_event(db, event_id, payload, event_type, property_uu
             "result": {"ignored_reason": "missing_property_uuid", "new_status": new_status},
         }
     if not new_status:
-        return {
-            "processing_status": "ignored",
-            "property_id": None,
-            "error_text": "missing_property_status",
-            "result": {"ignored_reason": "missing_property_status", "property_uuid": property_uuid},
-        }
+        if _is_reisift_status_change_webhook(payload, event_type):
+            new_status = "default"
+        else:
+            return {
+                "processing_status": "ignored",
+                "property_id": None,
+                "error_text": "missing_property_status",
+                "result": {"ignored_reason": "missing_property_status", "property_uuid": property_uuid},
+            }
     if is_strict_new_record_status(new_status):
         return {
             "processing_status": "ignored",

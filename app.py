@@ -3661,11 +3661,24 @@ def upsert_cached_contact_context(
             ),
         )
         return row["id"]
-    cur = db.execute(
+    db.execute(
         """
         INSERT INTO external_contact_context
         (phone_norm, property_id, person_id, classification, source, confidence, notes, reisift_property_uuid, reisift_full_address, reisift_owner_name, reisift_property_status, last_reisift_lookup_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(phone_norm) DO UPDATE SET
+            property_id = COALESCE(excluded.property_id, external_contact_context.property_id),
+            person_id = COALESCE(excluded.person_id, external_contact_context.person_id),
+            classification = COALESCE(NULLIF(excluded.classification, ''), external_contact_context.classification),
+            source = COALESCE(NULLIF(excluded.source, ''), external_contact_context.source),
+            confidence = MAX(excluded.confidence, external_contact_context.confidence),
+            notes = COALESCE(NULLIF(excluded.notes, ''), external_contact_context.notes),
+            reisift_property_uuid = COALESCE(NULLIF(excluded.reisift_property_uuid, ''), external_contact_context.reisift_property_uuid),
+            reisift_full_address = COALESCE(NULLIF(excluded.reisift_full_address, ''), external_contact_context.reisift_full_address),
+            reisift_owner_name = COALESCE(NULLIF(excluded.reisift_owner_name, ''), external_contact_context.reisift_owner_name),
+            reisift_property_status = COALESCE(NULLIF(excluded.reisift_property_status, ''), external_contact_context.reisift_property_status),
+            last_reisift_lookup_at = COALESCE(NULLIF(excluded.last_reisift_lookup_at, ''), external_contact_context.last_reisift_lookup_at),
+            last_seen_at = CURRENT_TIMESTAMP
         """,
         (
             norm,
@@ -3682,7 +3695,8 @@ def upsert_cached_contact_context(
             (last_reisift_lookup_at or "").strip(),
         ),
     )
-    return cur.lastrowid
+    row = get_cached_contact_context(db, norm)
+    return row["id"] if row else None
 
 
 def _status_rank_for_phone_match(status_value):
@@ -50388,7 +50402,7 @@ def smrtphone_call_completed_webhook(payload=None, db=None):
 
     cur = db.execute(
         """
-        INSERT INTO call_recording_jobs
+        INSERT OR IGNORE INTO call_recording_jobs
         (call_sid, from_number, to_number, property_id, person_id, recording_url, fetch_status, analysis_status, payload_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?)
         """,
@@ -50403,6 +50417,19 @@ def smrtphone_call_completed_webhook(payload=None, db=None):
             json.dumps({"webhook": payload, "recording_lookup": fetch_raw, "call_outcome": call_outcome}),
         ),
     )
+    if int(cur.rowcount or 0) == 0:
+        existing = db.execute("SELECT id FROM call_recording_jobs WHERE call_sid = ?", (call_sid,)).fetchone()
+        log_smrtphone_webhook_event(
+            db,
+            "call_completed",
+            payload,
+            processing_status="deduped",
+            from_number=from_number,
+            to_number=to_number,
+            error_text="duplicate call_sid",
+        )
+        db.commit()
+        return jsonify({"ok": True, "deduped": True, "job_id": existing["id"] if existing else None}), 200
 
     if property_id and normalized_outcome in NO_ANSWER_OUTCOMES:
         recommended_step, reason = _recommend_no_answer_next_step(db, int(property_id), person_id)
@@ -53368,6 +53395,83 @@ def process_reisift_webhook_event(db, event_id, payload, event_type, property_uu
     }
 
 
+def _process_reisift_webhook_event_background(event_id, payload, event_type, property_uuid):
+    db = open_sqlite_connection()
+    try:
+        event_row = db.execute(
+            """
+            SELECT id, processing_status
+            FROM reisift_webhook_events
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (int(event_id or 0),),
+        ).fetchone()
+        if not event_row or str(event_row["processing_status"] or "") in {"processed", "ignored", "unmatched", "unauthorized"}:
+            return
+        processing = process_reisift_webhook_event(db, event_row["id"], payload, event_type, property_uuid)
+        db.execute(
+            """
+            UPDATE reisift_webhook_events
+            SET property_id = ?,
+                processing_status = ?,
+                error_text = ?,
+                result_json = ?,
+                processed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                processing.get("property_id"),
+                processing.get("processing_status") or "processed",
+                processing.get("error_text") or "",
+                json.dumps(processing.get("result") or {}, ensure_ascii=True, default=str, sort_keys=True),
+                event_row["id"],
+            ),
+        )
+        commit_with_retry(db)
+    except Exception as exc:
+        db.rollback()
+        try:
+            log_app_error(
+                db,
+                source="reisift_events_webhook_async_processor",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="/webhooks/reisift/events:async",
+                status_code=500,
+            )
+            db.execute(
+                """
+                UPDATE reisift_webhook_events
+                SET processing_status = 'error',
+                    error_text = ?,
+                    result_json = ?,
+                    processed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    str(exc),
+                    json.dumps({"traceback": traceback.format_exc()}, ensure_ascii=True),
+                    int(event_id or 0),
+                ),
+            )
+            commit_with_retry(db)
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
+
+
+
+def _start_reisift_webhook_event_processor(event_id, payload, event_type, property_uuid):
+    thread = threading.Thread(
+        target=_process_reisift_webhook_event_background,
+        args=(event_id, payload if isinstance(payload, dict) else {}, event_type, property_uuid),
+        daemon=True,
+    )
+    thread.start()
+
+
 def _verify_reisift_webhook_request(db, payload):
     expected = get_reisift_webhook_token(db)
     if not expected:
@@ -53404,6 +53508,7 @@ def reisift_events_webhook():
     event_type = _extract_reisift_webhook_event_type(payload)
     property_uuid = _extract_reisift_webhook_property_uuid(payload)
     terminal_processing_statuses = {"processed", "ignored", "unmatched"}
+    async_event_id = None
     try:
         existing_event = db.execute(
             """
@@ -53471,42 +53576,16 @@ def reisift_events_webhook():
             and str(existing_event["processing_status"] or "") in terminal_processing_statuses
         )
         if ok and event_row and not duplicate_terminal:
-            try:
-                processing = process_reisift_webhook_event(db, event_row["id"], payload, event_type, property_uuid)
-            except Exception as process_exc:
-                processing = {
-                    "processing_status": "error",
-                    "property_id": None,
-                    "error_text": str(process_exc),
-                    "result": {"traceback": traceback.format_exc()},
-                }
-                log_app_error(
-                    db,
-                    source="reisift_events_webhook_processor",
-                    error_message=str(process_exc),
-                    details=traceback.format_exc(),
-                    route=request.path,
-                    status_code=500,
-                )
-            db.execute(
-                """
-                UPDATE reisift_webhook_events
-                SET property_id = ?,
-                    processing_status = ?,
-                    error_text = ?,
-                    result_json = ?,
-                    processed_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (
-                    processing.get("property_id"),
-                    processing.get("processing_status") or "processed",
-                    processing.get("error_text") or "",
-                    json.dumps(processing.get("result") or {}, ensure_ascii=True, default=str, sort_keys=True),
-                    event_row["id"],
-                ),
-            )
+            processing = {
+                "processing_status": "received",
+                "property_id": event_row["property_id"],
+                "error_text": "",
+                "result": {"queued_for_async_processing": True},
+            }
+            async_event_id = event_row["id"]
         commit_with_retry(db)
+        if async_event_id:
+            _start_reisift_webhook_event_processor(async_event_id, payload, event_type, property_uuid)
     except Exception as exc:
         db.rollback()
         log_app_error(

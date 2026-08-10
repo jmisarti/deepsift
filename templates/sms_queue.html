@@ -14,8 +14,8 @@
         <p>{{ summary.get('Sent', 0) }}</p>
     </article>
     <article>
-        <h3>Suppressed</h3>
-        <p>{{ summary.get('Suppressed', 0) }}</p>
+        <h3>Suppressed / Removed</h3>
+        <p><a href="{{ url_for('sms_queue_page', status='Suppressed') }}">{{ summary.get('Suppressed', 0) }}</a></p>
     </article>
 </section>
 
@@ -30,8 +30,10 @@
     </p>
     <p class="muted-text">
         Showing <strong>{{ queue_total }}</strong> matching SMS queue item(s) across <strong>{{ queue_property_total }}</strong> propert{% if queue_property_total == 1 %}y{% else %}ies{% endif %}.
+        {% if filters.status != 'Suppressed' %}Suppressed rows are removed from this active queue by default.{% endif %}
         {% if queue_display_count < queue_total %}Displaying first <strong>{{ queue_display_count }}</strong>.{% endif %}
         {% if filters.lists %}Selected list filters require records to match <strong>all</strong> selected lists.{% endif %}
+        {% if filters.status == 'Suppressed' %}This view is the suppressed/removed audit log; these rows will not send unless rebuilt by a future eligible refresh.{% endif %}
     </p>
 
     <div class="panel-actions">
@@ -115,9 +117,9 @@
                     </label>
                     <label>Status
                         <select name="status">
-                            <option value="">Review Queue</option>
+                            <option value="">Active Review Queue</option>
                             {% for status in ['Draft', 'Queued', 'Approved', 'Scheduled', 'Sending', 'Sent', 'Failed', 'Suppressed', 'Held'] %}
-                            <option value="{{ status }}" {% if filters.status == status %}selected{% endif %}>{{ status }}</option>
+                            <option value="{{ status }}" {% if filters.status == status %}selected{% endif %}>{% if status == 'Suppressed' %}Suppressed / Removed{% else %}{{ status }}{% endif %}</option>
                             {% endfor %}
                         </select>
                     </label>
@@ -149,6 +151,7 @@
         <form method="post" action="{{ url_for('sms_queue_revalidate') }}">
             <button type="submit">Revalidate + Find New Numbers</button>
         </form>
+        <a class="button-link secondary" href="{{ url_for('sms_queue_page', status='Suppressed') }}">View Suppressed / Removed</a>
         <form id="smsBulkActionForm" method="post" action="{{ url_for('sms_queue_bulk_action') }}" class="inline-form sms-bulk-form">
             <button type="submit" name="sms_action" value="approve_selected" data-loading-label="Approving selected..." disabled>Approve Selected AutoSend</button>
         </form>
@@ -191,7 +194,7 @@
                     </td>
                     <td>{{ row.number_pulled_at|fmt_short_date }}</td>
                     <td>
-                        <span class="pill sms-status-{{ row.status|lower|replace(' ', '-') }}">{{ row.status }}</span>
+                        <span class="pill sms-status-{{ row.status|lower|replace(' ', '-') }}">{% if row.status == 'Suppressed' %}Suppressed / Removed{% else %}{{ row.status }}{% endif %}</span>
                         {% if row.suppression_reason %}
                         <div class="sms-queue-reason">{{ row.suppression_reason }}</div>
                         {% endif %}
@@ -251,7 +254,7 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="11">No SMS queue items match these filters. Generate from New Records to create drafts.</td>
+                    <td colspan="11">{% if filters.status == 'Suppressed' %}No suppressed/removed SMS items match these filters.{% else %}No active SMS queue items match these filters. Generate from New Records to create drafts.{% endif %}</td>
                 </tr>
                 {% endfor %}
             </tbody>

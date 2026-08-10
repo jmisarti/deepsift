@@ -42156,7 +42156,7 @@ def get_sms_automation_queue_rows(db, filters=None):
         clauses.append("q.status = ?")
         params.append(status)
     else:
-        clauses.append("COALESCE(q.status, '') NOT IN ('Approved', 'Scheduled', 'Sending', 'Sent')")
+        clauses.append("COALESCE(q.status, '') NOT IN ('Approved', 'Scheduled', 'Sending', 'Sent', 'Suppressed')")
     bucket = (filters.get("bucket") or "").strip()
     if bucket:
         clauses.append("q.bucket = ?")

@@ -854,6 +854,7 @@ def inject_auth_state():
 
 def start_background_workers_async():
     global BACKGROUND_WORKERS_BOOTSTRAP_STARTED
+    start_emailoctopus_sync_queue_worker()
     if not RUN_BACKGROUND_WORKERS:
         return
     with BACKGROUND_WORKERS_BOOTSTRAP_LOCK:

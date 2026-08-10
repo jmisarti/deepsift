@@ -52654,30 +52654,35 @@ def _extract_reisift_webhook_event_type(payload):
 
 def _extract_reisift_webhook_property_uuid(payload):
     payload = payload if isinstance(payload, dict) else {}
-    direct = extract_first_string_by_keys(
-        payload,
-        [
-            "property_uuid",
-            "propertyUuid",
-            "property_id",
-            "propertyId",
-            "uuid",
-            "id",
-            "record_id",
-            "recordId",
-        ],
-    )
-    if normalize_uuid(direct):
-        return normalize_uuid(direct)
-    for key in ["property", "record", "data"]:
+
+    def _uuid_from_mapping(item, keys):
+        if not isinstance(item, dict):
+            return ""
+        for key in keys:
+            value = item.get(key)
+            if normalize_uuid(value):
+                return normalize_uuid(value)
+        return ""
+
+    property_keys = ["property_uuid", "propertyUuid", "property_id", "propertyId", "uuid", "id", "record_id", "recordId"]
+    for key in ["property", "record"]:
         item = payload.get(key)
-        if isinstance(item, dict):
-            nested = extract_first_string_by_keys(
-                item,
-                ["property_uuid", "propertyUuid", "property_id", "propertyId", "uuid", "id", "record_id", "recordId"],
-            )
-            if normalize_uuid(nested):
-                return normalize_uuid(nested)
+        nested = _uuid_from_mapping(item, property_keys)
+        if nested:
+            return nested
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    for key in ["property", "record"]:
+        nested = _uuid_from_mapping(data.get(key), property_keys)
+        if nested:
+            return nested
+
+    direct = _uuid_from_mapping(payload, ["property_uuid", "propertyUuid", "property_id", "propertyId", "record_id", "recordId"])
+    if direct:
+        return direct
+    direct = _uuid_from_mapping(data, ["property_uuid", "propertyUuid", "property_id", "propertyId", "record_id", "recordId"])
+    if direct:
+        return direct
     return ""
 
 

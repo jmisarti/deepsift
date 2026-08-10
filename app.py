@@ -216,6 +216,10 @@ REISIFT_NEW_RECORDS_MAX_ROWS = max(
     1,
     int((os.getenv("REISIFT_NEW_RECORDS_MAX_ROWS") or "10000").strip() or "10000"),
 )
+REISIFT_NEW_RECORD_ACTIONABLE_MAX_AGE_DAYS = max(
+    0,
+    int((os.getenv("REISIFT_NEW_RECORD_ACTIONABLE_MAX_AGE_DAYS") or "3").strip() or "3"),
+)
 REISIFT_NEW_RECORDS_REFRESH_HOUR_ET = max(
     0,
     min(23, int((os.getenv("REISIFT_NEW_RECORDS_REFRESH_HOUR_ET") or "6").strip() or "6")),
@@ -1105,6 +1109,9 @@ def migrate_db(db):
     ensure_column(db, "reisift_new_records", "rei_skipped", "rei_skipped INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "reisift_new_records", "deep_skipped", "deep_skipped INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "reisift_new_records", "no_good_numbers", "no_good_numbers INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "first_seen_at", "first_seen_at TEXT")
+    ensure_column(db, "reisift_new_records", "automation_eligible", "automation_eligible INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "automation_hold_reason", "automation_hold_reason TEXT")
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_county ON reisift_new_records(is_active, county, added_at)"
     )
@@ -1119,6 +1126,9 @@ def migrate_db(db):
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_local_property ON reisift_new_records(local_property_id)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_automation ON reisift_new_records(is_active, automation_eligible, added_at)"
     )
     db.execute(
         """
@@ -15113,7 +15123,11 @@ def _apply_email_validation_decision_to_touchpoint(db, touchpoint_id, email_valu
     )
 
 
-REISIFT_NEW_RECORD_EMAIL_VALIDATION_SOURCES = {"reisift_new_record", "reisift_new_record_repair"}
+REISIFT_NEW_RECORD_EMAIL_VALIDATION_SOURCES = {
+    "reisift_new_record",
+    "reisift_new_record_backfill",
+    "reisift_new_record_repair",
+}
 HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS = "held_reisift_new_record_manual_review"
 
 
@@ -33489,6 +33503,8 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
         if ids:
             clauses.append("n.local_property_id IN (" + ",".join(["?"] * len(ids)) + ")")
             params.extend(ids)
+    else:
+        clauses.append("COALESCE(n.automation_eligible, 0) = 1")
     rows = db.execute(
         f"""
         SELECT n.*
@@ -33620,28 +33636,29 @@ def sync_local_property_status_from_reisift_new_record(db, property_uuid, payloa
 def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_active=1, sift_rollup=None):
     payload = payload if isinstance(payload, dict) else {}
     search_row = search_row if isinstance(search_row, dict) else {}
+    existing_new_record = db.execute(
+        """
+        SELECT outbound_calls, inbound_calls, outbound_sms, inbound_sms,
+               outbound_email, inbound_email, inbound_responses, events_json, tasks_json,
+               first_seen_at, automation_eligible, automation_hold_reason
+        FROM reisift_new_records
+        WHERE property_uuid = ?
+        LIMIT 1
+        """,
+        (property_uuid,),
+    ).fetchone()
     has_sift_rollup = isinstance(sift_rollup, dict)
     if not has_sift_rollup:
-        existing_rollup = db.execute(
-            """
-            SELECT outbound_calls, inbound_calls, outbound_sms, inbound_sms,
-                   outbound_email, inbound_email, inbound_responses, events_json, tasks_json
-            FROM reisift_new_records
-            WHERE property_uuid = ?
-            LIMIT 1
-            """,
-            (property_uuid,),
-        ).fetchone()
         sift_rollup = {
-            "outbound_calls": int((existing_rollup["outbound_calls"] if existing_rollup else 0) or 0),
-            "inbound_calls": int((existing_rollup["inbound_calls"] if existing_rollup else 0) or 0),
-            "outbound_sms": int((existing_rollup["outbound_sms"] if existing_rollup else 0) or 0),
-            "inbound_sms": int((existing_rollup["inbound_sms"] if existing_rollup else 0) or 0),
-            "outbound_email": int((existing_rollup["outbound_email"] if existing_rollup else 0) or 0),
-            "inbound_email": int((existing_rollup["inbound_email"] if existing_rollup else 0) or 0),
-            "inbound_responses": int((existing_rollup["inbound_responses"] if existing_rollup else 0) or 0),
-            "events": parse_followup_json_list(existing_rollup["events_json"] if existing_rollup else ""),
-            "tasks": parse_followup_json_list(existing_rollup["tasks_json"] if existing_rollup else ""),
+            "outbound_calls": int((existing_new_record["outbound_calls"] if existing_new_record else 0) or 0),
+            "inbound_calls": int((existing_new_record["inbound_calls"] if existing_new_record else 0) or 0),
+            "outbound_sms": int((existing_new_record["outbound_sms"] if existing_new_record else 0) or 0),
+            "inbound_sms": int((existing_new_record["inbound_sms"] if existing_new_record else 0) or 0),
+            "outbound_email": int((existing_new_record["outbound_email"] if existing_new_record else 0) or 0),
+            "inbound_email": int((existing_new_record["inbound_email"] if existing_new_record else 0) or 0),
+            "inbound_responses": int((existing_new_record["inbound_responses"] if existing_new_record else 0) or 0),
+            "events": parse_followup_json_list(existing_new_record["events_json"] if existing_new_record else ""),
+            "tasks": parse_followup_json_list(existing_new_record["tasks_json"] if existing_new_record else ""),
         }
     else:
         sift_rollup = sift_rollup if isinstance(sift_rollup, dict) else {}
@@ -33661,6 +33678,13 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
         str(payload.get("updated") or payload.get("updated_at") or payload.get("owner_updated") or "").strip()
         or str(search_row.get("updated") or search_row.get("updated_at") or search_row.get("owner_updated") or "").strip()
     )
+    automation_eligible, automation_hold_reason = reisift_new_record_automation_gate(cached_fields["added_at"])
+    contact_source_label = "ReiSift New Records refresh" if automation_eligible else "ReiSift New Records backfill refresh"
+    email_validation_source = "reisift_new_record" if automation_eligible else "reisift_new_record_backfill"
+    first_seen_at = (
+        str(existing_new_record["first_seen_at"] if existing_new_record else "").strip()
+        or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    )
     match_payload = payload
     match_address = extract_reisift_property_address(match_payload)
     if not match_address.get("street") or not match_address.get("city"):
@@ -33672,7 +33696,8 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
             db,
             property_uuid,
             payload or search_row,
-            source="ReiSift New Records refresh",
+            source=contact_source_label,
+            email_validation_source=email_validation_source,
         )
         if local_import.get("property_id"):
             local_sync = sync_local_property_status_from_reisift_new_record(
@@ -33686,7 +33711,8 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
         local_sync.get("local_property_id"),
         property_uuid,
         payload or search_row,
-        source="ReiSift New Records refresh",
+        source=contact_source_label,
+        email_validation_source=email_validation_source,
     )
     contact_flags = compute_new_record_contact_flags(
         db,
@@ -33704,8 +33730,9 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
              outbound_calls, inbound_calls, outbound_sms, inbound_sms, outbound_email, inbound_email,
              inbound_responses, events_json, tasks_json,
              rei_skipped, deep_skipped, no_good_numbers,
+             first_seen_at, automation_eligible, automation_hold_reason,
              payload_json, is_active, last_synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(property_uuid) DO UPDATE SET
             status = excluded.status,
             full_address = excluded.full_address,
@@ -33732,6 +33759,9 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
             rei_skipped = excluded.rei_skipped,
             deep_skipped = excluded.deep_skipped,
             no_good_numbers = excluded.no_good_numbers,
+            first_seen_at = COALESCE(NULLIF(reisift_new_records.first_seen_at, ''), excluded.first_seen_at),
+            automation_eligible = excluded.automation_eligible,
+            automation_hold_reason = excluded.automation_hold_reason,
             payload_json = excluded.payload_json,
             is_active = excluded.is_active,
             last_synced_at = excluded.last_synced_at
@@ -33763,6 +33793,9 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
             int(contact_flags["rei_skipped"]),
             int(contact_flags["deep_skipped"]),
             int(contact_flags["no_good_numbers"]),
+            first_seen_at,
+            1 if automation_eligible else 0,
+            automation_hold_reason,
             json.dumps(payload or search_row),
             int(bool(is_active)),
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
@@ -33772,6 +33805,9 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
     local_sync["local_import"] = local_import
     local_sync["contact_sync"] = contact_sync
     local_sync["list_sync"] = list_sync
+    local_sync["automation_eligible"] = automation_eligible
+    local_sync["automation_hold_reason"] = automation_hold_reason
+    local_sync["email_validation_source"] = email_validation_source
     return local_sync
 
 
@@ -33811,6 +33847,8 @@ def refresh_reisift_new_records_cache(db):
     updated_phones = 0
     suppressed_phones = 0
     imported_emails = 0
+    automation_eligible_count = 0
+    automation_held_count = 0
     returned_property_uuids = set()
     status_exit_checks = 0
     status_exit_unsubscribed = 0
@@ -33842,6 +33880,10 @@ def refresh_reisift_new_records_cache(db):
             )
             if local_sync.get("local_property_id") and local_sync.get("before") != local_sync.get("after"):
                 local_updates += 1
+            if local_sync.get("automation_eligible"):
+                automation_eligible_count += 1
+            else:
+                automation_held_count += 1
             local_import = local_sync.get("local_import") if isinstance(local_sync.get("local_import"), dict) else {}
             if local_import.get("property_id") and local_import.get("reason") != "already_matched":
                 local_imports += 1
@@ -33908,6 +33950,8 @@ def refresh_reisift_new_records_cache(db):
         "updated_phones": updated_phones,
         "suppressed_phones": suppressed_phones,
         "imported_emails": imported_emails,
+        "automation_eligible": automation_eligible_count,
+        "automation_held": automation_held_count,
         "status_exit_checks": status_exit_checks,
         "status_exit_unsubscribed": status_exit_unsubscribed,
         "sms_queue": sms_queue,
@@ -34142,6 +34186,23 @@ def derive_reisift_new_record_cached_fields(payload, fallback_payload=None, summ
         "owner_out_of_state": None if owner_out is None else (1 if owner_out else 0),
         "added_at": format_db_time(derived_added_dt) if derived_added_dt else None,
     }
+
+
+def reisift_new_record_automation_gate(added_at):
+    parsed = parse_flexible_datetime(added_at)
+    if parsed is None:
+        return False, "Missing LP/upload/source date; cached only until recency is known."
+    record_date = parsed.date()
+    today_et = datetime.now(EST_TZ).date()
+    oldest_allowed = today_et - timedelta(days=REISIFT_NEW_RECORD_ACTIONABLE_MAX_AGE_DAYS)
+    if record_date < oldest_allowed:
+        return (
+            False,
+            f"Backfill LP/upload date {record_date.isoformat()}; older than {REISIFT_NEW_RECORD_ACTIONABLE_MAX_AGE_DAYS} day automation window.",
+        )
+    if record_date > today_et + timedelta(days=1):
+        return False, f"Future LP/upload date {record_date.isoformat()}; cached only until date is current."
+    return True, ""
 
 
 def _new_record_yes_no_filter_value(value):
@@ -35370,7 +35431,7 @@ def resolve_reisift_owner_person_for_property(db, property_id, property_uuid, ow
     )
 
 
-def _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, source_label):
+def _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, source_label, email_validation_source="reisift_new_record"):
     owner = owner if isinstance(owner, dict) else {}
     phones_created = 0
     phones_updated = 0
@@ -35445,14 +35506,14 @@ def _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, sourc
             person_id,
             value,
             note=note,
-            source="reisift_new_record",
+            source=email_validation_source or "reisift_new_record",
         )
         if result.get("created"):
             emails_created += 1
     return {"phones_created": phones_created, "phones_updated": phones_updated, "phones_suppressed": phones_suppressed, "emails_created": emails_created}
 
 
-def sync_reisift_owner_contacts_to_local_property(db, property_id, property_uuid, payload, source="ReiSift New Records refresh"):
+def sync_reisift_owner_contacts_to_local_property(db, property_id, property_uuid, payload, source="ReiSift New Records refresh", email_validation_source="reisift_new_record"):
     property_id = int(property_id or 0)
     property_uuid = normalize_uuid(property_uuid or "")
     payload = payload if isinstance(payload, dict) else {}
@@ -35484,7 +35545,14 @@ def sync_reisift_owner_contacts_to_local_property(db, property_id, property_uuid
         out["owners_processed"] += 1
         if idx == 0 and person_id != existing_owner_person_id:
             db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (person_id, property_id))
-        contact_counts = _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, source)
+        contact_counts = _upsert_reisift_owner_touchpoints(
+            db,
+            person_id,
+            owner,
+            property_uuid,
+            source,
+            email_validation_source=email_validation_source,
+        )
         for key in ["phones_created", "phones_updated", "phones_suppressed", "emails_created"]:
             out[key] += int(contact_counts.get(key) or 0)
     return out
@@ -35508,7 +35576,7 @@ def _ensure_reisift_owner_address(db, person_id, owner, property_address, source
     )
 
 
-def ensure_local_property_for_new_record_payload(db, property_uuid, payload, source="ReiSift New Records"):
+def ensure_local_property_for_new_record_payload(db, property_uuid, payload, source="ReiSift New Records", email_validation_source="reisift_new_record"):
     payload = payload if isinstance(payload, dict) else {}
     property_uuid = normalize_uuid(property_uuid or payload.get("uuid") or "")
     if not property_uuid:
@@ -35555,7 +35623,14 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
         owner_person_ids.append(person_id)
         if idx == 0:
             db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (person_id, property_id))
-        contact_counts = _upsert_reisift_owner_touchpoints(db, person_id, owner, property_uuid, source)
+        contact_counts = _upsert_reisift_owner_touchpoints(
+            db,
+            person_id,
+            owner,
+            property_uuid,
+            source,
+            email_validation_source=email_validation_source,
+        )
         phones_created += int(contact_counts.get("phones_created") or 0)
         phones_updated += int(contact_counts.get("phones_updated") or 0)
         phones_suppressed += int(contact_counts.get("phones_suppressed") or 0)

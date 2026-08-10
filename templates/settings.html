@@ -418,6 +418,9 @@
             <label class="span2">EmailOctopus Webhook Secret
                 <input name="emailoctopus_webhook_secret" value="{{ emailoctopus_webhook_secret }}" placeholder="Endpoint secret from EmailOctopus">
             </label>
+            <label class="span2">ReiSIFT/DataSift Webhook Token
+                <input name="reisift_webhook_token" value="{{ reisift_webhook_token }}" placeholder="Shared token for DataSift sequence webhooks">
+            </label>
             <div class="inline-actions span2">
                 <button type="submit">Save Integration Settings</button>
                 <button type="submit" name="integration_action" value="test_slack">Save + Test Slack</button>
@@ -431,6 +434,8 @@
         <p class="muted-text">The webhook secret key above should match the secret/token configured in OpenLetterConnect for the new events webhook.</p>
         <p class="muted-text">EmailOctopus events webhook URL: <code>{{ emailoctopus_events_webhook_url or 'Set Public App Base URL to generate the EmailOctopus events webhook URL.' }}</code></p>
         <p class="muted-text">EmailOctopus sends batches of contact events here. Use its endpoint secret above so DeepSift can verify the <code>EmailOctopus-Signature</code> header.</p>
+        <p class="muted-text">ReiSIFT/DataSift sequence webhook URL: <code>{{ reisift_events_webhook_url or 'Set Public App Base URL to generate the ReiSIFT/DataSift webhook URL.' }}</code></p>
+        <p class="muted-text">Use this URL in DataSift Sequences. DeepSift stores the raw payload first so we can map real event fields safely.</p>
         <p class="muted-text">Sequence <code>VM_DROP</code> steps use the Slybroadcast credentials above. The step body should be the recording name for that drop. Callback URL: <code>{{ slybroadcast_settings.callback_url or 'Set Public App Base URL to generate the Slybroadcast callback URL.' }}</code></p>
         <p class="muted-text">RentCast is used for systematic sale-listing checks via <code>/v1/listings/sale</code>. If a matching listing returns <code>status=Active</code>, the referral is treated as on-market, and listing agent details are cached with the referral payload.</p>
         <p class="muted-text">Anonymous browse-stage leads are only validated/pushed when they remain outside <code>/step-2/</code> and <code>/thank-you/</code>. Imported EmailOctopus sent-email registry size: {{ anonymous_email_registry_count }}.</p>
@@ -452,8 +457,8 @@
         <p><code>POST /api/integrations/google-sheets/row-added</code></p>
         <p><strong>Slack inbound endpoints:</strong></p>
         <p><code>POST /webhooks/slack/command</code> and <code>POST /webhooks/slack/events</code></p>
-        <p><strong>ReiSift placeholder webhook:</strong></p>
-        <p><code>POST /webhooks/reisift/automation</code></p>
+        <p><strong>ReiSIFT/DataSift inbound webhook:</strong></p>
+        <p><code>POST /webhooks/reisift/events</code> or <code>POST /webhooks/reisift/automation</code></p>
         <details class="collapsed-section" style="margin-top: 1rem;" open>
             <summary>PropertyLeads.com Webhook Log</summary>
             {% if propertyleads_webhook_events and propertyleads_webhook_events|length > 0 %}

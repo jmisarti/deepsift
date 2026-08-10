@@ -227,6 +227,7 @@ OPENLETTERCONNECT_TEMPLATE_ID = int(os.getenv("OPENLETTERCONNECT_TEMPLATE_ID", "
 OPENLETTERCONNECT_API_KEY = os.getenv("OPENLETTERCONNECT_API_KEY", "").strip()
 OPENLETTERCONNECT_WEBHOOK_SECRET = os.getenv("OPENLETTERCONNECT_WEBHOOK_SECRET", "").strip()
 EMAILOCTOPUS_WEBHOOK_SECRET = os.getenv("EMAILOCTOPUS_WEBHOOK_SECRET", "").strip()
+REISIFT_WEBHOOK_TOKEN = os.getenv("REISIFT_WEBHOOK_TOKEN", "").strip()
 CALL_RECORDING_WORKER_ENABLED = env_flag("CALL_RECORDING_WORKER_ENABLED", False)
 CALL_RECORDING_POLL_SECONDS = max(int((os.getenv("CALL_RECORDING_POLL_SECONDS") or "60").strip() or "60"), 15)
 SMS_ANALYSIS_WORKER_ENABLED = env_flag("SMS_ANALYSIS_WORKER_ENABLED", False)
@@ -1986,6 +1987,25 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_action ON emailoctopus_webhook_events(event_action, processing_status, received_at DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_contact ON emailoctopus_webhook_events(contact_email, contact_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_property ON emailoctopus_webhook_events(property_id, event_action)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reisift_webhook_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL UNIQUE,
+            event_type TEXT,
+            property_uuid TEXT,
+            verification_status TEXT NOT NULL DEFAULT 'unverified',
+            processing_status TEXT NOT NULL DEFAULT 'received',
+            error_text TEXT,
+            payload_json TEXT,
+            headers_json TEXT,
+            received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TEXT
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_reisift_webhook_events_type ON reisift_webhook_events(event_type, processing_status, received_at DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_reisift_webhook_events_property ON reisift_webhook_events(property_uuid, received_at DESC)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS emailoctopus_reisift_event_syncs (
@@ -13593,6 +13613,37 @@ def get_emailoctopus_events_webhook_url(db=None):
     if not base_url:
         return ""
     return f"{base_url.rstrip('/')}/webhooks/emailoctopus/events"
+
+
+def get_reisift_webhook_token(db=None):
+    temp_db = None
+    if db is None:
+        try:
+            db = get_db()
+        except Exception:
+            try:
+                temp_db = open_sqlite_connection()
+                db = temp_db
+            except Exception:
+                db = None
+    try:
+        if db is not None:
+            return (get_setting(db, "reisift_webhook_token", "") or REISIFT_WEBHOOK_TOKEN).strip()
+        return REISIFT_WEBHOOK_TOKEN
+    finally:
+        if temp_db is not None:
+            temp_db.close()
+
+
+def get_reisift_events_webhook_url(db=None):
+    base_url = get_public_app_base_url(db)
+    if not base_url:
+        return ""
+    url = f"{base_url.rstrip('/')}/webhooks/reisift/events"
+    token = get_reisift_webhook_token(db)
+    if token:
+        return f"{url}?token={quote(token)}"
+    return url
 
 
 def get_skipsherpa_api_key(db=None):
@@ -44728,6 +44779,7 @@ def settings_page():
                     "slack_agent_ops_channel": request.form.get("slack_agent_ops_channel", ""),
                     "openletterconnect_api_key": request.form.get("openletterconnect_api_key", ""),
                     "openletterconnect_webhook_secret": request.form.get("openletterconnect_webhook_secret", ""),
+                    "reisift_webhook_token": request.form.get("reisift_webhook_token", ""),
                     "skipsherpa_api_key": request.form.get("skipsherpa_api_key", ""),
                     "rentcast_api_key": request.form.get("rentcast_api_key", ""),
                     "slybroadcast_uid": request.form.get("slybroadcast_uid", ""),
@@ -44880,6 +44932,8 @@ def settings_page():
     openletterconnect_events_webhook_url = get_openletterconnect_events_webhook_url(db)
     emailoctopus_webhook_secret = get_emailoctopus_webhook_secret(db)
     emailoctopus_events_webhook_url = get_emailoctopus_events_webhook_url(db)
+    reisift_webhook_token = get_reisift_webhook_token(db)
+    reisift_events_webhook_url = get_reisift_events_webhook_url(db)
     skipsherpa_api_key = get_skipsherpa_api_key(db)
     rentcast_api_key = get_rentcast_api_key(db)
     slybroadcast_settings = get_slybroadcast_settings(db)
@@ -44988,6 +45042,8 @@ def settings_page():
         openletterconnect_events_webhook_url=openletterconnect_events_webhook_url,
         emailoctopus_webhook_secret=emailoctopus_webhook_secret,
         emailoctopus_events_webhook_url=emailoctopus_events_webhook_url,
+        reisift_webhook_token=reisift_webhook_token,
+        reisift_events_webhook_url=reisift_events_webhook_url,
         skipsherpa_api_key=skipsherpa_api_key,
         rentcast_api_key=rentcast_api_key,
         slybroadcast_settings=slybroadcast_settings,
@@ -52557,6 +52613,155 @@ def email_open_tracking_pixel(token):
             "Expires": "0",
         },
     )
+
+
+def _safe_reisift_webhook_headers(req):
+    safe = {}
+    for key, value in req.headers.items():
+        key_text = str(key or "")
+        if key_text.lower() in {"authorization", "cookie", "x-reisift-webhook-token", "x-webhook-token"}:
+            safe[key_text] = "[redacted]"
+        else:
+            safe[key_text] = str(value or "")
+    return safe
+
+
+def _extract_reisift_webhook_event_type(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    candidates = [
+        payload.get("event"),
+        payload.get("event_type"),
+        payload.get("eventType"),
+        payload.get("type"),
+        payload.get("trigger"),
+        payload.get("name"),
+    ]
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    candidates.extend([
+        data.get("event"),
+        data.get("event_type"),
+        data.get("eventType"),
+        data.get("type"),
+        data.get("trigger"),
+        data.get("name"),
+    ])
+    for value in candidates:
+        text = normalize_whitespace(value or "")
+        if text:
+            return text
+    return "unknown"
+
+
+def _extract_reisift_webhook_property_uuid(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    direct = extract_first_string_by_keys(
+        payload,
+        [
+            "property_uuid",
+            "propertyUuid",
+            "property_id",
+            "propertyId",
+            "uuid",
+            "id",
+            "record_id",
+            "recordId",
+        ],
+    )
+    if normalize_uuid(direct):
+        return normalize_uuid(direct)
+    for key in ["property", "record", "data"]:
+        item = payload.get(key)
+        if isinstance(item, dict):
+            nested = extract_first_string_by_keys(
+                item,
+                ["property_uuid", "propertyUuid", "property_id", "propertyId", "uuid", "id", "record_id", "recordId"],
+            )
+            if normalize_uuid(nested):
+                return normalize_uuid(nested)
+    return ""
+
+
+def _verify_reisift_webhook_request(db, payload):
+    expected = get_reisift_webhook_token(db)
+    if not expected:
+        return True, ""
+    payload = payload if isinstance(payload, dict) else {}
+    provided = (
+        (request.args.get("token") or "").strip()
+        or (request.headers.get("X-ReiSIFT-Webhook-Token") or "").strip()
+        or (request.headers.get("X-Reisift-Webhook-Token") or "").strip()
+        or (request.headers.get("X-DataSift-Webhook-Token") or "").strip()
+        or (request.headers.get("X-Webhook-Token") or "").strip()
+        or str(payload.get("token") or "").strip()
+    )
+    if not provided or not hmac.compare_digest(provided, expected):
+        return False, "Invalid ReiSIFT/DataSift webhook token."
+    return True, ""
+
+
+@app.route("/webhooks/reisift/events", methods=["POST"])
+@app.route("/webhooks/reisift/automation", methods=["POST"])
+def reisift_events_webhook():
+    ensure_db()
+    db = get_db()
+    raw_body = request.get_data(cache=True) or b""
+    payload = request.get_json(silent=True)
+    if payload is None:
+        payload = request.form.to_dict() or {}
+    if not isinstance(payload, dict):
+        payload = {"payload": payload}
+    safe_payload = _redact_clever_log_value("root", payload)
+    safe_headers = _safe_reisift_webhook_headers(request)
+    event_key = hashlib.sha256(raw_body or json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    ok, reason = _verify_reisift_webhook_request(db, payload)
+    event_type = _extract_reisift_webhook_event_type(payload)
+    property_uuid = _extract_reisift_webhook_property_uuid(payload)
+    try:
+        db.execute(
+            """
+            INSERT INTO reisift_webhook_events (
+                event_key, event_type, property_uuid, verification_status, processing_status,
+                error_text, payload_json, headers_json, processed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_key) DO UPDATE SET
+                event_type = excluded.event_type,
+                property_uuid = excluded.property_uuid,
+                verification_status = excluded.verification_status,
+                processing_status = excluded.processing_status,
+                error_text = excluded.error_text,
+                payload_json = excluded.payload_json,
+                headers_json = excluded.headers_json,
+                processed_at = excluded.processed_at
+            """,
+            (
+                event_key,
+                event_type,
+                property_uuid,
+                "verified" if ok else "unauthorized",
+                "received" if ok else "unauthorized",
+                "" if ok else reason,
+                json.dumps(safe_payload, ensure_ascii=True, default=str),
+                json.dumps(safe_headers, ensure_ascii=True, default=str),
+                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        commit_with_retry(db)
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="reisift_events_webhook",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route=request.path,
+            status_code=500,
+        )
+        commit_with_retry(db)
+        return jsonify({"ok": False, "error": "server_error"}), 500
+    if not ok:
+        return jsonify({"ok": False, "error": "invalid_token"}), 401
+    return jsonify({"ok": True, "event_key": event_key, "event_type": event_type, "property_uuid": property_uuid}), 200
 
 
 @app.route("/webhooks/emailoctopus/events", methods=["POST"])

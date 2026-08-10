@@ -33612,7 +33612,7 @@ def _find_local_property_for_reisift_new_record(db, property_uuid, payload):
     return row
 
 
-def sync_local_property_status_from_reisift_new_record(db, property_uuid, payload, status):
+def sync_local_property_status_from_reisift_new_record(db, property_uuid, payload, status, unsubscribe_emailoctopus=True):
     row = _find_local_property_for_reisift_new_record(db, property_uuid, payload)
     if not row:
         return {"local_property_id": None, "before": "", "after": ""}
@@ -33637,13 +33637,16 @@ def sync_local_property_status_from_reisift_new_record(db, property_uuid, payloa
             )
         except Exception:
             pass
-        unsubscribe_result = unsubscribe_emailoctopus_emails_for_property_status_exit(
-            db,
-            local_property_id,
-            before,
-            after,
-            source="reisift_new_records_status_sync",
-        )
+        if unsubscribe_emailoctopus:
+            unsubscribe_result = unsubscribe_emailoctopus_emails_for_property_status_exit(
+                db,
+                local_property_id,
+                before,
+                after,
+                source="reisift_new_records_status_sync",
+            )
+        else:
+            unsubscribe_result = {"deferred": True, "source": "reisift_new_records_status_sync"}
     return {"local_property_id": local_property_id, "before": before, "after": after, "emailoctopus_unsubscribe": unsubscribe_result}
 
 
@@ -53277,50 +53280,82 @@ def _mark_reisift_new_record_inactive_from_webhook(db, property_uuid, property_i
     return int(cur.rowcount or 0)
 
 
-def process_reisift_webhook_event(db, event_id, payload, event_type, property_uuid):
+REISIFT_WEBHOOK_TERMINAL_PROCESSING_STATUSES = {"processed", "ignored", "unmatched", "unauthorized"}
+
+
+def classify_reisift_webhook_status_change(payload, event_type, property_uuid):
     payload = payload if isinstance(payload, dict) else {}
     event_type = normalize_whitespace(event_type or "")
     property_uuid = normalize_uuid(property_uuid) or _extract_reisift_webhook_property_uuid(payload)
     if not _is_reisift_status_change_webhook(payload, event_type):
         return {
-            "processing_status": "ignored",
-            "property_id": None,
-            "error_text": "",
-            "result": {"ignored_reason": "not_status_change_webhook"},
+            "should_process": False,
+            "processing": {
+                "processing_status": "ignored",
+                "property_id": None,
+                "error_text": "",
+                "result": {"ignored_reason": "not_status_change_webhook"},
+            },
         }
 
     new_status = _extract_reisift_webhook_property_status(payload)
     if not property_uuid:
         return {
-            "processing_status": "ignored",
-            "property_id": None,
-            "error_text": "missing_property_uuid",
-            "result": {"ignored_reason": "missing_property_uuid", "new_status": new_status},
+            "should_process": False,
+            "processing": {
+                "processing_status": "ignored",
+                "property_id": None,
+                "error_text": "missing_property_uuid",
+                "result": {"ignored_reason": "missing_property_uuid", "new_status": new_status},
+            },
         }
     if not new_status:
         if _is_reisift_status_change_webhook(payload, event_type):
             new_status = "default"
         else:
             return {
-                "processing_status": "ignored",
-                "property_id": None,
-                "error_text": "missing_property_status",
-                "result": {"ignored_reason": "missing_property_status", "property_uuid": property_uuid},
+                "should_process": False,
+                "processing": {
+                    "processing_status": "ignored",
+                    "property_id": None,
+                    "error_text": "missing_property_status",
+                    "result": {"ignored_reason": "missing_property_status", "property_uuid": property_uuid},
+                },
             }
     if is_strict_new_record_status(new_status):
         return {
-            "processing_status": "ignored",
-            "property_id": None,
-            "error_text": "",
-            "result": {
-                "ignored_reason": "status_is_still_new_record",
-                "property_uuid": property_uuid,
-                "new_status": new_status,
+            "should_process": False,
+            "processing": {
+                "processing_status": "ignored",
+                "property_id": None,
+                "error_text": "",
+                "result": {
+                    "ignored_reason": "status_is_still_new_record",
+                    "property_uuid": property_uuid,
+                    "new_status": new_status,
+                },
             },
         }
+    return {
+        "should_process": True,
+        "property_uuid": property_uuid,
+        "new_status": new_status,
+        "property_payload": _extract_reisift_webhook_property_payload(payload),
+        "sequence": _extract_reisift_webhook_sequence_payload(payload),
+    }
 
-    property_payload = _extract_reisift_webhook_property_payload(payload)
-    sync_result = sync_local_property_status_from_reisift_new_record(db, property_uuid, property_payload, new_status)
+
+def apply_reisift_new_record_exit_core(db, event_id, context):
+    property_uuid = context["property_uuid"]
+    new_status = context["new_status"]
+    property_payload = context["property_payload"]
+    sync_result = sync_local_property_status_from_reisift_new_record(
+        db,
+        property_uuid,
+        property_payload,
+        new_status,
+        unsubscribe_emailoctopus=False,
+    )
     property_id = int(sync_result.get("local_property_id") or 0)
     if property_id <= 0:
         return {
@@ -53341,15 +53376,6 @@ def process_reisift_webhook_event(db, event_id, payload, event_type, property_uu
         new_status,
         property_payload,
     )
-    unsubscribe_result = sync_result.get("emailoctopus_unsubscribe") or {}
-    if int((unsubscribe_result or {}).get("attempted") or 0) <= 0 and not (unsubscribe_result or {}).get("skipped_active_elsewhere"):
-        unsubscribe_result = unsubscribe_emailoctopus_emails_for_new_record_segment_exit(
-            db,
-            property_id,
-            prior_status=sync_result.get("before") or REISIFT_NEW_RECORDS_STATUS,
-            current_status=new_status,
-            source="reisift_status_change_webhook",
-        )
     sms_suppressed = revalidate_sms_automation_queue(db, property_ids=[property_id])
     result = {
         "property_uuid": property_uuid,
@@ -53359,8 +53385,8 @@ def process_reisift_webhook_event(db, event_id, payload, event_type, property_uu
         "local_status_after": sync_result.get("after") or new_status,
         "cache_rows_deactivated": cache_rows_deactivated,
         "sms_queue_suppressed": sms_suppressed,
-        "emailoctopus_unsubscribe": unsubscribe_result,
-        "sequence": _extract_reisift_webhook_sequence_payload(payload),
+        "emailoctopus_unsubscribe": {"deferred": True},
+        "sequence": context.get("sequence") or {},
     }
     try:
         db.execute(
@@ -53378,7 +53404,7 @@ def process_reisift_webhook_event(db, event_id, payload, event_type, property_uu
                         "property_uuid": property_uuid,
                         "cache_rows_deactivated": cache_rows_deactivated,
                         "sms_queue_suppressed": sms_suppressed,
-                        "emailoctopus_unsubscribe": unsubscribe_result,
+                        "emailoctopus_unsubscribe": result["emailoctopus_unsubscribe"],
                     },
                     ensure_ascii=True,
                     sort_keys=True,
@@ -53395,6 +53421,38 @@ def process_reisift_webhook_event(db, event_id, payload, event_type, property_uu
     }
 
 
+def apply_reisift_new_record_exit_side_effects(db, core_processing, sync_source="reisift_status_change_webhook"):
+    result = core_processing.get("result") if isinstance(core_processing, dict) else {}
+    if not isinstance(result, dict) or core_processing.get("processing_status") != "processed":
+        return {}
+    property_id = int(result.get("property_id") or 0)
+    if property_id <= 0:
+        return {}
+    unsubscribe_result = unsubscribe_emailoctopus_emails_for_new_record_segment_exit(
+        db,
+        property_id,
+        prior_status=result.get("local_status_before") or REISIFT_NEW_RECORDS_STATUS,
+        current_status=result.get("local_status_after") or result.get("new_status") or "default",
+        source=sync_source,
+    )
+    result["emailoctopus_unsubscribe"] = unsubscribe_result
+    return unsubscribe_result
+
+
+def process_reisift_webhook_event_core(db, event_id, payload, event_type, property_uuid):
+    context = classify_reisift_webhook_status_change(payload, event_type, property_uuid)
+    if not context.get("should_process"):
+        return context["processing"]
+    return apply_reisift_new_record_exit_core(db, event_id, context)
+
+
+def process_reisift_webhook_event(db, event_id, payload, event_type, property_uuid):
+    processing = process_reisift_webhook_event_core(db, event_id, payload, event_type, property_uuid)
+    if processing.get("processing_status") == "processed":
+        apply_reisift_new_record_exit_side_effects(db, processing)
+    return processing
+
+
 def _process_reisift_webhook_event_background(event_id, payload, event_type, property_uuid):
     db = open_sqlite_connection()
     try:
@@ -53407,9 +53465,9 @@ def _process_reisift_webhook_event_background(event_id, payload, event_type, pro
             """,
             (int(event_id or 0),),
         ).fetchone()
-        if not event_row or str(event_row["processing_status"] or "") in {"processed", "ignored", "unmatched", "unauthorized"}:
+        if not event_row or str(event_row["processing_status"] or "") in REISIFT_WEBHOOK_TERMINAL_PROCESSING_STATUSES:
             return
-        processing = process_reisift_webhook_event(db, event_row["id"], payload, event_type, property_uuid)
+        processing = process_reisift_webhook_event_core(db, event_row["id"], payload, event_type, property_uuid)
         db.execute(
             """
             UPDATE reisift_webhook_events
@@ -53429,6 +53487,49 @@ def _process_reisift_webhook_event_background(event_id, payload, event_type, pro
             ),
         )
         commit_with_retry(db)
+        if processing.get("processing_status") == "processed":
+            try:
+                apply_reisift_new_record_exit_side_effects(db, processing)
+                db.execute(
+                    """
+                    UPDATE reisift_webhook_events
+                    SET result_json = ?,
+                        processed_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(processing.get("result") or {}, ensure_ascii=True, default=str, sort_keys=True),
+                        event_row["id"],
+                    ),
+                )
+                commit_with_retry(db)
+            except Exception as side_effect_exc:
+                db.rollback()
+                log_app_error(
+                    db,
+                    source="reisift_events_webhook_side_effects",
+                    error_message=str(side_effect_exc),
+                    details=traceback.format_exc(),
+                    route="/webhooks/reisift/events:side_effects",
+                    status_code=500,
+                )
+                result = processing.get("result") if isinstance(processing.get("result"), dict) else {}
+                result["emailoctopus_unsubscribe"] = {"ok": False, "error": str(side_effect_exc)}
+                db.execute(
+                    """
+                    UPDATE reisift_webhook_events
+                    SET result_json = ?,
+                        error_text = COALESCE(NULLIF(error_text, ''), ?),
+                        processed_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(result, ensure_ascii=True, default=str, sort_keys=True),
+                        f"side_effects_error: {side_effect_exc}",
+                        event_row["id"],
+                    ),
+                )
+                commit_with_retry(db)
     except Exception as exc:
         db.rollback()
         try:
@@ -53462,7 +53563,6 @@ def _process_reisift_webhook_event_background(event_id, payload, event_type, pro
         db.close()
 
 
-
 def _start_reisift_webhook_event_processor(event_id, payload, event_type, property_uuid):
     thread = threading.Thread(
         target=_process_reisift_webhook_event_background,
@@ -53470,6 +53570,150 @@ def _start_reisift_webhook_event_processor(event_id, payload, event_type, proper
         daemon=True,
     )
     thread.start()
+
+
+def run_reisift_webhook_pending_processor_once(limit=25, include_side_effects=True):
+    ensure_db()
+    try:
+        limit = max(1, min(100, int(limit or 25)))
+    except Exception:
+        limit = 25
+    db = open_sqlite_connection()
+    processed = 0
+    side_effects = 0
+    errors = 0
+    try:
+        rows = db.execute(
+            """
+            SELECT id, event_type, property_uuid, payload_json, processing_status
+            FROM reisift_webhook_events
+            WHERE verification_status = 'verified'
+              AND processing_status NOT IN ('processed', 'ignored', 'unmatched', 'unauthorized')
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        for row in rows:
+            payload = parse_json_object(row["payload_json"] or "{}", default={})
+            try:
+                processing = process_reisift_webhook_event_core(
+                    db,
+                    row["id"],
+                    payload,
+                    row["event_type"],
+                    row["property_uuid"],
+                )
+                db.execute(
+                    """
+                    UPDATE reisift_webhook_events
+                    SET property_id = ?,
+                        processing_status = ?,
+                        error_text = ?,
+                        result_json = ?,
+                        processed_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        processing.get("property_id"),
+                        processing.get("processing_status") or "processed",
+                        processing.get("error_text") or "",
+                        json.dumps(processing.get("result") or {}, ensure_ascii=True, default=str, sort_keys=True),
+                        row["id"],
+                    ),
+                )
+                commit_with_retry(db)
+                processed += 1
+                if include_side_effects and processing.get("processing_status") == "processed":
+                    try:
+                        apply_reisift_new_record_exit_side_effects(db, processing)
+                        db.execute(
+                            """
+                            UPDATE reisift_webhook_events
+                            SET result_json = ?,
+                                processed_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                            """,
+                            (
+                                json.dumps(processing.get("result") or {}, ensure_ascii=True, default=str, sort_keys=True),
+                                row["id"],
+                            ),
+                        )
+                        commit_with_retry(db)
+                        side_effects += 1
+                    except Exception as side_effect_exc:
+                        db.rollback()
+                        errors += 1
+                        log_app_error(
+                            db,
+                            source="reisift_pending_webhook_side_effects",
+                            error_message=str(side_effect_exc),
+                            details=traceback.format_exc(),
+                            route="run_reisift_webhook_pending_processor_once:side_effects",
+                            status_code=500,
+                        )
+                        result = processing.get("result") if isinstance(processing.get("result"), dict) else {}
+                        result["emailoctopus_unsubscribe"] = {"ok": False, "error": str(side_effect_exc)}
+                        db.execute(
+                            """
+                            UPDATE reisift_webhook_events
+                            SET result_json = ?,
+                                error_text = COALESCE(NULLIF(error_text, ''), ?),
+                                processed_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                            """,
+                            (
+                                json.dumps(result, ensure_ascii=True, default=str, sort_keys=True),
+                                f"side_effects_error: {side_effect_exc}",
+                                row["id"],
+                            ),
+                        )
+                        commit_with_retry(db)
+            except Exception as exc:
+                db.rollback()
+                errors += 1
+                log_app_error(
+                    db,
+                    source="reisift_pending_webhook_processor",
+                    error_message=str(exc),
+                    details=traceback.format_exc(),
+                    route="run_reisift_webhook_pending_processor_once",
+                    status_code=500,
+                )
+                db.execute(
+                    """
+                    UPDATE reisift_webhook_events
+                    SET processing_status = 'error',
+                        error_text = ?,
+                        result_json = ?,
+                        processed_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        str(exc),
+                        json.dumps({"traceback": traceback.format_exc()}, ensure_ascii=True),
+                        row["id"],
+                    ),
+                )
+                commit_with_retry(db)
+        remaining = db.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM reisift_webhook_events
+            WHERE verification_status = 'verified'
+              AND processing_status NOT IN ('processed', 'ignored', 'unmatched', 'unauthorized')
+            """
+        ).fetchone()
+        return {
+            "ok": True,
+            "picked_up": len(rows),
+            "processed": processed,
+            "side_effects": side_effects,
+            "errors": errors,
+            "remaining": int(remaining["c"] if remaining else 0),
+        }
+    finally:
+        db.close()
 
 
 def _verify_reisift_webhook_request(db, payload):

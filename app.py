@@ -15474,7 +15474,90 @@ def run_touchpoint_email_validation_queue_once(limit=10):
         db.close()
 
 
-def emailoctopus_upsert_contact(api_key, list_id, email_address, contact_status="PENDING", tags=None):
+EMAILOCTOPUS_CATEGORY_TAGS = ["foreclosure", "sheriff sale", "probate", "general"]
+EMAILOCTOPUS_CONTACT_FIELD_DEFS = {
+    "FirstName": {"label": "First name", "type": "TEXT"},
+    "LastName": {"label": "Last name", "type": "TEXT"},
+    "Address": {"label": "Property address", "type": "TEXT"},
+    "City": {"label": "Property city", "type": "TEXT"},
+    "State": {"label": "Property state", "type": "TEXT"},
+}
+EMAILOCTOPUS_FIELD_ENSURE_CACHE = set()
+
+
+def emailoctopus_get_list(api_key, list_id):
+    if not api_key:
+        raise ValueError("EmailOctopus API key is missing")
+    if not list_id:
+        raise ValueError("EmailOctopus list id is missing")
+    response = requests.get(
+        f"{EMAILOCTOPUS_BASE_URL.rstrip('/')}/lists/{quote_plus(list_id)}",
+        params={"api_key": api_key},
+        timeout=20,
+    )
+    payload = _safe_response_payload(response)
+    if response.ok:
+        return payload if isinstance(payload, dict) else {}
+    raise ValueError(
+        f"EmailOctopus list lookup failed ({response.status_code}): {json.dumps(payload) if isinstance(payload, dict) else payload}"
+    )
+
+
+def emailoctopus_create_list_field(api_key, list_id, tag, label, field_type="TEXT", fallback=""):
+    response = requests.post(
+        f"{EMAILOCTOPUS_BASE_URL.rstrip('/')}/lists/{quote_plus(list_id)}/fields",
+        headers={"Content-Type": "application/json"},
+        json={
+            "api_key": api_key,
+            "label": label,
+            "tag": tag,
+            "type": (field_type or "TEXT").strip().upper() or "TEXT",
+            "fallback": fallback or "",
+        },
+        timeout=20,
+    )
+    payload = _safe_response_payload(response)
+    if response.ok:
+        return payload if isinstance(payload, dict) else {"tag": tag}
+    code = _emailoctopus_error_code(payload)
+    message = normalize_whitespace((payload or {}).get("message") if isinstance(payload, dict) else payload).lower()
+    if "exist" in message or code in {"FIELD_EXISTS", "FIELD_ALREADY_EXISTS"}:
+        return {"tag": tag, "already_exists": True, "response": payload}
+    raise ValueError(
+        f"EmailOctopus field create failed ({response.status_code}): {json.dumps(payload) if isinstance(payload, dict) else payload}"
+    )
+
+
+def ensure_emailoctopus_contact_fields(api_key, list_id, field_tags=None):
+    field_tags = [str(tag or "").strip() for tag in (field_tags or EMAILOCTOPUS_CONTACT_FIELD_DEFS.keys()) if str(tag or "").strip()]
+    if not field_tags:
+        return {"ok": True, "checked": 0, "created": 0}
+    cache_key = (list_id, tuple(sorted(field_tags)))
+    if cache_key in EMAILOCTOPUS_FIELD_ENSURE_CACHE:
+        return {"ok": True, "cached": True, "checked": len(field_tags), "created": 0}
+    list_payload = emailoctopus_get_list(api_key, list_id)
+    existing_tags = {
+        normalize_whitespace(field.get("tag") or "")
+        for field in (list_payload.get("fields") or [])
+        if isinstance(field, dict) and normalize_whitespace(field.get("tag") or "")
+    }
+    created = []
+    for tag in field_tags:
+        if tag in existing_tags:
+            continue
+        definition = EMAILOCTOPUS_CONTACT_FIELD_DEFS.get(tag) or {"label": tag, "type": "TEXT"}
+        created.append(emailoctopus_create_list_field(
+            api_key,
+            list_id,
+            tag,
+            definition.get("label") or tag,
+            definition.get("type") or "TEXT",
+        ))
+    EMAILOCTOPUS_FIELD_ENSURE_CACHE.add(cache_key)
+    return {"ok": True, "checked": len(field_tags), "created": len(created), "created_fields": created}
+
+
+def emailoctopus_upsert_contact(api_key, list_id, email_address, contact_status="PENDING", tags=None, fields=None, tags_remove=None):
     email_address = normalize_email_identity(email_address)
     if not api_key:
         raise ValueError("EmailOctopus API key is missing")
@@ -15488,6 +15571,14 @@ def emailoctopus_upsert_contact(api_key, list_id, email_address, contact_status=
         "email_address": email_address,
         "status": (contact_status or "PENDING").strip().upper() or "PENDING",
     }
+    clean_fields = {
+        str(key).strip(): normalize_whitespace(value)
+        for key, value in (fields or {}).items()
+        if str(key or "").strip() and normalize_whitespace(value)
+    }
+    if clean_fields:
+        ensure_emailoctopus_contact_fields(api_key, list_id, clean_fields.keys())
+        create_payload["fields"] = clean_fields
     clean_tags = [str(tag).strip() for tag in (tags or []) if str(tag).strip()]
     if clean_tags:
         create_payload["tags"] = list(dict.fromkeys(clean_tags))
@@ -15522,8 +15613,14 @@ def emailoctopus_upsert_contact(api_key, list_id, email_address, contact_status=
             "api_key": api_key,
             "status": create_payload["status"],
         }
+        if clean_fields:
+            update_payload["fields"] = clean_fields
         if clean_tags:
             update_payload["tags"] = {tag: True for tag in clean_tags}
+        clean_remove_tags = [str(tag).strip() for tag in (tags_remove or []) if str(tag).strip() and str(tag).strip() not in clean_tags]
+        if clean_remove_tags:
+            update_payload.setdefault("tags", {})
+            update_payload["tags"].update({tag: False for tag in clean_remove_tags})
         member_id = _emailoctopus_member_id(email_address)
         update_response = requests.put(
             f"{base_url}/lists/{quote_plus(list_id)}/contacts/{member_id}",
@@ -15836,6 +15933,134 @@ def _email_campaign_tags(source):
     return list(dict.fromkeys(tags))
 
 
+def _emailoctopus_category_from_terms(terms):
+    haystack = " ".join(normalize_whitespace(term) for term in (terms or []) if normalize_whitespace(term)).lower()
+    if "sheriff" in haystack:
+        return "sheriff sale"
+    if "foreclosure" in haystack or "lis pendens" in haystack or "preforeclosure" in haystack:
+        return "foreclosure"
+    if "probate" in haystack or "obituary" in haystack or "estate" in haystack:
+        return "probate"
+    return "general"
+
+
+def _email_campaign_property_context(db, property_id):
+    try:
+        property_id = int(property_id or 0)
+    except Exception:
+        property_id = 0
+    if property_id <= 0:
+        return {
+            "property_id": None,
+            "address": "",
+            "city": "",
+            "state": "",
+            "postal_code": "",
+            "reisift_property_uuid": "",
+            "category_tag": "general",
+            "list_names": [],
+        }
+    row = db.execute(
+        """
+        SELECT p.id, p.reisift_property_uuid, a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if not row:
+        return {
+            "property_id": property_id,
+            "address": "",
+            "city": "",
+            "state": "",
+            "postal_code": "",
+            "reisift_property_uuid": "",
+            "category_tag": "general",
+            "list_names": [],
+        }
+    property_uuid = normalize_uuid(row["reisift_property_uuid"] or "")
+    list_names = []
+    if property_uuid:
+        list_names.extend([
+            item["list_name"]
+            for item in db.execute(
+                """
+                SELECT list_name
+                FROM reisift_new_record_lists
+                WHERE lower(property_uuid) = lower(?)
+                ORDER BY id ASC
+                """,
+                (property_uuid,),
+            ).fetchall()
+            if normalize_whitespace(item["list_name"] or "")
+        ])
+    payload_rows = db.execute(
+        """
+        SELECT payload_json
+        FROM reisift_new_records
+        WHERE local_property_id = ?
+           OR (COALESCE(?, '') <> '' AND lower(property_uuid) = lower(?))
+        ORDER BY COALESCE(last_synced_at, '') DESC, id DESC
+        LIMIT 3
+        """,
+        (property_id, property_uuid, property_uuid),
+    ).fetchall()
+    source_terms = list(list_names)
+    for payload_row in payload_rows:
+        payload = parse_json_object(payload_row["payload_json"] or "{}", default={})
+        source_terms.extend(_sms_source_terms_from_payload(payload))
+    category_tag = _emailoctopus_category_from_terms(source_terms)
+    return {
+        "property_id": property_id,
+        "address": normalize_whitespace(row["street"] or ""),
+        "city": normalize_whitespace(row["city"] or ""),
+        "state": normalize_state_code(row["state"] or "") or normalize_whitespace(row["state"] or ""),
+        "postal_code": normalize_postal_code(row["postal_code"] or ""),
+        "reisift_property_uuid": property_uuid,
+        "category_tag": category_tag,
+        "list_names": list(dict.fromkeys([normalize_whitespace(name) for name in list_names if normalize_whitespace(name)])),
+    }
+
+
+def build_emailoctopus_contact_profile(db, person_id, property_id=None, source="email_validation"):
+    try:
+        person_id = int(person_id or 0)
+    except Exception:
+        person_id = 0
+    person = db.execute("SELECT first_name, last_name FROM people WHERE id = ?", (person_id,)).fetchone() if person_id else None
+    if not property_id and person_id:
+        property_id = find_property_id_for_person(db, person_id)
+    property_context = _email_campaign_property_context(db, property_id)
+    fields = {}
+    first_name = proper_case_name(person["first_name"] or "") if person else ""
+    last_name = proper_case_name(person["last_name"] or "") if person else ""
+    if first_name:
+        fields["FirstName"] = first_name
+    if last_name:
+        fields["LastName"] = last_name
+    if property_context.get("address"):
+        fields["Address"] = property_context["address"]
+    if property_context.get("city"):
+        fields["City"] = property_context["city"]
+    if property_context.get("state"):
+        fields["State"] = property_context["state"]
+    category_tag = property_context.get("category_tag") or "general"
+    tags = _email_campaign_tags(source)
+    tags.append(category_tag)
+    remove_category_tags = [tag for tag in EMAILOCTOPUS_CATEGORY_TAGS if tag != category_tag]
+    return {
+        "fields": fields,
+        "tags": list(dict.fromkeys([tag for tag in tags if normalize_whitespace(tag)])),
+        "tags_remove": remove_category_tags,
+        "first_name": first_name,
+        "last_name": last_name,
+        "property": property_context,
+    }
+
+
 def _email_campaign_person_context(db, person_id):
     try:
         person_id = int(person_id or 0)
@@ -15928,12 +16153,22 @@ def upsert_email_campaign_sync_state(
     return True
 
 
-def sync_validated_email_to_emailoctopus(db, touchpoint_id, person_id, email_value, source="email_validation", validation_status="valid", validation_result=None):
+def sync_validated_email_to_emailoctopus(
+    db,
+    touchpoint_id,
+    person_id,
+    email_value,
+    source="email_validation",
+    validation_status="valid",
+    validation_result=None,
+    force_update=False,
+    property_id_override=None,
+):
     normalized_email = normalize_email_identity(email_value)
     if not normalized_email:
         return {"ok": True, "skipped": "missing_email"}
     context = _email_campaign_person_context(db, person_id)
-    property_id = context.get("property_id")
+    property_id = int(property_id_override or 0) or context.get("property_id")
     existing = db.execute(
         """
         SELECT sync_status
@@ -15943,7 +16178,7 @@ def sync_validated_email_to_emailoctopus(db, touchpoint_id, person_id, email_val
         """,
         (normalized_email,),
     ).fetchone()
-    if existing and _email_campaign_sync_success(existing["sync_status"]):
+    if existing and _email_campaign_sync_success(existing["sync_status"]) and not force_update:
         return {"ok": True, "skipped": "already_synced", "email": normalized_email}
     if existing and _email_campaign_sync_unsubscribed(existing["sync_status"]):
         target_status = ""
@@ -15952,32 +16187,6 @@ def sync_validated_email_to_emailoctopus(db, touchpoint_id, person_id, email_val
             target_status = prop["status"] if prop else ""
         if not is_strict_new_record_status(target_status):
             return {"ok": True, "skipped": "already_unsubscribed", "email": normalized_email}
-
-    registry = db.execute(
-        """
-        SELECT status, source_identifier
-        FROM anonymous_email_campaign_registry
-        WHERE normalized_email = ?
-        LIMIT 1
-        """,
-        (normalized_email,),
-    ).fetchone()
-    registry_status = str(registry["status"] or "").strip().lower() if registry else ""
-    if registry_status == "already_sent":
-        upsert_email_campaign_sync_state(
-            db,
-            normalized_email,
-            touchpoint_id=touchpoint_id,
-            person_id=person_id,
-            property_id=property_id,
-            source=source,
-            provider_contact_id=str(registry["source_identifier"] or "") if registry else "",
-            sync_status="already_synced",
-            validation_status=validation_status,
-            payload={"registry_status": registry_status},
-            synced_at=format_db_time(datetime.utcnow()),
-        )
-        return {"ok": True, "skipped": "already_synced", "email": normalized_email}
 
     settings = get_anonymous_email_marketing_settings(db)
     list_id = settings.get("emailoctopus_list_id") or ""
@@ -15997,12 +16206,15 @@ def sync_validated_email_to_emailoctopus(db, touchpoint_id, person_id, email_val
         return {"ok": False, "skipped": "awaiting_emailoctopus_config", "email": normalized_email}
 
     try:
+        contact_profile = build_emailoctopus_contact_profile(db, person_id, property_id=property_id, source=source)
         sync_result = emailoctopus_upsert_contact(
             settings["emailoctopus_api_key"],
             list_id,
             normalized_email,
             contact_status=settings["emailoctopus_contact_status"],
-            tags=_email_campaign_tags(source),
+            tags=contact_profile.get("tags") or _email_campaign_tags(source),
+            fields=contact_profile.get("fields") or {},
+            tags_remove=contact_profile.get("tags_remove") or [],
         )
         synced_at = format_db_time(datetime.utcnow())
         sync_status = f"{sync_result['action']}_{str(sync_result.get('status') or settings['emailoctopus_contact_status']).lower()}"
@@ -16018,7 +16230,11 @@ def sync_validated_email_to_emailoctopus(db, touchpoint_id, person_id, email_val
             provider_contact_id=provider_contact_id,
             sync_status=sync_status,
             validation_status=validation_status,
-            payload={"emailoctopus": sync_result, "validation": validation_result or {}},
+            payload={
+                "emailoctopus": sync_result,
+                "validation": validation_result or {},
+                "contact_profile": contact_profile,
+            },
             synced_at=synced_at,
         )
         upsert_anonymous_email_campaign_registry(
@@ -16026,12 +16242,18 @@ def sync_validated_email_to_emailoctopus(db, touchpoint_id, person_id, email_val
             normalized_email,
             source="deepsift_validated_email",
             source_identifier=provider_contact_id,
-            first_name=context.get("first_name") or "",
-            last_name=context.get("last_name") or "",
+            first_name=contact_profile.get("first_name") or context.get("first_name") or "",
+            last_name=contact_profile.get("last_name") or context.get("last_name") or "",
             status="already_sent",
             notes=f"Synced automatically after DeepSift email validation from {source or 'email_validation'}.",
         )
-        return {"ok": True, "email": normalized_email, "sync_status": sync_status, "contact_id": provider_contact_id}
+        return {
+            "ok": True,
+            "email": normalized_email,
+            "sync_status": sync_status,
+            "contact_id": provider_contact_id,
+            "contact_profile": contact_profile,
+        }
     except Exception as exc:
         upsert_email_campaign_sync_state(
             db,
@@ -16108,6 +16330,76 @@ def backfill_valid_email_campaign_syncs(db, limit=500):
             errors += 1
         commit_with_retry(db)
     return {"ok": True, "attempted": len(rows), "synced": synced, "skipped": skipped, "errors": errors}
+
+
+def backfill_emailoctopus_contact_profiles(db, limit=2000):
+    try:
+        limit = max(1, min(10000, int(limit or 2000)))
+    except Exception:
+        limit = 2000
+    rows = db.execute(
+        """
+        SELECT s.normalized_email,
+               COALESCE(s.touchpoint_id, t.id, 0) AS touchpoint_id,
+               COALESCE(s.person_id, t.person_id, 0) AS person_id,
+               COALESCE(s.property_id, 0) AS property_id,
+               COALESCE(s.source, 'emailoctopus_profile_backfill') AS source,
+               COALESCE(s.validation_status, 'valid') AS validation_status
+        FROM email_campaign_syncs s
+        LEFT JOIN touchpoints t
+               ON lower(trim(t.value)) = lower(trim(s.normalized_email))
+              AND lower(COALESCE(t.channel_type, '')) = 'email'
+        WHERE lower(COALESCE(s.provider, 'emailoctopus')) = 'emailoctopus'
+          AND (
+                lower(COALESCE(s.sync_status, '')) IN ('synced', 'already_synced', 'already_sent_emailoctopus')
+             OR lower(COALESCE(s.sync_status, '')) LIKE 'created_%'
+             OR lower(COALESCE(s.sync_status, '')) LIKE 'updated_%'
+          )
+          AND lower(COALESCE(s.sync_status, '')) NOT LIKE 'unsubscribed%'
+          AND COALESCE(trim(s.normalized_email), '') <> ''
+        GROUP BY s.normalized_email
+        ORDER BY COALESCE(s.synced_at, s.updated_at, s.created_at) ASC, s.id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    attempted = 0
+    updated = 0
+    skipped = 0
+    errors = 0
+    category_counts = {}
+    for row in rows:
+        attempted += 1
+        result = sync_validated_email_to_emailoctopus(
+            db,
+            row["touchpoint_id"],
+            row["person_id"],
+            row["normalized_email"],
+            source=row["source"] or "emailoctopus_profile_backfill",
+            validation_status=row["validation_status"] or "valid",
+            validation_result={"source": "backfill_emailoctopus_contact_profiles"},
+            force_update=True,
+            property_id_override=row["property_id"],
+        )
+        profile = result.get("contact_profile") if isinstance(result, dict) else {}
+        category = ((profile or {}).get("property") or {}).get("category_tag") or ""
+        if category:
+            category_counts[category] = int(category_counts.get(category, 0) or 0) + 1
+        if result.get("ok") and not result.get("skipped"):
+            updated += 1
+        elif result.get("skipped"):
+            skipped += 1
+        else:
+            errors += 1
+        commit_with_retry(db)
+    return {
+        "ok": errors == 0,
+        "attempted": attempted,
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+        "category_counts": category_counts,
+    }
 
 
 def upsert_anonymous_email_campaign_registry(db, normalized_email, source="manual_import", source_identifier="", first_name="", last_name="", status="already_sent", notes=""):

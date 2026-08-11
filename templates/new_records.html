@@ -15,27 +15,27 @@
     </article>
     <article>
         <h3>ReiSIFT Filter</h3>
-        <p>{{ target_list_ids_count }} lists / {{ target_zip5_count }} zips</p>
+        <p>{{ reisift_filter_summary or (target_list_ids_count ~ ' lists / ' ~ target_zip5_count ~ ' zips') }}</p>
     </article>
 </section>
 
 <section class="panel">
-    <h2>New Records (ReiSift)</h2>
+    <h2>{{ page_title or "New Records (ReiSift)" }}</h2>
     <p>
         Status: <strong>{{ status_slug }}</strong>.
-        Requires phone: <strong>Yes</strong>.
-        Lists: <strong>{{ target_list_ids_count }}</strong>.
-        ZIP5s: <strong>{{ target_zip5_count }}</strong>.
+        Requires phone: <strong>{{ requires_phone_label or "Yes" }}</strong>.
+        {% if target_list_ids_count is not none %}Lists: <strong>{{ target_list_ids_count }}</strong>.{% endif %}
+        {% if target_zip5_count is not none %}ZIP5s: <strong>{{ target_zip5_count }}</strong>.{% endif %}
         Excluded statuses: <strong>{{ excluded_statuses_count }}</strong>.
         {% if last_refresh_at %}Last refresh: <strong>{{ last_refresh_at|fmt_est_datetime }}</strong>.{% endif %}
     </p>
     <p>
         Showing <strong>{{ pagination.start }}-{{ pagination.end }}</strong> of <strong>{{ pagination.total_count }}</strong> matching records
-        from <strong>{{ summary.total_active_count }}</strong> cached New Records.
+        from <strong>{{ summary.total_active_count }}</strong> cached {{ segment_label or "New Records" }}.
         {% if filters.lists %}Selected list filters require records to match <strong>all</strong> selected lists.{% endif %}
     </p>
     <div class="panel-actions">
-        <form method="get" action="{{ url_for('new_records_page') }}" class="inline-form">
+        <form method="get" action="{{ url_for(page_endpoint or 'new_records_page') }}" class="inline-form">
             <input type="hidden" name="page" value="1">
             <label>Sort
                 <select name="sort">
@@ -138,12 +138,12 @@
                     </label>
                     <div class="filter-dropdown-actions">
                         <button type="submit">Apply Filters</button>
-                        <a class="button-link secondary" href="{{ url_for('new_records_page') }}">Clear</a>
+                        <a class="button-link secondary" href="{{ url_for(page_endpoint or 'new_records_page') }}">Clear</a>
                     </div>
                 </div>
             </details>
         </form>
-        <form method="post" action="{{ url_for('new_records_refresh') }}" id="newRecordsRefreshForm">
+        <form method="post" action="{{ url_for(refresh_endpoint or 'new_records_refresh') }}" id="newRecordsRefreshForm">
             <input type="hidden" name="sort" value="{{ sort_order }}">
             <input type="hidden" name="date_from" value="{{ filters.date_from }}">
             <input type="hidden" name="date_to" value="{{ filters.date_to }}">
@@ -161,7 +161,7 @@
             <input type="hidden" name="no_good_numbers" value="{{ filters.no_good_numbers }}">
             <input type="hidden" name="page" value="{{ pagination.page }}">
             <input type="hidden" name="per_page" value="{{ pagination.per_page }}">
-            <button type="submit">Refresh New Records</button>
+            <button type="submit">{{ refresh_button_label or "Refresh New Records" }}</button>
         </form>
     </div>
     {% if notice %}
@@ -172,10 +172,10 @@
     {% endif %}
     <div id="newRecordsBusy" class="busy-inline {% if refresh_state.status == 'running' %}{% else %}hidden{% endif %}">
         <span class="busy-spinner" aria-hidden="true"></span>
-        <span id="newRecordsBusyText">{{ refresh_state.message or "Refreshing New Records from ReiSift..." }}</span>
+        <span id="newRecordsBusyText">{{ refresh_state.message or busy_message or "Refreshing New Records from ReiSift..." }}</span>
     </div>
     <div id="newRecordsStatusMessage" class="notice-banner hidden"></div>
-    <nav class="pagination-controls" aria-label="New Records pages">
+    <nav class="pagination-controls" aria-label="{{ segment_label or 'New Records' }} pages">
         {% if pagination.has_prev %}
         <a class="button-link secondary" href="{{ pagination.first_url }}">First</a>
         <a class="button-link secondary" href="{{ pagination.prev_url }}">Previous</a>
@@ -244,13 +244,13 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="13">No New Records matched these filters. Click Refresh New Records or clear the filters.</td>
+                    <td colspan="13">{{ empty_message or "No New Records matched these filters. Click Refresh New Records or clear the filters." }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
-    <nav class="pagination-controls" aria-label="New Records pages">
+    <nav class="pagination-controls" aria-label="{{ segment_label or 'New Records' }} pages">
         {% if pagination.has_prev %}
         <a class="button-link secondary" href="{{ pagination.first_url }}">First</a>
         <a class="button-link secondary" href="{{ pagination.prev_url }}">Previous</a>
@@ -281,7 +281,7 @@
       statusMessage.textContent = '';
     }
     if (busy) busy.classList.remove('hidden');
-    if (busyText) busyText.textContent = message || 'Refreshing New Records from ReiSift...';
+    if (busyText) busyText.textContent = message || {{ (busy_message or "Refreshing New Records from ReiSift...")|tojson }};
   }
 
   function hideBusy() {
@@ -301,7 +301,7 @@
 
   async function pollRefreshStatus() {
     try {
-      const res = await fetch('/api/new-records/refresh-status');
+      const res = await fetch({{ (refresh_status_url or '/api/new-records/refresh-status')|tojson }});
       const data = await res.json();
       const state = (data && data.state) || {};
       if (state.status === 'running') {
@@ -329,7 +329,7 @@
   async function refreshCacheAsync() {
     setBusy('Starting ReiSift refresh...');
     try {
-      const res = await fetch('/api/new-records/refresh-cache', {
+      const res = await fetch({{ (refresh_cache_url or '/api/new-records/refresh-cache')|tojson }}, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       });

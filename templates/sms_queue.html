@@ -146,7 +146,7 @@
             </details>
         </form>
         <form method="post" action="{{ url_for('sms_queue_generate') }}">
-            <button type="submit">Generate From New Records</button>
+            <button type="submit">Generate From Prospect Segments</button>
         </form>
         <form method="post" action="{{ url_for('sms_queue_revalidate') }}">
             <button type="submit">Revalidate + Find New Numbers</button>
@@ -254,7 +254,7 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="11">{% if filters.status == 'Suppressed' %}No suppressed/removed SMS items match these filters.{% else %}No active SMS queue items match these filters. Generate from New Records to create drafts.{% endif %}</td>
+                    <td colspan="11">{% if filters.status == 'Suppressed' %}No suppressed/removed SMS items match these filters.{% else %}No active SMS queue items match these filters. Generate from prospect segments to create drafts.{% endif %}</td>
                 </tr>
                 {% endfor %}
             </tbody>

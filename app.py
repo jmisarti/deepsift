@@ -142,6 +142,13 @@ REISIFT_UI_VERSION = "2022.02.01.7"
 REISIFT_UNTITLED_TASK_ASSIGNED_TO_USER = "54b27291-93e4-443c-8d2f-e9779955fcd1"
 REISIFT_FOLLOWUPS_EXCLUDE_TAG = os.getenv("REISIFT_FOLLOWUPS_EXCLUDE_TAG", "3cf5a950-ac8f-47b0-87e1-bcea2604e2e1").strip()
 REISIFT_NEW_RECORDS_STATUS = (os.getenv("REISIFT_NEW_RECORDS_STATUS") or "New Record").strip() or "New Record"
+REISIFT_NEW_RECORDS_SEGMENT = "new_records"
+REISIFT_DEEP_PROSPECTING_STATUS = (os.getenv("REISIFT_DEEP_PROSPECTING_STATUS") or "Deep Prospecting").strip() or "Deep Prospecting"
+REISIFT_DEEP_PROSPECTING_SEGMENT = "deep_prospecting"
+REISIFT_PROSPECT_SEGMENT_LABELS = {
+    REISIFT_NEW_RECORDS_SEGMENT: "New Records",
+    REISIFT_DEEP_PROSPECTING_SEGMENT: "Deep Prospecting",
+}
 REISIFT_NEW_RECORDS_COUNTIES = tuple(
     item.strip()
     for item in (os.getenv("REISIFT_NEW_RECORDS_COUNTIES") or "Essex,Union,Bergen").split(",")
@@ -339,6 +346,7 @@ ROKU_ADS_TOKEN_URL = (os.getenv("ROKU_ADS_TOKEN_URL") or "https://api.ads.roku.c
 ROKU_ADS_API_BASE_URL = (os.getenv("ROKU_ADS_API_BASE_URL") or "https://api.ads.roku.com/v1/developer").strip().rstrip("/") or "https://api.ads.roku.com/v1/developer"
 ADS_REFRESH_LOCK = threading.RLock()
 REISIFT_NEW_RECORDS_REFRESH_LOCK = threading.Lock()
+REISIFT_DEEP_PROSPECTING_REFRESH_LOCK = threading.Lock()
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
     "running": False,
@@ -1118,6 +1126,10 @@ def migrate_db(db):
     ensure_column(db, "reisift_new_records", "first_seen_at", "first_seen_at TEXT")
     ensure_column(db, "reisift_new_records", "automation_eligible", "automation_eligible INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "reisift_new_records", "automation_hold_reason", "automation_hold_reason TEXT")
+    ensure_column(db, "reisift_new_records", "segment", "segment TEXT NOT NULL DEFAULT 'new_records'")
+    db.execute(
+        "UPDATE reisift_new_records SET segment = 'new_records' WHERE COALESCE(segment, '') = ''"
+    )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_county ON reisift_new_records(is_active, county, added_at)"
     )
@@ -1135,6 +1147,9 @@ def migrate_db(db):
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_automation ON reisift_new_records(is_active, automation_eligible, added_at)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_segment_active_added ON reisift_new_records(segment, is_active, added_at)"
     )
     db.execute(
         """
@@ -1946,6 +1961,51 @@ def migrate_db(db):
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_email_validation_queue_due ON email_validation_queue(queue_status, run_after, id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_email_validation_queue_email ON email_validation_queue(email_value, queue_status, id)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS email_validation_registry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            normalized_email TEXT NOT NULL UNIQUE,
+            provider TEXT NOT NULL DEFAULT 'emaillistverify',
+            queue_status TEXT NOT NULL DEFAULT 'Queued',
+            validation_status TEXT,
+            provider_status TEXT,
+            validation_raw TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            first_source TEXT,
+            last_source TEXT,
+            first_touchpoint_id INTEGER,
+            last_touchpoint_id INTEGER,
+            run_after TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            requested_at TEXT,
+            processed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_email_validation_registry_status ON email_validation_registry(queue_status, run_after, id)"
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS email_validation_registry_touchpoints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            registry_id INTEGER NOT NULL,
+            touchpoint_id INTEGER NOT NULL UNIQUE,
+            person_id INTEGER,
+            source TEXT NOT NULL DEFAULT 'email_validation',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(registry_id) REFERENCES email_validation_registry(id) ON DELETE CASCADE,
+            FOREIGN KEY(touchpoint_id) REFERENCES touchpoints(id) ON DELETE CASCADE,
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_email_validation_registry_touchpoints_registry ON email_validation_registry_touchpoints(registry_id)"
+    )
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS email_campaign_syncs (
@@ -14981,7 +15041,6 @@ def _emailoctopus_is_tag_limit_error(payload):
     return "TAG_LIMIT" in code or ("tag" in message and "limit" in message)
 
 
-
 def _emailoctopus_error_code(payload):
     if not isinstance(payload, dict):
         return ""
@@ -15066,6 +15125,321 @@ def _touchpoint_status_from_email_validation_status(validation_status):
     return ""
 
 
+EMAIL_VALIDATION_COMPLETED_STATUSES = {"valid", "invalid", "unknown", "undeliverable"}
+EMAIL_VALIDATION_REGISTRY_ACTIVE_STATUSES = {"queued", "retry", "inflight", "in_flight", "held"}
+EMAIL_VALIDATION_REGISTRY_BACKFILL_SETTING = "email_validation_registry_backfilled_at"
+
+
+def _email_validation_registry_row(db, email_value):
+    normalized_email = normalize_email_identity(email_value)
+    if not normalized_email:
+        return None
+    return db.execute(
+        """
+        SELECT *
+        FROM email_validation_registry
+        WHERE normalized_email = ?
+        LIMIT 1
+        """,
+        (normalized_email,),
+    ).fetchone()
+
+
+def _email_validation_registry_decision(row, exclude_touchpoint_id=0):
+    if not row:
+        return None
+    try:
+        exclude_touchpoint_id = int(exclude_touchpoint_id or 0)
+    except Exception:
+        exclude_touchpoint_id = 0
+    queue_status = str(row["queue_status"] or "").strip().lower()
+    validation_status = str(row["validation_status"] or "").strip().lower()
+    if queue_status == "completed" and validation_status in EMAIL_VALIDATION_COMPLETED_STATUSES:
+        return {
+            "kind": "email_validation_registry",
+            "registry_id": int(row["id"] or 0),
+            "validation_status": validation_status,
+            "validation_raw": row["validation_raw"] or "",
+            "processed_at": row["processed_at"] or "",
+            "touchpoint_status": _touchpoint_status_from_email_validation_status(validation_status),
+            "queue_status": "Completed",
+        }
+    first_touchpoint_id = int((row["first_touchpoint_id"] or 0) if "first_touchpoint_id" in row.keys() else 0)
+    if queue_status in EMAIL_VALIDATION_REGISTRY_ACTIVE_STATUSES and first_touchpoint_id != exclude_touchpoint_id:
+        return {
+            "kind": "email_validation_registry_pending",
+            "registry_id": int(row["id"] or 0),
+            "validation_status": queue_status,
+            "touchpoint_status": "",
+            "queue_status": "Skipped",
+        }
+    return None
+
+
+def _attach_email_validation_touchpoint(db, registry_id, touchpoint_id, person_id, source):
+    try:
+        registry_id = int(registry_id or 0)
+        touchpoint_id = int(touchpoint_id or 0)
+    except Exception:
+        return
+    if registry_id <= 0 or touchpoint_id <= 0:
+        return
+    db.execute(
+        """
+        INSERT INTO email_validation_registry_touchpoints (registry_id, touchpoint_id, person_id, source)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(touchpoint_id) DO UPDATE SET
+            registry_id = excluded.registry_id,
+            person_id = COALESCE(excluded.person_id, person_id),
+            source = excluded.source,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (registry_id, touchpoint_id, person_id, source or "email_validation"),
+    )
+
+
+def _ensure_email_validation_registry(db, email_value, touchpoint_id=0, person_id=None, source="email_validation", hold_reason=""):
+    normalized_email = normalize_email_identity(email_value)
+    if not normalized_email:
+        return None
+    now_stamp = format_db_time(datetime.utcnow())
+    source_value = (source or "email_validation").strip() or "email_validation"
+    row = _email_validation_registry_row(db, normalized_email)
+    if row:
+        registry_id = int(row["id"] or 0)
+        queue_status = str(row["queue_status"] or "").strip().lower()
+        if hold_reason and queue_status not in {"completed"}:
+            db.execute(
+                """
+                UPDATE email_validation_registry
+                SET last_source = ?,
+                    last_touchpoint_id = ?,
+                    validation_status = CASE
+                        WHEN lower(COALESCE(queue_status, '')) = 'held' THEN validation_status
+                        ELSE validation_status
+                    END,
+                    validation_raw = CASE
+                        WHEN lower(COALESCE(queue_status, '')) = 'held' THEN validation_raw
+                        ELSE validation_raw
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (source_value, int(touchpoint_id or 0), registry_id),
+            )
+        elif queue_status == "held":
+            db.execute(
+                """
+                UPDATE email_validation_registry
+                SET queue_status = 'Queued',
+                    validation_status = '',
+                    validation_raw = '',
+                    run_after = ?,
+                    requested_at = COALESCE(requested_at, ?),
+                    last_source = ?,
+                    last_touchpoint_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (now_stamp, now_stamp, source_value, int(touchpoint_id or 0), registry_id),
+            )
+        else:
+            db.execute(
+                """
+                UPDATE email_validation_registry
+                SET last_source = ?,
+                    last_touchpoint_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (source_value, int(touchpoint_id or 0), registry_id),
+            )
+        _attach_email_validation_touchpoint(db, registry_id, touchpoint_id, person_id, source_value)
+        return _email_validation_registry_row(db, normalized_email)
+
+    queue_status = "Held" if hold_reason else "Queued"
+    validation_status = HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS if hold_reason else ""
+    validation_raw = held_email_validation_payload(source_value, hold_reason) if hold_reason else ""
+    cur = db.execute(
+        """
+        INSERT INTO email_validation_registry (
+            normalized_email, provider, queue_status, validation_status, validation_raw,
+            first_source, last_source, first_touchpoint_id, last_touchpoint_id,
+            run_after, requested_at
+        )
+        VALUES (?, 'emaillistverify', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            normalized_email,
+            queue_status,
+            validation_status,
+            validation_raw,
+            source_value,
+            source_value,
+            int(touchpoint_id or 0),
+            int(touchpoint_id or 0),
+            now_stamp,
+            None if hold_reason else now_stamp,
+        ),
+    )
+    registry_id = int(cur.lastrowid or 0)
+    _attach_email_validation_touchpoint(db, registry_id, touchpoint_id, person_id, source_value)
+    return _email_validation_registry_row(db, normalized_email)
+
+
+def _update_email_validation_registry_from_result(db, email_value, queue_status, validation_status, validation_result, source="", touchpoint_id=0, run_after=""):
+    normalized_email = normalize_email_identity(email_value)
+    if not normalized_email:
+        return None
+    now_stamp = format_db_time(datetime.utcnow())
+    row = _ensure_email_validation_registry(
+        db,
+        normalized_email,
+        touchpoint_id=touchpoint_id,
+        person_id=None,
+        source=source or "email_validation_queue",
+    )
+    if not row:
+        return None
+    provider_status = ""
+    provider_call_made = True
+    if isinstance(validation_result, dict):
+        provider_status = str(validation_result.get("provider_status") or validation_result.get("normalized_status") or "").strip()
+        provider_call_made = validation_result.get("provider_call_made") is not False
+    raw = json.dumps(validation_result, ensure_ascii=True, sort_keys=True) if isinstance(validation_result, dict) else str(validation_result or "")
+    processed_at = now_stamp if str(queue_status or "").strip().lower() == "completed" else None
+    db.execute(
+        """
+        UPDATE email_validation_registry
+        SET queue_status = ?,
+            validation_status = ?,
+            provider_status = ?,
+            validation_raw = ?,
+            attempts = COALESCE(attempts, 0) + ?,
+            run_after = COALESCE(NULLIF(?, ''), run_after),
+            processed_at = COALESCE(?, processed_at),
+            last_source = ?,
+            last_touchpoint_id = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            queue_status,
+            validation_status,
+            provider_status,
+            raw,
+            1 if provider_call_made else 0,
+            run_after or "",
+            processed_at,
+            source or "email_validation_queue",
+            int(touchpoint_id or 0),
+            int(row["id"] or 0),
+        ),
+    )
+    return _email_validation_registry_row(db, normalized_email)
+
+
+def _mark_email_validation_registry_inflight(db, email_value, source="", touchpoint_id=0):
+    normalized_email = normalize_email_identity(email_value)
+    if not normalized_email:
+        return
+    row = _ensure_email_validation_registry(
+        db,
+        normalized_email,
+        touchpoint_id=touchpoint_id,
+        person_id=None,
+        source=source or "email_validation_queue",
+    )
+    if not row:
+        return
+    db.execute(
+        """
+        UPDATE email_validation_registry
+        SET queue_status = 'InFlight',
+            requested_at = COALESCE(requested_at, ?),
+            last_source = ?,
+            last_touchpoint_id = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND lower(COALESCE(queue_status, 'queued')) IN ('queued', 'retry')
+        """,
+        (
+            format_db_time(datetime.utcnow()),
+            source or "email_validation_queue",
+            int(touchpoint_id or 0),
+            int(row["id"] or 0),
+        ),
+    )
+
+
+def apply_email_validation_registry_to_attached_touchpoints(db, registry_row):
+    if not registry_row:
+        return {"updated": 0, "emailoctopus_synced": 0}
+    validation_status = str(registry_row["validation_status"] or "").strip().lower()
+    touch_status = _touchpoint_status_from_email_validation_status(validation_status)
+    if not touch_status:
+        return {"updated": 0, "emailoctopus_synced": 0}
+    normalized_email = normalize_email_identity(registry_row["normalized_email"] or "")
+    processed_at = registry_row["processed_at"] or format_db_time(datetime.utcnow())
+    validation_raw = registry_row["validation_raw"] or ""
+    rows = db.execute(
+        """
+        SELECT rt.touchpoint_id, rt.person_id, rt.source,
+               t.note AS touchpoint_note,
+               q.id AS queue_id
+        FROM email_validation_registry_touchpoints rt
+        JOIN touchpoints t ON t.id = rt.touchpoint_id
+        LEFT JOIN email_validation_queue q ON q.touchpoint_id = rt.touchpoint_id
+        WHERE rt.registry_id = ?
+        """,
+        (int(registry_row["id"] or 0),),
+    ).fetchall()
+    updated = 0
+    emailoctopus_synced = 0
+    for row in rows:
+        note = append_note_line(
+            row["touchpoint_note"] or "",
+            f"Email validation reused from registry for {normalized_email}; no duplicate EmailListVerify lookup was sent.",
+        )
+        db.execute(
+            """
+            UPDATE touchpoints
+            SET status = ?,
+                note = ?,
+                value = ?
+            WHERE id = ?
+            """,
+            (touch_status, note, normalized_email, row["touchpoint_id"]),
+        )
+        if row["queue_id"]:
+            db.execute(
+                """
+                UPDATE email_validation_queue
+                SET queue_status = 'Completed',
+                    validation_status = ?,
+                    validation_raw = ?,
+                    processed_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (validation_status, validation_raw, processed_at, row["queue_id"]),
+            )
+        if touch_status == "Valid":
+            sync_validated_email_to_emailoctopus(
+                db,
+                row["touchpoint_id"],
+                row["person_id"],
+                normalized_email,
+                source=row["source"] or "email_validation_registry",
+                validation_status="valid",
+                validation_result=parse_json_object(validation_raw or "{}", default={})
+                or {"source": "email_validation_registry"},
+            )
+            emailoctopus_synced += 1
+        updated += 1
+    return {"updated": updated, "emailoctopus_synced": emailoctopus_synced}
+
+
 def _find_existing_email_validation_decision(db, email_value, exclude_touchpoint_id=0):
     email_value = normalize_email_identity(email_value)
     if not email_value:
@@ -15074,6 +15448,12 @@ def _find_existing_email_validation_decision(db, email_value, exclude_touchpoint
         exclude_touchpoint_id = int(exclude_touchpoint_id or 0)
     except Exception:
         exclude_touchpoint_id = 0
+    registry_decision = _email_validation_registry_decision(
+        _email_validation_registry_row(db, email_value),
+        exclude_touchpoint_id=exclude_touchpoint_id,
+    )
+    if registry_decision:
+        return registry_decision
     sync_row = db.execute(
         """
         SELECT sync_status, validation_status
@@ -15182,6 +15562,7 @@ REISIFT_NEW_RECORD_EMAIL_VALIDATION_SOURCES = {
     "reisift_new_record",
     "reisift_new_record_backfill",
     "reisift_new_record_repair",
+    "reisift_deep_prospecting",
 }
 HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS = "held_reisift_new_record_manual_review"
 
@@ -15206,6 +15587,78 @@ def held_email_validation_payload(source, reason):
     )
 
 
+def _upsert_email_validation_queue_row(
+    db,
+    touchpoint_id,
+    person_id,
+    email_value,
+    source,
+    queue_status,
+    run_after,
+    validation_status="",
+    validation_raw="",
+    processed_at=None,
+):
+    existing = db.execute(
+        """
+        SELECT id, queue_status
+        FROM email_validation_queue
+        WHERE touchpoint_id = ?
+        LIMIT 1
+        """,
+        (int(touchpoint_id or 0),),
+    ).fetchone()
+    if existing:
+        db.execute(
+            """
+            UPDATE email_validation_queue
+            SET person_id = ?,
+                email_value = ?,
+                source = ?,
+                queue_status = ?,
+                validation_status = ?,
+                validation_raw = ?,
+                run_after = ?,
+                processed_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                person_id,
+                email_value,
+                source,
+                queue_status,
+                validation_status or "",
+                validation_raw or "",
+                run_after,
+                processed_at,
+                existing["id"],
+            ),
+        )
+        return int(existing["id"] or 0)
+    cur = db.execute(
+        """
+        INSERT INTO email_validation_queue (
+            touchpoint_id, person_id, email_value, source, queue_status,
+            run_after, validation_status, validation_raw, processed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(touchpoint_id or 0),
+            person_id,
+            email_value,
+            source,
+            queue_status,
+            run_after,
+            validation_status or "",
+            validation_raw or "",
+            processed_at,
+        ),
+    )
+    return int(cur.lastrowid or 0)
+
+
 def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value, source="skiptrace"):
     try:
         touchpoint_id = int(touchpoint_id or 0)
@@ -15216,108 +15669,136 @@ def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value,
         return None
     source_value = (source or "skiptrace").strip() or "skiptrace"
     hold_reason = email_validation_source_hold_reason(source_value)
-    existing = db.execute(
-        """
-        SELECT id, queue_status
-        FROM email_validation_queue
-        WHERE touchpoint_id = ?
-        LIMIT 1
-        """,
-        (touchpoint_id,),
-    ).fetchone()
     now_stamp = format_db_time(datetime.utcnow())
-    if existing:
-        if hold_reason:
-            db.execute(
-                """
-                UPDATE email_validation_queue
-                SET person_id = ?,
-                    email_value = ?,
-                    source = ?,
-                    queue_status = 'Held',
-                    validation_status = ?,
-                    validation_raw = ?,
-                    run_after = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                  AND lower(COALESCE(queue_status, '')) NOT IN ('completed', 'skipped')
-                """,
-                (
+    registry_row = _ensure_email_validation_registry(
+        db,
+        email_value,
+        touchpoint_id=touchpoint_id,
+        person_id=person_id,
+        source=source_value,
+        hold_reason=hold_reason,
+    )
+    registry_decision = _email_validation_registry_decision(
+        registry_row,
+        exclude_touchpoint_id=touchpoint_id,
+    )
+    if registry_decision:
+        decision_kind = str(registry_decision.get("kind") or "").strip()
+        if decision_kind == "email_validation_registry":
+            _apply_email_validation_decision_to_touchpoint(db, touchpoint_id, email_value, registry_decision)
+            validation_status = str(registry_decision.get("validation_status") or "").strip().lower()
+            if validation_status == "valid":
+                sync_validated_email_to_emailoctopus(
+                    db,
+                    touchpoint_id,
                     person_id,
                     email_value,
-                    source_value,
-                    HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS,
-                    held_email_validation_payload(source_value, hold_reason),
-                    now_stamp,
-                    existing["id"],
-                ),
+                    source=source_value,
+                    validation_status="valid",
+                    validation_result=parse_json_object(registry_decision.get("validation_raw") or "{}", default={})
+                    or {"source": "email_validation_registry"},
+                )
+            return _upsert_email_validation_queue_row(
+                db,
+                touchpoint_id,
+                person_id,
+                email_value,
+                source_value,
+                "Completed",
+                now_stamp,
+                validation_status=validation_status,
+                validation_raw=registry_decision.get("validation_raw") or "",
+                processed_at=registry_decision.get("processed_at") or now_stamp,
             )
-            return int(existing["id"])
-        if str(existing["queue_status"] or "").strip().lower() in {"completed", "skipped"}:
-            return int(existing["id"])
-        db.execute(
-            """
-            UPDATE email_validation_queue
-            SET person_id = ?,
-                email_value = ?,
-                source = ?,
-                run_after = ?,
-                updated_at = CURRENT_TIMESTAMP,
-                queue_status = CASE
-                    WHEN lower(COALESCE(queue_status, '')) IN ('completed', 'skipped')
-                        THEN queue_status
-                    ELSE 'Queued'
-                END
-            WHERE id = ?
-            """,
-            (person_id, email_value, source_value, now_stamp, existing["id"]),
+        return _upsert_email_validation_queue_row(
+            db,
+            touchpoint_id,
+            person_id,
+            email_value,
+            source_value,
+            "Skipped",
+            now_stamp,
+            validation_status="already_queued",
+            validation_raw=json.dumps(
+                {
+                    "source": "email_validation_registry_pending",
+                    "registry_id": registry_decision.get("registry_id") or None,
+                    "status": registry_decision.get("validation_status") or "",
+                    "provider_call_made": False,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            processed_at=now_stamp,
         )
-        return int(existing["id"])
     decision = _find_existing_email_validation_decision(db, email_value, exclude_touchpoint_id=touchpoint_id)
     if decision:
         _apply_email_validation_decision_to_touchpoint(db, touchpoint_id, email_value, decision)
-        if decision.get("kind") == "prior_validation" and str(decision.get("validation_status") or "").lower() == "valid":
+        validation_status = str(decision.get("validation_status") or "").strip().lower()
+        if validation_status in EMAIL_VALIDATION_COMPLETED_STATUSES:
+            _update_email_validation_registry_from_result(
+                db,
+                email_value,
+                "Completed",
+                validation_status,
+                parse_json_object(decision.get("validation_raw") or "{}", default={})
+                or {
+                    "source": decision.get("kind") or "existing_email_validation",
+                    "provider_call_made": False,
+                },
+                source=source_value,
+                touchpoint_id=touchpoint_id,
+            )
+        if validation_status == "valid":
             sync_validated_email_to_emailoctopus(
                 db,
                 touchpoint_id,
                 person_id,
                 email_value,
-                source=source,
+                source=source_value,
                 validation_status="valid",
                 validation_result={
                     "source": "reused_existing_email_validation",
                     "prior_processed_at": decision.get("processed_at") or "",
                 },
-        )
-        return None
-    if hold_reason:
-        cur = db.execute(
-            """
-            INSERT INTO email_validation_queue (
-                touchpoint_id, person_id, email_value, source, queue_status,
-                run_after, validation_status, validation_raw
             )
-            VALUES (?, ?, ?, ?, 'Held', ?, ?, ?)
-            """,
-            (
-                touchpoint_id,
-                person_id,
-                email_value,
-                source_value,
-                now_stamp,
-                HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS,
-                held_email_validation_payload(source_value, hold_reason),
+        return _upsert_email_validation_queue_row(
+            db,
+            touchpoint_id,
+            person_id,
+            email_value,
+            source_value,
+            decision.get("queue_status") or "Skipped",
+            now_stamp,
+            validation_status=validation_status,
+            validation_raw=decision.get("validation_raw") or json.dumps(
+                {"source": decision.get("kind") or "existing_email_validation", "provider_call_made": False},
+                ensure_ascii=True,
+                sort_keys=True,
             ),
+            processed_at=decision.get("processed_at") or now_stamp,
         )
-        return int(cur.lastrowid or 0)
-    cur = db.execute(
-        """
-        INSERT INTO email_validation_queue (touchpoint_id, person_id, email_value, source, queue_status, run_after)
-        VALUES (?, ?, ?, ?, 'Queued', ?)
-        """,
-        (touchpoint_id, person_id, email_value, source_value, now_stamp),
+    if hold_reason:
+        return _upsert_email_validation_queue_row(
+            db,
+            touchpoint_id,
+            person_id,
+            email_value,
+            source_value,
+            "Held",
+            now_stamp,
+            validation_status=HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS,
+            validation_raw=held_email_validation_payload(source_value, hold_reason),
+        )
+    return _upsert_email_validation_queue_row(
+        db,
+        touchpoint_id,
+        person_id,
+        email_value,
+        source_value,
+        "Queued",
+        now_stamp,
     )
-    return int(cur.lastrowid or 0)
 
 
 def _append_touchpoint_note(existing_note, extra_line):
@@ -15338,6 +15819,11 @@ def run_touchpoint_email_validation_queue_once(limit=10):
     processed = 0
     updated = 0
     try:
+        try:
+            backfill_email_validation_registry_from_queue(db, force=False)
+            commit_with_retry(db)
+        except Exception:
+            db.rollback()
         try:
             limit = max(1, min(50, int(limit)))
         except Exception:
@@ -15384,6 +15870,15 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                 commit_with_retry(db)
                 continue
             if touch_status_norm == "valid":
+                registry_row = _update_email_validation_registry_from_result(
+                    db,
+                    email_value,
+                    "Completed",
+                    "valid",
+                    {"source": "touchpoint_already_valid", "provider_call_made": False},
+                    source=row["source"] or "email_validation_queue",
+                    touchpoint_id=touchpoint_id,
+                )
                 sync_validated_email_to_emailoctopus(
                     db,
                     touchpoint_id,
@@ -15405,6 +15900,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     """,
                     (now_stamp, queue_id),
                 )
+                apply_email_validation_registry_to_attached_touchpoints(db, registry_row)
                 commit_with_retry(db)
                 continue
             if touch_status_norm in BLOCKED_CONTACT_STATUSES:
@@ -15431,7 +15927,23 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                 _apply_email_validation_decision_to_touchpoint(db, touchpoint_id, email_value, existing_decision)
                 decision_kind = str(existing_decision.get("kind") or "existing_email").strip()
                 reused_status = str(existing_decision.get("validation_status") or decision_kind or "existing_email").strip().lower()
-                if decision_kind == "prior_validation":
+                if reused_status in EMAIL_VALIDATION_COMPLETED_STATUSES:
+                    registry_row = None
+                    registry_row = _update_email_validation_registry_from_result(
+                        db,
+                        email_value,
+                        "Completed",
+                        reused_status,
+                        parse_json_object(existing_decision.get("validation_raw") or "{}", default={})
+                        or {
+                            "source": "reused_existing_email_validation",
+                            "decision": decision_kind,
+                            "prior_processed_at": existing_decision.get("processed_at") or "",
+                            "provider_call_made": False,
+                        },
+                        source=row["source"] or "email_validation_queue",
+                        touchpoint_id=touchpoint_id,
+                    )
                     if reused_status == "valid":
                         sync_validated_email_to_emailoctopus(
                             db,
@@ -15470,6 +15982,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                         ),
                     )
                     updated += 1
+                    apply_email_validation_registry_to_attached_touchpoints(db, registry_row)
                 else:
                     db.execute(
                         """
@@ -15500,6 +16013,14 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                 continue
             hold_reason = email_validation_source_hold_reason(row["source"] or "")
             if hold_reason:
+                _ensure_email_validation_registry(
+                    db,
+                    email_value,
+                    touchpoint_id=touchpoint_id,
+                    person_id=row["person_id"],
+                    source=row["source"] or "email_validation_queue",
+                    hold_reason=hold_reason,
+                )
                 db.execute(
                     """
                     UPDATE email_validation_queue
@@ -15517,6 +16038,12 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                 )
                 commit_with_retry(db)
                 continue
+            _mark_email_validation_registry_inflight(
+                db,
+                email_value,
+                source=row["source"] or "email_validation_queue",
+                touchpoint_id=touchpoint_id,
+            )
             try:
                 validation_result = verify_email_with_emaillistverify(api_key, email_value)
             except Exception as exc:
@@ -15532,6 +16059,17 @@ def run_touchpoint_email_validation_queue_once(limit=10):
             normalized_status = (validation_result.get("normalized_status") or "").strip().lower()
             if normalized_status in {"awaiting_emaillistverify_config", "awaiting_emaillistverify_provider_attention", "error"}:
                 retry_minutes = 15 if normalized_status == "awaiting_emaillistverify_config" else 60
+                retry_after = format_db_time(datetime.utcnow() + timedelta(minutes=retry_minutes))
+                _update_email_validation_registry_from_result(
+                    db,
+                    email_value,
+                    "Retry",
+                    normalized_status,
+                    validation_result,
+                    source=row["source"] or "email_validation_queue",
+                    touchpoint_id=touchpoint_id,
+                    run_after=retry_after,
+                )
                 db.execute(
                     """
                     UPDATE email_validation_queue
@@ -15546,7 +16084,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     (
                         normalized_status,
                         json.dumps(validation_result, ensure_ascii=True, sort_keys=True),
-                        format_db_time(datetime.utcnow() + timedelta(minutes=retry_minutes)),
+                        retry_after,
                         queue_id,
                     ),
                 )
@@ -15597,6 +16135,15 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     validation_status="valid",
                     validation_result=validation_result,
                 )
+            registry_row = _update_email_validation_registry_from_result(
+                db,
+                email_value,
+                "Completed",
+                normalized_status or ("valid" if new_touch_status == "Valid" else "error"),
+                validation_result,
+                source=row["source"] or "email_validation_queue",
+                touchpoint_id=touchpoint_id,
+            )
             db.execute(
                 """
                 UPDATE email_validation_queue
@@ -15615,6 +16162,7 @@ def run_touchpoint_email_validation_queue_once(limit=10):
                     queue_id,
                 ),
             )
+            apply_email_validation_registry_to_attached_touchpoints(db, registry_row)
             updated += 1
             commit_with_retry(db)
         commit_with_retry(db)
@@ -15633,6 +16181,166 @@ def run_touchpoint_email_validation_queue_once(limit=10):
         return {"ok": False, "error": str(exc), "attempted": processed, "updated": updated}
     finally:
         db.close()
+
+
+def _email_validation_registry_backfill_payload(row, normalized_status):
+    raw = str(row["validation_raw"] or "").strip()
+    if raw:
+        return raw
+    return json.dumps(
+        {
+            "source": "email_validation_queue_backfill",
+            "queue_id": int(row["id"] or 0),
+            "validation_status": normalized_status,
+            "provider_call_made": str(row["queue_status"] or "").strip().lower() == "completed",
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+
+
+def _email_validation_registry_backfill_state(row):
+    queue_status = str(row["queue_status"] or "").strip().lower()
+    validation_status = str(row["validation_status"] or "").strip().lower()
+    if queue_status == "completed" and validation_status in EMAIL_VALIDATION_COMPLETED_STATUSES:
+        return "Completed", validation_status
+    if queue_status == "retry":
+        return "Retry", validation_status or "retry"
+    if queue_status == "queued":
+        return "Queued", validation_status or ""
+    if queue_status == "held":
+        return "Held", validation_status or HELD_REISIFT_NEW_RECORD_EMAIL_VALIDATION_STATUS
+    if validation_status in EMAIL_VALIDATION_COMPLETED_STATUSES:
+        return "Completed", validation_status
+    return "Skipped", validation_status or queue_status or "skipped"
+
+
+def backfill_email_validation_registry_from_queue(db, force=False, limit=200000):
+    try:
+        already = db.execute(
+            "SELECT value FROM app_settings WHERE key = ? LIMIT 1",
+            (EMAIL_VALIDATION_REGISTRY_BACKFILL_SETTING,),
+        ).fetchone()
+        if already and not force:
+            return {"ok": True, "skipped": "already_backfilled", "at": already["value"]}
+    except Exception:
+        if not force:
+            return {"ok": False, "error": "app_settings_unavailable"}
+    try:
+        limit = max(1, min(500000, int(limit or 200000)))
+    except Exception:
+        limit = 200000
+    rows = db.execute(
+        """
+        SELECT q.id, q.touchpoint_id, q.person_id, q.email_value, q.source, q.queue_status,
+               q.validation_status, q.validation_raw, q.attempts, q.run_after, q.processed_at, q.created_at,
+               t.value AS touchpoint_value
+        FROM email_validation_queue q
+        LEFT JOIN touchpoints t ON t.id = q.touchpoint_id
+        WHERE COALESCE(q.email_value, '') <> ''
+           OR COALESCE(t.value, '') <> ''
+        ORDER BY q.id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    registry_created = 0
+    registry_updated = 0
+    attached = 0
+    for row in rows:
+        normalized_email = normalize_email_identity(row["touchpoint_value"] or row["email_value"] or "")
+        if not normalized_email:
+            continue
+        queue_status, validation_status = _email_validation_registry_backfill_state(row)
+        raw = _email_validation_registry_backfill_payload(row, validation_status)
+        source = str(row["source"] or "email_validation_queue_backfill").strip() or "email_validation_queue_backfill"
+        existing = _email_validation_registry_row(db, normalized_email)
+        if not existing:
+            db.execute(
+                """
+                INSERT INTO email_validation_registry (
+                    normalized_email, provider, queue_status, validation_status, provider_status, validation_raw,
+                    attempts, first_source, last_source, first_touchpoint_id, last_touchpoint_id,
+                    run_after, requested_at, processed_at, created_at, updated_at
+                )
+                VALUES (?, 'emaillistverify', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                (
+                    normalized_email,
+                    queue_status,
+                    validation_status,
+                    validation_status,
+                    raw,
+                    int(row["attempts"] or 0),
+                    source,
+                    source,
+                    int(row["touchpoint_id"] or 0),
+                    int(row["touchpoint_id"] or 0),
+                    row["run_after"] or row["created_at"] or format_db_time(datetime.utcnow()),
+                    row["created_at"] or None,
+                    row["processed_at"] if queue_status == "Completed" else None,
+                ),
+            )
+            registry_created += 1
+            existing = _email_validation_registry_row(db, normalized_email)
+        else:
+            existing_status = str(existing["queue_status"] or "").strip().lower()
+            should_promote = (
+                queue_status == "Completed" and existing_status != "completed"
+            ) or (
+                queue_status == "Completed"
+                and existing_status == "completed"
+                and str(row["processed_at"] or "") > str(existing["processed_at"] or "")
+            )
+            if should_promote:
+                db.execute(
+                    """
+                    UPDATE email_validation_registry
+                    SET queue_status = 'Completed',
+                        validation_status = ?,
+                        provider_status = ?,
+                        validation_raw = ?,
+                        attempts = MAX(COALESCE(attempts, 0), ?),
+                        processed_at = ?,
+                        last_source = ?,
+                        last_touchpoint_id = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        validation_status,
+                        validation_status,
+                        raw,
+                        int(row["attempts"] or 0),
+                        row["processed_at"] or format_db_time(datetime.utcnow()),
+                        source,
+                        int(row["touchpoint_id"] or 0),
+                        int(existing["id"] or 0),
+                    ),
+                )
+                registry_updated += 1
+                existing = _email_validation_registry_row(db, normalized_email)
+        if existing and int(row["touchpoint_id"] or 0) > 0:
+            _attach_email_validation_touchpoint(
+                db,
+                int(existing["id"] or 0),
+                int(row["touchpoint_id"] or 0),
+                row["person_id"],
+                source,
+            )
+            attached += 1
+    stamp = format_db_time(datetime.utcnow())
+    db.execute(
+        """
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at
+        """,
+        (EMAIL_VALIDATION_REGISTRY_BACKFILL_SETTING, stamp),
+    )
+    return {"ok": True, "created": registry_created, "updated": registry_updated, "attached": attached, "at": stamp}
 
 
 EMAILOCTOPUS_CATEGORY_TAGS = ["foreclosure", "sheriff sale", "probate", "general"]
@@ -15858,6 +16566,22 @@ def _email_campaign_sync_unsubscribed(status):
 
 def is_strict_new_record_status(value):
     return _normalize_reisift_status(value) in {"new record", "new records"}
+
+
+def is_deep_prospecting_status(value):
+    return _normalize_reisift_status(value) == _normalize_reisift_status(REISIFT_DEEP_PROSPECTING_STATUS)
+
+
+def reisift_prospect_segment_for_status(value):
+    if is_strict_new_record_status(value):
+        return REISIFT_NEW_RECORDS_SEGMENT
+    if is_deep_prospecting_status(value):
+        return REISIFT_DEEP_PROSPECTING_SEGMENT
+    return ""
+
+
+def reisift_prospect_segment_label(segment):
+    return REISIFT_PROSPECT_SEGMENT_LABELS.get(str(segment or "").strip(), "New Records")
 
 
 def _property_email_identities(db, property_id):
@@ -16111,6 +16835,8 @@ def _email_campaign_tags(source):
     tags = ["DeepSift Verified Email"]
     if "reisift_new_record" in source_key or "new_record" in source_key:
         tags.append("ReiSIFT New Records")
+    if "deep_prospecting" in source_key or "deep prospecting" in source_key:
+        tags.append("ReiSIFT Deep Prospecting")
     if "skiptrace" in source_key or "skipsherpa" in source_key:
         tags.append("SkipTrace")
     if "submitted" in source_key or "lead" in source_key:
@@ -16759,7 +17485,7 @@ def sync_validated_email_to_emailoctopus(
         if property_id:
             prop = db.execute("SELECT status FROM properties WHERE id = ?", (int(property_id),)).fetchone()
             target_status = prop["status"] if prop else ""
-        if not is_strict_new_record_status(target_status):
+        if not reisift_prospect_segment_for_status(target_status):
             return {"ok": True, "skipped": "already_unsubscribed", "email": normalized_email}
 
     settings = get_anonymous_email_marketing_settings(db)
@@ -22127,7 +22853,7 @@ def run_untitled_leads_snapshot_once():
                 snapshot_id,
             ),
         )
-        db.commit()
+        commit_with_retry(db)
         new_records_sync = {}
         try:
             new_records_sync = sync_existing_untitled_new_record_properties(db)
@@ -30119,6 +30845,10 @@ def build_reisift_new_records_search_query():
     return {"must": must_query}
 
 
+def build_reisift_deep_prospecting_search_query():
+    return {"must": {"any_property_status": [REISIFT_DEEP_PROSPECTING_STATUS]}}
+
+
 def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering="-list_count"):
     if not isinstance(query, dict) or not query:
         return [], 0
@@ -32428,7 +33158,7 @@ REISIFT_NEW_RECORD_TOUCHPOINT_SOURCE = "ReiSift New Records refresh"
 SMS_AUTOMATION_INITIAL_VARIATIONS_SETTING = "sms_automation_initial_message_variants_json"
 SMS_AUTOMATION_FOLLOWUP_VARIATIONS_SETTING = "sms_automation_followup_message_variants_json"
 
-SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES = {"new record", "new records"}
+SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES = {"new record", "new records", "deep prospecting"}
 
 
 def _sms_bucket_from_payload(payload):
@@ -32935,7 +33665,7 @@ def sms_automation_property_suppression_reason(db, property_id):
         return "Property no longer exists locally."
     status = _normalize_reisift_status(prop["status"] or "")
     if status not in SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES:
-        return f"Property status is '{prop['status'] or '-'}', not New Record."
+        return f"Property status is '{prop['status'] or '-'}', not an eligible prospecting status."
     new_record_state = db.execute(
         """
         SELECT
@@ -32947,7 +33677,7 @@ def sms_automation_property_suppression_reason(db, property_id):
         (int(property_id or 0),),
     ).fetchone()
     if int((new_record_state["total_rows"] if new_record_state else 0) or 0) > 0 and int((new_record_state["active_rows"] if new_record_state else 0) or 0) <= 0:
-        return "Property is no longer active in the ReiSIFT New Records refresh."
+        return "Property is no longer active in the ReiSIFT prospect refresh."
     return ""
 
 
@@ -34170,9 +34900,20 @@ def sync_local_property_status_from_reisift_new_record(db, property_uuid, payloa
     return {"local_property_id": local_property_id, "before": before, "after": after, "emailoctopus_unsubscribe": unsubscribe_result}
 
 
-def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_active=1, sift_rollup=None):
+def upsert_reisift_new_record(
+    db,
+    property_uuid,
+    payload,
+    search_row=None,
+    is_active=1,
+    sift_rollup=None,
+    segment=REISIFT_NEW_RECORDS_SEGMENT,
+    force_automation_eligible=False,
+):
     payload = payload if isinstance(payload, dict) else {}
     search_row = search_row if isinstance(search_row, dict) else {}
+    segment = str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip() or REISIFT_NEW_RECORDS_SEGMENT
+    segment_label = reisift_prospect_segment_label(segment)
     existing_new_record = db.execute(
         """
         SELECT outbound_calls, inbound_calls, outbound_sms, inbound_sms,
@@ -34215,9 +34956,15 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
         str(payload.get("updated") or payload.get("updated_at") or payload.get("owner_updated") or "").strip()
         or str(search_row.get("updated") or search_row.get("updated_at") or search_row.get("owner_updated") or "").strip()
     )
-    automation_eligible, automation_hold_reason = reisift_new_record_automation_gate(cached_fields["added_at"])
-    contact_source_label = "ReiSift New Records refresh" if automation_eligible else "ReiSift New Records backfill refresh"
-    email_validation_source = "reisift_new_record" if automation_eligible else "reisift_new_record_backfill"
+    if force_automation_eligible or segment == REISIFT_DEEP_PROSPECTING_SEGMENT:
+        automation_eligible, automation_hold_reason = True, ""
+    else:
+        automation_eligible, automation_hold_reason = reisift_new_record_automation_gate(cached_fields["added_at"])
+    contact_source_label = f"ReiSift {segment_label} refresh" if automation_eligible else f"ReiSift {segment_label} backfill refresh"
+    if segment == REISIFT_DEEP_PROSPECTING_SEGMENT:
+        email_validation_source = "reisift_deep_prospecting"
+    else:
+        email_validation_source = "reisift_new_record" if automation_eligible else "reisift_new_record_backfill"
     first_seen_at = (
         str(existing_new_record["first_seen_at"] if existing_new_record else "").strip()
         or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -34261,7 +35008,7 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
         db,
         """
         INSERT INTO reisift_new_records
-            (property_uuid, status, full_address, owner_names, county, city, completeness, owner_type, owner_out_of_state,
+            (property_uuid, segment, status, full_address, owner_names, county, city, completeness, owner_type, owner_out_of_state,
              added_at, reisift_updated_at,
              local_property_id, local_status_before, local_status_after,
              outbound_calls, inbound_calls, outbound_sms, inbound_sms, outbound_email, inbound_email,
@@ -34269,8 +35016,9 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
              rei_skipped, deep_skipped, no_good_numbers,
              first_seen_at, automation_eligible, automation_hold_reason,
              payload_json, is_active, last_synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(property_uuid) DO UPDATE SET
+            segment = excluded.segment,
             status = excluded.status,
             full_address = excluded.full_address,
             owner_names = excluded.owner_names,
@@ -34305,6 +35053,7 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
         """,
         (
             property_uuid,
+            segment,
             summary["status"],
             summary["full_address"],
             summary["owner_names"],
@@ -34345,20 +35094,32 @@ def upsert_reisift_new_record(db, property_uuid, payload, search_row=None, is_ac
     local_sync["automation_eligible"] = automation_eligible
     local_sync["automation_hold_reason"] = automation_hold_reason
     local_sync["email_validation_source"] = email_validation_source
+    local_sync["segment"] = segment
     return local_sync
 
 
-def refresh_reisift_new_records_cache(db):
+def refresh_reisift_prospect_segment_cache(
+    db,
+    *,
+    segment=REISIFT_NEW_RECORDS_SEGMENT,
+    status_slug=REISIFT_NEW_RECORDS_STATUS,
+    search_query=None,
+    max_rows=None,
+    force_automation_eligible=False,
+    last_refresh_setting="reisift_new_records_last_refresh_at",
+):
     token = reisift_get_access_token()
-    status_slug = REISIFT_NEW_RECORDS_STATUS
-    search_query = build_reisift_new_records_search_query()
+    segment = str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip() or REISIFT_NEW_RECORDS_SEGMENT
+    segment_label = reisift_prospect_segment_label(segment)
+    search_query = search_query if isinstance(search_query, dict) and search_query else build_reisift_new_records_search_query()
+    max_rows = int(max_rows or REISIFT_NEW_RECORDS_MAX_ROWS)
     errors = []
     search_failed = False
     try:
         rows, total = reisift_search_property_rows_by_query(
             token,
             search_query,
-            max_rows=REISIFT_NEW_RECORDS_MAX_ROWS,
+            max_rows=max_rows,
         )
     except Exception as exc:
         rows, total = [], 0
@@ -34371,10 +35132,17 @@ def refresh_reisift_new_records_cache(db):
             SELECT property_uuid, local_property_id, status
             FROM reisift_new_records
             WHERE COALESCE(is_active, 1) = 1
+              AND COALESCE(segment, 'new_records') = ?
               AND COALESCE(property_uuid, '') <> ''
             """
+            ,
+            (segment,),
         ).fetchall()
-        execute_with_retry(db, "UPDATE reisift_new_records SET is_active = 0")
+        execute_with_retry(
+            db,
+            "UPDATE reisift_new_records SET is_active = 0 WHERE COALESCE(segment, 'new_records') = ?",
+            (segment,),
+        )
     scanned = 0
     synced = 0
     skipped_county = 0
@@ -34414,6 +35182,8 @@ def refresh_reisift_new_records_cache(db):
                 search_row=row,
                 is_active=1,
                 sift_rollup=sift_rollup,
+                segment=segment,
+                force_automation_eligible=force_automation_eligible,
             )
             if local_sync.get("local_property_id") and local_sync.get("before") != local_sync.get("after"):
                 local_updates += 1
@@ -34468,15 +35238,17 @@ def refresh_reisift_new_records_cache(db):
         sms_queue = generate_sms_automation_queue_for_new_records(db, token=token)
     except Exception as exc:
         errors.append(f"sms_queue: {exc}")
-    set_setting(db, "reisift_new_records_last_refresh_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    set_setting(db, last_refresh_setting, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
     commit_with_retry(db)
     return {
+        "segment": segment,
+        "segment_label": segment_label,
         "status_slug": status_slug,
         "target_counties": [],
         "target_list_ids": len(REISIFT_NEW_RECORDS_LIST_IDS),
         "target_zip5": len(REISIFT_NEW_RECORDS_ZIP5),
         "excluded_statuses": list(REISIFT_NEW_RECORDS_EXCLUDED_STATUSES),
-        "max_rows": REISIFT_NEW_RECORDS_MAX_ROWS,
+        "max_rows": max_rows,
         "total": total,
         "scanned": scanned,
         "synced": synced,
@@ -34496,6 +35268,30 @@ def refresh_reisift_new_records_cache(db):
         "log_rollup_enabled": REISIFT_NEW_RECORDS_LOG_ROLLUP_ENABLED,
         "errors": errors,
     }
+
+
+def refresh_reisift_new_records_cache(db):
+    return refresh_reisift_prospect_segment_cache(
+        db,
+        segment=REISIFT_NEW_RECORDS_SEGMENT,
+        status_slug=REISIFT_NEW_RECORDS_STATUS,
+        search_query=build_reisift_new_records_search_query(),
+        max_rows=REISIFT_NEW_RECORDS_MAX_ROWS,
+        force_automation_eligible=False,
+        last_refresh_setting="reisift_new_records_last_refresh_at",
+    )
+
+
+def refresh_reisift_deep_prospecting_cache(db):
+    return refresh_reisift_prospect_segment_cache(
+        db,
+        segment=REISIFT_DEEP_PROSPECTING_SEGMENT,
+        status_slug=REISIFT_DEEP_PROSPECTING_STATUS,
+        search_query=build_reisift_deep_prospecting_search_query(),
+        max_rows=REISIFT_NEW_RECORDS_MAX_ROWS,
+        force_automation_eligible=True,
+        last_refresh_setting="reisift_deep_prospecting_last_refresh_at",
+    )
 
 
 def set_reisift_new_records_refresh_state(db, status, message="", result=None):
@@ -34581,6 +35377,101 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
     starter_db = open_sqlite_connection()
     try:
         state = set_reisift_new_records_refresh_state(
+            starter_db,
+            "running",
+            f"Refresh started ({triggered_by}).",
+        )
+        starter_db.commit()
+    finally:
+        starter_db.close()
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return {"ok": True, "started": True, "running": True, "state": state}
+
+
+def set_reisift_deep_prospecting_refresh_state(db, status, message="", result=None):
+    payload = {
+        "status": str(status or "").strip() or "unknown",
+        "message": str(message or "").strip(),
+        "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "result": result if isinstance(result, dict) else {},
+    }
+    set_setting(db, "reisift_deep_prospecting_refresh_state_json", json.dumps(payload))
+    return payload
+
+
+def get_reisift_deep_prospecting_refresh_state(db):
+    raw = get_setting(db, "reisift_deep_prospecting_refresh_state_json", "")
+    data = parse_json_object(raw or "{}", default={})
+    if not isinstance(data, dict) or not data:
+        return {"status": "idle", "message": "", "updated_at": "", "result": {}}
+    status = str(data.get("status") or "idle").strip() or "idle"
+    if status == "running" and not REISIFT_DEEP_PROSPECTING_REFRESH_LOCK.locked():
+        return {
+            "status": "idle",
+            "message": "",
+            "updated_at": str(data.get("updated_at") or "").strip(),
+            "result": data.get("result") if isinstance(data.get("result"), dict) else {},
+        }
+    return {
+        "status": status,
+        "message": str(data.get("message") or "").strip(),
+        "updated_at": str(data.get("updated_at") or "").strip(),
+        "result": data.get("result") if isinstance(data.get("result"), dict) else {},
+    }
+
+
+def start_reisift_deep_prospecting_refresh_job(triggered_by="manual"):
+    if not REISIFT_DEEP_PROSPECTING_REFRESH_LOCK.acquire(blocking=False):
+        db = open_sqlite_connection()
+        try:
+            state = get_reisift_deep_prospecting_refresh_state(db)
+            if state.get("status") != "running":
+                state = set_reisift_deep_prospecting_refresh_state(db, "running", "Refresh already in progress.")
+                db.commit()
+            return {"ok": True, "started": False, "running": True, "state": state}
+        finally:
+            db.close()
+
+    def worker():
+        db = open_sqlite_connection()
+        try:
+            set_reisift_deep_prospecting_refresh_state(db, "running", "Refreshing Deep Prospecting from ReiSift...")
+            db.commit()
+            result = refresh_reisift_deep_prospecting_cache(db)
+            message = (
+                f"Cached {result.get('synced', 0)} row(s) from {result.get('scanned', 0)} scanned; "
+                f"created/imported {result.get('local_imports', 0)} local record(s); "
+                f"updated {result.get('local_updates', 0)} local status value(s); "
+                f"SMS drafts created {((result.get('sms_queue') or {}).get('created', 0))}, "
+                f"suppressed {((result.get('sms_queue') or {}).get('suppressed', 0))}."
+            )
+            if result.get("search_failed"):
+                message = "ReiSift search is temporarily unavailable; existing cache was preserved. " + message
+            elif result.get("errors"):
+                message += f" Warnings: {len(result.get('errors') or [])}."
+            set_reisift_deep_prospecting_refresh_state(db, "complete", message, result=result)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            log_app_error(
+                db,
+                source="reisift_deep_prospecting_refresh_job",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="start_reisift_deep_prospecting_refresh_job",
+                status_code=500,
+            )
+            state = set_reisift_deep_prospecting_refresh_state(db, "error", str(exc), result={"error": str(exc)})
+            db.commit()
+            return state
+        finally:
+            db.close()
+            REISIFT_DEEP_PROSPECTING_REFRESH_LOCK.release()
+
+    starter_db = open_sqlite_connection()
+    try:
+        state = set_reisift_deep_prospecting_refresh_state(
             starter_db,
             "running",
             f"Refresh started ({triggered_by}).",
@@ -35067,7 +35958,8 @@ def _new_record_matches_filters(row, filters):
     return True
 
 
-def get_new_record_filter_options(db):
+def get_new_record_filter_options(db, segment=REISIFT_NEW_RECORDS_SEGMENT):
+    segment = str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip() or REISIFT_NEW_RECORDS_SEGMENT
     rows = db.execute(
         """
         SELECT n.status,
@@ -35077,7 +35969,10 @@ def get_new_record_filter_options(db):
                n.owner_type
         FROM reisift_new_records n
         WHERE n.is_active = 1
+          AND COALESCE(n.segment, 'new_records') = ?
         """
+        ,
+        (segment,),
     ).fetchall()
     statuses = sorted({normalize_whitespace(row["status"] or "") for row in rows if normalize_whitespace(row["status"] or "")})
     counties = sorted({display_county_name(row["county"] or "") for row in rows if display_county_name(row["county"] or "")})
@@ -35090,9 +35985,12 @@ def get_new_record_filter_options(db):
         FROM reisift_new_record_lists l
         JOIN reisift_new_records n ON n.property_uuid = l.property_uuid
         WHERE n.is_active = 1
+          AND COALESCE(n.segment, 'new_records') = ?
           AND COALESCE(l.list_name, '') <> ''
         ORDER BY l.list_name COLLATE NOCASE ASC
         """
+        ,
+        (segment,),
     ).fetchall()
     lists = [row["list_name"] for row in list_rows]
     return {"statuses": statuses, "counties": counties, "cities": cities, "completeness": completeness, "owner_types": owner_types, "lists": lists}
@@ -35477,10 +36375,11 @@ def bulk_new_record_local_contact_flags(db, property_ids):
     return defaults
 
 
-def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=None):
+def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=None, segment=REISIFT_NEW_RECORDS_SEGMENT):
     filters = filters if isinstance(filters, dict) else {}
-    clauses = ["n.is_active = 1"]
-    params = []
+    segment = str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip() or REISIFT_NEW_RECORDS_SEGMENT
+    clauses = ["n.is_active = 1", "COALESCE(n.segment, 'new_records') = ?"]
+    params = [segment]
     date_from = _parse_iso_date_only(filters.get("date_from") or "")
     date_to = _parse_iso_date_only(filters.get("date_to") or "")
     if date_from:
@@ -35550,6 +36449,7 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
     except Exception:
         clean_limit = 0
     order_dir = "ASC" if str(sort_dir).lower() == "asc" else "DESC"
+    local_status_target = "deep prospecting" if segment == REISIFT_DEEP_PROSPECTING_SEGMENT else "new records"
     total_count = int(
         (
             db.execute(
@@ -35570,13 +36470,13 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
         SELECT COALESCE(NULLIF(n.county, ''), 'Unknown') AS county,
                COUNT(*) AS count,
                SUM(CASE WHEN p.id IS NOT NULL THEN 1 ELSE 0 END) AS local_match_count,
-               SUM(CASE WHEN lower(trim(COALESCE(p.status, ''))) = 'new records' THEN 1 ELSE 0 END) AS local_update_count
+               SUM(CASE WHEN lower(trim(COALESCE(p.status, ''))) = ? THEN 1 ELSE 0 END) AS local_update_count
         FROM reisift_new_records n
         LEFT JOIN properties p ON p.id = n.local_property_id
         {where_sql}
         GROUP BY COALESCE(NULLIF(n.county, ''), 'Unknown')
         """,
-        tuple(params),
+        tuple([local_status_target] + params),
     ).fetchall()
     page_sql = f"""
         SELECT n.*,
@@ -36115,6 +37015,7 @@ def _ensure_reisift_owner_address(db, person_id, owner, property_address, source
 
 def ensure_local_property_for_new_record_payload(db, property_uuid, payload, source="ReiSift New Records", email_validation_source="reisift_new_record"):
     payload = payload if isinstance(payload, dict) else {}
+    source_label = normalize_whitespace(source or "") or "ReiSift New Records"
     property_uuid = normalize_uuid(property_uuid or payload.get("uuid") or "")
     if not property_uuid:
         return {"property_id": None, "created": False, "skipped": True, "reason": "missing_property_uuid"}
@@ -36203,8 +37104,8 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
         add_person_note(
             db,
             person_id,
-            "ReiSift New Records",
-            f"Imported from ReiSift New Records refresh for {format_property_address_line(address.get('street'), address.get('city'), address.get('state'), address.get('postal_code')) or property_uuid}.",
+            source_label,
+            f"Imported from {source_label} for {format_property_address_line(address.get('street'), address.get('city'), address.get('state'), address.get('postal_code')) or property_uuid}.",
             {
                 "property_uuid": property_uuid,
                 "owner_uuid": normalize_uuid(owner.get("uuid") or ""),
@@ -36214,7 +37115,7 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
             },
         )
 
-    note_bits = [f"ReiSift New Records local import on {now_text}."]
+    note_bits = [f"{source_label} local import on {now_text}."]
     if lists_text:
         note_bits.append(f"Lists: {lists_text}.")
     if tags:
@@ -36232,7 +37133,7 @@ def ensure_local_property_for_new_record_payload(db, property_uuid, payload, sou
         (
             property_id,
             owner_person_ids[0] if owner_person_ids else None,
-            "ReiSift New Records",
+            source_label,
             "Local property imported",
             json.dumps(
                 {
@@ -42313,20 +43214,26 @@ def new_records_page():
     page = max(1, _safe_int(request.args.get("page"), 1))
     per_page = max(25, min(500, _safe_int(request.args.get("per_page"), 200)))
     offset = (page - 1) * per_page
-    record_result = get_cached_new_records(db, sort_dir=sort_order, filters=filters, offset=offset, limit=per_page)
+    record_result = get_cached_new_records(db, sort_dir=sort_order, filters=filters, offset=offset, limit=per_page, segment=REISIFT_NEW_RECORDS_SEGMENT)
     rows = record_result["rows"]
     filtered_count = int(record_result["total_count"] or 0)
     total_pages = max(1, math.ceil(filtered_count / per_page)) if filtered_count else 1
     if page > total_pages:
         page = total_pages
         offset = (page - 1) * per_page
-        record_result = get_cached_new_records(db, sort_dir=sort_order, filters=filters, offset=offset, limit=per_page)
+        record_result = get_cached_new_records(db, sort_dir=sort_order, filters=filters, offset=offset, limit=per_page, segment=REISIFT_NEW_RECORDS_SEGMENT)
         rows = record_result["rows"]
         filtered_count = int(record_result["total_count"] or 0)
     summary_counts = record_result.get("summary_counts") or {}
-    filter_options = get_new_record_filter_options(db)
+    filter_options = get_new_record_filter_options(db, segment=REISIFT_NEW_RECORDS_SEGMENT)
     total_active_count = int(
-        (db.execute("SELECT COUNT(*) AS count FROM reisift_new_records WHERE COALESCE(is_active, 1) = 1").fetchone() or {"count": 0})["count"]
+        (
+            db.execute(
+                "SELECT COUNT(*) AS count FROM reisift_new_records WHERE COALESCE(is_active, 1) = 1 AND COALESCE(segment, 'new_records') = ?",
+                (REISIFT_NEW_RECORDS_SEGMENT,),
+            ).fetchone()
+            or {"count": 0}
+        )["count"]
         or 0
     )
     county_counts = summary_counts.get("county_counts") or {}
@@ -42343,6 +43250,17 @@ def new_records_page():
     return render_template(
         "new_records.html",
         rows=rows,
+        page_endpoint="new_records_page",
+        refresh_endpoint="new_records_refresh",
+        refresh_status_url="/api/new-records/refresh-status",
+        refresh_cache_url="/api/new-records/refresh-cache",
+        page_title="New Records (ReiSift)",
+        segment_label="New Records",
+        requires_phone_label="Yes",
+        reisift_filter_summary=f"{len(REISIFT_NEW_RECORDS_LIST_IDS)} lists / {len(REISIFT_NEW_RECORDS_ZIP5)} zips",
+        refresh_button_label="Refresh New Records",
+        busy_message="Refreshing New Records from ReiSift...",
+        empty_message="No New Records matched these filters. Click Refresh New Records or clear the filters.",
         notice=notice,
         error=error,
         sort_order=sort_order,
@@ -42369,6 +43287,131 @@ def new_records_page():
             "next_url": _new_records_page_url(page + 1) if page < total_pages else "",
             "first_url": _new_records_page_url(1),
             "last_url": _new_records_page_url(total_pages),
+        },
+        summary={
+            "record_count": filtered_count,
+            "page_count": len(rows),
+            "total_active_count": total_active_count,
+            "local_match_count": local_match_count,
+            "local_update_count": local_update_count,
+            "county_counts": county_counts,
+        },
+    )
+
+
+@app.route("/deep-prospecting")
+def deep_prospecting_page():
+    ensure_db()
+    db = get_db()
+    sort_order = (request.args.get("sort") or "desc").strip().lower()
+    if sort_order not in {"asc", "desc"}:
+        sort_order = "desc"
+    filters = {
+        "date_from": (request.args.get("date_from") or "").strip(),
+        "date_to": (request.args.get("date_to") or "").strip(),
+        "status": (request.args.get("status") or "").strip(),
+        "county": (request.args.get("county") or "").strip(),
+        "city": (request.args.get("city") or "").strip(),
+        "lists": [normalize_whitespace(item) for item in request.args.getlist("lists") if normalize_whitespace(item)],
+        "completeness": (request.args.get("completeness") or "").strip(),
+        "owner_type": (request.args.get("owner_type") or "").strip(),
+        "owner_out_of_state": (request.args.get("owner_out_of_state") or "").strip(),
+        "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
+        "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
+        "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),
+    }
+    notice = (request.args.get("notice") or "").strip()
+    error = (request.args.get("error") or "").strip()
+    page = max(1, _safe_int(request.args.get("page"), 1))
+    per_page = max(25, min(500, _safe_int(request.args.get("per_page"), 200)))
+    offset = (page - 1) * per_page
+    record_result = get_cached_new_records(
+        db,
+        sort_dir=sort_order,
+        filters=filters,
+        offset=offset,
+        limit=per_page,
+        segment=REISIFT_DEEP_PROSPECTING_SEGMENT,
+    )
+    rows = record_result["rows"]
+    filtered_count = int(record_result["total_count"] or 0)
+    total_pages = max(1, math.ceil(filtered_count / per_page)) if filtered_count else 1
+    if page > total_pages:
+        page = total_pages
+        offset = (page - 1) * per_page
+        record_result = get_cached_new_records(
+            db,
+            sort_dir=sort_order,
+            filters=filters,
+            offset=offset,
+            limit=per_page,
+            segment=REISIFT_DEEP_PROSPECTING_SEGMENT,
+        )
+        rows = record_result["rows"]
+        filtered_count = int(record_result["total_count"] or 0)
+    summary_counts = record_result.get("summary_counts") or {}
+    filter_options = get_new_record_filter_options(db, segment=REISIFT_DEEP_PROSPECTING_SEGMENT)
+    total_active_count = int(
+        (
+            db.execute(
+                "SELECT COUNT(*) AS count FROM reisift_new_records WHERE COALESCE(is_active, 1) = 1 AND COALESCE(segment, 'new_records') = ?",
+                (REISIFT_DEEP_PROSPECTING_SEGMENT,),
+            ).fetchone()
+            or {"count": 0}
+        )["count"]
+        or 0
+    )
+    county_counts = summary_counts.get("county_counts") or {}
+    local_match_count = int(summary_counts.get("local_match_count") or 0)
+    local_update_count = int(summary_counts.get("local_update_count") or 0)
+    base_page_args = request.args.to_dict(flat=False)
+
+    def _deep_prospecting_page_url(target_page):
+        args = {key: list(value) for key, value in base_page_args.items() if key != "refresh"}
+        args["page"] = [str(max(1, int(target_page or 1)))]
+        args["per_page"] = [str(per_page)]
+        return url_for("deep_prospecting_page") + ("?" + urlencode(args, doseq=True) if args else "")
+
+    return render_template(
+        "new_records.html",
+        rows=rows,
+        page_endpoint="deep_prospecting_page",
+        refresh_endpoint="deep_prospecting_refresh",
+        refresh_status_url="/api/deep-prospecting/refresh-status",
+        refresh_cache_url="/api/deep-prospecting/refresh-cache",
+        page_title="Deep Prospecting (ReiSift)",
+        segment_label="Deep Prospecting",
+        requires_phone_label="No",
+        reisift_filter_summary="Status: Deep Prospecting",
+        refresh_button_label="Refresh Deep Prospecting",
+        busy_message="Refreshing Deep Prospecting from ReiSift...",
+        empty_message="No Deep Prospecting records matched these filters. Click Refresh Deep Prospecting or clear the filters.",
+        notice=notice,
+        error=error,
+        sort_order=sort_order,
+        filters=filters,
+        filter_options=filter_options,
+        auto_refresh=(request.args.get("refresh") or "0") == "1",
+        status_slug=REISIFT_DEEP_PROSPECTING_STATUS,
+        target_list_ids_count=None,
+        target_zip5_count=None,
+        excluded_statuses_count=0,
+        last_refresh_at=get_setting(db, "reisift_deep_prospecting_last_refresh_at", ""),
+        refresh_state=get_reisift_deep_prospecting_refresh_state(db),
+        pagination={
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "total_count": filtered_count,
+            "page_count": len(rows),
+            "start": offset + 1 if rows else 0,
+            "end": offset + len(rows) if rows else 0,
+            "has_prev": page > 1,
+            "has_next": page < total_pages,
+            "prev_url": _deep_prospecting_page_url(page - 1) if page > 1 else "",
+            "next_url": _deep_prospecting_page_url(page + 1) if page < total_pages else "",
+            "first_url": _deep_prospecting_page_url(1),
+            "last_url": _deep_prospecting_page_url(total_pages),
         },
         summary={
             "record_count": filtered_count,
@@ -42416,6 +43459,41 @@ def new_records_refresh():
         return redirect(url_for("new_records_page", error=f"Refresh failed: {exc}", **redirect_args))
 
 
+@app.route("/deep-prospecting/refresh", methods=["POST"])
+def deep_prospecting_refresh():
+    ensure_db()
+    db = get_db()
+    sort_order = (request.form.get("sort") or request.args.get("sort") or "desc").strip().lower()
+    if sort_order not in {"asc", "desc"}:
+        sort_order = "desc"
+    redirect_args = {
+        "sort": sort_order,
+        "date_from": (request.form.get("date_from") or request.args.get("date_from") or "").strip(),
+        "date_to": (request.form.get("date_to") or request.args.get("date_to") or "").strip(),
+        "status": (request.form.get("status") or request.args.get("status") or "").strip(),
+        "county": (request.form.get("county") or request.args.get("county") or "").strip(),
+        "city": (request.form.get("city") or request.args.get("city") or "").strip(),
+        "lists": [normalize_whitespace(item) for item in (request.form.getlist("lists") or request.args.getlist("lists")) if normalize_whitespace(item)],
+        "completeness": (request.form.get("completeness") or request.args.get("completeness") or "").strip(),
+        "owner_type": (request.form.get("owner_type") or request.args.get("owner_type") or "").strip(),
+        "owner_out_of_state": (request.form.get("owner_out_of_state") or request.args.get("owner_out_of_state") or "").strip(),
+        "rei_skipped": (request.form.get("rei_skipped") or request.args.get("rei_skipped") or "").strip(),
+        "deep_skipped": (request.form.get("deep_skipped") or request.args.get("deep_skipped") or "").strip(),
+        "no_good_numbers": (request.form.get("no_good_numbers") or request.args.get("no_good_numbers") or "").strip(),
+        "page": (request.form.get("page") or request.args.get("page") or "1").strip(),
+        "per_page": (request.form.get("per_page") or request.args.get("per_page") or "200").strip(),
+    }
+    try:
+        data = start_reisift_deep_prospecting_refresh_job(triggered_by="manual_button")
+        notice = "Deep Prospecting refresh started. This page will update when the ReiSift pull finishes."
+        if not data.get("started"):
+            notice = "Deep Prospecting refresh is already running. This page will update when it finishes."
+        return redirect(url_for("deep_prospecting_page", notice=notice, refresh=1, **redirect_args))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("deep_prospecting_page", error=f"Refresh failed: {exc}", **redirect_args))
+
+
 @app.route("/api/new-records/refresh-cache", methods=["POST"])
 def new_records_refresh_cache_api():
     ensure_db()
@@ -42433,6 +43511,25 @@ def new_records_refresh_status_api():
     ensure_db()
     db = get_db()
     return jsonify({"ok": True, "state": get_reisift_new_records_refresh_state(db)})
+
+
+@app.route("/api/deep-prospecting/refresh-cache", methods=["POST"])
+def deep_prospecting_refresh_cache_api():
+    ensure_db()
+    db = get_db()
+    try:
+        result = start_reisift_deep_prospecting_refresh_job(triggered_by="api")
+        return jsonify({"ok": True, **result})
+    except Exception as exc:
+        db.rollback()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/deep-prospecting/refresh-status", methods=["GET"])
+def deep_prospecting_refresh_status_api():
+    ensure_db()
+    db = get_db()
+    return jsonify({"ok": True, "state": get_reisift_deep_prospecting_refresh_state(db)})
 
 
 def _sms_automation_today_window_utc():
@@ -53842,7 +54939,8 @@ def classify_reisift_webhook_status_change(payload, event_type, property_uuid):
                     "result": {"ignored_reason": "missing_property_status", "property_uuid": property_uuid},
                 },
             }
-    if is_strict_new_record_status(new_status):
+    segment = reisift_prospect_segment_for_status(new_status)
+    if segment == REISIFT_NEW_RECORDS_SEGMENT:
         return {
             "should_process": False,
             "processing": {
@@ -53856,12 +54954,133 @@ def classify_reisift_webhook_status_change(payload, event_type, property_uuid):
                 },
             },
         }
+    if segment == REISIFT_DEEP_PROSPECTING_SEGMENT:
+        return {
+            "should_process": True,
+            "action": "enter_segment",
+            "segment": segment,
+            "property_uuid": property_uuid,
+            "new_status": new_status,
+            "property_payload": _extract_reisift_webhook_property_payload(payload),
+            "sequence": _extract_reisift_webhook_sequence_payload(payload),
+        }
     return {
         "should_process": True,
+        "action": "exit_segment",
         "property_uuid": property_uuid,
         "new_status": new_status,
         "property_payload": _extract_reisift_webhook_property_payload(payload),
         "sequence": _extract_reisift_webhook_sequence_payload(payload),
+    }
+
+
+def apply_reisift_prospect_segment_enter_core(db, event_id, context):
+    property_uuid = context["property_uuid"]
+    segment = context.get("segment") or REISIFT_DEEP_PROSPECTING_SEGMENT
+    new_status = context.get("new_status") or REISIFT_DEEP_PROSPECTING_STATUS
+    property_payload = context.get("property_payload") if isinstance(context.get("property_payload"), dict) else {}
+    token = ""
+    details = property_payload
+    errors = []
+    try:
+        token = reisift_get_access_token()
+        details = fetch_reisift_property_payload(token, property_uuid)
+    except Exception as exc:
+        errors.append(f"detail_fetch: {exc}")
+        details = property_payload
+    sift_rollup = None
+    if token and REISIFT_NEW_RECORDS_LOG_ROLLUP_ENABLED:
+        try:
+            sift_rollup = fetch_reisift_property_log_rollup(token, property_uuid, max_rows=120)
+        except Exception as exc:
+            errors.append(f"log_rollup: {exc}")
+    try:
+        sync_result = upsert_reisift_new_record(
+            db,
+            property_uuid,
+            details,
+            search_row=property_payload,
+            is_active=1,
+            sift_rollup=sift_rollup,
+            segment=segment,
+            force_automation_eligible=segment == REISIFT_DEEP_PROSPECTING_SEGMENT,
+        )
+    except Exception as exc:
+        return {
+            "processing_status": "error",
+            "property_id": None,
+            "error_text": str(exc),
+            "result": {
+                "action": "enter_segment",
+                "segment": segment,
+                "property_uuid": property_uuid,
+                "new_status": new_status,
+                "errors": errors,
+            },
+        }
+    property_id = int(sync_result.get("local_property_id") or 0)
+    if property_id <= 0:
+        return {
+            "processing_status": "unmatched",
+            "property_id": None,
+            "error_text": "local_property_not_found",
+            "result": {
+                "action": "enter_segment",
+                "segment": segment,
+                "property_uuid": property_uuid,
+                "new_status": new_status,
+                "sync": sync_result,
+                "errors": errors,
+            },
+        }
+    sms_queue = {"created": 0, "updated": 0, "skipped": 0, "suppressed": 0}
+    try:
+        sms_queue = generate_sms_automation_queue_for_new_records(db, token=token, property_ids=[property_id])
+    except Exception as exc:
+        errors.append(f"sms_queue: {exc}")
+    result = {
+        "action": "enter_segment",
+        "segment": segment,
+        "segment_label": reisift_prospect_segment_label(segment),
+        "property_uuid": property_uuid,
+        "property_id": property_id,
+        "new_status": new_status,
+        "local_status_before": sync_result.get("before") or "",
+        "local_status_after": sync_result.get("after") or new_status,
+        "sms_queue": sms_queue,
+        "sequence": context.get("sequence") or {},
+        "errors": errors,
+    }
+    try:
+        db.execute(
+            """
+            INSERT INTO activity_log (property_id, activity_type, outcome, note)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                property_id,
+                "ReiSIFT Webhook Status Change",
+                new_status,
+                json.dumps(
+                    {
+                        "event_id": event_id,
+                        "property_uuid": property_uuid,
+                        "action": "enter_segment",
+                        "segment": segment,
+                        "sms_queue": sms_queue,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            ),
+        )
+    except Exception:
+        pass
+    return {
+        "processing_status": "processed",
+        "property_id": property_id,
+        "error_text": "",
+        "result": result,
     }
 
 
@@ -53898,6 +55117,7 @@ def apply_reisift_new_record_exit_core(db, event_id, context):
     )
     sms_suppressed = revalidate_sms_automation_queue(db, property_ids=[property_id])
     result = {
+        "action": "exit_segment",
         "property_uuid": property_uuid,
         "property_id": property_id,
         "new_status": new_status,
@@ -53945,6 +55165,8 @@ def apply_reisift_new_record_exit_side_effects(db, core_processing, sync_source=
     result = core_processing.get("result") if isinstance(core_processing, dict) else {}
     if not isinstance(result, dict) or core_processing.get("processing_status") != "processed":
         return {}
+    if result.get("action") and result.get("action") != "exit_segment":
+        return {}
     property_id = int(result.get("property_id") or 0)
     if property_id <= 0:
         return {}
@@ -53963,6 +55185,8 @@ def process_reisift_webhook_event_core(db, event_id, payload, event_type, proper
     context = classify_reisift_webhook_status_change(payload, event_type, property_uuid)
     if not context.get("should_process"):
         return context["processing"]
+    if context.get("action") == "enter_segment":
+        return apply_reisift_prospect_segment_enter_core(db, event_id, context)
     return apply_reisift_new_record_exit_core(db, event_id, context)
 
 

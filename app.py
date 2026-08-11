@@ -1132,8 +1132,9 @@ def migrate_db(db):
     ensure_column(db, "reisift_new_records", "automation_eligible", "automation_eligible INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "reisift_new_records", "automation_hold_reason", "automation_hold_reason TEXT")
     ensure_column(db, "reisift_new_records", "segment", "segment TEXT NOT NULL DEFAULT 'new_records'")
-    db.execute(
-        "UPDATE reisift_new_records SET segment = 'new_records' WHERE COALESCE(segment, '') = ''"
+    execute_with_retry(
+        db,
+        "UPDATE reisift_new_records SET segment = 'new_records' WHERE COALESCE(segment, '') = ''",
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_county ON reisift_new_records(is_active, county, added_at)"
@@ -2019,7 +2020,8 @@ def migrate_db(db):
             "reisift_deep_prospecting",
         )
         placeholders = ",".join("?" for _ in reisift_email_sources)
-        db.execute(
+        execute_with_retry(
+            db,
             f"""
             UPDATE email_validation_queue
             SET queue_status = 'Queued',
@@ -2033,7 +2035,8 @@ def migrate_db(db):
             """,
             reisift_email_sources,
         )
-        db.execute(
+        execute_with_retry(
+            db,
             f"""
             UPDATE email_validation_registry
             SET queue_status = 'Queued',

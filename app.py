@@ -19072,6 +19072,22 @@ def _normalize_address_key(address):
     return re.sub(r"[^a-z0-9]+", " ", str(address or "").lower()).strip()
 
 
+def _website_value_looks_like_street(value):
+    text = re.sub(r"[,\s]+", " ", str(value or "")).strip()
+    if not text:
+        return False
+    street_suffixes = {
+        "aly", "alley", "ave", "avenue", "blvd", "boulevard", "cir", "circle",
+        "ct", "court", "dr", "drive", "hwy", "highway", "ln", "lane",
+        "pkwy", "parkway", "pl", "place", "rd", "road", "st", "street",
+        "ter", "terrace", "tpk", "tpke", "turnpike", "trl", "trail", "way",
+    }
+    tokens = [re.sub(r"[^\w#-]", "", item).lower() for item in text.split()]
+    if tokens and re.fullmatch(r"\d+[a-z]?", tokens[0] or ""):
+        return True
+    return any(token in street_suffixes for token in tokens)
+
+
 def _derive_website_lead_key(payload, address="", phone="", email=""):
     clean_email = str(email or "").strip().lower()
     clean_phone = normalize_phone(phone)
@@ -19103,6 +19119,26 @@ def _extract_website_lead_fields(payload):
     city = _payload_value_by_keys(payload, ["7.3"])
     state = _payload_value_by_keys(payload, ["7.4"])
     postal_code = _payload_value_by_keys(payload, ["7.5"])
+    parsed_street_address = _parse_search_address_simple(street)
+    if parsed_street_address.get("street") and parsed_street_address.get("city"):
+        postal_has_zip = bool(re.search(r"\b\d{5}(?:-\d{4})?\b", str(postal_code or "")))
+        city_looks_like_street = _website_value_looks_like_street(city)
+        if city_looks_like_street and not postal_has_zip:
+            # Carrot Step-2 can send: 7.1=full Google address, 7.3=street,
+            # 7.5=city. Trust the full address for ZIP while preserving any
+            # corrected street/unit typed into 7.3.
+            shifted_city = postal_code
+            street = city or parsed_street_address.get("street") or street
+            city = shifted_city or parsed_street_address.get("city") or ""
+            state = state or parsed_street_address.get("state") or ""
+            postal_code = parsed_street_address.get("postal_code") or ""
+        else:
+            street = parsed_street_address.get("street") or street
+            if not city or city_looks_like_street:
+                city = parsed_street_address.get("city") or city
+            state = state or parsed_street_address.get("state") or ""
+            if not postal_has_zip:
+                postal_code = parsed_street_address.get("postal_code") or postal_code
     if not address:
         address_parts = [x for x in [street, street2, city, state, postal_code] if x]
         address = ", ".join(address_parts)

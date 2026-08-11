@@ -30937,7 +30937,7 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
 
     out["ok"] = bool(sync_result.get("ok"))
     out["result"] = sync_result
-    if out["ok"] and phones and out["property_uuid"]:
+    if out["ok"] and (phones or emails) and out["property_uuid"]:
         try:
             out["tag_sync"] = reisift_append_property_tags(
                 token,

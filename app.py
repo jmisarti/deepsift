@@ -328,11 +328,13 @@ AGENT_REFRESH_WORKER_STARTED = False
 UNTITLED_LEADS_WORKER_STARTED = False
 EMAIL_VALIDATION_QUEUE_WORKER_STARTED = False
 EMAILOCTOPUS_SYNC_QUEUE_WORKER_STARTED = False
+PROSPECT_TABLE_CACHE_WORKER_STARTED = False
 BACKGROUND_WORKERS_BOOTSTRAP_STARTED = False
 BACKGROUND_WORKERS_BOOTSTRAP_LOCK = threading.Lock()
 ENSURE_DB_READY = False
 ENSURE_DB_LOCK = threading.Lock()
 PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTES") or "60").strip() or "60"), 5)
+PROSPECT_TABLE_CACHE_REFRESH_SECONDS = max(int((os.getenv("PROSPECT_TABLE_CACHE_REFRESH_SECONDS") or "300").strip() or "300"), 60)
 PROVIDER_ALERT_SOURCE_PREFIX = "provider_"
 ADS_DEFAULT_LOOKBACK_DAYS = max(int((os.getenv("ADS_DEFAULT_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
 ADS_REFRESH_LOOKBACK_DAYS = max(int((os.getenv("ADS_REFRESH_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
@@ -731,6 +733,21 @@ def parse_json_object(raw, default=None):
         return {} if default is None else default
 
 
+def parse_json_list(raw, default=None):
+    if isinstance(raw, list):
+        return raw
+    if raw is None:
+        return [] if default is None else default
+    text = str(raw).strip()
+    if not text:
+        return [] if default is None else default
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, list) else ([] if default is None else default)
+    except Exception:
+        return [] if default is None else default
+
+
 def parse_flexible_datetime(value):
     if not value:
         return None
@@ -883,6 +900,7 @@ def start_background_workers_async():
             start_untitled_leads_worker()
             start_website_leads_hold_worker()
             start_ads_dashboard_worker()
+            start_prospect_table_cache_worker()
             if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
                 start_referral_on_market_worker()
             start_reisift_new_records_worker()
@@ -1159,6 +1177,72 @@ def migrate_db(db):
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_segment_active_added ON reisift_new_records(segment, is_active, added_at)"
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prospect_table_cache (
+            segment TEXT NOT NULL,
+            property_uuid TEXT NOT NULL,
+            status TEXT,
+            full_address TEXT,
+            owner_names TEXT,
+            county TEXT,
+            city TEXT,
+            completeness TEXT,
+            owner_type TEXT,
+            owner_out_of_state INTEGER,
+            added_at TEXT,
+            reisift_updated_at TEXT,
+            local_property_id INTEGER,
+            local_status_after TEXT,
+            deep_dive_property_id INTEGER,
+            deep_dive_status TEXT,
+            mail_out INTEGER NOT NULL DEFAULT 0,
+            call_out INTEGER NOT NULL DEFAULT 0,
+            call_in INTEGER NOT NULL DEFAULT 0,
+            sms_out INTEGER NOT NULL DEFAULT 0,
+            sms_in INTEGER NOT NULL DEFAULT 0,
+            email_out INTEGER NOT NULL DEFAULT 0,
+            email_in INTEGER NOT NULL DEFAULT 0,
+            emails_opened INTEGER NOT NULL DEFAULT 0,
+            inbound_responses INTEGER NOT NULL DEFAULT 0,
+            rei_skipped INTEGER NOT NULL DEFAULT 0,
+            deep_skipped INTEGER NOT NULL DEFAULT 0,
+            no_good_numbers INTEGER NOT NULL DEFAULT 0,
+            property_lists TEXT,
+            property_lists_json TEXT,
+            source_last_synced_at TEXT,
+            projection_updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(segment, property_uuid)
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_segment_added ON prospect_table_cache(segment, added_at DESC, property_uuid)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_segment_county ON prospect_table_cache(segment, county, city)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_segment_status ON prospect_table_cache(segment, status)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_segment_flags ON prospect_table_cache(segment, rei_skipped, deep_skipped, no_good_numbers)"
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prospect_table_cache_lists (
+            segment TEXT NOT NULL,
+            property_uuid TEXT NOT NULL,
+            list_name TEXT NOT NULL,
+            list_key TEXT NOT NULL,
+            projection_updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(segment, property_uuid, list_key)
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_lists_segment_name ON prospect_table_cache_lists(segment, list_name)"
     )
     db.execute(
         """
@@ -2557,6 +2641,10 @@ def ensure_db(force=False):
             ensure_default_sequence_campaign(db)
             ensure_default_sms_automation_routing_rules(db)
             normalize_unsent_sms_queue_addresses(db)
+            try:
+                ensure_prospect_table_cache_seeded(db)
+            except Exception:
+                pass
             db.commit()
             ENSURE_DB_READY = True
         finally:
@@ -9996,6 +10084,16 @@ def record_sms_delivery_status(db, payload, sms_id="", status="", from_number=""
             f"Prior SMS to this phone was undelivered ({delivery['failure_bucket']}); follow-up sequence stopped.",
             person_id=person_id,
         )
+    refresh_property_id = 0
+    if context["communication"]:
+        refresh_property_id = int(context["communication"]["property_id"] or 0)
+    elif context["queue"]:
+        refresh_property_id = int(context["queue"]["property_id"] or 0)
+    if refresh_property_id > 0:
+        try:
+            refresh_prospect_table_cache_for_property_id(db, refresh_property_id)
+        except Exception:
+            pass
     return {
         "ok": True,
         **delivery,
@@ -18454,6 +18552,10 @@ def process_emailoctopus_event(db, event, safe_headers=None):
         """,
         (final_status, error_text, event_db_id),
     )
+    try:
+        refresh_prospect_table_cache_for_property_id(db, property_id)
+    except Exception:
+        pass
     return {
         "ok": True,
         "event_id": event_db_id,
@@ -35460,6 +35562,11 @@ def refresh_reisift_prospect_segment_cache(
         sms_queue = generate_sms_automation_queue_for_new_records(db, token=token)
     except Exception as exc:
         errors.append(f"sms_queue: {exc}")
+    prospect_table_cache = {"rows": 0}
+    try:
+        prospect_table_cache = rebuild_prospect_table_cache(db, segment=segment, update_signature=True)
+    except Exception as exc:
+        errors.append(f"prospect_table_cache: {exc}")
     set_setting(db, last_refresh_setting, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
     commit_with_retry(db)
     return {
@@ -35486,6 +35593,7 @@ def refresh_reisift_prospect_segment_cache(
         "status_exit_checks": status_exit_checks,
         "status_exit_unsubscribed": status_exit_unsubscribed,
         "sms_queue": sms_queue,
+        "prospect_table_cache": prospect_table_cache,
         "search_failed": search_failed,
         "log_rollup_enabled": REISIFT_NEW_RECORDS_LOG_ROLLUP_ENABLED,
         "errors": errors,
@@ -36116,6 +36224,336 @@ def reisift_new_record_list_names_for_properties(db, property_uuids):
     return out
 
 
+def _prospect_cache_setting_key(segment):
+    clean_segment = re.sub(r"[^a-z0-9_]+", "_", str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip().lower())
+    return f"prospect_table_cache_signature_{clean_segment or REISIFT_NEW_RECORDS_SEGMENT}"
+
+
+def prospect_table_source_signature(db, segment):
+    segment = str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip() or REISIFT_NEW_RECORDS_SEGMENT
+    row = db.execute(
+        """
+        SELECT COUNT(*) AS row_count,
+               COALESCE(MAX(last_synced_at), '') AS max_synced_at,
+               COALESCE(MAX(id), 0) AS max_id
+        FROM reisift_new_records
+        WHERE COALESCE(is_active, 1) = 1
+          AND COALESCE(segment, 'new_records') = ?
+        """,
+        (segment,),
+    ).fetchone()
+    return json.dumps(
+        {
+            "segment": segment,
+            "row_count": int((row["row_count"] if row else 0) or 0),
+            "max_synced_at": str((row["max_synced_at"] if row else "") or ""),
+            "max_id": int((row["max_id"] if row else 0) or 0),
+        },
+        sort_keys=True,
+    )
+
+
+def _prospect_table_source_rows(db, segment, property_uuids=None, property_ids=None):
+    segment = str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip() or REISIFT_NEW_RECORDS_SEGMENT
+    clauses = ["COALESCE(n.is_active, 1) = 1", "COALESCE(n.segment, 'new_records') = ?"]
+    params = [segment]
+    clean_uuids = [normalize_uuid(value) for value in (property_uuids or []) if normalize_uuid(value)]
+    if clean_uuids:
+        placeholders = ",".join(["?"] * len(clean_uuids))
+        clauses.append(f"n.property_uuid IN ({placeholders})")
+        params.extend(clean_uuids)
+    clean_property_ids = []
+    for value in property_ids or []:
+        try:
+            clean_value = int(value or 0)
+        except Exception:
+            clean_value = 0
+        if clean_value > 0:
+            clean_property_ids.append(clean_value)
+    if clean_property_ids:
+        placeholders = ",".join(["?"] * len(clean_property_ids))
+        clauses.append(f"n.local_property_id IN ({placeholders})")
+        params.extend(clean_property_ids)
+    where_sql = " AND ".join(clauses)
+    rows = db.execute(
+        f"""
+        SELECT n.*,
+               p.id AS deep_dive_property_id,
+               p.status AS deep_dive_status
+        FROM reisift_new_records n
+        LEFT JOIN properties p ON p.id = n.local_property_id
+        WHERE {where_sql}
+        """,
+        tuple(params),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def rebuild_prospect_table_cache(
+    db,
+    segment=REISIFT_NEW_RECORDS_SEGMENT,
+    property_uuids=None,
+    property_ids=None,
+    update_signature=True,
+):
+    segment = str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip() or REISIFT_NEW_RECORDS_SEGMENT
+    clean_uuids = [normalize_uuid(value) for value in (property_uuids or []) if normalize_uuid(value)]
+    clean_uuids = list(dict.fromkeys(clean_uuids))
+    clean_property_ids = []
+    for value in property_ids or []:
+        try:
+            clean_value = int(value or 0)
+        except Exception:
+            clean_value = 0
+        if clean_value > 0:
+            clean_property_ids.append(clean_value)
+    clean_property_ids = list(dict.fromkeys(clean_property_ids))
+    is_partial = bool(clean_uuids or clean_property_ids)
+    delete_scope_uuids = list(clean_uuids)
+    if clean_property_ids:
+        placeholders = ",".join(["?"] * len(clean_property_ids))
+        source_uuid_rows = db.execute(
+            f"""
+            SELECT property_uuid
+            FROM reisift_new_records
+            WHERE COALESCE(segment, 'new_records') = ?
+              AND local_property_id IN ({placeholders})
+            UNION
+            SELECT property_uuid
+            FROM prospect_table_cache
+            WHERE segment = ?
+              AND local_property_id IN ({placeholders})
+            """,
+            tuple([segment] + clean_property_ids + [segment] + clean_property_ids),
+        ).fetchall()
+        for row in source_uuid_rows:
+            uuid = normalize_uuid(row["property_uuid"] or "")
+            if uuid:
+                delete_scope_uuids.append(uuid)
+        delete_scope_uuids = list(dict.fromkeys(delete_scope_uuids))
+
+    if is_partial:
+        delete_clauses = ["segment = ?"]
+        delete_params = [segment]
+        if clean_uuids:
+            placeholders = ",".join(["?"] * len(clean_uuids))
+            delete_clauses.append(f"property_uuid IN ({placeholders})")
+            delete_params.extend(clean_uuids)
+        if clean_property_ids:
+            placeholders = ",".join(["?"] * len(clean_property_ids))
+            delete_clauses.append(f"local_property_id IN ({placeholders})")
+            delete_params.extend(clean_property_ids)
+        db.execute(f"DELETE FROM prospect_table_cache WHERE {' AND '.join(delete_clauses)}", tuple(delete_params))
+        if delete_scope_uuids:
+            list_delete_clauses = ["segment = ?"]
+            list_delete_params = [segment]
+            placeholders = ",".join(["?"] * len(delete_scope_uuids))
+            list_delete_clauses.append(f"property_uuid IN ({placeholders})")
+            list_delete_params.extend(delete_scope_uuids)
+            db.execute(f"DELETE FROM prospect_table_cache_lists WHERE {' AND '.join(list_delete_clauses)}", tuple(list_delete_params))
+    else:
+        db.execute("DELETE FROM prospect_table_cache WHERE segment = ?", (segment,))
+        db.execute("DELETE FROM prospect_table_cache_lists WHERE segment = ?", (segment,))
+
+    rows = _prospect_table_source_rows(db, segment, property_uuids=clean_uuids, property_ids=clean_property_ids)
+    list_names_by_uuid = reisift_new_record_list_names_for_properties(db, [row["property_uuid"] for row in rows])
+    activity_counts = bulk_property_activity_counts_for_new_records(db, rows)
+    now_text = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    inserted = 0
+    for item in rows:
+        item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
+        item["county"] = display_county_name(item.get("county") or "") or "Unknown"
+        item["city"] = normalize_whitespace(item.get("city") or "")
+        item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
+        counts = activity_counts.get(id(item), _new_record_default_activity_counts(item))
+        list_names = list_names_by_uuid.get(item.get("property_uuid") or "") or []
+        property_lists = ", ".join(list_names)
+        db.execute(
+            """
+            INSERT INTO prospect_table_cache
+                (segment, property_uuid, status, full_address, owner_names, county, city, completeness, owner_type, owner_out_of_state,
+                 added_at, reisift_updated_at, local_property_id, local_status_after, deep_dive_property_id, deep_dive_status,
+                 mail_out, call_out, call_in, sms_out, sms_in, email_out, email_in, emails_opened, inbound_responses,
+                 rei_skipped, deep_skipped, no_good_numbers, property_lists, property_lists_json, source_last_synced_at, projection_updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(segment, property_uuid) DO UPDATE SET
+                status = excluded.status,
+                full_address = excluded.full_address,
+                owner_names = excluded.owner_names,
+                county = excluded.county,
+                city = excluded.city,
+                completeness = excluded.completeness,
+                owner_type = excluded.owner_type,
+                owner_out_of_state = excluded.owner_out_of_state,
+                added_at = excluded.added_at,
+                reisift_updated_at = excluded.reisift_updated_at,
+                local_property_id = excluded.local_property_id,
+                local_status_after = excluded.local_status_after,
+                deep_dive_property_id = excluded.deep_dive_property_id,
+                deep_dive_status = excluded.deep_dive_status,
+                mail_out = excluded.mail_out,
+                call_out = excluded.call_out,
+                call_in = excluded.call_in,
+                sms_out = excluded.sms_out,
+                sms_in = excluded.sms_in,
+                email_out = excluded.email_out,
+                email_in = excluded.email_in,
+                emails_opened = excluded.emails_opened,
+                inbound_responses = excluded.inbound_responses,
+                rei_skipped = excluded.rei_skipped,
+                deep_skipped = excluded.deep_skipped,
+                no_good_numbers = excluded.no_good_numbers,
+                property_lists = excluded.property_lists,
+                property_lists_json = excluded.property_lists_json,
+                source_last_synced_at = excluded.source_last_synced_at,
+                projection_updated_at = excluded.projection_updated_at
+            """,
+            (
+                segment,
+                item.get("property_uuid") or "",
+                item.get("status") or "",
+                item.get("full_address") or "",
+                item.get("owner_names") or "",
+                item.get("county") or "",
+                item.get("city") or "",
+                item.get("completeness") or "",
+                item.get("owner_type") or "",
+                int(item.get("owner_out_of_state") or 0),
+                item.get("added_at") or "",
+                item.get("reisift_updated_at") or "",
+                int(item.get("local_property_id") or 0) or None,
+                item.get("local_status_after") or "",
+                int(item.get("deep_dive_property_id") or 0) or None,
+                item.get("deep_dive_status") or "",
+                int(counts.get("mail_out") or 0),
+                int(counts.get("call_out") or 0),
+                int(counts.get("call_in") or 0),
+                int(counts.get("sms_out") or 0),
+                int(counts.get("sms_in") or 0),
+                int(counts.get("email_out") or 0),
+                int(counts.get("email_in") or 0),
+                int(counts.get("emails_opened") or 0),
+                int(item.get("inbound_responses") or 0),
+                int(item.get("rei_skipped") or 0),
+                int(item.get("deep_skipped") or 0),
+                int(item.get("no_good_numbers") or 0),
+                property_lists,
+                json.dumps(list_names, ensure_ascii=True),
+                item.get("last_synced_at") or "",
+                now_text,
+            ),
+        )
+        for list_name in list_names:
+            list_key = normalize_whitespace(list_name).lower()
+            if not list_key:
+                continue
+            db.execute(
+                """
+                INSERT INTO prospect_table_cache_lists (segment, property_uuid, list_name, list_key, projection_updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(segment, property_uuid, list_key) DO UPDATE SET
+                    list_name = excluded.list_name,
+                    projection_updated_at = excluded.projection_updated_at
+                """,
+                (segment, item.get("property_uuid") or "", list_name, list_key, now_text),
+            )
+        inserted += 1
+    if update_signature and not is_partial:
+        set_setting(db, _prospect_cache_setting_key(segment), prospect_table_source_signature(db, segment))
+        set_setting(db, f"{_prospect_cache_setting_key(segment)}_rebuilt_at", now_text)
+    return {"segment": segment, "rows": inserted, "partial": is_partial, "projection_updated_at": now_text}
+
+
+def refresh_prospect_table_cache_for_property_id(db, property_id):
+    try:
+        clean_property_id = int(property_id or 0)
+    except Exception:
+        clean_property_id = 0
+    if clean_property_id <= 0:
+        return {"rows": 0, "segments": []}
+    segments = [
+        row["segment"] or REISIFT_NEW_RECORDS_SEGMENT
+        for row in db.execute(
+            """
+            SELECT DISTINCT COALESCE(segment, 'new_records') AS segment
+            FROM reisift_new_records
+            WHERE local_property_id = ?
+            """,
+            (clean_property_id,),
+        ).fetchall()
+    ]
+    updated = 0
+    for segment in segments:
+        result = rebuild_prospect_table_cache(db, segment=segment, property_ids=[clean_property_id], update_signature=False)
+        updated += int(result.get("rows") or 0)
+    return {"rows": updated, "segments": segments}
+
+
+def refresh_stale_prospect_table_cache(db, force=False):
+    results = []
+    for segment in [REISIFT_NEW_RECORDS_SEGMENT, REISIFT_DEEP_PROSPECTING_SEGMENT]:
+        signature = prospect_table_source_signature(db, segment)
+        setting_key = _prospect_cache_setting_key(segment)
+        previous = get_setting(db, setting_key, "")
+        if force or signature != previous:
+            results.append(rebuild_prospect_table_cache(db, segment=segment, update_signature=True))
+        else:
+            results.append({"segment": segment, "rows": 0, "skipped": True})
+    return {"segments": results}
+
+
+def ensure_prospect_table_cache_seeded(db):
+    cache_count = int(
+        (
+            db.execute("SELECT COUNT(*) AS count FROM prospect_table_cache").fetchone()
+            or {"count": 0}
+        )["count"]
+        or 0
+    )
+    if cache_count > 0:
+        return {"seeded": False, "reason": "cache_has_rows"}
+    source_count = int(
+        (
+            db.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM reisift_new_records
+                WHERE COALESCE(is_active, 1) = 1
+                """
+            ).fetchone()
+            or {"count": 0}
+        )["count"]
+        or 0
+    )
+    if source_count <= 0:
+        return {"seeded": False, "reason": "no_source_rows"}
+    result = refresh_stale_prospect_table_cache(db, force=True)
+    return {"seeded": True, "source_rows": source_count, "result": result}
+
+
+def start_prospect_table_cache_worker():
+    global PROSPECT_TABLE_CACHE_WORKER_STARTED
+    if PROSPECT_TABLE_CACHE_WORKER_STARTED:
+        return
+    PROSPECT_TABLE_CACHE_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                db = open_sqlite_connection()
+                try:
+                    refresh_stale_prospect_table_cache(db, force=False)
+                    commit_with_retry(db)
+                finally:
+                    db.close()
+            except Exception:
+                pass
+            time.sleep(PROSPECT_TABLE_CACHE_REFRESH_SECONDS)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
 def _new_record_matches_filters(row, filters):
     filters = filters if isinstance(filters, dict) else {}
     date_from = _parse_iso_date_only(filters.get("date_from") or "")
@@ -36184,14 +36622,13 @@ def get_new_record_filter_options(db, segment=REISIFT_NEW_RECORDS_SEGMENT):
     segment = str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip() or REISIFT_NEW_RECORDS_SEGMENT
     rows = db.execute(
         """
-        SELECT n.status,
-               n.county,
-               n.city,
-               n.completeness,
-               n.owner_type
-        FROM reisift_new_records n
-        WHERE n.is_active = 1
-          AND COALESCE(n.segment, 'new_records') = ?
+        SELECT status,
+               county,
+               city,
+               completeness,
+               owner_type
+        FROM prospect_table_cache
+        WHERE segment = ?
         """
         ,
         (segment,),
@@ -36203,13 +36640,11 @@ def get_new_record_filter_options(db, segment=REISIFT_NEW_RECORDS_SEGMENT):
     owner_types = sorted({normalize_whitespace(row["owner_type"] or "") for row in rows if normalize_whitespace(row["owner_type"] or "")})
     list_rows = db.execute(
         """
-        SELECT DISTINCT l.list_name
-        FROM reisift_new_record_lists l
-        JOIN reisift_new_records n ON n.property_uuid = l.property_uuid
-        WHERE n.is_active = 1
-          AND COALESCE(n.segment, 'new_records') = ?
-          AND COALESCE(l.list_name, '') <> ''
-        ORDER BY l.list_name COLLATE NOCASE ASC
+        SELECT DISTINCT list_name
+        FROM prospect_table_cache_lists
+        WHERE segment = ?
+          AND COALESCE(list_name, '') <> ''
+        ORDER BY list_name COLLATE NOCASE ASC
         """
         ,
         (segment,),
@@ -36600,39 +37035,39 @@ def bulk_new_record_local_contact_flags(db, property_ids):
 def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=None, segment=REISIFT_NEW_RECORDS_SEGMENT):
     filters = filters if isinstance(filters, dict) else {}
     segment = str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip() or REISIFT_NEW_RECORDS_SEGMENT
-    clauses = ["n.is_active = 1", "COALESCE(n.segment, 'new_records') = ?"]
+    clauses = ["c.segment = ?"]
     params = [segment]
     date_from = _parse_iso_date_only(filters.get("date_from") or "")
     date_to = _parse_iso_date_only(filters.get("date_to") or "")
     if date_from:
-        clauses.append("date(n.added_at) >= date(?)")
+        clauses.append("date(c.added_at) >= date(?)")
         params.append(date_from.isoformat())
     if date_to:
-        clauses.append("date(n.added_at) <= date(?)")
+        clauses.append("date(c.added_at) <= date(?)")
         params.append(date_to.isoformat())
     status_filter = normalize_whitespace(filters.get("status") or "")
     if status_filter:
-        clauses.append("lower(trim(COALESCE(n.status, ''))) = lower(trim(?))")
+        clauses.append("lower(trim(COALESCE(c.status, ''))) = lower(trim(?))")
         params.append(status_filter)
     county_filter = display_county_name(filters.get("county") or "")
     if county_filter:
-        clauses.append("lower(trim(COALESCE(n.county, ''))) = lower(trim(?))")
+        clauses.append("lower(trim(COALESCE(c.county, ''))) = lower(trim(?))")
         params.append(county_filter)
     city_filter = normalize_whitespace(filters.get("city") or "")
     if city_filter:
-        clauses.append("lower(trim(COALESCE(n.city, ''))) = lower(trim(?))")
+        clauses.append("lower(trim(COALESCE(c.city, ''))) = lower(trim(?))")
         params.append(city_filter)
     completeness_filter = normalize_whitespace(filters.get("completeness") or "")
     if completeness_filter:
-        clauses.append("lower(trim(COALESCE(n.completeness, ''))) = lower(trim(?))")
+        clauses.append("lower(trim(COALESCE(c.completeness, ''))) = lower(trim(?))")
         params.append(completeness_filter)
     owner_type_filter = normalize_whitespace(filters.get("owner_type") or "")
     if owner_type_filter:
-        clauses.append("lower(trim(COALESCE(n.owner_type, ''))) = lower(trim(?))")
+        clauses.append("lower(trim(COALESCE(c.owner_type, ''))) = lower(trim(?))")
         params.append(owner_type_filter)
     owner_out_of_state_filter = _new_record_yes_no_filter_value(filters.get("owner_out_of_state") or "")
     if owner_out_of_state_filter is not None:
-        clauses.append("COALESCE(n.owner_out_of_state, 0) = ?")
+        clauses.append("COALESCE(c.owner_out_of_state, 0) = ?")
         params.append(1 if owner_out_of_state_filter else 0)
     for filter_key, column in [
         ("rei_skipped", "rei_skipped"),
@@ -36642,7 +37077,7 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
         expected = _new_record_yes_no_filter_value(filters.get(filter_key) or "")
         if expected is None:
             continue
-        clauses.append(f"COALESCE(n.{column}, 0) = ?")
+        clauses.append(f"COALESCE(c.{column}, 0) = ?")
         params.append(1 if expected else 0)
     selected_lists = filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")
     for selected_list in selected_lists:
@@ -36653,8 +37088,9 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
             """
             EXISTS (
                 SELECT 1
-                FROM reisift_new_record_lists l
-                WHERE l.property_uuid = n.property_uuid
+                FROM prospect_table_cache_lists l
+                WHERE l.segment = c.segment
+                  AND l.property_uuid = c.property_uuid
                   AND lower(trim(l.list_name)) = lower(trim(?))
             )
             """
@@ -36677,8 +37113,7 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
             db.execute(
                 f"""
                 SELECT COUNT(*) AS count
-                FROM reisift_new_records n
-                LEFT JOIN properties p ON p.id = n.local_property_id
+                FROM prospect_table_cache c
                 {where_sql}
                 """,
                 tuple(params),
@@ -36689,35 +37124,27 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
     )
     summary_rows = db.execute(
         f"""
-        SELECT COALESCE(NULLIF(n.county, ''), 'Unknown') AS county,
+        SELECT COALESCE(NULLIF(c.county, ''), 'Unknown') AS county,
                COUNT(*) AS count,
-               SUM(CASE WHEN p.id IS NOT NULL THEN 1 ELSE 0 END) AS local_match_count,
-               SUM(CASE WHEN lower(trim(COALESCE(p.status, ''))) = ? THEN 1 ELSE 0 END) AS local_update_count
-        FROM reisift_new_records n
-        LEFT JOIN properties p ON p.id = n.local_property_id
+               SUM(CASE WHEN c.deep_dive_property_id IS NOT NULL THEN 1 ELSE 0 END) AS local_match_count,
+               SUM(CASE WHEN lower(trim(COALESCE(c.deep_dive_status, ''))) = ? THEN 1 ELSE 0 END) AS local_update_count
+        FROM prospect_table_cache c
         {where_sql}
-        GROUP BY COALESCE(NULLIF(n.county, ''), 'Unknown')
+        GROUP BY COALESCE(NULLIF(c.county, ''), 'Unknown')
         """,
         tuple([local_status_target] + params),
     ).fetchall()
     page_sql = f"""
-        SELECT n.*,
-               p.id AS deep_dive_property_id,
-               p.status AS deep_dive_status
-        FROM reisift_new_records n
-        LEFT JOIN properties p ON p.id = n.local_property_id
+        SELECT c.*
+        FROM prospect_table_cache c
         {where_sql}
-        ORDER BY COALESCE(NULLIF(n.added_at, ''), '0001-01-01 00:00:00') {order_dir}, n.id {order_dir}
+        ORDER BY COALESCE(NULLIF(c.added_at, ''), '0001-01-01 00:00:00') {order_dir}, c.property_uuid {order_dir}
     """
     page_params = list(params)
     if clean_limit > 0:
         page_sql += " LIMIT ? OFFSET ?"
         page_params.extend([clean_limit, offset])
     page_rows = [dict(row) for row in db.execute(page_sql, tuple(page_params)).fetchall()]
-    list_names_by_uuid = reisift_new_record_list_names_for_properties(
-        db,
-        [row["property_uuid"] for row in page_rows],
-    )
     for item in page_rows:
         item["lp_added_at"] = item.get("added_at") or ""
         item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
@@ -36725,13 +37152,14 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
         item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
         item["county"] = display_county_name(item.get("county") or "") or "Unknown"
         item["city"] = normalize_whitespace(item.get("city") or "")
-        item["property_list_names"] = list_names_by_uuid.get(item.get("property_uuid") or "") or []
-        item["property_lists"] = ", ".join(item["property_list_names"])
+        item["property_list_names"] = parse_json_list(item.get("property_lists_json") or "[]")
+        if not item["property_list_names"] and item.get("property_lists"):
+            item["property_list_names"] = parse_csv_list(item.get("property_lists") or "")
+        item["property_lists"] = item.get("property_lists") or ", ".join(item["property_list_names"])
+        for count_key in ["mail_out", "call_out", "call_in", "sms_out", "sms_in", "email_out", "email_in", "emails_opened"]:
+            item[count_key] = int(item.get(count_key) or 0)
         for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
             item[flag_key] = 1 if int(item.get(flag_key) or 0) else 0
-
-    for item in page_rows:
-        item.update(_new_record_default_activity_counts(item))
     county_counts = {}
     local_match_count = 0
     local_update_count = 0
@@ -43450,7 +43878,7 @@ def new_records_page():
     total_active_count = int(
         (
             db.execute(
-                "SELECT COUNT(*) AS count FROM reisift_new_records WHERE COALESCE(is_active, 1) = 1 AND COALESCE(segment, 'new_records') = ?",
+                "SELECT COUNT(*) AS count FROM prospect_table_cache WHERE segment = ?",
                 (REISIFT_NEW_RECORDS_SEGMENT,),
             ).fetchone()
             or {"count": 0}
@@ -43575,7 +44003,7 @@ def deep_prospecting_page():
     total_active_count = int(
         (
             db.execute(
-                "SELECT COUNT(*) AS count FROM reisift_new_records WHERE COALESCE(is_active, 1) = 1 AND COALESCE(segment, 'new_records') = ?",
+                "SELECT COUNT(*) AS count FROM prospect_table_cache WHERE segment = ?",
                 (REISIFT_DEEP_PROSPECTING_SEGMENT,),
             ).fetchone()
             or {"count": 0}
@@ -43858,6 +44286,10 @@ def _sms_automation_send_queue_item(db, queue_id):
             "UPDATE sms_automation_queue SET status = 'Suppressed', suppression_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (reason, row["id"]),
         )
+        try:
+            refresh_prospect_table_cache_for_property_id(db, row["property_id"])
+        except Exception:
+            pass
         return {"ok": False, "error": reason, "suppressed": True}
     within, start, end = _sms_automation_within_send_window(db)
     if not within:
@@ -43942,6 +44374,10 @@ def _sms_automation_send_queue_item(db, queue_id):
                 route="_sms_automation_send_queue_item",
                 status_code=500,
             )
+        try:
+            refresh_prospect_table_cache_for_property_id(db, row["property_id"])
+        except Exception:
+            pass
         return {
             "ok": True,
             "communication_id": cur.lastrowid,
@@ -43961,6 +44397,10 @@ def _sms_automation_send_queue_item(db, queue_id):
             """,
             (str(exc), row["id"]),
         )
+        try:
+            refresh_prospect_table_cache_for_property_id(db, row["property_id"])
+        except Exception:
+            pass
         return {"ok": False, "error": str(exc)}
 
 
@@ -55259,6 +55699,17 @@ def apply_reisift_prospect_segment_enter_core(db, event_id, context):
         sms_queue = generate_sms_automation_queue_for_new_records(db, token=token, property_ids=[property_id])
     except Exception as exc:
         errors.append(f"sms_queue: {exc}")
+    prospect_table_cache = {"rows": 0}
+    try:
+        prospect_table_cache = rebuild_prospect_table_cache(
+            db,
+            segment=segment,
+            property_uuids=[property_uuid],
+            property_ids=[property_id],
+            update_signature=False,
+        )
+    except Exception as exc:
+        errors.append(f"prospect_table_cache: {exc}")
     result = {
         "action": "enter_segment",
         "segment": segment,
@@ -55269,6 +55720,7 @@ def apply_reisift_prospect_segment_enter_core(db, event_id, context):
         "local_status_before": sync_result.get("before") or "",
         "local_status_after": sync_result.get("after") or new_status,
         "sms_queue": sms_queue,
+        "prospect_table_cache": prospect_table_cache,
         "sequence": context.get("sequence") or {},
         "errors": errors,
     }
@@ -55336,6 +55788,11 @@ def apply_reisift_new_record_exit_core(db, event_id, context):
         new_status,
         property_payload,
     )
+    prospect_table_cache = {"rows": 0}
+    try:
+        prospect_table_cache = refresh_prospect_table_cache_for_property_id(db, property_id)
+    except Exception as exc:
+        prospect_table_cache = {"rows": 0, "error": str(exc)}
     sms_suppressed = revalidate_sms_automation_queue(db, property_ids=[property_id])
     result = {
         "action": "exit_segment",
@@ -55345,6 +55802,7 @@ def apply_reisift_new_record_exit_core(db, event_id, context):
         "local_status_before": sync_result.get("before") or "",
         "local_status_after": sync_result.get("after") or new_status,
         "cache_rows_deactivated": cache_rows_deactivated,
+        "prospect_table_cache": prospect_table_cache,
         "sms_queue_suppressed": sms_suppressed,
         "emailoctopus_unsubscribe": {"deferred": True},
         "sequence": context.get("sequence") or {},
@@ -56449,6 +56907,7 @@ if __name__ == "__main__":
         start_clever_leads_worker()
         start_untitled_leads_worker()
         start_ads_dashboard_worker()
+        start_prospect_table_cache_worker()
         if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
             start_referral_on_market_worker()
         start_reisift_new_records_worker()

@@ -250,7 +250,7 @@ EMAIL_VALIDATION_QUEUE_POLL_SECONDS = max(int((os.getenv("EMAIL_VALIDATION_QUEUE
 EMAILOCTOPUS_SYNC_QUEUE_WORKER_ENABLED = env_flag("EMAILOCTOPUS_SYNC_QUEUE_WORKER_ENABLED", True)
 EMAILOCTOPUS_SYNC_QUEUE_POLL_SECONDS = max(int((os.getenv("EMAILOCTOPUS_SYNC_QUEUE_POLL_SECONDS") or "60").strip() or "60"), 15)
 EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT = max(int((os.getenv("EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT") or "20").strip() or "20"), 1)
-REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED = env_flag("REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED", False)
+REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED = env_flag("REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED", True)
 GMAIL_WATCH_RENEWAL_WORKER_ENABLED = env_flag("GMAIL_WATCH_RENEWAL_WORKER_ENABLED", True)
 GMAIL_WATCH_RENEWAL_POLL_SECONDS = max(int((os.getenv("GMAIL_WATCH_RENEWAL_POLL_SECONDS") or "86400").strip() or "86400"), 3600)
 GMAIL_PUBSUB_TOPIC_NAME = (os.getenv("GMAIL_PUBSUB_TOPIC_NAME") or "").strip()
@@ -863,6 +863,7 @@ def inject_auth_state():
 def start_background_workers_async():
     global BACKGROUND_WORKERS_BOOTSTRAP_STARTED
     start_emailoctopus_sync_queue_worker()
+    start_email_validation_queue_worker()
     if not RUN_BACKGROUND_WORKERS:
         return
     with BACKGROUND_WORKERS_BOOTSTRAP_LOCK:
@@ -1031,7 +1032,11 @@ def close_db(_error):
 def ensure_column(db, table_name, column_name, definition):
     cols = [r["name"] for r in db.execute(f"PRAGMA table_info({table_name})").fetchall()]
     if column_name not in cols:
-        db.execute(f"ALTER TABLE {table_name} ADD COLUMN {definition}")
+        try:
+            db.execute(f"ALTER TABLE {table_name} ADD COLUMN {definition}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def migrate_db(db):
@@ -2006,6 +2011,42 @@ def migrate_db(db):
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_email_validation_registry_touchpoints_registry ON email_validation_registry_touchpoints(registry_id)"
     )
+    if REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED:
+        reisift_email_sources = (
+            "reisift_new_record",
+            "reisift_new_record_backfill",
+            "reisift_new_record_repair",
+            "reisift_deep_prospecting",
+        )
+        placeholders = ",".join("?" for _ in reisift_email_sources)
+        db.execute(
+            f"""
+            UPDATE email_validation_queue
+            SET queue_status = 'Queued',
+                validation_status = '',
+                validation_raw = '',
+                processed_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE lower(COALESCE(queue_status, '')) = 'held'
+              AND source IN ({placeholders})
+              AND COALESCE(validation_status, '') = 'held_reisift_new_record_manual_review'
+            """,
+            reisift_email_sources,
+        )
+        db.execute(
+            f"""
+            UPDATE email_validation_registry
+            SET queue_status = 'Queued',
+                validation_status = '',
+                validation_raw = '',
+                processed_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE lower(COALESCE(queue_status, '')) = 'held'
+              AND COALESCE(last_source, first_source, '') IN ({placeholders})
+              AND COALESCE(validation_status, '') = 'held_reisift_new_record_manual_review'
+            """,
+            reisift_email_sources,
+        )
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS email_campaign_syncs (

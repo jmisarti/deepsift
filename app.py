@@ -32434,12 +32434,15 @@ SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES = {"new record", "new records"}
 def _sms_bucket_from_payload(payload):
     payload = payload if isinstance(payload, dict) else {}
     texts = _sms_source_terms_from_payload(payload)
-    haystack = " ".join(texts).lower()
-    if "sheriff" in haystack:
+    if _sms_source_terms_match_token(texts, "sheriff"):
         return "Sheriff Sale"
-    if "probate" in haystack:
+    if _sms_source_terms_match_token(texts, "probate"):
         return "Probate"
-    if "foreclosure" in haystack or "lis pendens" in haystack or "preforeclosure" in haystack:
+    if (
+        _sms_source_terms_match_token(texts, "foreclosure")
+        or _sms_source_terms_match_token(texts, "lis pendens")
+        or _sms_source_terms_match_token(texts, "preforeclosure")
+    ):
         return "Foreclosure"
     return "General New Record"
 
@@ -32473,12 +32476,50 @@ def _sms_rule_tokens(rule):
     ]
 
 
+def _sms_source_term_words(term):
+    spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(term or ""))
+    return re.findall(r"[a-z0-9]+", spaced.lower())
+
+
+def _sms_source_term_is_negative_sheriff(term):
+    lowered = str(term or "").strip().lower()
+    compact = re.sub(r"[^a-z0-9]+", "", lowered)
+    words = _sms_source_term_words(term)
+    if "sheriff" not in words and "sheriff" not in compact:
+        return False
+    if compact.startswith(("removedfromsheriff", "removedsheriff", "notsheriff", "nosheriff")):
+        return True
+    negative_words = {"remove", "removed", "exclude", "excluded", "not", "no", "former", "old"}
+    return bool(set(words) & negative_words)
+
+
+def _sms_source_term_matches_token(term, token):
+    token = normalize_whitespace(token or "").lower()
+    if not token:
+        return False
+    if "sheriff" in token and _sms_source_term_is_negative_sheriff(term):
+        return False
+    term_words = _sms_source_term_words(term)
+    token_words = _sms_source_term_words(token)
+    if not token_words:
+        return False
+    if len(token_words) == 1:
+        return token_words[0] in term_words
+    for idx in range(0, len(term_words) - len(token_words) + 1):
+        if term_words[idx : idx + len(token_words)] == token_words:
+            return True
+    return False
+
+
+def _sms_source_terms_match_token(source_terms, token):
+    return any(_sms_source_term_matches_token(term, token) for term in (source_terms or []))
+
+
 def _sms_rule_source_matches(rule, source_terms):
     tokens = _sms_rule_tokens(rule)
     if not tokens:
         return True
-    haystack = " ".join(str(term or "") for term in (source_terms or [])).lower()
-    return any(token in haystack for token in tokens)
+    return any(_sms_source_terms_match_token(source_terms, token) for token in tokens)
 
 
 def _sms_rule_role_matches(rule, contact_role):
@@ -34022,7 +34063,7 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
             continue
         payload = parse_json_object(row["payload_json"] or "{}", default={})
         source_terms = _sms_source_terms_from_payload(payload)
-        has_sheriff_source = "sheriff" in " ".join(source_terms).lower()
+        has_sheriff_source = _sms_source_terms_match_token(source_terms, "sheriff")
         source_info = {}
         if has_sheriff_source and token:
             try:

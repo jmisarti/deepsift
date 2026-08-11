@@ -38,7 +38,7 @@
 
     <div class="panel-actions">
         <form method="get" action="{{ url_for('sms_queue_page') }}" class="inline-form">
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers or filters.status or filters.bucket or filters.contact_role %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.county or filters.city or filters.prospect_segment or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers or filters.status or filters.bucket or filters.contact_role %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>Numbers From
@@ -60,6 +60,14 @@
                             <option value="">All</option>
                             {% for city in filter_options.cities %}
                             <option value="{{ city }}" {% if filters.city == city %}selected{% endif %}>{{ city }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>Prospect Type
+                        <select name="prospect_segment">
+                            <option value="">All</option>
+                            {% for segment in filter_options.prospect_segments %}
+                            <option value="{{ segment.value }}" {% if filters.prospect_segment == segment.value %}selected{% endif %}>{{ segment.label }}</option>
                             {% endfor %}
                         </select>
                     </label>

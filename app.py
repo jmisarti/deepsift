@@ -44645,6 +44645,10 @@ def get_sms_automation_queue_rows(db, filters=None):
             clauses.append("lower(COALESCE(q.contact_role, '')) NOT IN ('owner', 'co-owner', 'co owner')")
         else:
             clauses.append("lower(COALESCE(q.contact_role, '')) IN ('owner', 'co-owner', 'co owner')")
+    prospect_segment = (filters.get("prospect_segment") or "").strip()
+    if prospect_segment in REISIFT_PROSPECT_SEGMENT_LABELS:
+        clauses.append(f"COALESCE(NULLIF(n.segment, ''), ?) = ?")
+        params.extend([REISIFT_NEW_RECORDS_SEGMENT, prospect_segment])
     for filter_key, column in [
         ("rei_skipped", "rei_skipped"),
         ("deep_skipped", "deep_skipped"),
@@ -44695,6 +44699,7 @@ def get_sms_automation_queue_rows(db, filters=None):
                n.owner_out_of_state AS new_record_owner_out_of_state,
                n.property_uuid AS new_record_property_uuid,
                n.full_address AS new_record_full_address,
+               COALESCE(NULLIF(n.segment, ''), ?) AS prospect_segment,
                n.rei_skipped AS new_record_rei_skipped,
                n.deep_skipped AS new_record_deep_skipped,
                n.no_good_numbers AS new_record_no_good_numbers,
@@ -44717,7 +44722,7 @@ def get_sms_automation_queue_rows(db, filters=None):
             q.id DESC
         LIMIT ?
         """,
-        tuple(params) + (display_limit,),
+        (REISIFT_NEW_RECORDS_SEGMENT,) + tuple(params) + (display_limit,),
     ).fetchall()
     out = []
     raw_rows = [dict(r) for r in rows]
@@ -44733,6 +44738,8 @@ def get_sms_automation_queue_rows(db, filters=None):
         d["owner_out_of_state"] = None if owner_out is None else bool(int(owner_out or 0))
         d["completeness"] = normalize_whitespace(d.get("new_record_completeness") or "")
         d["property_list_names"] = list_names_by_uuid.get(d.get("new_record_property_uuid") or "") or []
+        d["prospect_segment"] = d.get("prospect_segment") or REISIFT_NEW_RECORDS_SEGMENT
+        d["prospect_segment_label"] = reisift_prospect_segment_label(d["prospect_segment"])
         d["rei_skipped"] = 1 if int(d.get("new_record_rei_skipped") or 0) else 0
         d["deep_skipped"] = 1 if int(d.get("new_record_deep_skipped") or 0) else 0
         d["no_good_numbers"] = 1 if int(d.get("new_record_no_good_numbers") or 0) else 0
@@ -44775,6 +44782,11 @@ def _sms_queue_matches_new_record_filters(row, filters):
         if actual is None:
             return False
         if bool(actual) != owner_out_of_state_filter:
+            return False
+    prospect_segment = (filters.get("prospect_segment") or "").strip()
+    if prospect_segment in REISIFT_PROSPECT_SEGMENT_LABELS:
+        actual_segment = row.get("prospect_segment") or REISIFT_NEW_RECORDS_SEGMENT
+        if actual_segment != prospect_segment:
             return False
     selected_lists = filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")
     selected_list_keys = {normalize_whitespace(item).lower() for item in selected_lists if normalize_whitespace(item)}
@@ -44848,6 +44860,10 @@ def get_sms_automation_filter_options(db):
         "completeness": completeness,
         "owner_types": owner_types,
         "lists": lists,
+        "prospect_segments": [
+            {"value": key, "label": label}
+            for key, label in REISIFT_PROSPECT_SEGMENT_LABELS.items()
+        ],
     }
 
 
@@ -45115,6 +45131,7 @@ def sms_queue_page():
         "status": (request.args.get("status") or "").strip(),
         "bucket": (request.args.get("bucket") or "").strip(),
         "contact_role": (request.args.get("contact_role") or "").strip(),
+        "prospect_segment": (request.args.get("prospect_segment") or "").strip(),
     }
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()

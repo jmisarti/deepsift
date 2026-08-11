@@ -15322,6 +15322,14 @@ def _email_validation_registry_decision(row, exclude_touchpoint_id=0):
             "touchpoint_status": _touchpoint_status_from_email_validation_status(validation_status),
             "queue_status": "Completed",
         }
+    if queue_status in EMAIL_VALIDATION_REGISTRY_PASSIVE_STATUSES:
+        return {
+            "kind": "email_validation_registry_known",
+            "registry_id": int(row["id"] or 0),
+            "validation_status": "already_seen",
+            "touchpoint_status": "",
+            "queue_status": "Skipped",
+        }
     first_touchpoint_id = int((row["first_touchpoint_id"] or 0) if "first_touchpoint_id" in row.keys() else 0)
     if queue_status in EMAIL_VALIDATION_REGISTRY_ACTIVE_STATUSES and first_touchpoint_id != exclude_touchpoint_id:
         return {
@@ -15405,17 +15413,12 @@ def _ensure_email_validation_registry(db, email_value, touchpoint_id=0, person_i
             db.execute(
                 """
                 UPDATE email_validation_registry
-                SET queue_status = 'Queued',
-                    validation_status = '',
-                    validation_raw = '',
-                    run_after = ?,
-                    requested_at = COALESCE(requested_at, ?),
-                    last_source = ?,
+                SET last_source = ?,
                     last_touchpoint_id = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (now_stamp, now_stamp, source_value, int(touchpoint_id or 0), registry_id),
+                (source_value, int(touchpoint_id or 0), registry_id),
             )
         else:
             db.execute(
@@ -15892,10 +15895,10 @@ def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value,
             source_value,
             "Skipped",
             now_stamp,
-            validation_status="already_queued",
+            validation_status=registry_decision.get("validation_status") or "already_queued",
             validation_raw=json.dumps(
                 {
-                    "source": "email_validation_registry_pending",
+                    "source": decision_kind or "email_validation_registry_pending",
                     "registry_id": registry_decision.get("registry_id") or None,
                     "status": registry_decision.get("validation_status") or "",
                     "provider_call_made": False,

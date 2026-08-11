@@ -7091,6 +7091,7 @@ def import_skipsherpa_property_result(db, property_id, lookup_pkg):
         property_id,
         phone_items=sync_phone_items,
         email_items=sync_email_items,
+        property_tags=build_reisift_skipsherpa_skiptrace_tags(),
     )
     if primary_owner_id:
         add_person_note(
@@ -8150,6 +8151,7 @@ def import_skipsherpa_person_result(db, property_id, person_id, lookup_response)
         property_id,
         phone_items=sync_phone_items,
         email_items=sync_email_items,
+        property_tags=build_reisift_skipsherpa_skiptrace_tags(),
     )
 
     db.execute(
@@ -19673,6 +19675,15 @@ def _reisift_date_stamp_for_tag(when=None):
     return dt.strftime("%m%d%y")
 
 
+def _reisift_month_year_stamp_for_tag(when=None):
+    dt = when if isinstance(when, datetime) else datetime.now(EST_TZ)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=EST_TZ)
+    else:
+        dt = dt.astimezone(EST_TZ)
+    return dt.strftime("%m%y")
+
+
 def build_reisift_direct_mail_tags(when=None):
     stamp = _reisift_date_stamp_for_tag(when)
     return ["directmail", f"DM{stamp}"]
@@ -19710,6 +19721,13 @@ def build_reisift_mail_status_tag_plan(status_label, when=None):
 def build_reisift_skiptrace_tags(when=None):
     stamp = _reisift_date_stamp_for_tag(when)
     return ["skiptraced", f"skipped{stamp}"]
+
+
+def build_reisift_skipsherpa_skiptrace_tags(when=None):
+    stamp = _reisift_month_year_stamp_for_tag(when)
+    tags = build_reisift_skiptrace_tags(when=when)
+    tags.extend(["skipsherpaSkipped", f"skipsherpaSkipped {stamp}"])
+    return list(dict.fromkeys(tags))
 
 
 def _extract_reisift_property_tags(property_payload):
@@ -30742,10 +30760,11 @@ def collect_person_contact_items_for_reisift_sync(db, person_ids, property_id=No
     return phone_items, email_items
 
 
-def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, email_items=None):
+def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, email_items=None, property_tags=None):
     property_id = int(property_id or 0)
     phones_in = phone_items if isinstance(phone_items, list) else []
     emails_in = email_items if isinstance(email_items, list) else []
+    tags_to_append = property_tags if isinstance(property_tags, list) else build_reisift_skiptrace_tags()
     out = {
         "ok": False,
         "property_id": property_id,
@@ -30923,7 +30942,7 @@ def sync_skiptrace_contacts_to_reisift_owner(db, property_id, phone_items=None, 
             out["tag_sync"] = reisift_append_property_tags(
                 token,
                 out["property_uuid"],
-                build_reisift_skiptrace_tags(),
+                tags_to_append,
             )
         except Exception as exc:
             out["tag_sync"] = {

@@ -772,10 +772,17 @@ body {
 .action-icon-link {
     align-items: center;
     display: inline-flex;
+    gap: 0.18rem;
     justify-content: center;
     line-height: 1;
+    margin-right: 0.25rem;
     text-decoration: none;
     vertical-align: middle;
+}
+
+.action-link-text {
+    font-size: 0.68rem;
+    font-weight: 600;
 }
 
 .tiny-link-icon {

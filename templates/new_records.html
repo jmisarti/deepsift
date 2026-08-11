@@ -208,7 +208,7 @@
                     <th>Email Out</th>
                     <th>Email In</th>
                     <th>Emails Opened</th>
-                    <th>SIFT</th>
+                    <th>Links</th>
                 </tr>
             </thead>
             <tbody>
@@ -228,13 +228,15 @@
                     <td>{{ row.emails_opened }}</td>
                     <td>
                         {% if row.deep_dive_property_id %}
-                        <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.deep_dive_property_id) }}" title="Open in Deep Dive" aria-label="Open in Deep Dive">
+                        <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.deep_dive_property_id) }}" title="Open local DeepSift record" aria-label="Open local DeepSift record">
                             <img class="tiny-link-icon" src="https://iwillbuyyourhouseforcash.com/wp-content/uploads/2024/08/cropped-nj-logo-tiny-32x32.png" alt="Deep Dive">
+                            <span class="action-link-text">Local</span>
                         </a>
                         {% endif %}
                         {% if row.sift_record_url %}
                         <a class="action-icon-link" href="{{ row.sift_record_url }}" target="_blank" rel="noopener" title="Open in REISift" aria-label="Open in REISift">
                             <img class="tiny-link-icon" src="https://app.reisift.io/favicon.ico" alt="REISift">
+                            <span class="action-link-text">SIFT</span>
                         </a>
                         {% endif %}
                         {% if not row.deep_dive_property_id and not row.sift_record_url %}

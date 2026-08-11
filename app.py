@@ -331,6 +331,8 @@ EMAILOCTOPUS_SYNC_QUEUE_WORKER_STARTED = False
 PROSPECT_TABLE_CACHE_WORKER_STARTED = False
 BACKGROUND_WORKERS_BOOTSTRAP_STARTED = False
 BACKGROUND_WORKERS_BOOTSTRAP_LOCK = threading.Lock()
+EMAILOCTOPUS_WEBHOOK_PROCESSING_LOCK = threading.RLock()
+EMAILOCTOPUS_SYNC_QUEUE_LOCK = threading.RLock()
 ENSURE_DB_READY = False
 ENSURE_DB_LOCK = threading.Lock()
 PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTES") or "60").strip() or "60"), 5)
@@ -17714,6 +17716,8 @@ def process_emailoctopus_sync_queue_row(db, row, settings=None):
 
 def run_emailoctopus_sync_queue_once(limit=None):
     ensure_db()
+    if not EMAILOCTOPUS_SYNC_QUEUE_LOCK.acquire(blocking=False):
+        return {"ok": True, "skipped": "emailoctopus_sync_already_running", "attempted": 0, "completed": 0, "errors": 0}
     db = open_sqlite_connection()
     attempted = 0
     completed = 0
@@ -17766,6 +17770,7 @@ def run_emailoctopus_sync_queue_once(limit=None):
         }
     finally:
         db.close()
+        EMAILOCTOPUS_SYNC_QUEUE_LOCK.release()
 
 
 def sync_validated_email_to_emailoctopus(
@@ -18424,59 +18429,51 @@ def _sync_emailoctopus_event_to_reisift(db, event_db_id, fields, resolution):
 def process_emailoctopus_event(db, event, safe_headers=None):
     fields = _emailoctopus_event_fields(event)
     safe_payload = _redact_clever_log_value("root", event)
+    execute_with_retry(
+        db,
+        """
+        INSERT INTO emailoctopus_webhook_events (
+            event_key, event_type, event_action, list_id, contact_id, contact_email, campaign_id,
+            verification_status, processing_status, error_text, payload_json, headers_json, occurred_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'verified', 'received', '', ?, ?, ?)
+        ON CONFLICT(event_key) DO UPDATE SET
+            event_type = excluded.event_type,
+            event_action = excluded.event_action,
+            list_id = excluded.list_id,
+            contact_id = excluded.contact_id,
+            contact_email = excluded.contact_email,
+            campaign_id = excluded.campaign_id,
+            verification_status = 'verified',
+            processing_status = 'received',
+            error_text = '',
+            payload_json = excluded.payload_json,
+            headers_json = excluded.headers_json,
+            occurred_at = excluded.occurred_at
+        WHERE lower(COALESCE(emailoctopus_webhook_events.processing_status, '')) NOT IN ('processed', 'ignored', 'unmatched')
+        """,
+        (
+            fields["event_key"],
+            fields["event_type"],
+            fields["event_action"],
+            fields["list_id"],
+            fields["contact_id"],
+            fields["contact_email"],
+            fields["campaign_id"],
+            json.dumps(safe_payload or {}, ensure_ascii=True, default=str),
+            json.dumps(safe_headers or {}, ensure_ascii=True, default=str),
+            fields["occurred_at"],
+        ),
+    )
     existing = db.execute(
         "SELECT id, processing_status FROM emailoctopus_webhook_events WHERE event_key = ? LIMIT 1",
         (fields["event_key"],),
     ).fetchone()
-    if existing and str(existing["processing_status"] or "").strip().lower() in {"processed", "ignored", "unmatched"}:
-        return {"ok": True, "duplicate": True, "event_id": int(existing["id"])}
-
-    if existing:
-        event_db_id = int(existing["id"])
-        db.execute(
-            """
-            UPDATE emailoctopus_webhook_events
-            SET event_type = ?, event_action = ?, list_id = ?, contact_id = ?, contact_email = ?,
-                campaign_id = ?, verification_status = 'verified', processing_status = 'received',
-                error_text = '', payload_json = ?, headers_json = ?, occurred_at = ?
-            WHERE id = ?
-            """,
-            (
-                fields["event_type"],
-                fields["event_action"],
-                fields["list_id"],
-                fields["contact_id"],
-                fields["contact_email"],
-                fields["campaign_id"],
-                json.dumps(safe_payload or {}, ensure_ascii=True, default=str),
-                json.dumps(safe_headers or {}, ensure_ascii=True, default=str),
-                fields["occurred_at"],
-                event_db_id,
-            ),
-        )
-    else:
-        cur = db.execute(
-            """
-            INSERT INTO emailoctopus_webhook_events (
-                event_key, event_type, event_action, list_id, contact_id, contact_email, campaign_id,
-                verification_status, processing_status, error_text, payload_json, headers_json, occurred_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'verified', 'received', '', ?, ?, ?)
-            """,
-            (
-                fields["event_key"],
-                fields["event_type"],
-                fields["event_action"],
-                fields["list_id"],
-                fields["contact_id"],
-                fields["contact_email"],
-                fields["campaign_id"],
-                json.dumps(safe_payload or {}, ensure_ascii=True, default=str),
-                json.dumps(safe_headers or {}, ensure_ascii=True, default=str),
-                fields["occurred_at"],
-            ),
-        )
-        event_db_id = int(cur.lastrowid or 0)
+    if not existing:
+        raise RuntimeError("emailoctopus_event_not_stored")
+    event_db_id = int(existing["id"])
+    if str(existing["processing_status"] or "").strip().lower() in {"processed", "ignored", "unmatched"}:
+        return {"ok": True, "duplicate": True, "event_id": event_db_id}
 
     if not fields["event_action"]:
         db.execute(
@@ -56444,9 +56441,26 @@ def emailoctopus_events_webhook():
 
     results = []
     counts = Counter()
-    try:
+    with EMAILOCTOPUS_WEBHOOK_PROCESSING_LOCK:
         for event in events:
-            result = process_emailoctopus_event(db, event, safe_headers=safe_headers)
+            try:
+                result = process_emailoctopus_event(db, event, safe_headers=safe_headers)
+                commit_with_retry(db)
+            except Exception as exc:
+                db.rollback()
+                result = {"ok": False, "error": str(exc), "event_type": _emailoctopus_event_fields(event).get("event_type") or ""}
+                try:
+                    log_app_error(
+                        db,
+                        source="emailoctopus_events_webhook",
+                        error_message=str(exc),
+                        details=traceback.format_exc(),
+                        route="/webhooks/emailoctopus/events",
+                        status_code=500,
+                    )
+                    commit_with_retry(db)
+                except Exception:
+                    db.rollback()
             results.append(result)
             if result.get("duplicate"):
                 counts["duplicate"] += 1
@@ -56458,20 +56472,7 @@ def emailoctopus_events_webhook():
                 counts["processed"] += 1
             else:
                 counts["error"] += 1
-        commit_with_retry(db)
-        return jsonify({"ok": True, "events_seen": len(events), "counts": dict(counts), "results": results[:25]}), 200
-    except Exception as exc:
-        db.rollback()
-        log_app_error(
-            db,
-            source="emailoctopus_events_webhook",
-            error_message=str(exc),
-            details=traceback.format_exc(),
-            route="/webhooks/emailoctopus/events",
-            status_code=500,
-        )
-        commit_with_retry(db)
-        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": counts["error"] == 0, "events_seen": len(events), "counts": dict(counts), "results": results[:25]}), 200
 
 
 @app.route("/webhooks/reisift/automation", methods=["POST"])

@@ -15172,6 +15172,8 @@ def _touchpoint_status_from_email_validation_status(validation_status):
 EMAIL_VALIDATION_COMPLETED_STATUSES = {"valid", "invalid", "unknown", "undeliverable"}
 EMAIL_VALIDATION_REGISTRY_ACTIVE_STATUSES = {"queued", "retry", "inflight", "in_flight", "held"}
 EMAIL_VALIDATION_REGISTRY_BACKFILL_SETTING = "email_validation_registry_backfilled_at"
+EMAIL_VALIDATION_REGISTRY_TOUCHPOINT_BACKFILL_SETTING = "email_validation_registry_touchpoints_backfilled_at"
+EMAIL_VALIDATION_REGISTRY_PASSIVE_STATUSES = {"known", "discovered", "skipped"}
 
 
 def _email_validation_registry_row(db, email_value):
@@ -15272,6 +15274,22 @@ def _ensure_email_validation_registry(db, email_value, touchpoint_id=0, person_i
                 (source_value, int(touchpoint_id or 0), registry_id),
             )
         elif queue_status == "held":
+            db.execute(
+                """
+                UPDATE email_validation_registry
+                SET queue_status = 'Queued',
+                    validation_status = '',
+                    validation_raw = '',
+                    run_after = ?,
+                    requested_at = COALESCE(requested_at, ?),
+                    last_source = ?,
+                    last_touchpoint_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (now_stamp, now_stamp, source_value, int(touchpoint_id or 0), registry_id),
+            )
+        elif queue_status in EMAIL_VALIDATION_REGISTRY_PASSIVE_STATUSES:
             db.execute(
                 """
                 UPDATE email_validation_registry
@@ -15864,6 +15882,8 @@ def run_touchpoint_email_validation_queue_once(limit=10):
     updated = 0
     try:
         try:
+            backfill_email_validation_registry_from_touchpoints(db, force=False)
+            commit_with_retry(db)
             backfill_email_validation_registry_from_queue(db, force=False)
             commit_with_retry(db)
         except Exception:
@@ -16257,6 +16277,148 @@ def _email_validation_registry_backfill_state(row):
     if validation_status in EMAIL_VALIDATION_COMPLETED_STATUSES:
         return "Completed", validation_status
     return "Skipped", validation_status or queue_status or "skipped"
+
+
+def _email_validation_registry_state_from_touchpoint_status(status):
+    status_key = str(status or "").strip().lower()
+    if status_key == "valid":
+        return "Completed", "valid", "valid"
+    if status_key in {"undeliverable", "invalid", "bounced"}:
+        return "Completed", "undeliverable", status_key
+    if status_key in BLOCKED_CONTACT_STATUSES:
+        return "Skipped", status_key, status_key
+    return "Known", status_key or "known", status_key or "known"
+
+
+def backfill_email_validation_registry_from_touchpoints(db, force=False, limit=300000):
+    try:
+        already = db.execute(
+            "SELECT value FROM app_settings WHERE key = ? LIMIT 1",
+            (EMAIL_VALIDATION_REGISTRY_TOUCHPOINT_BACKFILL_SETTING,),
+        ).fetchone()
+        if already and not force:
+            return {"ok": True, "skipped": "already_backfilled", "at": already["value"]}
+    except Exception:
+        if not force:
+            return {"ok": False, "error": "app_settings_unavailable"}
+    try:
+        limit = max(1, min(500000, int(limit or 300000)))
+    except Exception:
+        limit = 300000
+    rows = db.execute(
+        """
+        SELECT t.id AS touchpoint_id,
+               t.person_id,
+               t.value,
+               t.status,
+               t.created_at
+        FROM touchpoints t
+        WHERE lower(COALESCE(t.channel_type, '')) = 'email'
+          AND COALESCE(t.value, '') <> ''
+        ORDER BY t.id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    registry_created = 0
+    registry_promoted = 0
+    attached = 0
+    for row in rows:
+        normalized_email = normalize_email_identity(row["value"] or "")
+        if not normalized_email:
+            continue
+        queue_status, validation_status, provider_status = _email_validation_registry_state_from_touchpoint_status(row["status"] or "")
+        raw = json.dumps(
+            {
+                "source": "touchpoint_registry_backfill",
+                "touchpoint_id": int(row["touchpoint_id"] or 0),
+                "touchpoint_status": row["status"] or "",
+                "provider_call_made": False,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        existing = _email_validation_registry_row(db, normalized_email)
+        if not existing:
+            db.execute(
+                """
+                INSERT INTO email_validation_registry (
+                    normalized_email, provider, queue_status, validation_status, provider_status, validation_raw,
+                    attempts, first_source, last_source, first_touchpoint_id, last_touchpoint_id,
+                    run_after, requested_at, processed_at, created_at, updated_at
+                )
+                VALUES (?, 'emaillistverify', ?, ?, ?, ?, 0, 'touchpoint_registry_backfill', 'touchpoint_registry_backfill', ?, ?, ?, NULL, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                (
+                    normalized_email,
+                    queue_status,
+                    validation_status,
+                    provider_status,
+                    raw,
+                    int(row["touchpoint_id"] or 0),
+                    int(row["touchpoint_id"] or 0),
+                    row["created_at"] or format_db_time(datetime.utcnow()),
+                    format_db_time(datetime.utcnow()) if queue_status == "Completed" else None,
+                ),
+            )
+            registry_created += 1
+            existing = _email_validation_registry_row(db, normalized_email)
+        else:
+            existing_status = str(existing["queue_status"] or "").strip().lower()
+            existing_validation = str(existing["validation_status"] or "").strip().lower()
+            should_promote = (
+                queue_status == "Completed"
+                and (
+                    existing_status != "completed"
+                    or existing_validation not in EMAIL_VALIDATION_COMPLETED_STATUSES
+                )
+            )
+            if should_promote:
+                db.execute(
+                    """
+                    UPDATE email_validation_registry
+                    SET queue_status = 'Completed',
+                        validation_status = ?,
+                        provider_status = ?,
+                        validation_raw = ?,
+                        processed_at = COALESCE(processed_at, ?),
+                        last_source = 'touchpoint_registry_backfill',
+                        last_touchpoint_id = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        validation_status,
+                        provider_status,
+                        raw,
+                        format_db_time(datetime.utcnow()),
+                        int(row["touchpoint_id"] or 0),
+                        int(existing["id"] or 0),
+                    ),
+                )
+                registry_promoted += 1
+                existing = _email_validation_registry_row(db, normalized_email)
+        if existing and int(row["touchpoint_id"] or 0) > 0:
+            _attach_email_validation_touchpoint(
+                db,
+                int(existing["id"] or 0),
+                int(row["touchpoint_id"] or 0),
+                row["person_id"],
+                "touchpoint_registry_backfill",
+            )
+            attached += 1
+    stamp = format_db_time(datetime.utcnow())
+    db.execute(
+        """
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at
+        """,
+        (EMAIL_VALIDATION_REGISTRY_TOUCHPOINT_BACKFILL_SETTING, stamp),
+    )
+    return {"ok": True, "created": registry_created, "promoted": registry_promoted, "attached": attached, "at": stamp}
 
 
 def backfill_email_validation_registry_from_queue(db, force=False, limit=200000):

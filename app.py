@@ -330,6 +330,8 @@ EMAIL_VALIDATION_QUEUE_WORKER_STARTED = False
 EMAILOCTOPUS_SYNC_QUEUE_WORKER_STARTED = False
 BACKGROUND_WORKERS_BOOTSTRAP_STARTED = False
 BACKGROUND_WORKERS_BOOTSTRAP_LOCK = threading.Lock()
+ENSURE_DB_READY = False
+ENSURE_DB_LOCK = threading.Lock()
 PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTES") or "60").strip() or "60"), 5)
 PROVIDER_ALERT_SOURCE_PREFIX = "provider_"
 ADS_DEFAULT_LOOKBACK_DAYS = max(int((os.getenv("ADS_DEFAULT_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
@@ -1118,6 +1120,7 @@ def migrate_db(db):
     ensure_column(db, "reisift_new_records", "local_status_after", "local_status_after TEXT")
     ensure_column(db, "reisift_new_records", "outbound_calls", "outbound_calls INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "reisift_new_records", "inbound_calls", "inbound_calls INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "mail_out", "mail_out INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "reisift_new_records", "outbound_sms", "outbound_sms INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "reisift_new_records", "inbound_sms", "inbound_sms INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "reisift_new_records", "outbound_email", "outbound_email INTEGER NOT NULL DEFAULT 0")
@@ -2534,20 +2537,30 @@ def init_db():
     db.close()
 
 
-def ensure_db():
-    if not DB_PATH.exists():
-        init_db()
+def ensure_db(force=False):
+    global ENSURE_DB_READY
+    if ENSURE_DB_READY and DB_PATH.exists() and not force:
         return
+    with ENSURE_DB_LOCK:
+        if ENSURE_DB_READY and DB_PATH.exists() and not force:
+            return
+        if not DB_PATH.exists():
+            init_db()
+            ENSURE_DB_READY = True
+            return
 
-    db = open_sqlite_connection()
-    migrate_db(db)
-    normalize_people_name_data(db)
-    backfill_openletterconnect_mail_orders(db)
-    ensure_default_sequence_campaign(db)
-    ensure_default_sms_automation_routing_rules(db)
-    normalize_unsent_sms_queue_addresses(db)
-    db.commit()
-    db.close()
+        db = open_sqlite_connection()
+        try:
+            migrate_db(db)
+            normalize_people_name_data(db)
+            backfill_openletterconnect_mail_orders(db)
+            ensure_default_sequence_campaign(db)
+            ensure_default_sms_automation_routing_rules(db)
+            normalize_unsent_sms_queue_addresses(db)
+            db.commit()
+            ENSURE_DB_READY = True
+        finally:
+            db.close()
 
 
 def _address_metadata_values(
@@ -35123,7 +35136,7 @@ def upsert_reisift_new_record(
     existing_new_record = db.execute(
         """
         SELECT outbound_calls, inbound_calls, outbound_sms, inbound_sms,
-               outbound_email, inbound_email, inbound_responses, events_json, tasks_json,
+               mail_out, outbound_email, inbound_email, inbound_responses, events_json, tasks_json,
                first_seen_at, automation_eligible, automation_hold_reason
         FROM reisift_new_records
         WHERE property_uuid = ?
@@ -35136,6 +35149,7 @@ def upsert_reisift_new_record(
         sift_rollup = {
             "outbound_calls": int((existing_new_record["outbound_calls"] if existing_new_record else 0) or 0),
             "inbound_calls": int((existing_new_record["inbound_calls"] if existing_new_record else 0) or 0),
+            "mail_out": int((existing_new_record["mail_out"] if existing_new_record and "mail_out" in existing_new_record.keys() else 0) or 0),
             "outbound_sms": int((existing_new_record["outbound_sms"] if existing_new_record else 0) or 0),
             "inbound_sms": int((existing_new_record["inbound_sms"] if existing_new_record else 0) or 0),
             "outbound_email": int((existing_new_record["outbound_email"] if existing_new_record else 0) or 0),
@@ -35217,12 +35231,12 @@ def upsert_reisift_new_record(
             (property_uuid, segment, status, full_address, owner_names, county, city, completeness, owner_type, owner_out_of_state,
              added_at, reisift_updated_at,
              local_property_id, local_status_before, local_status_after,
-             outbound_calls, inbound_calls, outbound_sms, inbound_sms, outbound_email, inbound_email,
+             outbound_calls, inbound_calls, mail_out, outbound_sms, inbound_sms, outbound_email, inbound_email,
              inbound_responses, events_json, tasks_json,
              rei_skipped, deep_skipped, no_good_numbers,
              first_seen_at, automation_eligible, automation_hold_reason,
              payload_json, is_active, last_synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(property_uuid) DO UPDATE SET
             segment = excluded.segment,
             status = excluded.status,
@@ -35240,6 +35254,7 @@ def upsert_reisift_new_record(
             local_status_after = excluded.local_status_after,
             outbound_calls = excluded.outbound_calls,
             inbound_calls = excluded.inbound_calls,
+            mail_out = excluded.mail_out,
             outbound_sms = excluded.outbound_sms,
             inbound_sms = excluded.inbound_sms,
             outbound_email = excluded.outbound_email,
@@ -35275,6 +35290,7 @@ def upsert_reisift_new_record(
             local_sync["after"],
             int(sift_rollup.get("outbound_calls") or 0),
             int(sift_rollup.get("inbound_calls") or 0),
+            int(sift_rollup.get("mail_out") or 0),
             int(sift_rollup.get("outbound_sms") or 0),
             int(sift_rollup.get("inbound_sms") or 0),
             int(sift_rollup.get("outbound_email") or 0),
@@ -36341,7 +36357,7 @@ def property_activity_counts_for_new_record(db, property_id, new_record_row=None
 def _new_record_default_activity_counts(row):
     nr = row if isinstance(row, dict) else {}
     return {
-        "mail_out": 0,
+        "mail_out": int(nr.get("mail_out") or 0),
         "call_out": int(nr.get("outbound_calls") or 0),
         "call_in": int(nr.get("inbound_calls") or 0),
         "sms_out": int(nr.get("outbound_sms") or 0),
@@ -36714,9 +36730,8 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
         for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
             item[flag_key] = 1 if int(item.get(flag_key) or 0) else 0
 
-    activity_counts = bulk_property_activity_counts_for_new_records(db, page_rows)
     for item in page_rows:
-        item.update(activity_counts.get(id(item), _new_record_default_activity_counts(item)))
+        item.update(_new_record_default_activity_counts(item))
     county_counts = {}
     local_match_count = 0
     local_update_count = 0

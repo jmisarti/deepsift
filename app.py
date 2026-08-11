@@ -337,6 +337,7 @@ ENSURE_DB_READY = False
 ENSURE_DB_LOCK = threading.Lock()
 PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTES") or "60").strip() or "60"), 5)
 PROSPECT_TABLE_CACHE_REFRESH_SECONDS = max(int((os.getenv("PROSPECT_TABLE_CACHE_REFRESH_SECONDS") or "300").strip() or "300"), 60)
+REISIFT_REFRESH_STALE_MINUTES = max(int((os.getenv("REISIFT_REFRESH_STALE_MINUTES") or "180").strip() or "180"), 30)
 PROVIDER_ALERT_SOURCE_PREFIX = "provider_"
 ADS_DEFAULT_LOOKBACK_DAYS = max(int((os.getenv("ADS_DEFAULT_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
 ADS_REFRESH_LOOKBACK_DAYS = max(int((os.getenv("ADS_REFRESH_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
@@ -2643,6 +2644,7 @@ def ensure_db(force=False):
             ensure_default_sequence_campaign(db)
             ensure_default_sms_automation_routing_rules(db)
             normalize_unsent_sms_queue_addresses(db)
+            purge_suppressed_sms_automation_queue(db)
             try:
                 ensure_prospect_table_cache_seeded(db)
             except Exception:
@@ -9959,13 +9961,10 @@ def suppress_sms_automation_followups_for_delivery_failure(db, property_id, phon
         params.append(int(person_id or 0))
     cur = db.execute(
         f"""
-        UPDATE sms_automation_queue
-        SET status = 'Suppressed',
-            suppression_reason = ?,
-            updated_at = CURRENT_TIMESTAMP
+        DELETE FROM sms_automation_queue
         WHERE {' AND '.join(clauses)}
         """,
-        tuple([reason] + params),
+        tuple(params),
     )
     return int(cur.rowcount or 0)
 
@@ -34088,14 +34087,7 @@ def revalidate_sms_automation_queue(db, property_ids=None):
         if not reason:
             reason = sms_automation_inbound_reply_suppression_reason(db, row)
         if reason:
-            db.execute(
-                """
-                UPDATE sms_automation_queue
-                SET status = 'Suppressed', suppression_reason = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (reason, row["id"]),
-            )
+            db.execute("DELETE FROM sms_automation_queue WHERE id = ?", (row["id"],))
             suppressed += 1
     return suppressed
 
@@ -34455,14 +34447,7 @@ def approve_sms_automation_queue_items(db, queue_ids):
         if not reason:
             reason = sms_automation_inbound_reply_suppression_reason(db, row)
         if reason:
-            db.execute(
-                """
-                UPDATE sms_automation_queue
-                SET status = 'Suppressed', suppression_reason = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (reason, queue_id),
-            )
+            db.execute("DELETE FROM sms_automation_queue WHERE id = ?", (queue_id,))
             result["suppressed"] += 1
             result["suppressed_ids"].append(queue_id)
             continue
@@ -34532,6 +34517,21 @@ def normalize_unsent_sms_queue_addresses(db):
         )
         updated += 1
     return updated
+
+
+def purge_suppressed_sms_automation_queue(db, property_ids=None):
+    clauses = ["status = 'Suppressed'"]
+    params = []
+    if property_ids:
+        ids = sorted({int(pid) for pid in property_ids if int(pid or 0) > 0})
+        if ids:
+            clauses.append("property_id IN (" + ",".join(["?"] * len(ids)) + ")")
+            params.extend(ids)
+    cur = db.execute(
+        f"DELETE FROM sms_automation_queue WHERE {' AND '.join(clauses)}",
+        tuple(params),
+    )
+    return int(cur.rowcount or 0)
 
 
 def collect_sms_automation_targets_for_property(db, property_id, active_property_uuid=None):
@@ -34646,18 +34646,15 @@ def suppress_duplicate_sms_automation_queue_items(db, property_ids=None):
                 continue
             if int(item["id"]) == int(keep["id"]):
                 continue
-            db.execute(
+            cur = db.execute(
                 """
-                UPDATE sms_automation_queue
-                SET status = 'Suppressed',
-                    suppression_reason = ?,
-                    updated_at = CURRENT_TIMESTAMP
+                DELETE FROM sms_automation_queue
                 WHERE id = ?
                   AND status NOT IN ('Sent', 'Sending', 'Approved')
                 """,
-                (f"Duplicate SMS candidate for this property/phone; kept queue #{keep['id']}.", item["id"]),
+                (item["id"],),
             )
-            suppressed += 1
+            suppressed += int(cur.rowcount or 0)
     return suppressed
 
 
@@ -34882,13 +34879,10 @@ def suppress_sms_automation_followups_for_reply(db, property_id, phone_number, p
         reason += f" Communication #{communication_id}."
     cur = db.execute(
         f"""
-        UPDATE sms_automation_queue
-        SET status = 'Suppressed',
-            suppression_reason = ?,
-            updated_at = CURRENT_TIMESTAMP
+        DELETE FROM sms_automation_queue
         WHERE {' AND '.join(clauses)}
         """,
-        tuple([reason] + params),
+        tuple(params),
     )
     return int(cur.rowcount or 0)
 
@@ -35146,6 +35140,7 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
     cleanup_property_ids = property_ids if property_ids else None
     duplicates_suppressed += suppress_duplicate_sms_automation_queue_items(db, property_ids=cleanup_property_ids)
     suppressed += revalidate_sms_automation_queue(db, property_ids=cleanup_property_ids)
+    suppressed += purge_suppressed_sms_automation_queue(db, property_ids=cleanup_property_ids)
     return {
         "records": len(rows),
         "created": created,
@@ -35447,23 +35442,6 @@ def refresh_reisift_prospect_segment_cache(
         search_failed = True
         errors.append(f"reisift_search: {exc}")
     previous_active_rows = []
-    if not search_failed:
-        previous_active_rows = db.execute(
-            """
-            SELECT property_uuid, local_property_id, status
-            FROM reisift_new_records
-            WHERE COALESCE(is_active, 1) = 1
-              AND COALESCE(segment, 'new_records') = ?
-              AND COALESCE(property_uuid, '') <> ''
-            """
-            ,
-            (segment,),
-        ).fetchall()
-        execute_with_retry(
-            db,
-            "UPDATE reisift_new_records SET is_active = 0 WHERE COALESCE(segment, 'new_records') = ?",
-            (segment,),
-        )
     scanned = 0
     synced = 0
     skipped_county = 0
@@ -35478,6 +35456,7 @@ def refresh_reisift_prospect_segment_cache(
     returned_property_uuids = set()
     status_exit_checks = 0
     status_exit_unsubscribed = 0
+    prepared_rows = []
     for row in rows:
         scanned += 1
         property_uuid = normalize_uuid(row.get("uuid") or "")
@@ -35495,14 +35474,41 @@ def refresh_reisift_prospect_segment_cache(
                 sift_rollup = fetch_reisift_property_log_rollup(token, property_uuid, max_rows=120)
             except Exception as exc:
                 errors.append(f"{property_uuid} logs: {exc}")
+        prepared_rows.append(
+            {
+                "property_uuid": property_uuid,
+                "details": details,
+                "search_row": row,
+                "sift_rollup": sift_rollup,
+            }
+        )
+    if not search_failed:
+        previous_active_rows = db.execute(
+            """
+            SELECT property_uuid, local_property_id, status
+            FROM reisift_new_records
+            WHERE COALESCE(is_active, 1) = 1
+              AND COALESCE(segment, 'new_records') = ?
+              AND COALESCE(property_uuid, '') <> ''
+            """
+            ,
+            (segment,),
+        ).fetchall()
+        execute_with_retry(
+            db,
+            "UPDATE reisift_new_records SET is_active = 0 WHERE COALESCE(segment, 'new_records') = ?",
+            (segment,),
+        )
+    for prepared in prepared_rows:
+        property_uuid = prepared["property_uuid"]
         try:
             local_sync = upsert_reisift_new_record(
                 db,
                 property_uuid,
-                details,
-                search_row=row,
+                prepared["details"],
+                search_row=prepared["search_row"],
                 is_active=1,
-                sift_rollup=sift_rollup,
+                sift_rollup=prepared["sift_rollup"],
                 segment=segment,
                 force_automation_eligible=force_automation_eligible,
             )
@@ -35554,6 +35560,10 @@ def refresh_reisift_prospect_segment_cache(
                     local_updates += 1
             except Exception as exc:
                 errors.append(f"{property_uuid}: status exit check failed ({exc})")
+    try:
+        commit_with_retry(db)
+    except Exception as exc:
+        errors.append(f"cache_commit_before_sms_queue: {exc}")
     sms_queue = {"created": 0, "updated": 0, "skipped": 0, "suppressed": 0}
     try:
         sms_queue = generate_sms_automation_queue_for_new_records(db, token=token)
@@ -35632,16 +35642,28 @@ def set_reisift_new_records_refresh_state(db, status, message="", result=None):
     return payload
 
 
+def _reisift_refresh_state_is_stale(data):
+    if not isinstance(data, dict):
+        return False
+    status = str(data.get("status") or "").strip().lower()
+    if status != "running":
+        return False
+    updated_at = parse_db_time(data.get("updated_at") or "")
+    if not updated_at:
+        return False
+    return datetime.utcnow() - updated_at > timedelta(minutes=REISIFT_REFRESH_STALE_MINUTES)
+
+
 def get_reisift_new_records_refresh_state(db):
     raw = get_setting(db, "reisift_new_records_refresh_state_json", "")
     data = parse_json_object(raw or "{}", default={})
     if not isinstance(data, dict) or not data:
         return {"status": "idle", "message": "", "updated_at": "", "result": {}}
     status = str(data.get("status") or "idle").strip() or "idle"
-    if status == "running" and not REISIFT_NEW_RECORDS_REFRESH_LOCK.locked():
+    if status == "running" and (_reisift_refresh_state_is_stale(data) or not REISIFT_NEW_RECORDS_REFRESH_LOCK.locked()):
         return {
             "status": "idle",
-            "message": "",
+            "message": "Previous refresh state was stale; ready to retry." if _reisift_refresh_state_is_stale(data) else "",
             "updated_at": str(data.get("updated_at") or "").strip(),
             "result": data.get("result") if isinstance(data.get("result"), dict) else {},
         }
@@ -35733,10 +35755,10 @@ def get_reisift_deep_prospecting_refresh_state(db):
     if not isinstance(data, dict) or not data:
         return {"status": "idle", "message": "", "updated_at": "", "result": {}}
     status = str(data.get("status") or "idle").strip() or "idle"
-    if status == "running" and not REISIFT_DEEP_PROSPECTING_REFRESH_LOCK.locked():
+    if status == "running" and (_reisift_refresh_state_is_stale(data) or not REISIFT_DEEP_PROSPECTING_REFRESH_LOCK.locked()):
         return {
             "status": "idle",
-            "message": "",
+            "message": "Previous refresh state was stale; ready to retry." if _reisift_refresh_state_is_stale(data) else "",
             "updated_at": str(data.get("updated_at") or "").strip(),
             "result": data.get("result") if isinstance(data.get("result"), dict) else {},
         }
@@ -44279,15 +44301,12 @@ def _sms_automation_send_queue_item(db, queue_id):
     if not reason:
         reason = sms_automation_touchpoint_suppression_reason(db, row["touchpoint_id"])
     if reason:
-        db.execute(
-            "UPDATE sms_automation_queue SET status = 'Suppressed', suppression_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (reason, row["id"]),
-        )
+        db.execute("DELETE FROM sms_automation_queue WHERE id = ? AND status NOT IN ('Sent', 'Sending')", (row["id"],))
         try:
             refresh_prospect_table_cache_for_property_id(db, row["property_id"])
         except Exception:
             pass
-        return {"ok": False, "error": reason, "suppressed": True}
+        return {"ok": False, "error": reason, "suppressed": True, "deleted": True}
     within, start, end = _sms_automation_within_send_window(db)
     if not within:
         return {
@@ -55600,17 +55619,13 @@ def classify_reisift_webhook_status_change(payload, event_type, property_uuid):
     segment = reisift_prospect_segment_for_status(new_status)
     if segment == REISIFT_NEW_RECORDS_SEGMENT:
         return {
-            "should_process": False,
-            "processing": {
-                "processing_status": "ignored",
-                "property_id": None,
-                "error_text": "",
-                "result": {
-                    "ignored_reason": "status_is_still_new_record",
-                    "property_uuid": property_uuid,
-                    "new_status": new_status,
-                },
-            },
+            "should_process": True,
+            "action": "enter_segment",
+            "segment": segment,
+            "property_uuid": property_uuid,
+            "new_status": new_status,
+            "property_payload": _extract_reisift_webhook_property_payload(payload),
+            "sequence": _extract_reisift_webhook_sequence_payload(payload),
         }
     if segment == REISIFT_DEEP_PROSPECTING_SEGMENT:
         return {

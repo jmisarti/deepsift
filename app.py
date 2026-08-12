@@ -96,6 +96,9 @@ def open_sqlite_connection():
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA wal_autocheckpoint = 1000")
+    journal_limit_mb = max(8, int((os.getenv("CRM_SQLITE_JOURNAL_SIZE_LIMIT_MB") or "64").strip() or "64"))
+    conn.execute(f"PRAGMA journal_size_limit = {journal_limit_mb * 1024 * 1024}")
     return conn
 
 
@@ -292,6 +295,24 @@ APP_AUTH_USERNAME = os.getenv("APP_AUTH_USERNAME", "").strip()
 APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD", "")
 APP_AUTH_PASSWORD_HASH = os.getenv("APP_AUTH_PASSWORD_HASH", "").strip()
 RUN_BACKGROUND_WORKERS = env_flag("RUN_BACKGROUND_WORKERS", True)
+DATABASE_MAINTENANCE_WORKER_ENABLED = env_flag("DATABASE_MAINTENANCE_WORKER_ENABLED", True)
+DATABASE_MAINTENANCE_POLL_SECONDS = max(
+    int((os.getenv("DATABASE_MAINTENANCE_POLL_SECONDS") or "21600").strip() or "21600"),
+    900,
+)
+DATABASE_MAINTENANCE_START_DELAY_SECONDS = max(
+    int((os.getenv("DATABASE_MAINTENANCE_START_DELAY_SECONDS") or "180").strip() or "180"),
+    30,
+)
+APP_ERROR_DEDUPE_MINUTES = max(int((os.getenv("APP_ERROR_DEDUPE_MINUTES") or "15").strip() or "15"), 1)
+APP_ERROR_RETENTION_DAYS = max(int((os.getenv("APP_ERROR_RETENTION_DAYS") or "30").strip() or "30"), 1)
+WEBHOOK_EVENT_RETENTION_DAYS = max(int((os.getenv("WEBHOOK_EVENT_RETENTION_DAYS") or "60").strip() or "60"), 1)
+CALL_RECORDING_FAILED_RETENTION_DAYS = max(
+    int((os.getenv("CALL_RECORDING_FAILED_RETENTION_DAYS") or "30").strip() or "30"),
+    1,
+)
+JOB_QUEUE_RETENTION_DAYS = max(int((os.getenv("JOB_QUEUE_RETENTION_DAYS") or "45").strip() or "45"), 1)
+SHEET_CHANGE_RETENTION_DAYS = max(int((os.getenv("SHEET_CHANGE_RETENTION_DAYS") or "90").strip() or "90"), 1)
 REFERRAL_MARKET_AUTO_REFRESH_ENABLED = env_flag("REFERRAL_MARKET_AUTO_REFRESH_ENABLED", False)
 REISIFT_TASK_WRITE_ENABLED = env_flag("REISIFT_TASK_WRITE_ENABLED", False)
 GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
@@ -329,6 +350,7 @@ UNTITLED_LEADS_WORKER_STARTED = False
 EMAIL_VALIDATION_QUEUE_WORKER_STARTED = False
 EMAILOCTOPUS_SYNC_QUEUE_WORKER_STARTED = False
 PROSPECT_TABLE_CACHE_WORKER_STARTED = False
+DATABASE_MAINTENANCE_WORKER_STARTED = False
 BACKGROUND_WORKERS_BOOTSTRAP_STARTED = False
 BACKGROUND_WORKERS_BOOTSTRAP_LOCK = threading.Lock()
 EMAILOCTOPUS_WEBHOOK_PROCESSING_LOCK = threading.RLock()
@@ -904,6 +926,7 @@ def start_background_workers_async():
             start_website_leads_hold_worker()
             start_ads_dashboard_worker()
             start_prospect_table_cache_worker()
+            start_database_maintenance_worker()
             if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
                 start_referral_on_market_worker()
             start_reisift_new_records_worker()
@@ -1473,11 +1496,15 @@ def migrate_db(db):
             error_message TEXT NOT NULL,
             details TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            dismissed_at TEXT
+            dismissed_at TEXT,
+            occurrence_count INTEGER NOT NULL DEFAULT 1,
+            last_seen_at TEXT
         )
         """
     )
     ensure_column(db, "app_errors", "dismissed_at", "dismissed_at TEXT")
+    ensure_column(db, "app_errors", "occurrence_count", "occurrence_count INTEGER NOT NULL DEFAULT 1")
+    ensure_column(db, "app_errors", "last_seen_at", "last_seen_at TEXT")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS slack_comp_requests (
@@ -2464,22 +2491,68 @@ def migrate_db(db):
 
 
 def log_app_error(db, source, error_message, details="", route="", status_code=None):
+    source_text = (source or "app")[:80]
+    route_text = (route or "")[:255]
+    message_text = str(error_message or "")[:2000]
+    details_text = str(details or "")[:20000]
+    try:
+        updated = db.execute(
+            """
+            UPDATE app_errors
+            SET occurrence_count = COALESCE(occurrence_count, 1) + 1,
+                last_seen_at = CURRENT_TIMESTAMP,
+                details = CASE WHEN ? <> '' THEN ? ELSE details END
+            WHERE id = (
+                SELECT id
+                FROM app_errors
+                WHERE source = ?
+                  AND route = ?
+                  AND COALESCE(status_code, -1) = COALESCE(?, -1)
+                  AND error_message = ?
+                  AND datetime(COALESCE(last_seen_at, created_at)) >= datetime('now', ?)
+                ORDER BY id DESC
+                LIMIT 1
+            )
+            """,
+            (
+                details_text,
+                details_text,
+                source_text,
+                route_text,
+                status_code,
+                message_text,
+                f"-{int(APP_ERROR_DEDUPE_MINUTES)} minutes",
+            ),
+        ).rowcount
+        if updated:
+            return
+    except Exception:
+        pass
     try:
         db.execute(
             """
-            INSERT INTO app_errors (source, route, status_code, error_message, details)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO app_errors (source, route, status_code, error_message, details, occurrence_count, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
             """,
             (
-                (source or "app")[:80],
-                (route or "")[:255],
+                source_text,
+                route_text,
                 status_code,
-                str(error_message or "")[:2000],
-                str(details or "")[:20000],
+                message_text,
+                details_text,
             ),
         )
     except Exception:
-        pass
+        try:
+            db.execute(
+                """
+                INSERT INTO app_errors (source, route, status_code, error_message, details)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (source_text, route_text, status_code, message_text, details_text),
+            )
+        except Exception:
+            pass
 
 
 def _provider_alert_text(value):
@@ -36658,6 +36731,165 @@ def start_prospect_table_cache_worker():
     thread.start()
 
 
+def _maintenance_delete_older_than(db, table_name, timestamp_expr, retention_days, extra_where="", params=()):
+    cutoff = f"-{int(retention_days)} days"
+    where_parts = [f"datetime({timestamp_expr}) < datetime('now', ?)"]
+    query_params = [cutoff]
+    if extra_where:
+        where_parts.append(f"({extra_where})")
+        query_params.extend(params or [])
+    sql = f"DELETE FROM {table_name} WHERE {' AND '.join(where_parts)}"
+    cur = execute_with_retry(db, sql, tuple(query_params), retries=3, base_delay=0.15)
+    return max(int(cur.rowcount or 0), 0)
+
+
+def run_database_maintenance_once(force=False):
+    ensure_db()
+    db = open_sqlite_connection()
+    started_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    result = {
+        "ok": True,
+        "started_at": started_at,
+        "deleted": {},
+        "checkpoint": None,
+        "errors": [],
+    }
+    try:
+        if not force:
+            last_started = get_setting(db, "database_maintenance_last_started_at", "")
+            if last_started:
+                try:
+                    last_dt = datetime.strptime(last_started, "%Y-%m-%d %H:%M:%S")
+                    if datetime.utcnow() - last_dt < timedelta(seconds=DATABASE_MAINTENANCE_POLL_SECONDS - 60):
+                        result["skipped"] = "recently_ran"
+                        return result
+                except Exception:
+                    pass
+        set_setting(db, "database_maintenance_last_started_at", started_at)
+        deletions = [
+            (
+                "app_errors",
+                "COALESCE(last_seen_at, created_at)",
+                APP_ERROR_RETENTION_DAYS,
+                "",
+                (),
+            ),
+            (
+                "smrtphone_webhook_events",
+                "received_at",
+                WEBHOOK_EVENT_RETENTION_DAYS,
+                "",
+                (),
+            ),
+            (
+                "emailoctopus_webhook_events",
+                "received_at",
+                WEBHOOK_EVENT_RETENTION_DAYS,
+                "",
+                (),
+            ),
+            (
+                "openletterconnect_webhook_events",
+                "received_at",
+                WEBHOOK_EVENT_RETENTION_DAYS,
+                "",
+                (),
+            ),
+            (
+                "reisift_webhook_events",
+                "received_at",
+                WEBHOOK_EVENT_RETENTION_DAYS,
+                "",
+                (),
+            ),
+            (
+                "email_validation_queue",
+                "COALESCE(processed_at, updated_at, created_at)",
+                JOB_QUEUE_RETENTION_DAYS,
+                "lower(COALESCE(queue_status, '')) IN ('completed', 'failed', 'skipped')",
+                (),
+            ),
+            (
+                "emailoctopus_sync_queue",
+                "COALESCE(processed_at, updated_at, created_at)",
+                JOB_QUEUE_RETENTION_DAYS,
+                "lower(COALESCE(queue_status, '')) IN ('completed', 'failed', 'skipped')",
+                (),
+            ),
+            (
+                "call_recording_jobs",
+                "COALESCE(updated_at, created_at)",
+                CALL_RECORDING_FAILED_RETENTION_DAYS,
+                "lower(COALESCE(analysis_status, '')) = 'failed' OR lower(COALESCE(fetch_status, '')) IN ('error', 'no recording url')",
+                (),
+            ),
+            (
+                "untitled_sheet_changes",
+                "created_at",
+                SHEET_CHANGE_RETENTION_DAYS,
+                "",
+                (),
+            ),
+        ]
+        for table_name, timestamp_expr, days, extra_where, params in deletions:
+            try:
+                deleted = _maintenance_delete_older_than(db, table_name, timestamp_expr, days, extra_where, params)
+                result["deleted"][table_name] = deleted
+            except Exception as exc:
+                result["errors"].append({"table": table_name, "error": str(exc)})
+        try:
+            result["deleted"]["sms_automation_queue_suppressed"] = purge_suppressed_sms_automation_queue(db)
+        except Exception as exc:
+            result["errors"].append({"table": "sms_automation_queue", "error": str(exc)})
+        set_setting(db, "database_maintenance_last_completed_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+        set_setting(db, "database_maintenance_last_result_json", json.dumps(result, ensure_ascii=True, sort_keys=True)[:10000])
+        commit_with_retry(db)
+        try:
+            result["checkpoint"] = [list(row) for row in db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()]
+        except Exception as exc:
+            result["checkpoint_error"] = str(exc)
+        result["ok"] = not bool(result["errors"])
+        return result
+    except Exception as exc:
+        db.rollback()
+        result["ok"] = False
+        result["error"] = str(exc)
+        try:
+            log_app_error(
+                db,
+                source="database_maintenance_worker",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="run_database_maintenance_once",
+                status_code=500,
+            )
+            db.commit()
+        except Exception:
+            pass
+        return result
+    finally:
+        db.close()
+
+
+def start_database_maintenance_worker():
+    global DATABASE_MAINTENANCE_WORKER_STARTED
+    if DATABASE_MAINTENANCE_WORKER_STARTED or not DATABASE_MAINTENANCE_WORKER_ENABLED:
+        return
+    DATABASE_MAINTENANCE_WORKER_STARTED = True
+
+    def worker():
+        time.sleep(DATABASE_MAINTENANCE_START_DELAY_SECONDS)
+        while True:
+            try:
+                run_database_maintenance_once(force=False)
+            except Exception:
+                pass
+            time.sleep(DATABASE_MAINTENANCE_POLL_SECONDS)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
 def _new_record_matches_filters(row, filters):
     filters = filters if isinstance(filters, dict) else {}
     date_from = _parse_iso_date_only(filters.get("date_from") or "")
@@ -56948,6 +57180,13 @@ def api_app_errors():
         (limit,),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/admin/database-maintenance/run", methods=["POST"])
+def api_run_database_maintenance():
+    result = run_database_maintenance_once(force=True)
+    status_code = 200 if result.get("ok") else 500
+    return jsonify(result), status_code
 
 
 @app.route("/api/provider-alerts/recent", methods=["GET"])

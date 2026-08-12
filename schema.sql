@@ -395,7 +395,9 @@ CREATE TABLE IF NOT EXISTS app_errors (
     error_message TEXT NOT NULL,
     details TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    dismissed_at TEXT
+    dismissed_at TEXT,
+    occurrence_count INTEGER NOT NULL DEFAULT 1,
+    last_seen_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS slack_comp_requests (

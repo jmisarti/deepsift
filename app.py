@@ -305,12 +305,19 @@ DATABASE_MAINTENANCE_START_DELAY_SECONDS = max(
     30,
 )
 APP_ERROR_DEDUPE_MINUTES = max(int((os.getenv("APP_ERROR_DEDUPE_MINUTES") or "15").strip() or "15"), 1)
-APP_ERROR_RETENTION_DAYS = max(int((os.getenv("APP_ERROR_RETENTION_DAYS") or "30").strip() or "30"), 1)
-WEBHOOK_EVENT_RETENTION_DAYS = max(int((os.getenv("WEBHOOK_EVENT_RETENTION_DAYS") or "60").strip() or "60"), 1)
-CALL_RECORDING_FAILED_RETENTION_DAYS = max(
-    int((os.getenv("CALL_RECORDING_FAILED_RETENTION_DAYS") or "30").strip() or "30"),
-    1,
+APP_ERROR_RETENTION_DAYS = max(int((os.getenv("APP_ERROR_RETENTION_DAYS") or "7").strip() or "7"), 1)
+WEBHOOK_EVENT_RETENTION_DAYS = max(int((os.getenv("WEBHOOK_EVENT_RETENTION_DAYS") or "14").strip() or "14"), 1)
+AGENT_SIGNAL_RETENTION_DAYS = max(int((os.getenv("AGENT_SIGNAL_RETENTION_DAYS") or "0").strip() or "0"), 0)
+CALL_RECORDING_JOB_RETENTION_DAYS = max(
+    int((os.getenv("CALL_RECORDING_JOB_RETENTION_DAYS") or "0").strip() or "0"),
+    0,
 )
+PERSON_NOTE_PAYLOAD_RETENTION_DAYS = max(int((os.getenv("PERSON_NOTE_PAYLOAD_RETENTION_DAYS") or "0").strip() or "0"), 0)
+EMAIL_CAMPAIGN_SYNC_PAYLOAD_RETENTION_DAYS = max(
+    int((os.getenv("EMAIL_CAMPAIGN_SYNC_PAYLOAD_RETENTION_DAYS") or "0").strip() or "0"),
+    0,
+)
+SMS_QUEUE_JSON_RETENTION_DAYS = max(int((os.getenv("SMS_QUEUE_JSON_RETENTION_DAYS") or "0").strip() or "0"), 0)
 JOB_QUEUE_RETENTION_DAYS = max(int((os.getenv("JOB_QUEUE_RETENTION_DAYS") or "45").strip() or "45"), 1)
 SHEET_CHANGE_RETENTION_DAYS = max(int((os.getenv("SHEET_CHANGE_RETENTION_DAYS") or "90").strip() or "90"), 1)
 REFERRAL_MARKET_AUTO_REFRESH_ENABLED = env_flag("REFERRAL_MARKET_AUTO_REFRESH_ENABLED", False)
@@ -36743,6 +36750,18 @@ def _maintenance_delete_older_than(db, table_name, timestamp_expr, retention_day
     return max(int(cur.rowcount or 0), 0)
 
 
+def _maintenance_update_older_than(db, table_name, set_clause, timestamp_expr, retention_days, extra_where="", params=()):
+    cutoff = f"-{int(retention_days)} days"
+    where_parts = [f"datetime({timestamp_expr}) < datetime('now', ?)"]
+    query_params = [cutoff]
+    if extra_where:
+        where_parts.append(f"({extra_where})")
+        query_params.extend(params or [])
+    sql = f"UPDATE {table_name} SET {set_clause} WHERE {' AND '.join(where_parts)}"
+    cur = execute_with_retry(db, sql, tuple(query_params), retries=3, base_delay=0.15)
+    return max(int(cur.rowcount or 0), 0)
+
+
 def run_database_maintenance_once(force=False):
     ensure_db()
     db = open_sqlite_connection()
@@ -36803,6 +36822,20 @@ def run_database_maintenance_once(force=False):
                 (),
             ),
             (
+                "agent_signals",
+                "created_at",
+                AGENT_SIGNAL_RETENTION_DAYS,
+                "",
+                (),
+            ),
+            (
+                "call_recording_jobs",
+                "COALESCE(updated_at, created_at)",
+                CALL_RECORDING_JOB_RETENTION_DAYS,
+                "",
+                (),
+            ),
+            (
                 "email_validation_queue",
                 "COALESCE(processed_at, updated_at, created_at)",
                 JOB_QUEUE_RETENTION_DAYS,
@@ -36814,13 +36847,6 @@ def run_database_maintenance_once(force=False):
                 "COALESCE(processed_at, updated_at, created_at)",
                 JOB_QUEUE_RETENTION_DAYS,
                 "lower(COALESCE(queue_status, '')) IN ('completed', 'failed', 'skipped')",
-                (),
-            ),
-            (
-                "call_recording_jobs",
-                "COALESCE(updated_at, created_at)",
-                CALL_RECORDING_FAILED_RETENTION_DAYS,
-                "lower(COALESCE(analysis_status, '')) = 'failed' OR lower(COALESCE(fetch_status, '')) IN ('error', 'no recording url')",
                 (),
             ),
             (
@@ -36841,6 +36867,56 @@ def run_database_maintenance_once(force=False):
             result["deleted"]["sms_automation_queue_suppressed"] = purge_suppressed_sms_automation_queue(db)
         except Exception as exc:
             result["errors"].append({"table": "sms_automation_queue", "error": str(exc)})
+        compact_note_sources = [
+            "EmailListVerify",
+            "ReiSift New Records",
+            "Call Recording Analysis",
+            "ReiSift New Records refresh",
+            "SkipSherpa",
+            "OpenLetterConnect Webhook",
+            "SkipSherpa Property",
+            "ReiSift New Records backfill refresh",
+            "ReiSift Deep Prospecting refresh",
+            "OpenLetterConnect",
+            "Anon Lead Intake",
+        ]
+        placeholders = ",".join("?" for _ in compact_note_sources)
+        try:
+            result.setdefault("compacted", {})["person_notes_payload_json"] = _maintenance_update_older_than(
+                db,
+                "person_notes",
+                "payload_json = NULL",
+                "created_at",
+                PERSON_NOTE_PAYLOAD_RETENTION_DAYS,
+                f"source IN ({placeholders}) AND COALESCE(payload_json, '') <> ''",
+                compact_note_sources,
+            )
+        except Exception as exc:
+            result["errors"].append({"table": "person_notes.payload_json", "error": str(exc)})
+        try:
+            result.setdefault("compacted", {})["email_campaign_syncs_payload_json"] = _maintenance_update_older_than(
+                db,
+                "email_campaign_syncs",
+                "payload_json = NULL",
+                "COALESCE(synced_at, updated_at, created_at)",
+                EMAIL_CAMPAIGN_SYNC_PAYLOAD_RETENTION_DAYS,
+                "COALESCE(payload_json, '') <> '' AND lower(COALESCE(sync_status, '')) NOT IN ('queued', 'queued_emailoctopus_sync', 'queued_emailoctopus_unsubscribe', 'sync_error', 'unsubscribe_error')",
+                (),
+            )
+        except Exception as exc:
+            result["errors"].append({"table": "email_campaign_syncs.payload_json", "error": str(exc)})
+        try:
+            result.setdefault("compacted", {})["sms_automation_queue_json"] = _maintenance_update_older_than(
+                db,
+                "sms_automation_queue",
+                "rendered_variables_json = NULL, source_info_json = NULL",
+                "COALESCE(sent_at, updated_at, created_at)",
+                SMS_QUEUE_JSON_RETENTION_DAYS,
+                "status IN ('Sent', 'Failed', 'Held') AND (COALESCE(rendered_variables_json, '') <> '' OR COALESCE(source_info_json, '') <> '')",
+                (),
+            )
+        except Exception as exc:
+            result["errors"].append({"table": "sms_automation_queue.json", "error": str(exc)})
         set_setting(db, "database_maintenance_last_completed_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         set_setting(db, "database_maintenance_last_result_json", json.dumps(result, ensure_ascii=True, sort_keys=True)[:10000])
         commit_with_retry(db)

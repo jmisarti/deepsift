@@ -1233,6 +1233,9 @@ def migrate_db(db):
         "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_segment_flags ON prospect_table_cache(segment, rei_skipped, deep_skipped, no_good_numbers)"
     )
     db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_local_property ON prospect_table_cache(local_property_id)"
+    )
+    db.execute(
         """
         CREATE TABLE IF NOT EXISTS prospect_table_cache_lists (
             segment TEXT NOT NULL,
@@ -1384,6 +1387,8 @@ def migrate_db(db):
         ensure_column(db, "sms_automation_queue", col, ddl)
     db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_status ON sms_automation_queue(status, scheduled_for)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_property ON sms_automation_queue(property_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_status_approved ON sms_automation_queue(status, approved_at, created_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_sent_from ON sms_automation_queue(status, from_number, sent_at)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS sms_delivery_events (
@@ -10910,6 +10915,28 @@ def select_sms_automation_send_from_number(db, preferred_from_number="", bucket=
             return candidate, ""
         last_reason = reason
     return (candidates[0] if candidates else ""), last_reason
+
+
+def select_sms_automation_schedule_from_number(settings, preferred_from_number="", bucket="", contact_role="", seed="", health_reasons=None):
+    health_reasons = health_reasons if isinstance(health_reasons, dict) else {}
+    if settings.get("number_strategy") == "default":
+        candidates = [normalize_phone(preferred_from_number)]
+        if not candidates[0]:
+            ordered = _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed)
+            candidates = ordered[:1]
+    else:
+        candidates = _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed)
+        preferred = normalize_phone(preferred_from_number)
+        if preferred and preferred not in candidates:
+            candidates.append(preferred)
+    if not candidates:
+        candidates = [normalize_phone(SMS_AUTOMATION_DEFAULT_FROM_NUMBER) or normalize_phone(SMRTPHONE_FROM_NUMBER)]
+    clean_candidates = [num for num in candidates if normalize_phone(num)]
+    for candidate in clean_candidates:
+        if not health_reasons.get(normalize_phone(candidate)):
+            return normalize_phone(candidate), ""
+    fallback = normalize_phone(clean_candidates[0]) if clean_candidates else ""
+    return fallback, health_reasons.get(fallback, "") if fallback else ""
 
 
 def get_email_settings(db):
@@ -44988,24 +45015,26 @@ def get_sms_automation_schedule_rows(db):
         SELECT q.*, p.status AS property_status, p.reisift_property_uuid,
                a.street, a.city, a.state, a.postal_code,
                pe.first_name, pe.last_name, t.channel_label, t.status AS phone_status,
-               n.county AS property_county,
+               COALESCE(pc_local.county, pc_uuid.county, '') AS property_county,
                COALESCE(NULLIF(t.created_at, ''), NULLIF(q.created_at, '')) AS number_pulled_at
         FROM sms_automation_queue q
         JOIN properties p ON p.id = q.property_id
         LEFT JOIN addresses a ON a.id = p.property_address_id
         LEFT JOIN people pe ON pe.id = q.person_id
         LEFT JOIN touchpoints t ON t.id = q.touchpoint_id
-        LEFT JOIN reisift_new_records n ON n.id = (
-            SELECT nr.id
-            FROM reisift_new_records nr
-            WHERE nr.local_property_id = p.id
-               OR (
-                    COALESCE(p.reisift_property_uuid, '') != ''
-                    AND nr.property_uuid = p.reisift_property_uuid
-               )
-            ORDER BY nr.id DESC
-            LIMIT 1
-        )
+        LEFT JOIN (
+            SELECT local_property_id, MAX(county) AS county
+            FROM prospect_table_cache
+            WHERE local_property_id IS NOT NULL
+            GROUP BY local_property_id
+        ) pc_local ON pc_local.local_property_id = p.id
+        LEFT JOIN (
+            SELECT property_uuid, MAX(county) AS county
+            FROM prospect_table_cache
+            WHERE COALESCE(property_uuid, '') != ''
+            GROUP BY property_uuid
+        ) pc_uuid ON COALESCE(p.reisift_property_uuid, '') != ''
+                 AND pc_uuid.property_uuid = p.reisift_property_uuid
         WHERE COALESCE(q.status, '') IN ('Draft', 'Queued', 'Approved', 'Scheduled', 'Failed', 'Held', 'Sending')
         ORDER BY
             CASE q.status
@@ -45032,6 +45061,19 @@ def get_sms_automation_schedule_rows(db):
     out = []
     now_utc = datetime.utcnow()
     now_et = datetime.now(EST_TZ)
+    health_numbers = {
+        normalize_phone(num)
+        for num in settings.get("from_numbers") or []
+        if normalize_phone(num)
+    }
+    for row in rows:
+        from_norm = normalize_phone(row["from_number"] if "from_number" in row.keys() else "")
+        if from_norm:
+            health_numbers.add(from_norm)
+    sender_health_reasons = {
+        number: sms_sender_health_suppression_reason(db, number)
+        for number in health_numbers
+    }
     day_start, day_end = _sms_automation_today_window_utc()
     sent_rows = db.execute(
         """
@@ -45068,12 +45110,13 @@ def get_sms_automation_schedule_rows(db):
         d["person_name"] = f"{d.get('first_name') or ''} {d.get('last_name') or ''}".strip()
         d["sift_url"] = _sift_record_url(d.get("reisift_property_uuid") or "")
         if d.get("status") == "Approved":
-            from_norm, _ = select_sms_automation_send_from_number(
-                db,
+            from_norm, _ = select_sms_automation_schedule_from_number(
+                settings,
                 preferred_from_number=d.get("from_number"),
                 bucket=d.get("bucket"),
                 contact_role=d.get("contact_role"),
                 seed=d.get("queue_key") or d.get("id"),
+                health_reasons=sender_health_reasons,
             )
             from_norm = normalize_phone(from_norm)
             candidate = max(now_utc, next_available_by_number.get(from_norm, now_utc))
@@ -45100,12 +45143,13 @@ def get_sms_automation_schedule_rows(db):
             else:
                 d["send_readiness"] = "Waiting for sender min-gap"
         elif d.get("status") == "Scheduled":
-            from_norm, _ = select_sms_automation_send_from_number(
-                db,
+            from_norm, _ = select_sms_automation_schedule_from_number(
+                settings,
                 preferred_from_number=d.get("from_number"),
                 bucket=d.get("bucket"),
                 contact_role=d.get("contact_role"),
                 seed=d.get("queue_key") or d.get("id"),
+                health_reasons=sender_health_reasons,
             )
             from_norm = normalize_phone(from_norm)
             scheduled_dt = parse_db_time(d.get("scheduled_for"))

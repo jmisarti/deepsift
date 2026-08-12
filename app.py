@@ -16981,6 +16981,41 @@ def emailoctopus_set_contact_status(api_key, list_id, email_address, status="UNS
     )
 
 
+def emailoctopus_update_contacts_bulk(api_key, list_id, contact_updates):
+    if not api_key or not list_id:
+        return {"ok": False, "skipped": "missing_config"}
+    clean_updates = []
+    for item in contact_updates or []:
+        if not isinstance(item, dict):
+            continue
+        email_address = normalize_email_identity(item.get("email_address") or "")
+        member_id = str(item.get("id") or _emailoctopus_member_id(email_address)).strip()
+        if not email_address or not member_id:
+            continue
+        clean_updates.append(
+            {
+                "id": member_id,
+                "email_address": email_address,
+                "status": str(item.get("status") or "UNSUBSCRIBED").strip().upper() or "UNSUBSCRIBED",
+            }
+        )
+    if not clean_updates:
+        return {"ok": True, "skipped": "no_contacts", "data": []}
+    response = requests.put(
+        f"{EMAILOCTOPUS_BASE_URL.rstrip('/')}/lists/{quote_plus(list_id)}/contacts",
+        headers={"Content-Type": "application/json"},
+        json={"api_key": api_key, "data": clean_updates[:100]},
+        timeout=30,
+    )
+    payload = _safe_response_payload(response)
+    if response.ok:
+        payload_dict = payload if isinstance(payload, dict) else {}
+        return {"ok": True, "data": payload_dict.get("data") or [], "response": payload}
+    raise ValueError(
+        f"EmailOctopus bulk contact update failed ({response.status_code}): {json.dumps(payload) if isinstance(payload, dict) else payload}"
+    )
+
+
 def _email_campaign_sync_success(status):
     status = str(status or "").strip().lower()
     return status in {"synced", "already_synced", "already_sent_emailoctopus"} or status.startswith(("created_", "updated_"))
@@ -17666,6 +17701,154 @@ def _schedule_emailoctopus_queue_retry(db, row_id, error_text, attempts):
     )
 
 
+def process_emailoctopus_unsubscribe_queue_bulk(db, rows, settings=None):
+    settings = settings or get_anonymous_email_marketing_settings(db)
+    api_key = (settings.get("emailoctopus_api_key") or "").strip()
+    list_id = (settings.get("emailoctopus_list_id") or "").strip()
+    if not api_key or not list_id:
+        return {"ok": True, "skipped": "awaiting_emailoctopus_config", "attempted": 0, "completed": 0, "errors": 0}
+    valid_rows = []
+    skipped = 0
+    for row in rows or []:
+        normalized_email = normalize_email_identity(row["normalized_email"] or "")
+        if not normalized_email:
+            _mark_emailoctopus_queue_item(db, row["id"], "Skipped", "missing_email", processed=True)
+            skipped += 1
+            continue
+        property_id = int(row["property_id"] or 0)
+        if property_id and email_identity_has_other_new_record_property(db, normalized_email, property_id):
+            _mark_emailoctopus_queue_item(db, row["id"], "Skipped", "active_new_record_elsewhere", processed=True)
+            skipped += 1
+            continue
+        valid_rows.append(row)
+    if not valid_rows:
+        return {"ok": True, "attempted": 0, "completed": 0, "skipped": skipped, "errors": 0}
+    attempts_by_id = {}
+    for row in valid_rows:
+        attempts = int(row["attempts"] or 0) + 1
+        attempts_by_id[int(row["id"])] = attempts
+        db.execute(
+            """
+            UPDATE emailoctopus_sync_queue
+            SET queue_status = 'InFlight',
+                attempts = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (attempts, row["id"]),
+        )
+    commit_with_retry(db)
+    updates = [
+        {
+            "id": _emailoctopus_member_id(row["normalized_email"]),
+            "email_address": row["normalized_email"],
+            "status": "UNSUBSCRIBED",
+        }
+        for row in valid_rows
+    ]
+    completed = 0
+    errors = 0
+    response_by_id = {}
+    try:
+        bulk_result = emailoctopus_update_contacts_bulk(api_key, list_id, updates)
+        response_by_email = {}
+        for item in bulk_result.get("data") or []:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "").strip()
+            if item_id:
+                response_by_id[item_id] = item
+            item_email = normalize_email_identity(item.get("email_address") or "")
+            if item_email:
+                response_by_email[item_email] = item
+        timestamp = format_db_time(datetime.utcnow())
+        for row in valid_rows:
+            normalized_email = normalize_email_identity(row["normalized_email"] or "")
+            member_id = _emailoctopus_member_id(normalized_email)
+            item = response_by_email.get(normalized_email) or response_by_id.get(member_id) or {}
+            item_status = str(item.get("status") or "").strip().upper()
+            if not item:
+                errors += 1
+                _schedule_emailoctopus_queue_retry(
+                    db,
+                    row["id"],
+                    "EmailOctopus bulk unsubscribe omitted contact result",
+                    attempts_by_id.get(int(row["id"]), int(row["attempts"] or 0) + 1),
+                )
+                continue
+            if item_status and item_status not in {"UNSUBSCRIBED", "MEMBER_NOT_FOUND"}:
+                errors += 1
+                _schedule_emailoctopus_queue_retry(
+                    db,
+                    row["id"],
+                    f"EmailOctopus bulk unsubscribe returned {item_status}",
+                    attempts_by_id.get(int(row["id"]), int(row["attempts"] or 0) + 1),
+                )
+                continue
+            contact_id = str(item.get("id") or member_id)
+            db.execute(
+                """
+                UPDATE email_campaign_syncs
+                SET sync_status = ?,
+                    last_error = '',
+                    payload_json = ?,
+                    synced_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE normalized_email = ?
+                """,
+                (
+                    "unsubscribed_property_status_exit",
+                    json.dumps(
+                        {
+                            "emailoctopus": item or {"status": "MEMBER_NOT_FOUND", "id": member_id},
+                            "queue_id": int(row["id"] or 0),
+                            "bulk": True,
+                        },
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                    normalized_email,
+                ),
+            )
+            upsert_anonymous_email_campaign_registry(
+                db,
+                normalized_email,
+                source="deepsift_property_status_exit",
+                source_identifier=contact_id,
+                status="unsubscribed_property_status_exit",
+                notes=f"Unsubscribed by bulk EmailOctopus sync item #{int(row['id'] or 0)}.",
+            )
+            _mark_emailoctopus_queue_item(db, row["id"], "Completed", "", processed=True)
+            completed += 1
+    except Exception as exc:
+        error_text = str(exc)
+        for row in valid_rows:
+            _schedule_emailoctopus_queue_retry(
+                db,
+                row["id"],
+                error_text,
+                attempts_by_id.get(int(row["id"]), int(row["attempts"] or 0) + 1),
+            )
+        log_app_error(
+            db,
+            source="emailoctopus_sync_queue",
+            error_message=error_text,
+            details=traceback.format_exc(),
+            route="process_emailoctopus_unsubscribe_queue_bulk",
+            status_code=500,
+        )
+        errors = len(valid_rows)
+    return {
+        "ok": errors == 0,
+        "attempted": len(valid_rows),
+        "completed": completed,
+        "skipped": skipped,
+        "errors": errors,
+        "bulk": True,
+    }
+
+
 def process_emailoctopus_sync_queue_row(db, row, settings=None):
     settings = settings or get_anonymous_email_marketing_settings(db)
     api_key = settings.get("emailoctopus_api_key") or ""
@@ -17852,7 +18035,16 @@ def run_emailoctopus_sync_queue_once(limit=None):
             (now_stamp, limit),
         ).fetchall()
         settings = get_anonymous_email_marketing_settings(db)
-        for row in rows:
+        unsubscribe_rows = [row for row in rows if normalize_whitespace(row["action"] or "").lower() == "unsubscribe"]
+        subscribe_rows = [row for row in rows if normalize_whitespace(row["action"] or "").lower() != "unsubscribe"]
+        if unsubscribe_rows:
+            result = process_emailoctopus_unsubscribe_queue_bulk(db, unsubscribe_rows, settings=settings)
+            attempted += int(result.get("attempted") or 0)
+            completed += int(result.get("completed") or 0)
+            skipped += int(result.get("skipped") or 0)
+            errors += int(result.get("errors") or 0)
+            commit_with_retry(db)
+        for row in subscribe_rows:
             attempted += 1
             result = process_emailoctopus_sync_queue_row(db, row, settings=settings)
             if result.get("ok") and result.get("skipped"):

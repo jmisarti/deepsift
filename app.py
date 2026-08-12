@@ -56002,7 +56002,8 @@ def process_reisift_webhook_event_core(db, event_id, payload, event_type, proper
 
 def process_reisift_webhook_event(db, event_id, payload, event_type, property_uuid):
     processing = process_reisift_webhook_event_core(db, event_id, payload, event_type, property_uuid)
-    if processing.get("processing_status") == "processed":
+    result = processing.get("result") if isinstance(processing.get("result"), dict) else {}
+    if processing.get("processing_status") == "processed" and result.get("action") == "exit_segment":
         apply_reisift_new_record_exit_side_effects(db, processing)
     return processing
 
@@ -56041,7 +56042,8 @@ def _process_reisift_webhook_event_background(event_id, payload, event_type, pro
             ),
         )
         commit_with_retry(db)
-        if processing.get("processing_status") == "processed":
+        result = processing.get("result") if isinstance(processing.get("result"), dict) else {}
+        if processing.get("processing_status") == "processed" and result.get("action") == "exit_segment":
             try:
                 apply_reisift_new_record_exit_side_effects(db, processing)
                 db.execute(
@@ -56178,7 +56180,8 @@ def run_reisift_webhook_pending_processor_once(limit=25, include_side_effects=Tr
                 )
                 commit_with_retry(db)
                 processed += 1
-                if include_side_effects and processing.get("processing_status") == "processed":
+                result = processing.get("result") if isinstance(processing.get("result"), dict) else {}
+                if include_side_effects and processing.get("processing_status") == "processed" and result.get("action") == "exit_segment":
                     try:
                         apply_reisift_new_record_exit_side_effects(db, processing)
                         db.execute(

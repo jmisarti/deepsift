@@ -17100,24 +17100,160 @@ def collect_emailoctopus_syncs_for_property(db, property_id):
     return candidates
 
 
-def email_identity_has_other_new_record_property(db, email_address, exclude_property_id):
+def _email_identity_related_property_ids(db, email_address):
+    email_identity = normalize_email_identity(email_address)
+    if not email_identity:
+        return set()
+    property_ids = set()
+    try:
+        for row in db.execute(
+            """
+            SELECT DISTINCT property_id
+            FROM email_campaign_syncs
+            WHERE normalized_email = ?
+              AND COALESCE(property_id, 0) > 0
+            """,
+            (email_identity,),
+        ).fetchall():
+            property_ids.add(int(row["property_id"] or 0))
+    except Exception:
+        pass
+    try:
+        domain = email_identity.rsplit("@", 1)[1] if "@" in email_identity else ""
+        if domain == "gmail.com":
+            touchpoint_where = """
+              AND (
+                    lower(COALESCE(t.value, '')) LIKE '%@gmail.com'
+                 OR lower(COALESCE(t.value, '')) LIKE '%@googlemail.com'
+              )
+            """
+            touchpoint_params = ()
+        else:
+            touchpoint_where = "AND lower(COALESCE(t.value, '')) = ?"
+            touchpoint_params = (email_identity.lower(),)
+        rows = db.execute(
+            f"""
+            SELECT t.value, p.id AS property_id
+            FROM touchpoints t
+            JOIN properties p ON p.owner_person_id = t.person_id OR p.resident_person_id = t.person_id
+            WHERE lower(COALESCE(t.channel_type, '')) = 'email'
+              AND COALESCE(p.id, 0) > 0
+              {touchpoint_where}
+            """,
+            touchpoint_params,
+        ).fetchall()
+        for row in rows:
+            if normalize_email_identity(row["value"] or "") == email_identity:
+                property_ids.add(int(row["property_id"] or 0))
+    except Exception:
+        pass
+    return {pid for pid in property_ids if int(pid or 0) > 0}
+
+
+def _email_identity_has_active_prospect_property(db, email_address, exclude_property_id=0):
     email_identity = normalize_email_identity(email_address)
     if not email_identity:
         return False
-    rows = db.execute(
-        """
-        SELECT t.value, p.id AS property_id, p.status
-        FROM touchpoints t
-        JOIN properties p ON p.owner_person_id = t.person_id OR p.resident_person_id = t.person_id
-        WHERE lower(COALESCE(t.channel_type, '')) = 'email'
-          AND p.id <> ?
-        """,
-        (int(exclude_property_id or 0),),
-    ).fetchall()
-    for row in rows:
-        if normalize_email_identity(row["value"] or "") == email_identity and is_strict_new_record_status(row["status"] or ""):
+    try:
+        exclude_property_id = int(exclude_property_id or 0)
+    except Exception:
+        exclude_property_id = 0
+    property_ids = _email_identity_related_property_ids(db, email_identity)
+    property_ids = {pid for pid in property_ids if pid and pid != exclude_property_id}
+    if not property_ids:
+        return False
+    placeholders = ",".join(["?"] * len(property_ids))
+    params = tuple(sorted(property_ids))
+    try:
+        rows = db.execute(
+            f"""
+            SELECT id, status
+            FROM properties
+            WHERE id IN ({placeholders})
+            """,
+            params,
+        ).fetchall()
+        for row in rows:
+            status = row["status"] or ""
+            if is_strict_new_record_status(status) or is_deep_prospecting_status(status):
+                return True
+    except Exception:
+        pass
+    try:
+        row = db.execute(
+            f"""
+            SELECT 1
+            FROM reisift_new_records
+            WHERE COALESCE(is_active, 1) = 1
+              AND COALESCE(segment, 'new_records') IN (?, ?)
+              AND local_property_id IN ({placeholders})
+            LIMIT 1
+            """,
+            (REISIFT_NEW_RECORDS_SEGMENT, REISIFT_DEEP_PROSPECTING_SEGMENT, *params),
+        ).fetchone()
+        if row:
             return True
+    except Exception:
+        pass
     return False
+
+
+def _email_identity_has_active_submitted_lead(db, email_address):
+    email_identity = normalize_email_identity(email_address)
+    if not email_identity:
+        return False
+    property_ids = _email_identity_related_property_ids(db, email_identity)
+    submitted_tables = (
+        "website_lead_submissions",
+        "clever_lead_submissions",
+        "propertyleads_lead_submissions",
+        "manual_lead_submissions",
+    )
+    inactive_statuses = {"failed", "timed_out_step1_only_failed"}
+    for table_name in submitted_tables:
+        try:
+            if not _table_has_column(db, table_name, "latest_email"):
+                continue
+            rows = db.execute(
+                f"""
+                SELECT latest_email, local_property_id, status
+                FROM {table_name}
+                WHERE COALESCE(local_property_id, 0) > 0
+                   OR COALESCE(latest_email, '') <> ''
+                """
+            ).fetchall()
+        except Exception:
+            continue
+        for row in rows:
+            status = normalize_whitespace(row["status"] or "").lower()
+            if status in inactive_statuses:
+                continue
+            if normalize_email_identity(row["latest_email"] or "") == email_identity:
+                return True
+            try:
+                local_property_id = int(row["local_property_id"] or 0)
+            except Exception:
+                local_property_id = 0
+            if local_property_id > 0 and local_property_id in property_ids:
+                return True
+    return False
+
+
+def email_identity_has_emailoctopus_eligible_property(db, email_address, exclude_property_id=0):
+    """Return true when an email should remain subscribed through another active DeepSift bucket."""
+    if _email_identity_has_active_prospect_property(db, email_address, exclude_property_id=exclude_property_id):
+        return True
+    if _email_identity_has_active_submitted_lead(db, email_address):
+        return True
+    return False
+
+
+def email_identity_has_other_new_record_property(db, email_address, exclude_property_id):
+    return email_identity_has_emailoctopus_eligible_property(
+        db,
+        email_address,
+        exclude_property_id=exclude_property_id,
+    )
 
 
 def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, before_status, after_status, source="property_status_transition"):
@@ -17127,8 +17263,10 @@ def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, be
         property_id = 0
     if property_id <= 0:
         return {"ok": True, "skipped": "missing_property_id", "attempted": 0, "unsubscribed": 0, "errors": 0}
-    if not is_strict_new_record_status(before_status) or is_strict_new_record_status(after_status):
-        return {"ok": True, "skipped": "not_new_record_exit", "attempted": 0, "unsubscribed": 0, "errors": 0}
+    before_is_prospect = is_strict_new_record_status(before_status) or is_deep_prospecting_status(before_status)
+    after_is_prospect = is_strict_new_record_status(after_status) or is_deep_prospecting_status(after_status)
+    if not before_is_prospect or after_is_prospect:
+        return {"ok": True, "skipped": "not_prospect_segment_exit", "attempted": 0, "unsubscribed": 0, "errors": 0}
     candidates = collect_emailoctopus_syncs_for_property(db, property_id)
     if not candidates:
         return {"ok": True, "skipped": "no_synced_emails", "attempted": 0, "unsubscribed": 0, "errors": 0}
@@ -17168,7 +17306,7 @@ def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, be
                 priority=0,
             )
             if queue_result.get("skipped"):
-                skipped_active_elsewhere += 1 if queue_result.get("skipped") == "active_new_record_elsewhere" else 0
+                skipped_active_elsewhere += 1 if queue_result.get("skipped") in {"active_new_record_elsewhere", "active_emailoctopus_eligible_elsewhere"} else 0
                 continue
             db.execute(
                 """
@@ -17577,7 +17715,7 @@ def enqueue_emailoctopus_sync(
     except Exception:
         property_id = 0
     if action == "unsubscribe" and property_id and email_identity_has_other_new_record_property(db, normalized_email, property_id):
-        return {"ok": True, "skipped": "active_new_record_elsewhere", "email": normalized_email}
+        return {"ok": True, "skipped": "active_emailoctopus_eligible_elsewhere", "email": normalized_email}
     if action == "unsubscribe":
         db.execute(
             """
@@ -17717,7 +17855,7 @@ def process_emailoctopus_unsubscribe_queue_bulk(db, rows, settings=None):
             continue
         property_id = int(row["property_id"] or 0)
         if property_id and email_identity_has_other_new_record_property(db, normalized_email, property_id):
-            _mark_emailoctopus_queue_item(db, row["id"], "Skipped", "active_new_record_elsewhere", processed=True)
+            _mark_emailoctopus_queue_item(db, row["id"], "Skipped", "active_emailoctopus_eligible_elsewhere", processed=True)
             skipped += 1
             continue
         valid_rows.append(row)
@@ -17877,8 +18015,8 @@ def process_emailoctopus_sync_queue_row(db, row, settings=None):
         if action == "unsubscribe":
             property_id = int(row["property_id"] or 0)
             if property_id and email_identity_has_other_new_record_property(db, normalized_email, property_id):
-                _mark_emailoctopus_queue_item(db, row["id"], "Skipped", "active_new_record_elsewhere", processed=True)
-                return {"ok": True, "skipped": "active_new_record_elsewhere"}
+                _mark_emailoctopus_queue_item(db, row["id"], "Skipped", "active_emailoctopus_eligible_elsewhere", processed=True)
+                return {"ok": True, "skipped": "active_emailoctopus_eligible_elsewhere"}
             result = emailoctopus_set_contact_status(api_key, list_id, normalized_email, status="UNSUBSCRIBED")
             timestamp = format_db_time(datetime.utcnow())
             db.execute(

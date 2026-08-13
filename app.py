@@ -48,7 +48,7 @@ except Exception:
     BeautifulSoup = None
 from flask import Flask, g, jsonify, redirect, render_template, request, send_from_directory, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.exceptions import HTTPException
 try:
     from google.oauth2 import service_account
@@ -302,6 +302,7 @@ APP_AUTH_ENABLED = env_flag("APP_AUTH_ENABLED", False)
 APP_AUTH_USERNAME = os.getenv("APP_AUTH_USERNAME", "").strip()
 APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD", "")
 APP_AUTH_PASSWORD_HASH = os.getenv("APP_AUTH_PASSWORD_HASH", "").strip()
+OMAR_INITIAL_PASSWORD = os.getenv("OMAR_INITIAL_PASSWORD", "Omar2026!").strip() or "Omar2026!"
 RUN_BACKGROUND_WORKERS = env_flag("RUN_BACKGROUND_WORKERS", True)
 DATABASE_MAINTENANCE_WORKER_ENABLED = env_flag("DATABASE_MAINTENANCE_WORKER_ENABLED", True)
 DATABASE_MAINTENANCE_POLL_SECONDS = max(
@@ -888,23 +889,141 @@ app.jinja_env.filters["linkify_note"] = linkify_note
 def app_auth_is_configured():
     if not APP_AUTH_ENABLED:
         return False
-    if not APP_AUTH_USERNAME:
+    if APP_AUTH_USERNAME and (APP_AUTH_PASSWORD_HASH or APP_AUTH_PASSWORD):
+        return True
+    if not DB_PATH.exists():
         return False
-    return bool(APP_AUTH_PASSWORD_HASH or APP_AUTH_PASSWORD)
+    try:
+        db = open_sqlite_connection()
+        try:
+            row = db.execute("SELECT COUNT(*) AS count FROM app_users WHERE COALESCE(is_active, 1) = 1").fetchone()
+            return int(row["count"] or 0) > 0
+        finally:
+            db.close()
+    except Exception:
+        return False
 
 
 def verify_app_login(username, password):
     if not app_auth_is_configured():
-        return False
-    if not hmac.compare_digest((username or "").strip(), APP_AUTH_USERNAME):
-        return False
+        return None
+    username_norm = normalize_app_username(username)
     candidate = password or ""
+    try:
+        ensure_db()
+        db = get_db()
+        row = db.execute(
+            """
+            SELECT id, username, display_name, password_hash, is_active, can_manage_settings
+            FROM app_users
+            WHERE username = ?
+            """,
+            (username_norm,),
+        ).fetchone()
+        if row and int(row["is_active"] or 0) == 1 and check_password_hash(row["password_hash"], candidate):
+            db.execute("UPDATE app_users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+            commit_with_retry(db)
+            return {
+                "id": row["id"],
+                "username": row["username"],
+                "display_name": row["display_name"] or row["username"],
+                "can_manage_settings": bool(row["can_manage_settings"]),
+            }
+    except Exception:
+        pass
+
+    if not hmac.compare_digest(username_norm, normalize_app_username(APP_AUTH_USERNAME)):
+        return None
     if APP_AUTH_PASSWORD_HASH:
         try:
-            return check_password_hash(APP_AUTH_PASSWORD_HASH, candidate)
+            if not check_password_hash(APP_AUTH_PASSWORD_HASH, candidate):
+                return None
         except Exception:
-            return False
-    return hmac.compare_digest(candidate, APP_AUTH_PASSWORD)
+            return None
+    elif not hmac.compare_digest(candidate, APP_AUTH_PASSWORD):
+        return None
+    return {
+        "id": None,
+        "username": normalize_app_username(APP_AUTH_USERNAME),
+        "display_name": APP_AUTH_USERNAME,
+        "can_manage_settings": True,
+    }
+
+
+def current_user_can_manage_settings():
+    if not APP_AUTH_ENABLED:
+        return True
+    if bool(session.get("auth_can_manage_settings")):
+        return True
+    auth_user = normalize_app_username(session.get("auth_user", ""))
+    return bool(auth_user and APP_AUTH_USERNAME and hmac.compare_digest(auth_user, normalize_app_username(APP_AUTH_USERNAME)))
+
+
+def app_user_rows(db):
+    return db.execute(
+        """
+        SELECT id, username, display_name, is_active, can_manage_settings, created_at, updated_at, last_login_at
+        FROM app_users
+        ORDER BY username
+        """
+    ).fetchall()
+
+
+def save_app_user_from_settings(db, form):
+    user_id_raw = (form.get("app_user_id") or "").strip()
+    username = normalize_app_username(form.get("app_user_username") or "")
+    display_name = normalize_whitespace(form.get("app_user_display_name") or "")
+    password = form.get("app_user_password") or ""
+    is_active = 1 if (form.get("app_user_is_active") or "").strip().lower() in {"1", "true", "on", "yes"} else 0
+    can_manage_settings = 1 if (form.get("app_user_can_manage_settings") or "").strip().lower() in {"1", "true", "on", "yes"} else 0
+    if not username:
+        raise ValueError("Username is required.")
+
+    try:
+        user_id = int(user_id_raw or 0)
+    except Exception:
+        user_id = 0
+
+    if user_id > 0:
+        existing = db.execute("SELECT id, username FROM app_users WHERE id = ?", (user_id,)).fetchone()
+        if not existing:
+            raise ValueError("User not found.")
+        duplicate = db.execute("SELECT id FROM app_users WHERE username = ? AND id <> ?", (username, user_id)).fetchone()
+        if duplicate:
+            raise ValueError("That username is already in use.")
+        params = [username, display_name or username, is_active, can_manage_settings]
+        password_sql = ""
+        if password:
+            password_sql = ", password_hash = ?"
+            params.append(generate_password_hash(password))
+        params.append(user_id)
+        db.execute(
+            f"""
+            UPDATE app_users
+            SET username = ?,
+                display_name = ?,
+                is_active = ?,
+                can_manage_settings = ?,
+                updated_at = CURRENT_TIMESTAMP
+                {password_sql}
+            WHERE id = ?
+            """,
+            tuple(params),
+        )
+        return "User updated."
+
+    if not password:
+        raise ValueError("Password is required for new users.")
+    if db.execute("SELECT id FROM app_users WHERE username = ?", (username,)).fetchone():
+        raise ValueError("That username is already in use.")
+    db.execute(
+        """
+        INSERT INTO app_users (username, display_name, password_hash, is_active, can_manage_settings)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (username, display_name or username, generate_password_hash(password), is_active, can_manage_settings),
+    )
+    return "User created."
 
 
 def is_safe_next_path(value):
@@ -924,6 +1043,8 @@ def inject_auth_state():
     return {
         "auth_enabled": APP_AUTH_ENABLED,
         "auth_user": session.get("auth_user", ""),
+        "auth_display_name": session.get("auth_display_name", "") or session.get("auth_user", ""),
+        "auth_can_manage_settings": current_user_can_manage_settings(),
     }
 
 
@@ -1008,6 +1129,10 @@ def require_login_if_enabled():
     if request.path.startswith("/api/integrations/"):
         return None
     if session.get("auth_ok"):
+        if request.path.startswith("/settings") and not current_user_can_manage_settings():
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Settings access denied"}), 403
+            return redirect(url_for("dashboard", error="Settings access denied."))
         return None
     if request.path.startswith("/api/"):
         return jsonify({"error": "Authentication required"}), 401
@@ -1108,9 +1233,72 @@ def ensure_column(db, table_name, column_name, definition):
                 raise
 
 
+def normalize_app_username(value):
+    return normalize_whitespace(value or "").lower()
+
+
+def seed_app_users(db):
+    if APP_AUTH_USERNAME and (APP_AUTH_PASSWORD_HASH or APP_AUTH_PASSWORD):
+        username = normalize_app_username(APP_AUTH_USERNAME)
+        display_name = normalize_whitespace(APP_AUTH_USERNAME) or username
+        password_hash = APP_AUTH_PASSWORD_HASH
+        if not password_hash and APP_AUTH_PASSWORD:
+            password_hash = generate_password_hash(APP_AUTH_PASSWORD)
+        if password_hash:
+            existing = db.execute("SELECT id FROM app_users WHERE username = ?", (username,)).fetchone()
+            if existing:
+                db.execute(
+                    """
+                    UPDATE app_users
+                    SET display_name = COALESCE(NULLIF(display_name, ''), ?),
+                        password_hash = ?,
+                        is_active = 1,
+                        can_manage_settings = 1,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (display_name, password_hash, existing["id"]),
+                )
+            else:
+                db.execute(
+                    """
+                    INSERT INTO app_users (username, display_name, password_hash, is_active, can_manage_settings)
+                    VALUES (?, ?, ?, 1, 1)
+                    """,
+                    (username, display_name, password_hash),
+                )
+
+    if not db.execute("SELECT id FROM app_users WHERE username = ?", ("omar",)).fetchone():
+        db.execute(
+            """
+            INSERT INTO app_users (username, display_name, password_hash, is_active, can_manage_settings)
+            VALUES (?, ?, ?, 1, 0)
+            """,
+            ("omar", "Omar", generate_password_hash(OMAR_INITIAL_PASSWORD)),
+        )
+
+
 def migrate_db(db):
     with SCHEMA_PATH.open("r", encoding="utf-8") as schema_file:
         db.executescript(schema_file.read())
+
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            display_name TEXT,
+            password_hash TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            can_manage_settings INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_login_at TEXT
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_app_users_active ON app_users(is_active, username)")
+    seed_app_users(db)
 
     ensure_column(db, "people", "outreach_status", "outreach_status TEXT NOT NULL DEFAULT 'No Contact'")
     ensure_column(db, "people", "middle_name", "middle_name TEXT")
@@ -40797,9 +40985,12 @@ def login():
     if request.method == "POST":
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
-        if verify_app_login(username, password):
+        user = verify_app_login(username, password)
+        if user:
             session["auth_ok"] = True
-            session["auth_user"] = username
+            session["auth_user"] = user["username"]
+            session["auth_display_name"] = user.get("display_name") or user["username"]
+            session["auth_can_manage_settings"] = bool(user.get("can_manage_settings"))
             if is_safe_next_path(next_target):
                 return redirect(next_target)
             return redirect(url_for("dashboard"))
@@ -48615,6 +48806,12 @@ def settings_page():
                 ads_dashboard_enabled = (request.form.get("automation_ads_dashboard_enabled") or "").strip().lower() in {"1", "true", "on", "yes"}
                 set_setting(db, "automation_ads_dashboard_enabled", "1" if ads_dashboard_enabled else "0")
             notice = "Automation settings saved."
+        elif active_tab == "users":
+            try:
+                notice = save_app_user_from_settings(db, request.form)
+            except Exception as exc:
+                db.rollback()
+                error_notice = str(exc)
         elif active_tab == "helpers":
             market_helper_address = (request.form.get("market_helper_address") or "").strip()
             reisift_add_request = {
@@ -48793,6 +48990,7 @@ def settings_page():
     anonymous_email_registry_count = db.execute(
         "SELECT COUNT(*) AS c FROM anonymous_email_campaign_registry WHERE COALESCE(status, 'already_sent') = 'already_sent'"
     ).fetchone()["c"]
+    app_users = app_user_rows(db)
     return render_template(
         "settings.html",
         dm=settings,
@@ -48837,6 +49035,7 @@ def settings_page():
         untitled_change_log=untitled_change_log,
         untitled_email_sync_rows=untitled_email_sync_rows,
         anonymous_email_registry_count=anonymous_email_registry_count,
+        app_users=app_users,
         untitled_poll_hours=max(round(UNTITLED_LEADS_POLL_SECONDS / 3600, 1), 1),
         template_id=get_direct_mail_template_id(db),
         market_helper_address=market_helper_address,

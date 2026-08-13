@@ -18,6 +18,7 @@
         <a class="settings-tab {% if active_tab == 'ads' %}active{% endif %}" href="{{ url_for('settings_page', tab='ads') }}">Ad Platforms</a>
         <a class="settings-tab {% if active_tab == 'integrations' %}active{% endif %}" href="{{ url_for('settings_page', tab='integrations') }}">Integration Settings</a>
         <a class="settings-tab {% if active_tab == 'automations' %}active{% endif %}" href="{{ url_for('settings_page', tab='automations') }}">Automations</a>
+        <a class="settings-tab {% if active_tab == 'users' %}active{% endif %}" href="{{ url_for('settings_page', tab='users') }}">Users</a>
         <a class="settings-tab {% if active_tab == 'helpers' %}active{% endif %}" href="{{ url_for('settings_page', tab='helpers') }}">Helpers</a>
     </nav>
 
@@ -610,6 +611,77 @@
         </div>
         <p class="muted-text" style="margin-top:0.5rem;">Current poll interval: every {{ clever_poll_minutes }} minute{% if clever_poll_minutes != 1 %}s{% endif %}.</p>
         <p class="muted-text" style="margin-top:0.25rem;">Anonymous lead monitor interval: every {{ untitled_poll_hours }} hour{% if untitled_poll_hours != 1 %}s{% endif %}.</p>
+    {% elif active_tab == 'users' %}
+        <p>Manage who can sign in and whether they can access Settings. Password fields are only used when creating a user or resetting an existing password.</p>
+        <h3>Create User</h3>
+        <form method="post" class="grid-form">
+            <input type="hidden" name="settings_tab" value="users">
+            <input type="hidden" name="app_user_id" value="">
+            <label>Username
+                <input name="app_user_username" autocomplete="off" required>
+            </label>
+            <label>Display Name
+                <input name="app_user_display_name" autocomplete="off">
+            </label>
+            <label>Password
+                <input type="password" name="app_user_password" autocomplete="new-password" required>
+            </label>
+            <label class="checkbox-label">
+                <input type="checkbox" name="app_user_is_active" value="1" checked>
+                App access enabled
+            </label>
+            <label class="checkbox-label">
+                <input type="checkbox" name="app_user_can_manage_settings" value="1">
+                Can access Settings
+            </label>
+            <button type="submit">Create User</button>
+        </form>
+
+        <h3 style="margin-top:1.5rem;">Existing Users</h3>
+        <div class="table-wrap">
+            <table class="compact-table">
+                <thead>
+                    <tr>
+                        <th>User</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for user in app_users %}
+                    <tr>
+                        <td>
+                            <form method="post" class="grid-form" style="margin:0;">
+                                <input type="hidden" name="settings_tab" value="users">
+                                <input type="hidden" name="app_user_id" value="{{ user.id }}">
+                                <label>Username
+                                <input name="app_user_username" value="{{ user.username }}" required>
+                                </label>
+                                <label>Display Name
+                                <input name="app_user_display_name" value="{{ user.display_name or '' }}" placeholder="Display name" style="margin-top:0.35rem;">
+                                </label>
+                                <label>Last Login
+                                    <input value="{{ user.last_login_at|fmt_est_datetime if user.last_login_at else '-' }}" disabled>
+                                </label>
+                                <label>Reset Password
+                                    <input type="password" name="app_user_password" autocomplete="new-password" placeholder="Leave blank to keep">
+                                </label>
+                                <label class="checkbox-label">
+                                    <input type="checkbox" name="app_user_is_active" value="1" {% if user.is_active %}checked{% endif %}>
+                                    App access enabled
+                                </label>
+                                <label class="checkbox-label">
+                                    <input type="checkbox" name="app_user_can_manage_settings" value="1" {% if user.can_manage_settings %}checked{% endif %}>
+                                    Can access Settings
+                                </label>
+                                <button type="submit">Save User</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td>No users found.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
     {% else %}
         <h3>On-Market Checker (Beta Helper)</h3>
         <p>This helper generates fast lookup links for Zillow/Realtor/Redfin based on a property address. Use it to quickly verify whether a property appears as coming soon, active, pending, or sold.</p>

@@ -72,11 +72,13 @@
 
                     <div class="module-dropdown user-menu" id="userMenuWrap">
                         <button type="button" class="module-link module-dropdown-toggle user-menu-toggle" id="userMenuToggle">
-                            <span>User: {{ ((auth_user.split('@')[0] if auth_user and '@' in auth_user else auth_user) or 'John').title() }}</span>
+                            <span>User: {{ ((auth_display_name.split('@')[0] if auth_display_name and '@' in auth_display_name else auth_display_name) or 'John').title() }}</span>
                             <span class="user-menu-caret">&#9662;</span>
                         </button>
                         <div class="module-dropdown-menu hidden" id="userMenuPanel">
+                            {% if auth_can_manage_settings %}
                             <a class="module-dropdown-item {% if request.path.startswith('/settings') or request.path.startswith('/sequences') or request.path.startswith('/coming-soon') %}active{% endif %}" href="{{ url_for('settings_page') }}">Settings</a>
+                            {% endif %}
                             {% if auth_enabled %}
                             <form method="post" action="{{ url_for('logout') }}" class="user-menu-form">
                                 <button type="submit" class="module-dropdown-item user-menu-action">Logout</button>

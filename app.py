@@ -17210,17 +17210,37 @@ def _email_identity_has_active_submitted_lead(db, email_address):
         "manual_lead_submissions",
     )
     inactive_statuses = {"failed", "timed_out_step1_only_failed"}
+    property_id_list = sorted(pid for pid in property_ids if int(pid or 0) > 0)
+    domain = email_identity.rsplit("@", 1)[1] if "@" in email_identity else ""
     for table_name in submitted_tables:
         try:
             if not _table_has_column(db, table_name, "latest_email"):
                 continue
+            clauses = []
+            params = []
+            if property_id_list:
+                placeholders = ",".join(["?"] * len(property_id_list))
+                clauses.append(f"COALESCE(local_property_id, 0) IN ({placeholders})")
+                params.extend(property_id_list)
+            if domain == "gmail.com":
+                clauses.append(
+                    """
+                    (
+                        lower(COALESCE(latest_email, '')) LIKE '%@gmail.com'
+                     OR lower(COALESCE(latest_email, '')) LIKE '%@googlemail.com'
+                    )
+                    """
+                )
+            else:
+                clauses.append("lower(COALESCE(latest_email, '')) = ?")
+                params.append(email_identity.lower())
             rows = db.execute(
                 f"""
                 SELECT latest_email, local_property_id, status
                 FROM {table_name}
-                WHERE COALESCE(local_property_id, 0) > 0
-                   OR COALESCE(latest_email, '') <> ''
-                """
+                WHERE {' OR '.join(f'({clause})' for clause in clauses)}
+                """,
+                tuple(params),
             ).fetchall()
         except Exception:
             continue

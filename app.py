@@ -282,6 +282,14 @@ SMS_AUTOMATION_FOLLOWUP_COUNT = max(int((os.getenv("SMS_AUTOMATION_FOLLOWUP_COUN
 SMS_AUTOMATION_REISIFT_SENT_TAG = "AutoSMS:Sent"
 WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or "600").strip() or "600"), 60)
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
+WEBSITE_LEAD_ACK_SMS_FROM_NUMBER = (os.getenv("WEBSITE_LEAD_ACK_SMS_FROM_NUMBER", "19083410891") or "19083410891").strip()
+WEBSITE_LEAD_ACK_SMS_BODY = (
+    os.getenv(
+        "WEBSITE_LEAD_ACK_SMS_BODY",
+        "We just received your form request. Please let me know when you're free to speak for 5 min. Tx, John",
+    ).strip()
+    or "We just received your form request. Please let me know when you're free to speak for 5 min. Tx, John"
+)
 MARKET_STATUS_REMOTE_URL = (os.getenv("MARKET_STATUS_REMOTE_URL") or "").strip()
 MARKET_STATUS_REMOTE_TOKEN = (os.getenv("MARKET_STATUS_REMOTE_TOKEN") or "").strip()
 SLYBROADCAST_BASE_URL = os.getenv("SLYBROADCAST_BASE_URL", "https://www.mobile-sphere.com/gateway/vmb.php").strip()
@@ -1773,6 +1781,11 @@ def migrate_db(db):
     ensure_column(db, "website_lead_submissions", "google_ads_qualified_result_json", "google_ads_qualified_result_json TEXT")
     ensure_column(db, "website_lead_submissions", "google_ads_converted_at", "google_ads_converted_at TEXT")
     ensure_column(db, "website_lead_submissions", "google_ads_converted_result_json", "google_ads_converted_result_json TEXT")
+    ensure_column(db, "website_lead_submissions", "ack_sms_status", "ack_sms_status TEXT")
+    ensure_column(db, "website_lead_submissions", "ack_sms_sent_at", "ack_sms_sent_at TEXT")
+    ensure_column(db, "website_lead_submissions", "ack_sms_external_id", "ack_sms_external_id TEXT")
+    ensure_column(db, "website_lead_submissions", "ack_sms_communication_id", "ack_sms_communication_id INTEGER")
+    ensure_column(db, "website_lead_submissions", "ack_sms_error", "ack_sms_error TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS idx_website_lead_status_expiry ON website_lead_submissions(status, hold_expires_at)")
     db.execute(
         """
@@ -21711,6 +21724,162 @@ def build_submitted_leads_snapshot(db, q="", source="", page=1, per_page=50, sor
     return page_rows, totals, pagination, ["website", "clever", "manual", "ppl"]
 
 
+def _website_lead_ack_sms_person_id(db, local_property_id):
+    try:
+        local_property_id = int(local_property_id or 0)
+    except Exception:
+        local_property_id = 0
+    if local_property_id <= 0:
+        return 0
+    try:
+        row = db.execute(
+            "SELECT owner_person_id, resident_person_id FROM properties WHERE id = ? LIMIT 1",
+            (local_property_id,),
+        ).fetchone()
+    except Exception:
+        return 0
+    if not row:
+        return 0
+    return int((row["owner_person_id"] or row["resident_person_id"] or 0) or 0)
+
+
+def send_website_lead_ack_sms(db, lead_key, to_number, local_property_id=0, source_event_key=""):
+    lead_key = normalize_whitespace(lead_key or "")
+    to_number = normalize_phone(to_number or "")
+    if not lead_key:
+        return {"ok": True, "skipped": "missing_lead_key"}
+    if not to_number:
+        return {"ok": True, "skipped": "missing_phone"}
+    lead_row = db.execute(
+        """
+        SELECT id, ack_sms_sent_at, ack_sms_status, ack_sms_external_id, ack_sms_communication_id
+        FROM website_lead_submissions
+        WHERE lead_key = ?
+        LIMIT 1
+        """,
+        (lead_key,),
+    ).fetchone()
+    if lead_row and str(lead_row["ack_sms_sent_at"] or "").strip():
+        return {
+            "ok": True,
+            "skipped": "already_sent",
+            "external_id": str(lead_row["ack_sms_external_id"] or ""),
+            "communication_id": int(lead_row["ack_sms_communication_id"] or 0),
+        }
+    claim = db.execute(
+        """
+        UPDATE website_lead_submissions
+        SET ack_sms_status = 'Sending',
+            ack_sms_error = '',
+            last_received_at = CURRENT_TIMESTAMP
+        WHERE lead_key = ?
+          AND COALESCE(ack_sms_sent_at, '') = ''
+          AND lower(COALESCE(ack_sms_status, '')) <> 'sending'
+        """,
+        (lead_key,),
+    )
+    if claim.rowcount != 1:
+        return {"ok": True, "skipped": "already_claimed"}
+
+    from_number = normalize_phone(WEBSITE_LEAD_ACK_SMS_FROM_NUMBER) or "19083410891"
+    body = WEBSITE_LEAD_ACK_SMS_BODY
+    try:
+        send_result = send_smrtphone_sms(to_number, body, from_number=from_number)
+        external_id = send_result.get("sms_id") or ""
+        sms_status = send_result.get("status") or "Sent"
+        sent_at = format_db_time(datetime.utcnow())
+        person_id = _website_lead_ack_sms_person_id(db, local_property_id)
+        cur = db.execute(
+            """
+            INSERT INTO communications (property_id, person_id, channel, direction, from_number, to_number, body, status, is_read, sent_at, external_id)
+            VALUES (NULLIF(?, 0), NULLIF(?, 0), 'SMS', 'Outbound', ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                int(local_property_id or 0),
+                person_id,
+                from_number,
+                to_number,
+                body,
+                sms_status,
+                sent_at,
+                external_id,
+            ),
+        )
+        communication_id = int(cur.lastrowid or 0)
+        db.execute(
+            """
+            UPDATE website_lead_submissions
+            SET ack_sms_status = ?,
+                ack_sms_sent_at = ?,
+                ack_sms_external_id = ?,
+                ack_sms_communication_id = ?,
+                ack_sms_error = ''
+            WHERE lead_key = ?
+            """,
+            (sms_status, sent_at, external_id, communication_id, lead_key),
+        )
+        add_website_webhook_note(
+            db,
+            source_event_key or lead_key,
+            lead_key,
+            "Website lead acknowledgement SMS\nResult: sent",
+            {
+                "from": from_number,
+                "to": to_number,
+                "message": body,
+                "status": sms_status,
+                "external_id": external_id,
+                "communication_id": communication_id,
+            },
+        )
+        try:
+            send_slack_notification(db, "SMS sent")
+        except Exception as slack_exc:
+            log_app_error(
+                db,
+                source="website_lead_ack_sms_slack",
+                error_message=str(slack_exc),
+                details=traceback.format_exc(),
+                route="send_website_lead_ack_sms:slack",
+                status_code=500,
+            )
+        return {
+            "ok": True,
+            "sent": True,
+            "from": from_number,
+            "to": to_number,
+            "status": sms_status,
+            "external_id": external_id,
+            "communication_id": communication_id,
+        }
+    except Exception as exc:
+        db.execute(
+            """
+            UPDATE website_lead_submissions
+            SET ack_sms_status = 'Failed',
+                ack_sms_error = ?
+            WHERE lead_key = ?
+            """,
+            (str(exc), lead_key),
+        )
+        add_website_webhook_note(
+            db,
+            source_event_key or lead_key,
+            lead_key,
+            "Website lead acknowledgement SMS\nResult: failed",
+            {"from": from_number, "to": to_number, "message": body, "error": str(exc)},
+        )
+        log_app_error(
+            db,
+            source="website_lead_ack_sms",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="send_website_lead_ack_sms",
+            status_code=500,
+        )
+        return {"ok": False, "error": str(exc), "from": from_number, "to": to_number}
+
+
 def process_website_lead_payload(db, payload, source_label="webhook"):
     if not isinstance(payload, dict):
         return {"ok": False, "error": "Invalid payload object.", "error_type": "validation", "slack_sent": False}
@@ -21974,6 +22143,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
     note_sync = None
     list_sync = None
     tag_sync = None
+    ack_sms_result = None
     enrich_result = None
     create_result = None
     duplicate_reason = ""
@@ -22084,6 +22254,14 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 status_code=500,
             )
 
+        ack_sms_result = send_website_lead_ack_sms(
+            db,
+            lead_key,
+            merged_fields.get("phone") or "",
+            local_property_id=local_property_id,
+            source_event_key=event_key,
+        )
+
         sift_link = _sift_record_url(created_uuid)
         if duplicate_existing:
             mode = "sift_duplicate_existing"
@@ -22112,6 +22290,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             "tag_sync": tag_sync,
             "enrich": enrich_result,
             "create_result": create_result,
+            "ack_sms": ack_sms_result,
             "duplicate_existing": duplicate_existing,
             "duplicate_reason": duplicate_reason,
         }
@@ -26253,6 +26432,7 @@ def run_website_step1_hold_once():
             note_sync = None
             list_sync = None
             tag_sync = None
+            ack_sms_result = None
             duplicate_existing = False
             duplicate_reason = ""
             mode = "step1_only_timeout"
@@ -26278,6 +26458,7 @@ def run_website_step1_hold_once():
                 "note_sync": note_sync,
                 "list_sync": list_sync,
                 "tag_sync": tag_sync,
+                "ack_sms": ack_sms_result,
             }
             should_notify = False
             slack_result = {"sent": False, "error": ""}
@@ -26381,6 +26562,7 @@ def run_website_step1_hold_once():
                     "note_sync": note_sync,
                     "list_sync": list_sync,
                     "tag_sync": tag_sync,
+                    "ack_sms": ack_sms_result,
                 }
                 log_app_error(
                     db,
@@ -26420,6 +26602,15 @@ def run_website_step1_hold_once():
                     details=traceback.format_exc(),
                     route="run_website_step1_hold_once:local_property",
                     status_code=500,
+                )
+
+            if status_value != "timed_out_step1_only_failed":
+                ack_sms_result = send_website_lead_ack_sms(
+                    db,
+                    row["lead_key"],
+                    merged_fields.get("phone") or "",
+                    local_property_id=local_property_id,
+                    source_event_key=str(row["lead_key"] or ""),
                 )
 
             if should_notify:
@@ -26467,6 +26658,7 @@ def run_website_step1_hold_once():
                     "note_sync": note_sync,
                     "list_sync": list_sync,
                     "tag_sync": tag_sync,
+                    "ack_sms": ack_sms_result,
                     "slack_result": slack_result,
                 }
             )

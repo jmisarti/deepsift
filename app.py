@@ -375,6 +375,14 @@ ENSURE_DB_LOCK = threading.Lock()
 PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTES") or "60").strip() or "60"), 5)
 PROSPECT_TABLE_CACHE_REFRESH_SECONDS = max(int((os.getenv("PROSPECT_TABLE_CACHE_REFRESH_SECONDS") or "300").strip() or "300"), 60)
 REISIFT_REFRESH_STALE_MINUTES = max(int((os.getenv("REISIFT_REFRESH_STALE_MINUTES") or "180").strip() or "180"), 30)
+REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE = max(
+    int((os.getenv("REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE") or "50").strip() or "50"),
+    1,
+)
+PROSPECT_TABLE_CACHE_COMMIT_BATCH_SIZE = max(
+    int((os.getenv("PROSPECT_TABLE_CACHE_COMMIT_BATCH_SIZE") or "100").strip() or "100"),
+    1,
+)
 PROVIDER_ALERT_SOURCE_PREFIX = "provider_"
 ADS_DEFAULT_LOOKBACK_DAYS = max(int((os.getenv("ADS_DEFAULT_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
 ADS_REFRESH_LOOKBACK_DAYS = max(int((os.getenv("ADS_REFRESH_LOOKBACK_DAYS") or "30").strip() or "30"), 1)
@@ -36206,6 +36214,10 @@ def refresh_reisift_prospect_segment_cache(
             "UPDATE reisift_new_records SET is_active = 0 WHERE COALESCE(segment, 'new_records') = ?",
             (segment,),
         )
+        try:
+            commit_with_retry(db)
+        except Exception as exc:
+            errors.append(f"cache_deactivate_commit: {exc}")
     for prepared in prepared_rows:
         property_uuid = prepared["property_uuid"]
         try:
@@ -36234,6 +36246,11 @@ def refresh_reisift_prospect_segment_cache(
             updated_phones += int(contact_sync.get("phones_updated") or 0)
             suppressed_phones += int(contact_sync.get("phones_suppressed") or 0)
             synced += 1
+            if synced % REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE == 0:
+                try:
+                    commit_with_retry(db)
+                except Exception as exc:
+                    errors.append(f"{property_uuid}: cache_batch_commit failed ({exc})")
         except Exception as exc:
             errors.append(f"{property_uuid}: {exc}")
     if not search_failed and previous_active_rows:
@@ -36265,6 +36282,11 @@ def refresh_reisift_prospect_segment_cache(
                 status_exit_unsubscribed += int(unsub.get("unsubscribed") or 0)
                 if local_sync.get("local_property_id") and local_sync.get("before") != local_sync.get("after"):
                     local_updates += 1
+                if status_exit_checks % REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE == 0:
+                    try:
+                        commit_with_retry(db)
+                    except Exception as exc:
+                        errors.append(f"{property_uuid}: status_exit_batch_commit failed ({exc})")
             except Exception as exc:
                 errors.append(f"{property_uuid}: status exit check failed ({exc})")
     try:
@@ -36274,6 +36296,7 @@ def refresh_reisift_prospect_segment_cache(
     sms_queue = {"created": 0, "updated": 0, "skipped": 0, "suppressed": 0}
     try:
         sms_queue = generate_sms_automation_queue_for_new_records(db, token=token)
+        commit_with_retry(db)
     except Exception as exc:
         errors.append(f"sms_queue: {exc}")
     prospect_table_cache = {"rows": 0}
@@ -37080,6 +37103,7 @@ def rebuild_prospect_table_cache(
     else:
         db.execute("DELETE FROM prospect_table_cache WHERE segment = ?", (segment,))
         db.execute("DELETE FROM prospect_table_cache_lists WHERE segment = ?", (segment,))
+    commit_with_retry(db)
 
     rows = _prospect_table_source_rows(db, segment, property_uuids=clean_uuids, property_ids=clean_property_ids)
     list_names_by_uuid = reisift_new_record_list_names_for_properties(db, [row["property_uuid"] for row in rows])
@@ -37184,9 +37208,12 @@ def rebuild_prospect_table_cache(
                 (segment, item.get("property_uuid") or "", list_name, list_key, now_text),
             )
         inserted += 1
+        if inserted % PROSPECT_TABLE_CACHE_COMMIT_BATCH_SIZE == 0:
+            commit_with_retry(db)
     if update_signature and not is_partial:
         set_setting(db, _prospect_cache_setting_key(segment), prospect_table_source_signature(db, segment))
         set_setting(db, f"{_prospect_cache_setting_key(segment)}_rebuilt_at", now_text)
+    commit_with_retry(db)
     return {"segment": segment, "rows": inserted, "partial": is_partial, "projection_updated_at": now_text}
 
 

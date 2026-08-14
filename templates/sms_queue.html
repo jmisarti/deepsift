@@ -236,12 +236,12 @@
                         <div class="sms-queue-reason">{{ row.property_county }}</div>
                         {% endif %}
                         {% if row.priority_preset %}
-                        <div class="sms-queue-reason">Priority {{ row.priority_preset }}: {{ row.priority_match }}</div>
+                        <div class="sms-queue-reason">Priority {{ row.priority_preset }}{% if row.priority_match %}: {{ row.priority_match }}{% endif %}</div>
                         {% elif row.is_llc_owner %}
                         <div class="sms-queue-reason">LLC excluded from priority presets</div>
                         {% endif %}
-                        {% if row.is_vacant is not none %}
-                        <div class="sms-queue-reason">{% if row.is_vacant %}Vacant{% else %}Not vacant{% endif %}</div>
+                        {% if row.is_vacant %}
+                        <div class="sms-queue-reason">Vacant</div>
                         {% endif %}
                         <div class="inline-actions compact-icons">
                             <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.property_id) }}" title="Open in Deep Dive">

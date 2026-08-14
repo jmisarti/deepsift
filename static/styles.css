@@ -758,8 +758,18 @@ body {
     width: 3.4rem;
 }
 
+.new-records-table .priority-cell {
+    max-width: 7.8rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 .new-records-table .pill {
     font-size: 0.66rem;
+}
+
+.new-records-table .secondary-pill {
+    margin-left: 0.18rem;
 }
 
 .help-text {

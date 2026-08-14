@@ -51,7 +51,7 @@
                 </select>
             </label>
             <button type="submit">Apply</button>
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.is_vacant or filters.priority_preset or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>From
@@ -115,6 +115,22 @@
                             <option value="no" {% if filters.owner_out_of_state == 'no' %}selected{% endif %}>No</option>
                         </select>
                     </label>
+                    <label>Vacant?
+                        <select name="is_vacant">
+                            <option value="">All</option>
+                            <option value="yes" {% if filters.is_vacant == 'yes' %}selected{% endif %}>Yes</option>
+                            <option value="no" {% if filters.is_vacant == 'no' %}selected{% endif %}>No</option>
+                        </select>
+                    </label>
+                    <label>Priority Preset
+                        <select name="priority_preset">
+                            <option value="">All</option>
+                            {% for priority in filter_options.priorities %}
+                            <option value="{{ priority.value }}" {% if filters.priority_preset == priority.value %}selected{% endif %}>{{ priority.label }}</option>
+                            {% endfor %}
+                        </select>
+                        <span class="help-text">LLC owners are excluded from priority presets.</span>
+                    </label>
                     <label>ReiSkipped?
                         <select name="rei_skipped">
                             <option value="">All</option>
@@ -156,6 +172,8 @@
             <input type="hidden" name="completeness" value="{{ filters.completeness }}">
             <input type="hidden" name="owner_type" value="{{ filters.owner_type }}">
             <input type="hidden" name="owner_out_of_state" value="{{ filters.owner_out_of_state }}">
+            <input type="hidden" name="is_vacant" value="{{ filters.is_vacant }}">
+            <input type="hidden" name="priority_preset" value="{{ filters.priority_preset }}">
             <input type="hidden" name="rei_skipped" value="{{ filters.rei_skipped }}">
             <input type="hidden" name="deep_skipped" value="{{ filters.deep_skipped }}">
             <input type="hidden" name="no_good_numbers" value="{{ filters.no_good_numbers }}">
@@ -198,6 +216,7 @@
                 <tr>
                     <th>Address</th>
                     <th>Status</th>
+                    <th>Priority</th>
                     <th>Owner Name(s)</th>
                     <th>Date Added</th>
                     <th>Mail Out</th>
@@ -216,6 +235,19 @@
                 <tr>
                     <td>{{ row.full_address or "-" }}</td>
                     <td><span class="pill">{{ row.status or "-" }}</span></td>
+                    <td>
+                        {% if row.priority_preset %}
+                        <span class="pill">P{{ row.priority_preset }}</span>
+                        <div class="sms-queue-reason">{{ row.priority_match }}</div>
+                        {% elif row.is_llc_owner %}
+                        <span class="pill">LLC Excluded</span>
+                        {% else %}
+                        -
+                        {% endif %}
+                        {% if row.is_vacant is not none %}
+                        <div class="sms-queue-reason">{% if row.is_vacant %}Vacant{% else %}Not vacant{% endif %}</div>
+                        {% endif %}
+                    </td>
                     <td>{{ row.owner_names or "-" }}</td>
                     <td>{{ row.added_at|fmt_short_date }}</td>
                     <td>{{ row.mail_out }}</td>
@@ -246,7 +278,7 @@
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="13">{{ empty_message or "No New Records matched these filters. Click Refresh New Records or clear the filters." }}</td>
+                    <td colspan="14">{{ empty_message or "No New Records matched these filters. Click Refresh New Records or clear the filters." }}</td>
                 </tr>
                 {% endfor %}
             </tbody>

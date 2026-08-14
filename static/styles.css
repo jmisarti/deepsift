@@ -740,14 +740,14 @@ body {
 }
 
 .new-records-table td:first-child,
-.new-records-table td:nth-child(3) {
+.new-records-table td:nth-child(4) {
     max-width: 230px;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-.new-records-table th:nth-child(n+5):nth-child(-n+12),
-.new-records-table td:nth-child(n+5):nth-child(-n+12) {
+.new-records-table th:nth-child(n+6):nth-child(-n+13),
+.new-records-table td:nth-child(n+6):nth-child(-n+13) {
     text-align: center;
     width: 3.35rem;
 }

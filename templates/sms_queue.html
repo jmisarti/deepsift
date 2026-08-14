@@ -38,7 +38,7 @@
 
     <div class="panel-actions">
         <form method="get" action="{{ url_for('sms_queue_page') }}" class="inline-form">
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.county or filters.city or filters.prospect_segment or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers or filters.status or filters.bucket or filters.contact_role %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.county or filters.city or filters.prospect_segment or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.is_vacant or filters.priority_preset or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers or filters.status or filters.bucket or filters.contact_role %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>Numbers From
@@ -101,6 +101,22 @@
                             <option value="yes" {% if filters.owner_out_of_state == 'yes' %}selected{% endif %}>Yes</option>
                             <option value="no" {% if filters.owner_out_of_state == 'no' %}selected{% endif %}>No</option>
                         </select>
+                    </label>
+                    <label>Vacant?
+                        <select name="is_vacant">
+                            <option value="">All</option>
+                            <option value="yes" {% if filters.is_vacant == 'yes' %}selected{% endif %}>Yes</option>
+                            <option value="no" {% if filters.is_vacant == 'no' %}selected{% endif %}>No</option>
+                        </select>
+                    </label>
+                    <label>Priority Preset
+                        <select name="priority_preset">
+                            <option value="">All</option>
+                            {% for priority in filter_options.priorities %}
+                            <option value="{{ priority.value }}" {% if filters.priority_preset == priority.value %}selected{% endif %}>{{ priority.label }}</option>
+                            {% endfor %}
+                        </select>
+                        <span class="help-text">LLC owners are excluded from priority presets.</span>
                     </label>
                     <label>ReiSkipped?
                         <select name="rei_skipped">
@@ -218,6 +234,14 @@
                         <div>{{ row.property_address or '-' }}</div>
                         {% if row.property_county %}
                         <div class="sms-queue-reason">{{ row.property_county }}</div>
+                        {% endif %}
+                        {% if row.priority_preset %}
+                        <div class="sms-queue-reason">Priority {{ row.priority_preset }}: {{ row.priority_match }}</div>
+                        {% elif row.is_llc_owner %}
+                        <div class="sms-queue-reason">LLC excluded from priority presets</div>
+                        {% endif %}
+                        {% if row.is_vacant is not none %}
+                        <div class="sms-queue-reason">{% if row.is_vacant %}Vacant{% else %}Not vacant{% endif %}</div>
                         {% endif %}
                         <div class="inline-actions compact-icons">
                             <a class="action-icon-link" href="{{ url_for('property_detail', property_id=row.property_id) }}" title="Open in Deep Dive">

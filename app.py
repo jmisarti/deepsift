@@ -152,6 +152,71 @@ REISIFT_PROSPECT_SEGMENT_LABELS = {
     REISIFT_NEW_RECORDS_SEGMENT: "New Records",
     REISIFT_DEEP_PROSPECTING_SEGMENT: "Deep Prospecting",
 }
+PROSPECT_PRIORITY_FILTER_OPTIONS = [
+    {"value": "1", "label": "Priority 1"},
+    {"value": "2", "label": "Priority 2"},
+    {"value": "3", "label": "Priority 3"},
+]
+PROSPECT_PRIORITY_SIGNAL_LABELS = {
+    "judgment_lien": "Judgment Lien",
+    "lis_pendens": "Foreclosure",
+    "senior": "Senior",
+    "high_equity": "High Equity",
+    "free_clear": "Free & Clear",
+    "vacant": "Vacant",
+    "low_income": "Low Income",
+    "out_of_state": "Out-of-State",
+    "absentee": "Absentee",
+    "tired_landlord": "Tired Landlord",
+    "bad_credit": "Bad Credit",
+}
+PROSPECT_PRIORITY_STACKS = {
+    "1": [
+        ("judgment_lien",),
+        ("high_equity", "lis_pendens", "senior"),
+        ("lis_pendens", "senior"),
+        ("free_clear", "lis_pendens"),
+        ("lis_pendens", "out_of_state"),
+        ("high_equity", "lis_pendens"),
+        ("absentee", "lis_pendens"),
+        ("lis_pendens",),
+        ("free_clear", "vacant"),
+        ("low_income", "senior"),
+        ("high_equity", "out_of_state", "tired_landlord"),
+        ("absentee", "free_clear", "out_of_state"),
+        ("free_clear", "out_of_state"),
+        ("absentee", "high_equity", "out_of_state"),
+        ("high_equity", "out_of_state"),
+        ("absentee", "out_of_state"),
+        ("absentee", "free_clear"),
+        ("out_of_state",),
+        ("low_income",),
+    ],
+    "2": [
+        ("high_equity", "lis_pendens"),
+        ("lis_pendens",),
+        ("out_of_state", "tired_landlord"),
+        ("absentee", "free_clear", "out_of_state"),
+        ("free_clear", "out_of_state"),
+        ("high_equity", "out_of_state"),
+        ("free_clear", "low_income"),
+        ("vacant",),
+        ("free_clear", "senior", "tired_landlord"),
+        ("free_clear", "tired_landlord"),
+        ("senior", "tired_landlord"),
+        ("absentee", "free_clear", "senior"),
+        ("high_equity", "senior", "tired_landlord"),
+        ("absentee", "out_of_state"),
+        ("free_clear", "senior"),
+        ("absentee", "free_clear"),
+        ("bad_credit",),
+        ("free_clear",),
+        ("tired_landlord",),
+        ("senior",),
+        ("absentee",),
+        ("low_income",),
+    ],
+}
 REISIFT_NEW_RECORDS_COUNTIES = tuple(
     item.strip()
     for item in (os.getenv("REISIFT_NEW_RECORDS_COUNTIES") or "Essex,Union,Bergen").split(",")
@@ -1352,6 +1417,10 @@ def migrate_db(db):
             completeness TEXT,
             owner_type TEXT,
             owner_out_of_state INTEGER,
+            is_vacant INTEGER,
+            is_llc_owner INTEGER NOT NULL DEFAULT 0,
+            priority_preset TEXT,
+            priority_match TEXT,
             added_at TEXT,
             reisift_updated_at TEXT,
             local_property_id INTEGER,
@@ -1369,6 +1438,10 @@ def migrate_db(db):
     ensure_column(db, "reisift_new_records", "completeness", "completeness TEXT")
     ensure_column(db, "reisift_new_records", "owner_type", "owner_type TEXT")
     ensure_column(db, "reisift_new_records", "owner_out_of_state", "owner_out_of_state INTEGER")
+    ensure_column(db, "reisift_new_records", "is_vacant", "is_vacant INTEGER")
+    ensure_column(db, "reisift_new_records", "is_llc_owner", "is_llc_owner INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "reisift_new_records", "priority_preset", "priority_preset TEXT")
+    ensure_column(db, "reisift_new_records", "priority_match", "priority_match TEXT")
     ensure_column(db, "reisift_new_records", "reisift_updated_at", "reisift_updated_at TEXT")
     ensure_column(db, "reisift_new_records", "local_property_id", "local_property_id INTEGER")
     ensure_column(db, "reisift_new_records", "local_status_before", "local_status_before TEXT")
@@ -1407,6 +1480,9 @@ def migrate_db(db):
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_active_owner ON reisift_new_records(is_active, owner_type, completeness, owner_out_of_state)"
     )
     db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_priority ON reisift_new_records(segment, is_active, priority_preset, is_llc_owner)"
+    )
+    db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_local_property ON reisift_new_records(local_property_id)"
     )
     db.execute(
@@ -1428,6 +1504,10 @@ def migrate_db(db):
             completeness TEXT,
             owner_type TEXT,
             owner_out_of_state INTEGER,
+            is_vacant INTEGER,
+            is_llc_owner INTEGER NOT NULL DEFAULT 0,
+            priority_preset TEXT,
+            priority_match TEXT,
             added_at TEXT,
             reisift_updated_at TEXT,
             local_property_id INTEGER,
@@ -1465,6 +1545,13 @@ def migrate_db(db):
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_segment_flags ON prospect_table_cache(segment, rei_skipped, deep_skipped, no_good_numbers)"
+    )
+    ensure_column(db, "prospect_table_cache", "is_vacant", "is_vacant INTEGER")
+    ensure_column(db, "prospect_table_cache", "is_llc_owner", "is_llc_owner INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "prospect_table_cache", "priority_preset", "priority_preset TEXT")
+    ensure_column(db, "prospect_table_cache", "priority_match", "priority_match TEXT")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_priority ON prospect_table_cache(segment, priority_preset, is_llc_owner)"
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_local_property ON prospect_table_cache(local_property_id)"
@@ -2918,6 +3005,31 @@ def init_db():
     db.close()
 
 
+def ensure_prospect_priority_backfill(db):
+    if get_setting(db, "prospect_priority_presets_v1_backfilled", "") == "1":
+        return {"backfilled": False, "reason": "already_done"}
+    source_count = int(
+        (
+            db.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM reisift_new_records
+                WHERE COALESCE(is_active, 1) = 1
+                """
+            ).fetchone()
+            or {"count": 0}
+        )["count"]
+        or 0
+    )
+    if source_count <= 0:
+        set_setting(db, "prospect_priority_presets_v1_backfilled", "1")
+        return {"backfilled": False, "reason": "no_source_rows"}
+    field_result = backfill_reisift_new_record_cached_fields(db, only_missing=False)
+    cache_result = refresh_stale_prospect_table_cache(db, force=True)
+    set_setting(db, "prospect_priority_presets_v1_backfilled", "1")
+    return {"backfilled": True, "fields": field_result, "cache": cache_result}
+
+
 def ensure_db(force=False):
     global ENSURE_DB_READY
     if ENSURE_DB_READY and DB_PATH.exists() and not force:
@@ -2939,6 +3051,10 @@ def ensure_db(force=False):
             ensure_default_sms_automation_routing_rules(db)
             normalize_unsent_sms_queue_addresses(db)
             purge_suppressed_sms_automation_queue(db)
+            try:
+                ensure_prospect_priority_backfill(db)
+            except Exception as exc:
+                log_app_error(db, "prospect_priority_backfill", str(exc), status_code=500)
             try:
                 ensure_prospect_table_cache_seeded(db)
             except Exception:
@@ -36221,11 +36337,22 @@ def upsert_reisift_new_record(
         payload,
         fallback_payload=search_row,
     )
+    local_vacancy = local_property_vacancy_value(db, local_sync.get("local_property_id"))
+    is_vacant = cached_fields["is_vacant"] if cached_fields.get("is_vacant") is not None else local_vacancy
+    priority = classify_prospect_priority(
+        list_names=extract_property_list_names(payload or search_row),
+        owner_out_of_state=bool(cached_fields["owner_out_of_state"]),
+        is_vacant=is_vacant,
+        owner_type=cached_fields["owner_type"],
+        owner_names=summary["owner_names"],
+        payload=payload or search_row,
+    )
     execute_with_retry(
         db,
         """
         INSERT INTO reisift_new_records
             (property_uuid, segment, status, full_address, owner_names, county, city, completeness, owner_type, owner_out_of_state,
+             is_vacant, is_llc_owner, priority_preset, priority_match,
              added_at, reisift_updated_at,
              local_property_id, local_status_before, local_status_after,
              outbound_calls, inbound_calls, mail_out, outbound_sms, inbound_sms, outbound_email, inbound_email,
@@ -36233,7 +36360,7 @@ def upsert_reisift_new_record(
              rei_skipped, deep_skipped, no_good_numbers,
              first_seen_at, automation_eligible, automation_hold_reason,
              payload_json, is_active, last_synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(property_uuid) DO UPDATE SET
             segment = excluded.segment,
             status = excluded.status,
@@ -36244,6 +36371,10 @@ def upsert_reisift_new_record(
             completeness = excluded.completeness,
             owner_type = excluded.owner_type,
             owner_out_of_state = excluded.owner_out_of_state,
+            is_vacant = excluded.is_vacant,
+            is_llc_owner = excluded.is_llc_owner,
+            priority_preset = excluded.priority_preset,
+            priority_match = excluded.priority_match,
             added_at = excluded.added_at,
             reisift_updated_at = excluded.reisift_updated_at,
             local_property_id = excluded.local_property_id,
@@ -36280,6 +36411,10 @@ def upsert_reisift_new_record(
             cached_fields["completeness"],
             cached_fields["owner_type"],
             cached_fields["owner_out_of_state"],
+            is_vacant,
+            int(priority["is_llc_owner"]),
+            priority["priority_preset"],
+            priority["priority_match"],
             cached_fields["added_at"],
             updated_at,
             local_sync["local_property_id"],
@@ -36873,12 +37008,14 @@ def derive_reisift_new_record_cached_fields(payload, fallback_payload=None, summ
         except Exception:
             city = ""
     owner_out = _new_record_owner_out_of_state(field_payload)
+    payload_vacancy = _payload_vacancy_value(field_payload)
     return {
         "county": cached_county,
         "city": city,
         "completeness": _new_record_completeness(field_payload),
         "owner_type": _new_record_owner_type(field_payload),
         "owner_out_of_state": None if owner_out is None else (1 if owner_out else 0),
+        "is_vacant": payload_vacancy,
         "added_at": format_db_time(derived_added_dt) if derived_added_dt else None,
     }
 
@@ -37090,11 +37227,13 @@ def backfill_reisift_new_record_cached_fields(db, only_missing=False):
              OR COALESCE(owner_type, '') = ''
              OR added_at IS NULL
              OR COALESCE(added_at, '') = ''
+             OR priority_preset IS NULL
+             OR COALESCE(priority_preset, '') = ''
           )
         """
     rows = db.execute(
         f"""
-        SELECT property_uuid, payload_json, full_address, county
+        SELECT property_uuid, payload_json, full_address, county, local_property_id, owner_names
         FROM reisift_new_records
         {where_sql}
         """
@@ -37109,6 +37248,17 @@ def backfill_reisift_new_record_cached_fields(db, only_missing=False):
             summary=summary,
             county=row["county"] or "",
         )
+        list_names = extract_property_list_names(payload)
+        local_vacancy = local_property_vacancy_value(db, row["local_property_id"])
+        is_vacant = fields["is_vacant"] if fields.get("is_vacant") is not None else local_vacancy
+        priority = classify_prospect_priority(
+            list_names=list_names,
+            owner_out_of_state=bool(fields["owner_out_of_state"]),
+            is_vacant=is_vacant,
+            owner_type=fields["owner_type"],
+            owner_names=summary.get("owner_names") or row["owner_names"] or "",
+            payload=payload,
+        )
         execute_with_retry(
             db,
             """
@@ -37118,6 +37268,10 @@ def backfill_reisift_new_record_cached_fields(db, only_missing=False):
                 completeness = ?,
                 owner_type = ?,
                 owner_out_of_state = ?,
+                is_vacant = ?,
+                is_llc_owner = ?,
+                priority_preset = ?,
+                priority_match = ?,
                 added_at = COALESCE(NULLIF(?, ''), added_at)
             WHERE property_uuid = ?
             """,
@@ -37127,6 +37281,10 @@ def backfill_reisift_new_record_cached_fields(db, only_missing=False):
                 fields["completeness"],
                 fields["owner_type"],
                 fields["owner_out_of_state"],
+                is_vacant,
+                int(priority["is_llc_owner"]),
+                priority["priority_preset"],
+                priority["priority_match"],
                 fields["added_at"] or "",
                 row["property_uuid"],
             ),
@@ -37310,10 +37468,11 @@ def rebuild_prospect_table_cache(
             """
             INSERT INTO prospect_table_cache
                 (segment, property_uuid, status, full_address, owner_names, county, city, completeness, owner_type, owner_out_of_state,
+                 is_vacant, is_llc_owner, priority_preset, priority_match,
                  added_at, reisift_updated_at, local_property_id, local_status_after, deep_dive_property_id, deep_dive_status,
                  mail_out, call_out, call_in, sms_out, sms_in, email_out, email_in, emails_opened, inbound_responses,
                  rei_skipped, deep_skipped, no_good_numbers, property_lists, property_lists_json, source_last_synced_at, projection_updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(segment, property_uuid) DO UPDATE SET
                 status = excluded.status,
                 full_address = excluded.full_address,
@@ -37323,6 +37482,10 @@ def rebuild_prospect_table_cache(
                 completeness = excluded.completeness,
                 owner_type = excluded.owner_type,
                 owner_out_of_state = excluded.owner_out_of_state,
+                is_vacant = excluded.is_vacant,
+                is_llc_owner = excluded.is_llc_owner,
+                priority_preset = excluded.priority_preset,
+                priority_match = excluded.priority_match,
                 added_at = excluded.added_at,
                 reisift_updated_at = excluded.reisift_updated_at,
                 local_property_id = excluded.local_property_id,
@@ -37357,6 +37520,10 @@ def rebuild_prospect_table_cache(
                 item.get("completeness") or "",
                 item.get("owner_type") or "",
                 int(item.get("owner_out_of_state") or 0),
+                item.get("is_vacant"),
+                int(item.get("is_llc_owner") or 0),
+                item.get("priority_preset") or "",
+                item.get("priority_match") or "",
                 item.get("added_at") or "",
                 item.get("reisift_updated_at") or "",
                 int(item.get("local_property_id") or 0) or None,
@@ -37765,6 +37932,16 @@ def _new_record_matches_filters(row, filters):
             return False
         if bool(actual) != owner_out_of_state_filter:
             return False
+    is_vacant_filter = _new_record_yes_no_filter_value(filters.get("is_vacant") or "")
+    if is_vacant_filter is not None:
+        actual = row.get("is_vacant")
+        if actual is None:
+            return False
+        if bool(actual) != is_vacant_filter:
+            return False
+    priority_filter = normalize_whitespace(filters.get("priority_preset") or "")
+    if priority_filter in {"1", "2", "3"} and normalize_whitespace(row.get("priority_preset") or "") != priority_filter:
+        return False
 
     selected_lists = filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")
     selected_list_keys = {normalize_whitespace(item).lower() for item in selected_lists if normalize_whitespace(item)}
@@ -37819,7 +37996,15 @@ def get_new_record_filter_options(db, segment=REISIFT_NEW_RECORDS_SEGMENT):
         (segment,),
     ).fetchall()
     lists = [row["list_name"] for row in list_rows]
-    return {"statuses": statuses, "counties": counties, "cities": cities, "completeness": completeness, "owner_types": owner_types, "lists": lists}
+    return {
+        "statuses": statuses,
+        "counties": counties,
+        "cities": cities,
+        "completeness": completeness,
+        "owner_types": owner_types,
+        "lists": lists,
+        "priorities": PROSPECT_PRIORITY_FILTER_OPTIONS,
+    }
 
 
 def _new_record_call_direction_from_job(db, row):
@@ -38238,6 +38423,14 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
     if owner_out_of_state_filter is not None:
         clauses.append("COALESCE(c.owner_out_of_state, 0) = ?")
         params.append(1 if owner_out_of_state_filter else 0)
+    is_vacant_filter = _new_record_yes_no_filter_value(filters.get("is_vacant") or "")
+    if is_vacant_filter is not None:
+        clauses.append("COALESCE(c.is_vacant, 0) = ?")
+        params.append(1 if is_vacant_filter else 0)
+    priority_filter = normalize_whitespace(filters.get("priority_preset") or "")
+    if priority_filter in {"1", "2", "3"}:
+        clauses.append("COALESCE(c.priority_preset, '') = ?")
+        params.append(priority_filter)
     for filter_key, column in [
         ("rei_skipped", "rei_skipped"),
         ("deep_skipped", "deep_skipped"),
@@ -38329,6 +38522,10 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
             item[count_key] = int(item.get(count_key) or 0)
         for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
             item[flag_key] = 1 if int(item.get(flag_key) or 0) else 0
+        item["is_vacant"] = None if item.get("is_vacant") is None else (1 if int(item.get("is_vacant") or 0) else 0)
+        item["is_llc_owner"] = 1 if int(item.get("is_llc_owner") or 0) else 0
+        item["priority_preset"] = normalize_whitespace(item.get("priority_preset") or "")
+        item["priority_match"] = normalize_whitespace(item.get("priority_match") or "")
     county_counts = {}
     local_match_count = 0
     local_update_count = 0
@@ -38564,6 +38761,178 @@ def extract_property_list_items(payload):
 
 def extract_property_lists(payload):
     return ", ".join(extract_property_list_names(payload))
+
+
+def _prospect_list_haystack(list_names):
+    return " | ".join(normalize_whitespace(name).lower() for name in (list_names or []) if normalize_whitespace(name))
+
+
+def _prospect_text_has_any(haystack, needles):
+    text = normalize_whitespace(haystack or "").lower()
+    return any(needle in text for needle in needles)
+
+
+def _payload_truthy_flag(payload, key_fragments):
+    if not isinstance(payload, (dict, list)):
+        return False
+    fragments = [str(item or "").lower() for item in key_fragments if str(item or "").strip()]
+
+    def walk(value, key_path=""):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                next_key = f"{key_path}.{key}" if key_path else str(key)
+                key_low = next_key.lower()
+                if any(fragment in key_low for fragment in fragments):
+                    if child in (True, 1, "1"):
+                        return True
+                    child_text = normalize_whitespace(child).lower()
+                    if child_text in {"true", "yes", "y", "absentee", "vacant"}:
+                        return True
+                if walk(child, next_key):
+                    return True
+        elif isinstance(value, list):
+            for child in value:
+                if walk(child, key_path):
+                    return True
+        return False
+
+    return walk(payload)
+
+
+def _payload_vacancy_value(payload):
+    if not isinstance(payload, (dict, list)):
+        return None
+
+    def parse_value(value):
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return 1 if value else 0
+        if isinstance(value, (int, float)) and value in {0, 1}:
+            return 1 if int(value) == 1 else 0
+        text = normalize_whitespace(value).lower()
+        if not text:
+            return None
+        if "not vacant" in text or "non-vacant" in text or text in {"occupied", "false", "no", "n", "0"}:
+            return 0
+        if "vacant" in text or text in {"true", "yes", "y", "1"}:
+            return 1
+        return None
+
+    def walk(value, key_path=""):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                next_key = f"{key_path}.{key}" if key_path else str(key)
+                key_low = next_key.lower()
+                if "vacant" in key_low or "vacancy" in key_low:
+                    parsed = parse_value(child)
+                    if parsed is not None:
+                        return parsed
+                parsed = walk(child, next_key)
+                if parsed is not None:
+                    return parsed
+        elif isinstance(value, list):
+            for child in value:
+                parsed = walk(child, key_path)
+                if parsed is not None:
+                    return parsed
+        return None
+
+    return walk(payload)
+
+
+def local_property_vacancy_value(db, property_id):
+    try:
+        clean_property_id = int(property_id or 0)
+    except Exception:
+        clean_property_id = 0
+    if clean_property_id <= 0:
+        return None
+    row = db.execute(
+        """
+        SELECT a.is_vacant
+        FROM properties p
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        LIMIT 1
+        """,
+        (clean_property_id,),
+    ).fetchone()
+    if not row or row["is_vacant"] is None:
+        return None
+    return 1 if int(row["is_vacant"] or 0) == 1 else 0
+
+
+def prospect_owner_is_llc(owner_type="", owner_names=""):
+    owner_type_text = normalize_whitespace(owner_type).lower()
+    owner_text = normalize_whitespace(owner_names).lower()
+    if owner_type_text in {"llc", "l.l.c.", "limited liability company"}:
+        return True
+    return bool(
+        re.search(r"\bllc\b", owner_text)
+        or re.search(r"\bl\.l\.c\.?\b", owner_text)
+        or "limited liability" in owner_text
+    )
+
+
+def prospect_signal_set(list_names=None, owner_out_of_state=False, is_vacant=None, payload=None):
+    haystack = _prospect_list_haystack(list_names or [])
+    signals = set()
+    if _prospect_text_has_any(haystack, ["judgment lien", "judgement lien"]):
+        signals.add("judgment_lien")
+    if _prospect_text_has_any(haystack, ["foreclosure", "lis pendens", "lispendens"]):
+        signals.add("lis_pendens")
+    if _prospect_text_has_any(haystack, ["senior"]):
+        signals.add("senior")
+    if _prospect_text_has_any(haystack, ["high equity"]):
+        signals.add("high_equity")
+    if _prospect_text_has_any(haystack, ["free & clear", "free and clear", "free clear"]):
+        signals.add("free_clear")
+    if _prospect_text_has_any(haystack, ["low income"]):
+        signals.add("low_income")
+    if _prospect_text_has_any(haystack, ["tired landlord"]):
+        signals.add("tired_landlord")
+    if _prospect_text_has_any(haystack, ["bad credit"]):
+        signals.add("bad_credit")
+    if _prospect_text_has_any(haystack, ["absentee"]) or _payload_truthy_flag(payload, ["absentee"]):
+        signals.add("absentee")
+    if bool(owner_out_of_state):
+        signals.add("out_of_state")
+    if is_vacant is not None and int(is_vacant or 0) == 1:
+        signals.add("vacant")
+    return signals
+
+
+def _priority_stack_label(stack):
+    return " + ".join(PROSPECT_PRIORITY_SIGNAL_LABELS.get(signal, signal.replace("_", " ").title()) for signal in stack)
+
+
+def classify_prospect_priority(
+    *,
+    list_names=None,
+    owner_out_of_state=False,
+    is_vacant=None,
+    owner_type="",
+    owner_names="",
+    payload=None,
+):
+    if prospect_owner_is_llc(owner_type, owner_names):
+        return {"priority_preset": "", "priority_match": "Excluded LLC owner", "is_llc_owner": 1}
+    signals = prospect_signal_set(
+        list_names=list_names or [],
+        owner_out_of_state=owner_out_of_state,
+        is_vacant=is_vacant,
+        payload=payload,
+    )
+    for priority in ["1", "2"]:
+        for stack in PROSPECT_PRIORITY_STACKS.get(priority, []):
+            if all(signal in signals for signal in stack):
+                return {
+                    "priority_preset": priority,
+                    "priority_match": _priority_stack_label(stack),
+                    "is_llc_owner": 0,
+                }
+    return {"priority_preset": "3", "priority_match": "Other non-LLC prospect", "is_llc_owner": 0}
 
 
 def _reisift_owner_name_parts(owner):
@@ -45026,6 +45395,8 @@ def new_records_page():
         "completeness": (request.args.get("completeness") or "").strip(),
         "owner_type": (request.args.get("owner_type") or "").strip(),
         "owner_out_of_state": (request.args.get("owner_out_of_state") or "").strip(),
+        "is_vacant": (request.args.get("is_vacant") or "").strip(),
+        "priority_preset": (request.args.get("priority_preset") or "").strip(),
         "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),
@@ -45137,6 +45508,8 @@ def deep_prospecting_page():
         "completeness": (request.args.get("completeness") or "").strip(),
         "owner_type": (request.args.get("owner_type") or "").strip(),
         "owner_out_of_state": (request.args.get("owner_out_of_state") or "").strip(),
+        "is_vacant": (request.args.get("is_vacant") or "").strip(),
+        "priority_preset": (request.args.get("priority_preset") or "").strip(),
         "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),
@@ -45263,6 +45636,8 @@ def new_records_refresh():
         "completeness": (request.form.get("completeness") or request.args.get("completeness") or "").strip(),
         "owner_type": (request.form.get("owner_type") or request.args.get("owner_type") or "").strip(),
         "owner_out_of_state": (request.form.get("owner_out_of_state") or request.args.get("owner_out_of_state") or "").strip(),
+        "is_vacant": (request.form.get("is_vacant") or request.args.get("is_vacant") or "").strip(),
+        "priority_preset": (request.form.get("priority_preset") or request.args.get("priority_preset") or "").strip(),
         "rei_skipped": (request.form.get("rei_skipped") or request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.form.get("deep_skipped") or request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.form.get("no_good_numbers") or request.args.get("no_good_numbers") or "").strip(),
@@ -45298,6 +45673,8 @@ def deep_prospecting_refresh():
         "completeness": (request.form.get("completeness") or request.args.get("completeness") or "").strip(),
         "owner_type": (request.form.get("owner_type") or request.args.get("owner_type") or "").strip(),
         "owner_out_of_state": (request.form.get("owner_out_of_state") or request.args.get("owner_out_of_state") or "").strip(),
+        "is_vacant": (request.form.get("is_vacant") or request.args.get("is_vacant") or "").strip(),
+        "priority_preset": (request.form.get("priority_preset") or request.args.get("priority_preset") or "").strip(),
         "rei_skipped": (request.form.get("rei_skipped") or request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.form.get("deep_skipped") or request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.form.get("no_good_numbers") or request.args.get("no_good_numbers") or "").strip(),
@@ -45767,6 +46144,14 @@ def get_sms_automation_queue_rows(db, filters=None):
     if owner_out_of_state_filter is not None:
         clauses.append("COALESCE(n.owner_out_of_state, 0) = ?")
         params.append(1 if owner_out_of_state_filter else 0)
+    is_vacant_filter = _new_record_yes_no_filter_value(filters.get("is_vacant") or "")
+    if is_vacant_filter is not None:
+        clauses.append("COALESCE(n.is_vacant, 0) = ?")
+        params.append(1 if is_vacant_filter else 0)
+    priority_filter = normalize_whitespace(filters.get("priority_preset") or "")
+    if priority_filter in {"1", "2", "3"}:
+        clauses.append("COALESCE(n.priority_preset, '') = ?")
+        params.append(priority_filter)
     for selected_list in (filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")):
         list_name = normalize_whitespace(selected_list)
         if not list_name:
@@ -45850,6 +46235,10 @@ def get_sms_automation_queue_rows(db, filters=None):
                n.completeness AS new_record_completeness,
                n.owner_type AS new_record_owner_type,
                n.owner_out_of_state AS new_record_owner_out_of_state,
+               n.is_vacant AS new_record_is_vacant,
+               n.is_llc_owner AS new_record_is_llc_owner,
+               n.priority_preset AS new_record_priority_preset,
+               n.priority_match AS new_record_priority_match,
                n.property_uuid AS new_record_property_uuid,
                n.full_address AS new_record_full_address,
                COALESCE(NULLIF(n.segment, ''), ?) AS prospect_segment,
@@ -45889,6 +46278,11 @@ def get_sms_automation_queue_rows(db, filters=None):
         d["owner_type"] = normalize_whitespace(d.get("new_record_owner_type") or "")
         owner_out = d.get("new_record_owner_out_of_state")
         d["owner_out_of_state"] = None if owner_out is None else bool(int(owner_out or 0))
+        vacant = d.get("new_record_is_vacant")
+        d["is_vacant"] = None if vacant is None else bool(int(vacant or 0))
+        d["is_llc_owner"] = 1 if int(d.get("new_record_is_llc_owner") or 0) else 0
+        d["priority_preset"] = normalize_whitespace(d.get("new_record_priority_preset") or "")
+        d["priority_match"] = normalize_whitespace(d.get("new_record_priority_match") or "")
         d["completeness"] = normalize_whitespace(d.get("new_record_completeness") or "")
         d["property_list_names"] = list_names_by_uuid.get(d.get("new_record_property_uuid") or "") or []
         d["prospect_segment"] = d.get("prospect_segment") or REISIFT_NEW_RECORDS_SEGMENT
@@ -45936,6 +46330,16 @@ def _sms_queue_matches_new_record_filters(row, filters):
             return False
         if bool(actual) != owner_out_of_state_filter:
             return False
+    is_vacant_filter = _new_record_yes_no_filter_value(filters.get("is_vacant") or "")
+    if is_vacant_filter is not None:
+        actual = row.get("is_vacant")
+        if actual is None:
+            return False
+        if bool(actual) != is_vacant_filter:
+            return False
+    priority_filter = normalize_whitespace(filters.get("priority_preset") or "")
+    if priority_filter in {"1", "2", "3"} and normalize_whitespace(row.get("priority_preset") or "") != priority_filter:
+        return False
     prospect_segment = (filters.get("prospect_segment") or "").strip()
     if prospect_segment in REISIFT_PROSPECT_SEGMENT_LABELS:
         actual_segment = row.get("prospect_segment") or REISIFT_NEW_RECORDS_SEGMENT
@@ -46013,6 +46417,7 @@ def get_sms_automation_filter_options(db):
         "completeness": completeness,
         "owner_types": owner_types,
         "lists": lists,
+        "priorities": PROSPECT_PRIORITY_FILTER_OPTIONS,
         "prospect_segments": [
             {"value": key, "label": label}
             for key, label in REISIFT_PROSPECT_SEGMENT_LABELS.items()
@@ -46295,6 +46700,8 @@ def sms_queue_page():
         "completeness": (request.args.get("completeness") or "").strip(),
         "owner_type": (request.args.get("owner_type") or "").strip(),
         "owner_out_of_state": (request.args.get("owner_out_of_state") or "").strip(),
+        "is_vacant": (request.args.get("is_vacant") or "").strip(),
+        "priority_preset": (request.args.get("priority_preset") or "").strip(),
         "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),

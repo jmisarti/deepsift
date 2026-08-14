@@ -10593,8 +10593,10 @@ def sync_sms_delivery_phone_status_to_reisift(db, property_id, phone_number, sta
     existing_tags = _reisift_parse_phone_tags(existing_phone.get("tags") if isinstance(existing_phone, dict) else [])
     tags = []
     seen_tags = set()
-    for tag in [*existing_tags, "AutoSMS:DeliveryFailure"]:
+    for tag in existing_tags:
         key = normalize_whitespace(tag).lower()
+        if key == "autosms:deliveryfailure":
+            continue
         if not key or key in seen_tags:
             continue
         seen_tags.add(key)

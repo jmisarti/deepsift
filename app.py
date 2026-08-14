@@ -3030,6 +3030,51 @@ def ensure_prospect_priority_backfill(db):
     return {"backfilled": True, "fields": field_result, "cache": cache_result}
 
 
+def ensure_sms_delivery_classification_backfill(db):
+    if get_setting(db, "sms_delivery_classification_v2_backfilled", "") == "1":
+        return {"backfilled": False, "reason": "already_done"}
+    rows = db.execute(
+        """
+        SELECT id, from_number, provider_status, failure_reason, received_at
+        FROM sms_delivery_events
+        WHERE received_at >= datetime('now', '-30 days')
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    touched_dates = set()
+    updated = 0
+    for row in rows:
+        delivery = classify_sms_delivery_status(row["provider_status"] or "", row["failure_reason"] or "")
+        db.execute(
+            """
+            UPDATE sms_delivery_events
+            SET failure_bucket = ?,
+                is_final = ?,
+                is_recipient_issue = ?,
+                is_sender_issue = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                delivery["failure_bucket"],
+                1 if delivery["is_final"] else 0,
+                1 if delivery["is_recipient_issue"] else 0,
+                1 if delivery["is_sender_issue"] else 0,
+                row["id"],
+            ),
+        )
+        updated += 1
+        from_norm = normalize_phone(row["from_number"] or "")
+        received_dt = parse_db_time(row["received_at"] or "")
+        if from_norm and received_dt:
+            et_date = received_dt.replace(tzinfo=timezone.utc).astimezone(EST_TZ).date().isoformat()
+            touched_dates.add((from_norm, et_date))
+    for from_norm, et_date in touched_dates:
+        refresh_sms_sender_health_for_number_date(db, from_norm, et_date)
+    set_setting(db, "sms_delivery_classification_v2_backfilled", "1")
+    return {"backfilled": True, "events": updated, "sender_dates": len(touched_dates)}
+
+
 def ensure_db(force=False):
     global ENSURE_DB_READY
     if ENSURE_DB_READY and DB_PATH.exists() and not force:
@@ -3055,6 +3100,10 @@ def ensure_db(force=False):
                 ensure_prospect_priority_backfill(db)
             except Exception as exc:
                 log_app_error(db, "prospect_priority_backfill", str(exc), status_code=500)
+            try:
+                ensure_sms_delivery_classification_backfill(db)
+            except Exception as exc:
+                log_app_error(db, "sms_delivery_classification_backfill", str(exc), status_code=500)
             try:
                 ensure_prospect_table_cache_seeded(db)
             except Exception:
@@ -10113,7 +10162,9 @@ def infer_touchpoint_update_from_status(status_text):
         update["channel_label"] = "VoIP"
     if "fax" in s:
         update["channel_label"] = "Fax"
-    if any(x in s for x in ["undeliverable", "undelivered", "not deliver", "no route", "unable to receive", "unreachable carrier", "failed", "failure"]):
+    if any(x in s for x in ["unknown and may no longer exist", "no longer exist", "not in service", "disconnected", "deactivated"]):
+        update["status"] = "Dead"
+    if any(x in s for x in ["undeliverable", "undelivered", "not deliver", "no route", "unable to receive", "unreachable carrier", "switched off", "otherwise unavailable", "failed", "failure"]):
         update["status"] = "Undeliverable"
     if any(x in s for x in ["no longer in service", "not in service", "disconnected", "deactivated"]):
         update["status"] = "Not in service"
@@ -10156,6 +10207,10 @@ def classify_sms_delivery_status(status_text, failure_reason=""):
             "unable to receive",
             "unreachable carrier",
             "no route",
+            "switched off",
+            "otherwise unavailable",
+            "unknown and may no longer exist",
+            "may no longer exist",
             "not in service",
             "disconnected",
             "deactivated",
@@ -10189,23 +10244,43 @@ def classify_sms_delivery_status(status_text, failure_reason=""):
 def apply_touchpoint_status_inference(db, phone_number, status_text):
     normalized = normalize_phone(phone_number)
     if not normalized:
-        return
+        return {"matched": 0, "updated": 0, "status": "", "channel_label": ""}
     update = infer_touchpoint_update_from_status(status_text)
     if not update:
-        return
+        return {"matched": 0, "updated": 0, "status": "", "channel_label": ""}
 
     rows = db.execute(
         "SELECT id, value, channel_label, status FROM touchpoints WHERE lower(channel_type) = 'phone'"
     ).fetchall()
+    matched = 0
+    updated = 0
+    final_status = ""
+    final_label = ""
     for row in rows:
         if normalize_phone(row["value"]) != normalized:
             continue
+        matched += 1
         channel_label = update.get("channel_label", row["channel_label"])
         status = update.get("status", row["status"])
+        if is_hard_blocked_contact_status(row["status"]) and not is_hard_blocked_contact_status(status):
+            status = row["status"]
+        if normalize_whitespace(channel_label) == normalize_whitespace(row["channel_label"]) and normalize_whitespace(status) == normalize_whitespace(row["status"]):
+            final_status = status or final_status
+            final_label = channel_label or final_label
+            continue
         db.execute(
             "UPDATE touchpoints SET channel_label = ?, status = ? WHERE id = ?",
             (channel_label, status, row["id"]),
         )
+        updated += 1
+        final_status = status or final_status
+        final_label = channel_label or final_label
+    return {
+        "matched": matched,
+        "updated": updated,
+        "status": final_status or normalize_whitespace(update.get("status") or ""),
+        "channel_label": final_label or normalize_whitespace(update.get("channel_label") or ""),
+    }
 
 
 def _sms_delivery_event_key(sms_id, provider_status, failure_bucket, failure_reason):
@@ -10327,6 +10402,100 @@ def refresh_sms_sender_health_for_number_date(db, from_number, et_date_text):
     )
 
 
+def sms_delivery_breakdown_for_senders(db, numbers=None, days=2):
+    clean_numbers = [normalize_phone(n) for n in (numbers or []) if normalize_phone(n)]
+    now_et = datetime.now(EST_TZ).date()
+    since_et = now_et - timedelta(days=max(0, int(days or 2) - 1))
+    start_et = datetime(since_et.year, since_et.month, since_et.day, tzinfo=EST_TZ)
+    start_utc = start_et.astimezone(timezone.utc).replace(tzinfo=None)
+    rows = db.execute(
+        """
+        SELECT sms_id, from_number, to_number, provider_status, failure_bucket, failure_reason,
+               is_recipient_issue, is_sender_issue, received_at, id
+        FROM sms_delivery_events
+        WHERE received_at >= ?
+          AND COALESCE(sms_id, '') != ''
+        ORDER BY id ASC
+        """,
+        (format_db_time(start_utc),),
+    ).fetchall()
+    latest_by_sms = {}
+    for row in rows:
+        from_norm = normalize_phone(row["from_number"] or "")
+        if clean_numbers and from_norm not in clean_numbers:
+            continue
+        latest_by_sms[row["sms_id"]] = row
+    by_sender = {
+        n: {
+            "pending_count": 0,
+            "carrier_filter_count": 0,
+            "recipient_unreachable_count": 0,
+            "recipient_opt_out_count": 0,
+            "unknown_undelivered_count": 0,
+        }
+        for n in clean_numbers
+    }
+    summary = {
+        "period_days": int(days or 2),
+        "sent_count": 0,
+        "pending_count": 0,
+        "delivered_count": 0,
+        "undelivered_count": 0,
+        "recipient_issue_count": 0,
+        "sender_issue_count": 0,
+        "reason_rows": [],
+    }
+    reason_counts = {}
+    for row in latest_by_sms.values():
+        from_norm = normalize_phone(row["from_number"] or "")
+        bucket = normalize_whitespace(row["failure_bucket"] or "").lower()
+        provider_status = normalize_whitespace(row["provider_status"] or "").lower()
+        sender = by_sender.setdefault(
+            from_norm,
+            {
+                "pending_count": 0,
+                "carrier_filter_count": 0,
+                "recipient_unreachable_count": 0,
+                "recipient_opt_out_count": 0,
+                "unknown_undelivered_count": 0,
+            },
+        )
+        summary["sent_count"] += 1
+        if bucket == "delivered" or provider_status == "delivered":
+            summary["delivered_count"] += 1
+            continue
+        if bucket == "pending" or provider_status in {"sent", "queued", "pending"}:
+            sender["pending_count"] += 1
+            summary["pending_count"] += 1
+            continue
+        if bucket in {"carrier_filter", "recipient_unreachable", "recipient_opt_out", "unknown_undelivered"}:
+            summary["undelivered_count"] += 1
+            key = f"{bucket}|{normalize_whitespace(row['failure_reason'] or '')}"
+            reason_counts.setdefault(
+                key,
+                {
+                    "failure_bucket": bucket,
+                    "failure_reason": normalize_whitespace(row["failure_reason"] or "") or "(no reason returned)",
+                    "count": 0,
+                },
+            )
+            reason_counts[key]["count"] += 1
+        if bucket == "carrier_filter":
+            sender["carrier_filter_count"] += 1
+        elif bucket == "recipient_unreachable":
+            sender["recipient_unreachable_count"] += 1
+        elif bucket == "recipient_opt_out":
+            sender["recipient_opt_out_count"] += 1
+        elif bucket == "unknown_undelivered":
+            sender["unknown_undelivered_count"] += 1
+        if int(row["is_recipient_issue"] or 0):
+            summary["recipient_issue_count"] += 1
+        if int(row["is_sender_issue"] or 0):
+            summary["sender_issue_count"] += 1
+    summary["reason_rows"] = sorted(reason_counts.values(), key=lambda item: item["count"], reverse=True)
+    return {"by_sender": by_sender, "summary": summary}
+
+
 def sms_sender_health_suppression_reason(db, from_number, lookback_hours=48):
     from_norm = normalize_phone(from_number)
     if not from_norm:
@@ -10379,6 +10548,86 @@ def suppress_sms_automation_followups_for_delivery_failure(db, property_id, phon
         tuple(params),
     )
     return int(cur.rowcount or 0)
+
+
+def _reisift_status_for_sms_delivery_failure(failure_bucket, failure_reason):
+    reason = normalize_whitespace(failure_reason).lower()
+    bucket = normalize_whitespace(failure_bucket).lower()
+    if bucket == "recipient_opt_out":
+        return "DNT"
+    if "unknown and may no longer exist" in reason or "may no longer exist" in reason:
+        return "Dead"
+    if any(token in reason for token in ["not in service", "disconnected", "deactivated", "no longer in service"]):
+        return "Not in service"
+    if bucket == "recipient_unreachable" or any(token in reason for token in ["switched off", "otherwise unavailable", "unable to receive", "unreachable carrier", "no route"]):
+        return "Undeliverable"
+    return ""
+
+
+def sync_sms_delivery_phone_status_to_reisift(db, property_id, phone_number, status, channel_label="", failure_reason=""):
+    phone_norm = normalize_phone(phone_number)
+    property_id = int(property_id or 0)
+    status = normalize_whitespace(status)
+    if property_id <= 0 or not phone_norm or not status:
+        return {"ok": False, "skipped": True, "reason": "missing_property_phone_or_status"}
+    property_uuid = normalize_uuid(_get_local_property_uuid(db, property_id) or "")
+    if not property_uuid:
+        return {"ok": False, "skipped": True, "reason": "property_uuid_missing"}
+    try:
+        token = reisift_get_access_token()
+        property_payload = fetch_reisift_property_payload(token, property_uuid) or {}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    owner_uuid = _reisift_find_owner_uuid(property_payload) or ""
+    if not owner_uuid:
+        return {"ok": False, "skipped": True, "reason": "owner_uuid_missing"}
+
+    existing_phone = {}
+    for owner_item in _reisift_iter_owner_dicts(property_payload):
+        for item in _reisift_parse_owner_phones(owner_item):
+            if normalize_phone(item.get("number") or "") == phone_norm:
+                existing_phone = item
+                break
+        if existing_phone:
+            break
+    existing_tags = _reisift_parse_phone_tags(existing_phone.get("tags") if isinstance(existing_phone, dict) else [])
+    tags = []
+    seen_tags = set()
+    for tag in [*existing_tags, "AutoSMS:DeliveryFailure"]:
+        key = normalize_whitespace(tag).lower()
+        if not key or key in seen_tags:
+            continue
+        seen_tags.add(key)
+        tags.append(normalize_whitespace(tag))
+    phone_type = _reisift_phone_type_from_touchpoint(channel_label)
+    if phone_type == "UNKNOWN" and existing_phone:
+        phone_type = str(existing_phone.get("type") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    payload_phone = {
+        "number": phone_norm,
+        "type": phone_type,
+        "status": status,
+        "tags": tags,
+    }
+    try:
+        result = reisift_upsert_owner_contacts(token, owner_uuid, [payload_phone], [])
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "request_phone": payload_phone}
+    try:
+        db.execute(
+            """
+            INSERT INTO activity_log (property_id, activity_type, outcome, note)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                property_id,
+                "SMS Delivery Phone Status Sync",
+                status,
+                f"Updated {format_phone_display(phone_norm)} from SmrtPhone delivery failure. Reason: {failure_reason or '-'}",
+            ),
+        )
+    except Exception:
+        pass
+    return {"ok": bool(result.get("ok")), "result": result, "request_phone": payload_phone}
 
 
 def record_sms_delivery_status(db, payload, sms_id="", status="", from_number="", to_number="", communication_id=None, received_at=None):
@@ -10480,16 +10729,40 @@ def record_sms_delivery_status(db, payload, sms_id="", status="", from_number=""
         received_dt = parse_db_time(received_at) or datetime.utcnow()
         et_date = received_dt.replace(tzinfo=timezone.utc).astimezone(EST_TZ).date().isoformat()
         refresh_sms_sender_health_for_number_date(db, context["from_number"], et_date)
+    property_id = None
+    person_id = None
+    if context["communication"]:
+        property_id = context["communication"]["property_id"]
+        person_id = context["communication"]["person_id"]
+    elif context["queue"]:
+        property_id = context["queue"]["property_id"]
+        person_id = context["queue"]["person_id"]
     if delivery["is_recipient_issue"] and context["to_number"]:
-        apply_touchpoint_status_inference(db, context["to_number"], failure_reason or status_text)
-        property_id = None
-        person_id = None
-        if context["communication"]:
-            property_id = context["communication"]["property_id"]
-            person_id = context["communication"]["person_id"]
-        elif context["queue"]:
-            property_id = context["queue"]["property_id"]
-            person_id = context["queue"]["person_id"]
+        touchpoint_update = apply_touchpoint_status_inference(db, context["to_number"], failure_reason or status_text)
+        reisift_status = _reisift_status_for_sms_delivery_failure(delivery["failure_bucket"], delivery["failure_reason"])
+        if not reisift_status:
+            reisift_status = touchpoint_update.get("status") or ""
+        if reisift_status:
+            sync_result = sync_sms_delivery_phone_status_to_reisift(
+                db,
+                property_id,
+                context["to_number"],
+                reisift_status,
+                channel_label=touchpoint_update.get("channel_label") or "",
+                failure_reason=delivery["failure_reason"],
+            )
+            if not sync_result.get("ok") and not sync_result.get("skipped"):
+                try:
+                    log_app_error(
+                        db,
+                        source="sms_delivery_reisift_phone_sync",
+                        error_message=sync_result.get("error") or "Unknown ReiSIFT phone sync error",
+                        details=json.dumps(sync_result, ensure_ascii=True, sort_keys=True),
+                        route="record_sms_delivery_status",
+                        status_code=500,
+                    )
+                except Exception:
+                    pass
         suppress_sms_automation_followups_for_delivery_failure(
             db,
             property_id,
@@ -31464,10 +31737,12 @@ def reisift_upsert_owner_contacts(token, owner_uuid, phones, emails):
         if isinstance(p, dict):
             number = normalize_phone(p.get("number") or p.get("phone") or "")
             p_type = (p.get("type") or "UNKNOWN").strip().upper()
+            p_status = normalize_whitespace(p.get("status") or "")
             raw_tags = p.get("tags") if isinstance(p.get("tags"), list) else []
         else:
             number = normalize_phone(str(p or ""))
             p_type = "UNKNOWN"
+            p_status = ""
             raw_tags = []
         if not number or number in seen_phones:
             continue
@@ -31481,7 +31756,10 @@ def reisift_upsert_owner_contacts(token, owner_uuid, phones, emails):
                 continue
             seen_tags.add(low)
             tags.append(tag)
-        normalized_phones.append({"type": p_type or "UNKNOWN", "tags": tags, "number": number})
+        phone_item = {"type": p_type or "UNKNOWN", "tags": tags, "number": number}
+        if p_status:
+            phone_item["status"] = p_status
+        normalized_phones.append(phone_item)
 
     normalized_emails = []
     seen_emails = set()
@@ -46425,9 +46703,12 @@ def get_sms_automation_filter_options(db):
     }
 
 
-def get_sms_sender_health_rows(db, days=2):
+def get_sms_sender_health_rows(db, days=2, delivery_breakdown=None):
     settings = get_sms_automation_settings(db)
     numbers = [normalize_phone(n) for n in settings.get("from_numbers") or [] if normalize_phone(n)]
+    if delivery_breakdown is None:
+        delivery_breakdown = sms_delivery_breakdown_for_senders(db, numbers=numbers, days=days)
+    breakdown_by_sender = delivery_breakdown.get("by_sender") or {}
     now_et = datetime.now(EST_TZ).date()
     since_et = now_et - timedelta(days=max(0, int(days or 2) - 1))
     rows = db.execute(
@@ -46455,6 +46736,7 @@ def get_sms_sender_health_rows(db, days=2):
         undelivered_count = int((row["undelivered_count"] if row else 0) or 0)
         recipient_issue_count = int((row["recipient_issue_count"] if row else 0) or 0)
         sender_issue_count = int((row["sender_issue_count"] if row else 0) or 0)
+        sender_breakdown = breakdown_by_sender.get(number) or {}
         health_reason = sms_sender_health_suppression_reason(db, number)
         if health_reason:
             health_status = "cooldown"
@@ -46471,6 +46753,11 @@ def get_sms_sender_health_rows(db, days=2):
                 "undelivered_count": undelivered_count,
                 "recipient_issue_count": recipient_issue_count,
                 "sender_issue_count": sender_issue_count,
+                "pending_count": int(sender_breakdown.get("pending_count") or 0),
+                "carrier_filter_count": int(sender_breakdown.get("carrier_filter_count") or 0),
+                "recipient_unreachable_count": int(sender_breakdown.get("recipient_unreachable_count") or 0),
+                "recipient_opt_out_count": int(sender_breakdown.get("recipient_opt_out_count") or 0),
+                "unknown_undelivered_count": int(sender_breakdown.get("unknown_undelivered_count") or 0),
                 "delivered_rate": delivered_rate,
                 "health_status": health_status,
                 "health_reason": health_reason,
@@ -46670,6 +46957,10 @@ def _sms_queue_action_response(ok, message, status_code=200, **payload):
 def sms_queue_schedule_page():
     ensure_db()
     db = get_db()
+    sms_health_days = 2
+    sms_settings = get_sms_automation_settings(db)
+    sender_numbers = [normalize_phone(n) for n in sms_settings.get("from_numbers") or [] if normalize_phone(n)]
+    delivery_breakdown = sms_delivery_breakdown_for_senders(db, numbers=sender_numbers, days=sms_health_days)
     summary_rows = db.execute(
         """
         SELECT status, COUNT(*) AS c
@@ -46682,8 +46973,9 @@ def sms_queue_schedule_page():
         "sms_schedule.html",
         rows=get_sms_automation_schedule_rows(db),
         summary={r["status"]: int(r["c"] or 0) for r in summary_rows},
-        settings=get_sms_automation_settings(db),
-        sender_health=get_sms_sender_health_rows(db),
+        settings=sms_settings,
+        sender_health=get_sms_sender_health_rows(db, days=sms_health_days, delivery_breakdown=delivery_breakdown),
+        sms_delivery_summary=delivery_breakdown.get("summary") or {},
     )
 
 

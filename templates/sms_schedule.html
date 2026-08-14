@@ -41,10 +41,14 @@
                     <th>Number</th>
                     <th>Health</th>
                     <th>Sent</th>
+                    <th>Pending</th>
                     <th>Delivered</th>
                     <th>Undelivered</th>
                     <th>Recipient Issue</th>
                     <th>Sender/Filter Issue</th>
+                    <th>Carrier Filter</th>
+                    <th>Recipient Unreachable</th>
+                    <th>Unknown Fail</th>
                     <th>Delivered %</th>
                 </tr>
             </thead>
@@ -59,18 +63,55 @@
                         {% endif %}
                     </td>
                     <td>{{ item.sent_count }}</td>
+                    <td>{{ item.pending_count }}</td>
                     <td>{{ item.delivered_count }}</td>
                     <td>{{ item.undelivered_count }}</td>
                     <td>{{ item.recipient_issue_count }}</td>
                     <td>{{ item.sender_issue_count }}</td>
+                    <td>{{ item.carrier_filter_count }}</td>
+                    <td>{{ item.recipient_unreachable_count + item.recipient_opt_out_count }}</td>
+                    <td>{{ item.unknown_undelivered_count }}</td>
                     <td>{{ item.delivered_rate }}%</td>
                 </tr>
                 {% else %}
-                <tr><td colspan="8">No sender health data yet.</td></tr>
+                <tr><td colspan="12">No sender health data yet.</td></tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
+    {% if sms_delivery_summary %}
+    <h4>Delivery Breakdown (Last {{ sms_delivery_summary.period_days or 2 }} Days)</h4>
+    <p class="muted-text">
+        Sent {{ sms_delivery_summary.sent_count or 0 }},
+        pending {{ sms_delivery_summary.pending_count or 0 }},
+        delivered {{ sms_delivery_summary.delivered_count or 0 }},
+        undelivered {{ sms_delivery_summary.undelivered_count or 0 }},
+        recipient issues {{ sms_delivery_summary.recipient_issue_count or 0 }},
+        sender/filter issues {{ sms_delivery_summary.sender_issue_count or 0 }}.
+    </p>
+    {% if sms_delivery_summary.reason_rows %}
+    <div class="table-wrap">
+        <table class="crm-table">
+            <thead>
+                <tr>
+                    <th>Bucket</th>
+                    <th>Count</th>
+                    <th>SmrtPhone Reason</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for reason in sms_delivery_summary.reason_rows %}
+                <tr>
+                    <td>{{ reason.failure_bucket|replace('_', ' ')|title }}</td>
+                    <td>{{ reason.count }}</td>
+                    <td>{{ reason.failure_reason }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+    {% endif %}
 
     <div class="table-wrap sms-queue-table-wrap">
         <table class="crm-table sms-queue-table">

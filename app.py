@@ -31299,6 +31299,25 @@ def should_apply_reisift_phone_status(current_status, reisift_status):
     return current_key in {"", "unknown"}
 
 
+def _reisift_phone_status_for_upsert(status):
+    key = normalize_whitespace(status).lower().replace("-", " ").replace("_", " ")
+    if not key:
+        return ""
+    if key in {"correct", "verified", "confirmed"}:
+        return "CORRECT"
+    if key in {"no answer", "noanswer"}:
+        return "NO_ANSWER"
+    if key in {"dnc", "do not call", "dnt", "do not text", "opt out", "opted out"}:
+        return "DNC"
+    if key in {"wrong", "wrong number", "bad number", "incorrect", "invalid"}:
+        return "WRONG"
+    if key in {"dead", "not in service", "disconnected", "deactivated", "undeliverable", "undelivered", "bounced"}:
+        return "DEAD"
+    if key in {"unknown", "manual", "captured", "new", "unchecked"}:
+        return "UNKNOWN"
+    return ""
+
+
 def _reisift_build_property_create_payload(address_info_payload, input_payload):
     input_payload = input_payload or {}
     source_address = _reisift_find_first_address_dict(address_info_payload)
@@ -31737,7 +31756,7 @@ def reisift_upsert_owner_contacts(token, owner_uuid, phones, emails):
         if isinstance(p, dict):
             number = normalize_phone(p.get("number") or p.get("phone") or "")
             p_type = (p.get("type") or "UNKNOWN").strip().upper()
-            p_status = normalize_whitespace(p.get("status") or "")
+            p_status = _reisift_phone_status_for_upsert(p.get("status") or "")
             raw_tags = p.get("tags") if isinstance(p.get("tags"), list) else []
         else:
             number = normalize_phone(str(p or ""))

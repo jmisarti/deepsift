@@ -37281,15 +37281,26 @@ def run_reisift_phone_status_delta_sync(db, start_utc=None, end_utc=None, trigge
             errors.append(f"{property_uuid}: {exc}")
 
     commit_with_retry(db)
-    sms_queue = {"records": 0, "created": 0, "updated": 0, "skipped": 0, "suppressed": 0, "duplicates_suppressed": 0}
+    sms_queue = {
+        "records": 0,
+        "created": 0,
+        "updated": 0,
+        "skipped": 0,
+        "suppressed": 0,
+        "duplicates_suppressed": 0,
+        "purged": 0,
+    }
     cache_results = []
     property_ids = sorted(touched_property_ids)
     if property_ids:
         try:
-            sms_queue = generate_sms_automation_queue_for_new_records(db, token=token, property_ids=property_ids)
+            sms_queue["records"] = len(property_ids)
+            sms_queue["duplicates_suppressed"] = suppress_duplicate_sms_automation_queue_items(db, property_ids=property_ids)
+            sms_queue["suppressed"] = revalidate_sms_automation_queue(db, property_ids=property_ids)
+            sms_queue["purged"] = purge_suppressed_sms_automation_queue(db, property_ids=property_ids)
             commit_with_retry(db)
         except Exception as exc:
-            errors.append(f"sms_queue: {exc}")
+            errors.append(f"sms_queue_reconcile: {exc}")
         try:
             for segment in sorted(touched_segments or {REISIFT_NEW_RECORDS_SEGMENT}):
                 cache_results.append(
@@ -39657,7 +39668,13 @@ def _reisift_owner_has_meaningful_name(owner):
 def _is_reisift_placeholder_owner_name(first_name, last_name):
     first = normalize_whitespace(first_name).lower()
     last = normalize_whitespace(last_name).lower()
-    return (first, last) in {("reisift", "owner"), ("company", "owner"), ("unknown", "owner")}
+    return (first, last) in {
+        ("reisift", "owner"),
+        ("company", "owner"),
+        ("unknown", "owner"),
+        ("unknown", "unknown"),
+        ("blk", "unknown"),
+    }
 
 
 def _is_reisift_property_placeholder_person(db, person_id, property_uuid):

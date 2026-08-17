@@ -300,6 +300,19 @@ REISIFT_NEW_RECORDS_REFRESH_HOUR_ET = max(
     min(23, int((os.getenv("REISIFT_NEW_RECORDS_REFRESH_HOUR_ET") or "6").strip() or "6")),
 )
 REISIFT_NEW_RECORDS_LOG_ROLLUP_ENABLED = env_flag("REISIFT_NEW_RECORDS_LOG_ROLLUP_ENABLED", False)
+REISIFT_PHONE_STATUS_DELTA_SYNC_ENABLED = env_flag("REISIFT_PHONE_STATUS_DELTA_SYNC_ENABLED", True)
+REISIFT_PHONE_STATUS_DELTA_POLL_SECONDS = max(
+    int((os.getenv("REISIFT_PHONE_STATUS_DELTA_POLL_SECONDS") or "3600").strip() or "3600"),
+    900,
+)
+REISIFT_PHONE_STATUS_DELTA_OVERLAP_MINUTES = max(
+    int((os.getenv("REISIFT_PHONE_STATUS_DELTA_OVERLAP_MINUTES") or "10").strip() or "10"),
+    0,
+)
+REISIFT_PHONE_STATUS_DELTA_MAX_ROWS = max(
+    1,
+    int((os.getenv("REISIFT_PHONE_STATUS_DELTA_MAX_ROWS") or "5000").strip() or "5000"),
+)
 REISIFT_DISABLE_MAP_LOOKUP = env_flag("REISIFT_DISABLE_MAP_LOOKUP", True)
 OPENLETTERCONNECT_BASE_URL = os.getenv("OPENLETTERCONNECT_BASE_URL", "https://api.openletterconnect.com/api/v1")
 OPENLETTERCONNECT_TEMPLATE_ID = int(os.getenv("OPENLETTERCONNECT_TEMPLATE_ID", "9256"))
@@ -421,6 +434,7 @@ EMAIL_POLL_WORKER_STARTED = False
 CLEVER_LEADS_WORKER_STARTED = False
 REFERRAL_MARKET_WORKER_STARTED = False
 REISIFT_NEW_RECORDS_WORKER_STARTED = False
+REISIFT_PHONE_STATUS_DELTA_WORKER_STARTED = False
 ADS_DASHBOARD_WORKER_STARTED = False
 CALL_RECORDING_WORKER_STARTED = False
 SMS_ANALYSIS_WORKER_STARTED = False
@@ -465,6 +479,7 @@ ROKU_ADS_API_BASE_URL = (os.getenv("ROKU_ADS_API_BASE_URL") or "https://api.ads.
 ADS_REFRESH_LOCK = threading.RLock()
 REISIFT_NEW_RECORDS_REFRESH_LOCK = threading.Lock()
 REISIFT_DEEP_PROSPECTING_REFRESH_LOCK = threading.Lock()
+REISIFT_PHONE_STATUS_DELTA_LOCK = threading.Lock()
 UNTITLED_EMAIL_DRAIN_LOCK = threading.RLock()
 UNTITLED_EMAIL_DRAIN_STATE = {
     "running": False,
@@ -1139,6 +1154,7 @@ def start_background_workers_async():
             if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
                 start_referral_on_market_worker()
             start_reisift_new_records_worker()
+            start_reisift_phone_status_delta_worker()
             start_call_recording_worker()
             start_sms_analysis_worker()
             start_sms_automation_send_worker()
@@ -26938,6 +26954,33 @@ def start_reisift_new_records_worker():
     thread.start()
 
 
+def start_reisift_phone_status_delta_worker():
+    global REISIFT_PHONE_STATUS_DELTA_WORKER_STARTED
+    if REISIFT_PHONE_STATUS_DELTA_WORKER_STARTED or not REISIFT_PHONE_STATUS_DELTA_SYNC_ENABLED:
+        return
+    REISIFT_PHONE_STATUS_DELTA_WORKER_STARTED = True
+
+    def worker():
+        time.sleep(90)
+        while True:
+            try:
+                now_et = datetime.now(EST_TZ)
+                if now_et.weekday() < 5:
+                    db = open_sqlite_connection()
+                    try:
+                        within, _, _ = _sms_automation_within_send_window(db)
+                    finally:
+                        db.close()
+                    if within:
+                        run_reisift_phone_status_delta_sync_once(triggered_by="automation")
+            except Exception:
+                pass
+            time.sleep(REISIFT_PHONE_STATUS_DELTA_POLL_SECONDS)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
 def run_clever_leads_poll_once():
     ensure_db()
     db = open_sqlite_connection()
@@ -32486,6 +32529,55 @@ def build_reisift_deep_prospecting_search_query():
     return {"must": {"any_property_status": [REISIFT_DEEP_PROSPECTING_STATUS]}}
 
 
+def _isoformat_millis_z(dt):
+    if not isinstance(dt, datetime):
+        dt = datetime.utcnow()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _phone_status_delta_default_window(db):
+    now_utc = datetime.now(timezone.utc)
+    last_end_raw = get_setting(db, "reisift_phone_status_delta_last_window_end_utc", "")
+    last_end = parse_db_time(last_end_raw)
+    if last_end:
+        start_utc = last_end.replace(tzinfo=timezone.utc) - timedelta(minutes=REISIFT_PHONE_STATUS_DELTA_OVERLAP_MINUTES)
+    else:
+        now_et = now_utc.astimezone(EST_TZ)
+        start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_utc = start_et.astimezone(timezone.utc)
+    return start_utc, now_utc
+
+
+def build_reisift_phone_status_delta_search_query(start_utc, end_utc):
+    return {
+        "must": {
+            "any_property_status": [
+                REISIFT_NEW_RECORDS_STATUS,
+                REISIFT_DEEP_PROSPECTING_STATUS,
+            ],
+            "owner_last_updated_date": [
+                {
+                    "field": "phone_status",
+                    "options": [
+                        _isoformat_millis_z(start_utc),
+                        _isoformat_millis_z(end_utc),
+                    ],
+                }
+            ],
+        }
+    }
+
+
+def _prospect_segment_for_reisift_status(status):
+    key = _normalize_reisift_status(status)
+    if key == _normalize_reisift_status(REISIFT_DEEP_PROSPECTING_STATUS):
+        return REISIFT_DEEP_PROSPECTING_SEGMENT
+    return REISIFT_NEW_RECORDS_SEGMENT
+
+
 def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering="-list_count"):
     if not isinstance(query, dict) or not query:
         return [], 0
@@ -37120,6 +37212,155 @@ def refresh_reisift_deep_prospecting_cache(db):
         force_automation_eligible=True,
         last_refresh_setting="reisift_deep_prospecting_last_refresh_at",
     )
+
+
+def run_reisift_phone_status_delta_sync(db, start_utc=None, end_utc=None, triggered_by="manual"):
+    start_utc, end_utc = (start_utc, end_utc) if start_utc and end_utc else _phone_status_delta_default_window(db)
+    if start_utc.tzinfo is None:
+        start_utc = start_utc.replace(tzinfo=timezone.utc)
+    if end_utc.tzinfo is None:
+        end_utc = end_utc.replace(tzinfo=timezone.utc)
+    if end_utc <= start_utc:
+        end_utc = start_utc + timedelta(minutes=1)
+
+    token = reisift_get_access_token()
+    search_query = build_reisift_phone_status_delta_search_query(start_utc, end_utc)
+    rows, total = reisift_search_property_rows_by_query(
+        token,
+        search_query,
+        max_rows=REISIFT_PHONE_STATUS_DELTA_MAX_ROWS,
+    )
+    synced = 0
+    skipped = 0
+    errors = []
+    touched_property_ids = set()
+    touched_segments = set()
+    phones_created = 0
+    phones_updated = 0
+    phones_suppressed = 0
+    imported_emails = 0
+    sms_queue_removed_for_correct_owner = 0
+
+    for row in rows:
+        property_uuid = normalize_uuid(row.get("uuid") or row.get("id") or row.get("property_uuid") or "")
+        if not property_uuid:
+            skipped += 1
+            continue
+        try:
+            try:
+                details = fetch_reisift_property_payload(token, property_uuid)
+            except Exception as exc:
+                details = row
+                errors.append(f"{property_uuid}: detail fallback used ({exc})")
+            summary = summarize_reisift_property(details, fallback_payload=row)
+            segment = _prospect_segment_for_reisift_status(summary.get("status") or "")
+            local_sync = upsert_reisift_new_record(
+                db,
+                property_uuid,
+                details,
+                search_row=row,
+                is_active=1,
+                segment=segment,
+                force_automation_eligible=(segment == REISIFT_DEEP_PROSPECTING_SEGMENT),
+            )
+            local_property_id = int(local_sync.get("local_property_id") or 0)
+            if local_property_id > 0:
+                touched_property_ids.add(local_property_id)
+            touched_segments.add(segment)
+            contact_sync = local_sync.get("contact_sync") if isinstance(local_sync.get("contact_sync"), dict) else {}
+            phones_created += int(contact_sync.get("phones_created") or 0)
+            phones_updated += int(contact_sync.get("phones_updated") or 0)
+            phones_suppressed += int(contact_sync.get("phones_suppressed") or 0)
+            imported_emails += int(contact_sync.get("emails_created") or 0)
+            sms_queue_removed_for_correct_owner += int(local_sync.get("sms_queue_removed_for_correct_owner") or 0)
+            synced += 1
+            if synced % REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE == 0:
+                commit_with_retry(db)
+        except Exception as exc:
+            skipped += 1
+            errors.append(f"{property_uuid}: {exc}")
+
+    commit_with_retry(db)
+    sms_queue = {"records": 0, "created": 0, "updated": 0, "skipped": 0, "suppressed": 0, "duplicates_suppressed": 0}
+    cache_results = []
+    property_ids = sorted(touched_property_ids)
+    if property_ids:
+        try:
+            sms_queue = generate_sms_automation_queue_for_new_records(db, token=token, property_ids=property_ids)
+            commit_with_retry(db)
+        except Exception as exc:
+            errors.append(f"sms_queue: {exc}")
+        try:
+            for segment in sorted(touched_segments or {REISIFT_NEW_RECORDS_SEGMENT}):
+                cache_results.append(
+                    rebuild_prospect_table_cache(
+                        db,
+                        segment=segment,
+                        property_ids=property_ids,
+                        update_signature=False,
+                    )
+                )
+            commit_with_retry(db)
+        except Exception as exc:
+            errors.append(f"prospect_table_cache: {exc}")
+
+    result = {
+        "triggered_by": triggered_by,
+        "window_start_utc": _isoformat_millis_z(start_utc),
+        "window_end_utc": _isoformat_millis_z(end_utc),
+        "query": search_query,
+        "total": total,
+        "scanned": len(rows),
+        "synced": synced,
+        "skipped": skipped,
+        "touched_properties": len(property_ids),
+        "phones_created": phones_created,
+        "phones_updated": phones_updated,
+        "phones_suppressed": phones_suppressed,
+        "imported_emails": imported_emails,
+        "sms_queue_removed_for_correct_owner": sms_queue_removed_for_correct_owner,
+        "sms_queue": sms_queue,
+        "prospect_table_cache": cache_results,
+        "errors": errors,
+    }
+    set_setting(db, "reisift_phone_status_delta_last_result_json", json.dumps(result, ensure_ascii=True, sort_keys=True))
+    set_setting(db, "reisift_phone_status_delta_last_window_start_utc", format_db_time(start_utc.replace(tzinfo=None)))
+    set_setting(db, "reisift_phone_status_delta_last_window_end_utc", format_db_time(end_utc.replace(tzinfo=None)))
+    set_setting(db, "reisift_phone_status_delta_last_run_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    commit_with_retry(db)
+    return result
+
+
+def run_reisift_phone_status_delta_sync_once(triggered_by="automation", start_utc=None, end_utc=None):
+    ensure_db()
+    if REISIFT_NEW_RECORDS_REFRESH_LOCK.locked() or REISIFT_DEEP_PROSPECTING_REFRESH_LOCK.locked():
+        return {"ok": True, "skipped": "prospect_refresh_running"}
+    if not REISIFT_PHONE_STATUS_DELTA_LOCK.acquire(blocking=False):
+        return {"ok": True, "skipped": "phone_status_delta_already_running"}
+    db = open_sqlite_connection()
+    try:
+        result = run_reisift_phone_status_delta_sync(
+            db,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            triggered_by=triggered_by,
+        )
+        return {"ok": True, "result": result}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="reisift_phone_status_delta_sync",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="run_reisift_phone_status_delta_sync_once",
+            status_code=500,
+        )
+        commit_with_retry(db)
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+        REISIFT_PHONE_STATUS_DELTA_LOCK.release()
 
 
 def set_reisift_new_records_refresh_state(db, status, message="", result=None):
@@ -46150,6 +46391,49 @@ def new_records_refresh_status_api():
     ensure_db()
     db = get_db()
     return jsonify({"ok": True, "state": get_reisift_new_records_refresh_state(db)})
+
+
+@app.route("/api/reisift/phone-status-delta-sync", methods=["POST"])
+def reisift_phone_status_delta_sync_api():
+    ensure_db()
+    db = get_db()
+    payload = request.get_json(silent=True) or {}
+
+    def _parse_window_value(value):
+        if not value:
+            return None
+        dt = parse_flexible_datetime(value)
+        if not dt:
+            return None
+        return dt.replace(tzinfo=timezone.utc)
+
+    start_utc = _parse_window_value(payload.get("start_utc") or payload.get("start"))
+    end_utc = _parse_window_value(payload.get("end_utc") or payload.get("end"))
+    result = run_reisift_phone_status_delta_sync_once(
+        triggered_by="api",
+        start_utc=start_utc,
+        end_utc=end_utc,
+    )
+    status_code = 200 if result.get("ok") else 500
+    return jsonify(result), status_code
+
+
+@app.route("/api/reisift/phone-status-delta-sync", methods=["GET"])
+def reisift_phone_status_delta_sync_status_api():
+    ensure_db()
+    db = get_db()
+    result = parse_json_object(get_setting(db, "reisift_phone_status_delta_last_result_json", "{}"), default={})
+    return jsonify(
+        {
+            "ok": True,
+            "enabled": REISIFT_PHONE_STATUS_DELTA_SYNC_ENABLED,
+            "poll_seconds": REISIFT_PHONE_STATUS_DELTA_POLL_SECONDS,
+            "last_run_at": get_setting(db, "reisift_phone_status_delta_last_run_at", ""),
+            "last_window_start_utc": get_setting(db, "reisift_phone_status_delta_last_window_start_utc", ""),
+            "last_window_end_utc": get_setting(db, "reisift_phone_status_delta_last_window_end_utc", ""),
+            "last_result": result if isinstance(result, dict) else {},
+        }
+    )
 
 
 @app.route("/api/deep-prospecting/refresh-cache", methods=["POST"])
@@ -59079,6 +59363,7 @@ if __name__ == "__main__":
         if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
             start_referral_on_market_worker()
         start_reisift_new_records_worker()
+        start_reisift_phone_status_delta_worker()
         start_call_recording_worker()
         start_sms_analysis_worker()
         start_agent_refresh_worker()

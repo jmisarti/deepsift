@@ -458,11 +458,15 @@ PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTE
 PROSPECT_TABLE_CACHE_REFRESH_SECONDS = max(int((os.getenv("PROSPECT_TABLE_CACHE_REFRESH_SECONDS") or "300").strip() or "300"), 60)
 REISIFT_REFRESH_STALE_MINUTES = max(int((os.getenv("REISIFT_REFRESH_STALE_MINUTES") or "180").strip() or "180"), 30)
 REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE = max(
-    int((os.getenv("REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE") or "50").strip() or "50"),
+    int((os.getenv("REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE") or "20").strip() or "20"),
     1,
 )
+REISIFT_REFRESH_BATCH_PAUSE_SECONDS = max(
+    float((os.getenv("REISIFT_REFRESH_BATCH_PAUSE_SECONDS") or "0.02").strip() or "0.02"),
+    0.0,
+)
 PROSPECT_TABLE_CACHE_COMMIT_BATCH_SIZE = max(
-    int((os.getenv("PROSPECT_TABLE_CACHE_COMMIT_BATCH_SIZE") or "100").strip() or "100"),
+    int((os.getenv("PROSPECT_TABLE_CACHE_COMMIT_BATCH_SIZE") or "50").strip() or "50"),
     1,
 )
 PROVIDER_ALERT_SOURCE_PREFIX = "provider_"
@@ -1285,6 +1289,16 @@ def commit_with_retry(db, retries=8, base_delay=0.2):
             if "locked" not in str(exc).lower() or attempt >= retries - 1:
                 raise
             time.sleep(base_delay * (attempt + 1))
+
+
+def commit_refresh_batch(db):
+    commit_with_retry(db)
+    if REISIFT_REFRESH_BATCH_PAUSE_SECONDS > 0:
+        time.sleep(REISIFT_REFRESH_BATCH_PAUSE_SECONDS)
+
+
+def prospect_refresh_in_progress():
+    return REISIFT_NEW_RECORDS_REFRESH_LOCK.locked() or REISIFT_DEEP_PROSPECTING_REFRESH_LOCK.locked()
 
 
 @contextmanager
@@ -18059,7 +18073,7 @@ def unsubscribe_emailoctopus_emails_for_property_status_exit(db, property_id, be
                 route="unsubscribe_emailoctopus_emails_for_property_status_exit",
                 status_code=500,
             )
-        db.commit()
+        commit_refresh_batch(db)
     try:
         db.execute(
             """
@@ -36737,7 +36751,7 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
             else:
                 skipped += 1
         if index % REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE == 0:
-            commit_with_retry(db)
+            commit_refresh_batch(db)
     cleanup_property_ids = property_ids if property_ids else None
     duplicates_suppressed += suppress_duplicate_sms_automation_queue_items(db, property_ids=cleanup_property_ids)
     suppressed += revalidate_sms_automation_queue(db, property_ids=cleanup_property_ids)
@@ -37062,6 +37076,7 @@ def refresh_reisift_prospect_segment_cache(
         search_failed = True
         errors.append(f"reisift_search: {exc}")
     previous_active_rows = []
+    missing_active_rows = []
     scanned = 0
     synced = 0
     skipped_county = 0
@@ -37115,15 +37130,10 @@ def refresh_reisift_prospect_segment_cache(
             ,
             (segment,),
         ).fetchall()
-        execute_with_retry(
-            db,
-            "UPDATE reisift_new_records SET is_active = 0 WHERE COALESCE(segment, 'new_records') = ?",
-            (segment,),
-        )
-        try:
-            commit_with_retry(db)
-        except Exception as exc:
-            errors.append(f"cache_deactivate_commit: {exc}")
+        missing_active_rows = [
+            prior for prior in previous_active_rows
+            if normalize_uuid(prior["property_uuid"] or "") not in returned_property_uuids
+        ]
     for prepared in prepared_rows:
         property_uuid = prepared["property_uuid"]
         try:
@@ -37157,15 +37167,15 @@ def refresh_reisift_prospect_segment_cache(
             synced += 1
             if synced % REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE == 0:
                 try:
-                    commit_with_retry(db)
+                    commit_refresh_batch(db)
                 except Exception as exc:
                     errors.append(f"{property_uuid}: cache_batch_commit failed ({exc})")
         except Exception as exc:
             errors.append(f"{property_uuid}: {exc}")
-    if not search_failed and previous_active_rows:
-        for prior in previous_active_rows:
+    if not search_failed and missing_active_rows:
+        for prior in missing_active_rows:
             property_uuid = normalize_uuid(prior["property_uuid"] or "")
-            if not property_uuid or property_uuid in returned_property_uuids:
+            if not property_uuid:
                 continue
             try:
                 details = fetch_reisift_property_payload(token, property_uuid)
@@ -37193,15 +37203,26 @@ def refresh_reisift_prospect_segment_cache(
                 status_exit_unsubscribed += int(unsub.get("unsubscribed") or 0)
                 if local_sync.get("local_property_id") and local_sync.get("before") != local_sync.get("after"):
                     local_updates += 1
+                execute_with_retry(
+                    db,
+                    """
+                    UPDATE reisift_new_records
+                    SET is_active = 0,
+                        last_synced_at = CURRENT_TIMESTAMP
+                    WHERE property_uuid = ?
+                      AND COALESCE(segment, 'new_records') = ?
+                    """,
+                    (property_uuid, segment),
+                )
                 if status_exit_checks % REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE == 0:
                     try:
-                        commit_with_retry(db)
+                        commit_refresh_batch(db)
                     except Exception as exc:
                         errors.append(f"{property_uuid}: status_exit_batch_commit failed ({exc})")
             except Exception as exc:
                 errors.append(f"{property_uuid}: status exit check failed ({exc})")
     try:
-        commit_with_retry(db)
+        commit_refresh_batch(db)
     except Exception as exc:
         errors.append(f"cache_commit_before_sms_queue: {exc}")
     sms_queue = {"created": 0, "updated": 0, "skipped": 0, "suppressed": 0}
@@ -37214,7 +37235,7 @@ def refresh_reisift_prospect_segment_cache(
                 property_ids=queue_property_ids,
                 segment=segment,
             )
-        commit_with_retry(db)
+        commit_refresh_batch(db)
     except Exception as exc:
         errors.append(f"sms_queue: {exc}")
     prospect_table_cache = {"rows": 0}
@@ -37223,7 +37244,7 @@ def refresh_reisift_prospect_segment_cache(
     except Exception as exc:
         errors.append(f"prospect_table_cache: {exc}")
     set_setting(db, last_refresh_setting, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
-    commit_with_retry(db)
+    commit_refresh_batch(db)
     return {
         "segment": segment,
         "segment_label": segment_label,
@@ -37340,12 +37361,12 @@ def run_reisift_phone_status_delta_sync(db, start_utc=None, end_utc=None, trigge
             sms_queue_removed_for_correct_owner += int(local_sync.get("sms_queue_removed_for_correct_owner") or 0)
             synced += 1
             if synced % REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE == 0:
-                commit_with_retry(db)
+                commit_refresh_batch(db)
         except Exception as exc:
             skipped += 1
             errors.append(f"{property_uuid}: {exc}")
 
-    commit_with_retry(db)
+    commit_refresh_batch(db)
     sms_queue = {
         "records": 0,
         "created": 0,
@@ -37363,7 +37384,7 @@ def run_reisift_phone_status_delta_sync(db, start_utc=None, end_utc=None, trigge
             sms_queue["duplicates_suppressed"] = suppress_duplicate_sms_automation_queue_items(db, property_ids=property_ids)
             sms_queue["suppressed"] = revalidate_sms_automation_queue(db, property_ids=property_ids)
             sms_queue["purged"] = purge_suppressed_sms_automation_queue(db, property_ids=property_ids)
-            commit_with_retry(db)
+            commit_refresh_batch(db)
         except Exception as exc:
             errors.append(f"sms_queue_reconcile: {exc}")
         try:
@@ -37376,7 +37397,7 @@ def run_reisift_phone_status_delta_sync(db, start_utc=None, end_utc=None, trigge
                         update_signature=False,
                     )
                 )
-            commit_with_retry(db)
+            commit_refresh_batch(db)
         except Exception as exc:
             errors.append(f"prospect_table_cache: {exc}")
 
@@ -37403,7 +37424,7 @@ def run_reisift_phone_status_delta_sync(db, start_utc=None, end_utc=None, trigge
     set_setting(db, "reisift_phone_status_delta_last_window_start_utc", format_db_time(start_utc.replace(tzinfo=None)))
     set_setting(db, "reisift_phone_status_delta_last_window_end_utc", format_db_time(end_utc.replace(tzinfo=None)))
     set_setting(db, "reisift_phone_status_delta_last_run_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
-    commit_with_retry(db)
+    commit_refresh_batch(db)
     return result
 
 
@@ -37517,7 +37538,7 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
             state = get_reisift_new_records_refresh_state(db)
             if state.get("status") != "running":
                 state = set_reisift_new_records_refresh_state(db, "running", "Refresh already in progress.")
-                db.commit()
+                commit_with_retry(db)
             return {"ok": True, "started": False, "running": True, "state": state}
         finally:
             db.close()
@@ -37526,7 +37547,7 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
         db = open_sqlite_connection()
         try:
             set_reisift_new_records_refresh_state(db, "running", "Refreshing New Records from ReiSift...")
-            db.commit()
+            commit_with_retry(db)
             result = refresh_reisift_new_records_cache(db)
             message = (
                 f"Cached {result.get('synced', 0)} row(s) from {result.get('scanned', 0)} scanned; "
@@ -37540,7 +37561,7 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
             elif result.get("errors"):
                 message += f" Warnings: {len(result.get('errors') or [])}."
             set_reisift_new_records_refresh_state(db, "complete", message, result=result)
-            db.commit()
+            commit_with_retry(db)
         except Exception as exc:
             db.rollback()
             log_app_error(
@@ -37552,7 +37573,7 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
                 status_code=500,
             )
             state = set_reisift_new_records_refresh_state(db, "error", str(exc), result={"error": str(exc)})
-            db.commit()
+            commit_with_retry(db)
             return state
         finally:
             db.close()
@@ -37565,7 +37586,7 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
             "running",
             f"Refresh started ({triggered_by}).",
         )
-        starter_db.commit()
+        commit_with_retry(starter_db)
     finally:
         starter_db.close()
     thread = threading.Thread(target=worker, daemon=True)
@@ -37607,7 +37628,7 @@ def start_reisift_deep_prospecting_refresh_job(triggered_by="manual"):
             state = get_reisift_deep_prospecting_refresh_state(db)
             if state.get("status") != "running":
                 state = set_reisift_deep_prospecting_refresh_state(db, "running", "Refresh already in progress.")
-                db.commit()
+                commit_with_retry(db)
             return {"ok": True, "started": False, "running": True, "state": state}
         finally:
             db.close()
@@ -37616,7 +37637,7 @@ def start_reisift_deep_prospecting_refresh_job(triggered_by="manual"):
         db = open_sqlite_connection()
         try:
             set_reisift_deep_prospecting_refresh_state(db, "running", "Refreshing Deep Prospecting from ReiSift...")
-            db.commit()
+            commit_with_retry(db)
             result = refresh_reisift_deep_prospecting_cache(db)
             message = (
                 f"Cached {result.get('synced', 0)} row(s) from {result.get('scanned', 0)} scanned; "
@@ -37630,7 +37651,7 @@ def start_reisift_deep_prospecting_refresh_job(triggered_by="manual"):
             elif result.get("errors"):
                 message += f" Warnings: {len(result.get('errors') or [])}."
             set_reisift_deep_prospecting_refresh_state(db, "complete", message, result=result)
-            db.commit()
+            commit_with_retry(db)
         except Exception as exc:
             db.rollback()
             log_app_error(
@@ -37642,7 +37663,7 @@ def start_reisift_deep_prospecting_refresh_job(triggered_by="manual"):
                 status_code=500,
             )
             state = set_reisift_deep_prospecting_refresh_state(db, "error", str(exc), result={"error": str(exc)})
-            db.commit()
+            commit_with_retry(db)
             return state
         finally:
             db.close()
@@ -37655,7 +37676,7 @@ def start_reisift_deep_prospecting_refresh_job(triggered_by="manual"):
             "running",
             f"Refresh started ({triggered_by}).",
         )
-        starter_db.commit()
+        commit_with_retry(starter_db)
     finally:
         starter_db.close()
     thread = threading.Thread(target=worker, daemon=True)
@@ -38226,7 +38247,7 @@ def rebuild_prospect_table_cache(
     else:
         db.execute("DELETE FROM prospect_table_cache WHERE segment = ?", (segment,))
         db.execute("DELETE FROM prospect_table_cache_lists WHERE segment = ?", (segment,))
-    commit_with_retry(db)
+    commit_refresh_batch(db)
 
     rows = _prospect_table_source_rows(db, segment, property_uuids=clean_uuids, property_ids=clean_property_ids)
     list_names_by_uuid = reisift_new_record_list_names_for_properties(db, [row["property_uuid"] for row in rows])
@@ -38341,11 +38362,11 @@ def rebuild_prospect_table_cache(
             )
         inserted += 1
         if inserted % PROSPECT_TABLE_CACHE_COMMIT_BATCH_SIZE == 0:
-            commit_with_retry(db)
+            commit_refresh_batch(db)
     if update_signature and not is_partial:
         set_setting(db, _prospect_cache_setting_key(segment), prospect_table_source_signature(db, segment))
         set_setting(db, f"{_prospect_cache_setting_key(segment)}_rebuilt_at", now_text)
-    commit_with_retry(db)
+    commit_refresh_batch(db)
     return {"segment": segment, "rows": inserted, "partial": is_partial, "projection_updated_at": now_text}
 
 
@@ -38425,12 +38446,13 @@ def start_prospect_table_cache_worker():
     def worker():
         while True:
             try:
-                db = open_sqlite_connection()
-                try:
-                    refresh_stale_prospect_table_cache(db, force=False)
-                    commit_with_retry(db)
-                finally:
-                    db.close()
+                if not prospect_refresh_in_progress():
+                    db = open_sqlite_connection()
+                    try:
+                        refresh_stale_prospect_table_cache(db, force=False)
+                        commit_with_retry(db)
+                    finally:
+                        db.close()
             except Exception:
                 pass
             time.sleep(PROSPECT_TABLE_CACHE_REFRESH_SECONDS)
@@ -46406,8 +46428,6 @@ def deep_prospecting_page():
 
 @app.route("/new-records/refresh", methods=["POST"])
 def new_records_refresh():
-    ensure_db()
-    db = get_db()
     sort_order = (request.form.get("sort") or request.args.get("sort") or "desc").strip().lower()
     if sort_order not in {"asc", "desc"}:
         sort_order = "desc"
@@ -46437,14 +46457,11 @@ def new_records_refresh():
             notice = "New Records refresh is already running. This page will update when it finishes."
         return redirect(url_for("new_records_page", notice=notice, refresh=1, **redirect_args))
     except Exception as exc:
-        db.rollback()
         return redirect(url_for("new_records_page", error=f"Refresh failed: {exc}", **redirect_args))
 
 
 @app.route("/deep-prospecting/refresh", methods=["POST"])
 def deep_prospecting_refresh():
-    ensure_db()
-    db = get_db()
     sort_order = (request.form.get("sort") or request.args.get("sort") or "desc").strip().lower()
     if sort_order not in {"asc", "desc"}:
         sort_order = "desc"
@@ -46474,19 +46491,15 @@ def deep_prospecting_refresh():
             notice = "Deep Prospecting refresh is already running. This page will update when it finishes."
         return redirect(url_for("deep_prospecting_page", notice=notice, refresh=1, **redirect_args))
     except Exception as exc:
-        db.rollback()
         return redirect(url_for("deep_prospecting_page", error=f"Refresh failed: {exc}", **redirect_args))
 
 
 @app.route("/api/new-records/refresh-cache", methods=["POST"])
 def new_records_refresh_cache_api():
-    ensure_db()
-    db = get_db()
     try:
         result = start_reisift_new_records_refresh_job(triggered_by="api")
         return jsonify({"ok": True, **result})
     except Exception as exc:
-        db.rollback()
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
@@ -46540,13 +46553,10 @@ def reisift_phone_status_delta_sync_status_api():
 
 @app.route("/api/deep-prospecting/refresh-cache", methods=["POST"])
 def deep_prospecting_refresh_cache_api():
-    ensure_db()
-    db = get_db()
     try:
         result = start_reisift_deep_prospecting_refresh_job(triggered_by="api")
         return jsonify({"ok": True, **result})
     except Exception as exc:
-        db.rollback()
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 

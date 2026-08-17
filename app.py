@@ -11583,6 +11583,13 @@ def _ordered_sms_automation_from_numbers(settings, bucket="", contact_role="", s
     return numbers[idx:] + numbers[:idx]
 
 
+def sms_automation_sender_is_configured(settings, from_number):
+    normalized = normalize_phone(from_number)
+    if not normalized:
+        return False
+    return normalized in {normalize_phone(number) for number in settings.get("from_numbers") or [] if normalize_phone(number)}
+
+
 def select_sms_automation_from_number(db, bucket="", contact_role="", seed=""):
     settings = get_sms_automation_settings(db)
     numbers = _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed)
@@ -11595,7 +11602,7 @@ def select_sms_automation_send_from_number(db, preferred_from_number="", bucket=
     settings = get_sms_automation_settings(db)
     preferred = normalize_phone(preferred_from_number)
     candidates = []
-    if preferred:
+    if sms_automation_sender_is_configured(settings, preferred):
         candidates.append(preferred)
     if settings.get("number_strategy") == "default":
         fallback = select_sms_automation_from_number(db, bucket, contact_role, seed=seed)
@@ -11624,7 +11631,7 @@ def select_sms_automation_schedule_from_number(settings, preferred_from_number="
     health_reasons = health_reasons if isinstance(health_reasons, dict) else {}
     preferred = normalize_phone(preferred_from_number)
     candidates = []
-    if preferred:
+    if sms_automation_sender_is_configured(settings, preferred):
         candidates.append(preferred)
     if settings.get("number_strategy") == "default":
         ordered = _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed)
@@ -36484,7 +36491,10 @@ def ensure_sms_automation_followups_for_sent_row(db, sent_row, communication_id=
             "business_days_after_initial": followup_index,
         }
         message = _sms_automation_followup_message(db, sent_row, step_order)
-        from_number = normalize_phone(sent_row["from_number"]) or select_sms_automation_from_number(
+        parent_from_number = normalize_phone(sent_row["from_number"])
+        if not sms_automation_sender_is_configured(settings, parent_from_number):
+            parent_from_number = ""
+        from_number = parent_from_number or select_sms_automation_from_number(
             db,
             bucket=sent_row["bucket"],
             contact_role=sent_row["contact_role"],

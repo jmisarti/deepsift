@@ -36665,10 +36665,14 @@ def upsert_sms_automation_draft(db, property_id, target, route, source_info, pay
     return "created"
 
 
-def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=None):
+def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=None, segment=None):
     token = token or ""
     clauses = ["COALESCE(n.is_active, 1) = 1", "COALESCE(n.local_property_id, 0) > 0"]
     params = []
+    clean_segment = str(segment or "").strip()
+    if clean_segment:
+        clauses.append("COALESCE(n.segment, 'new_records') = ?")
+        params.append(clean_segment)
     if property_ids:
         ids = [int(pid) for pid in property_ids if int(pid or 0) > 0]
         if ids:
@@ -36688,7 +36692,7 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
     ).fetchall()
     created = updated = skipped = suppressed = duplicates_suppressed = 0
     touched_property_ids = set()
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         property_id = int(row["local_property_id"] or 0)
         if property_id <= 0:
             skipped += 1
@@ -36732,6 +36736,8 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
                 updated += 1
             else:
                 skipped += 1
+        if index % REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE == 0:
+            commit_with_retry(db)
     cleanup_property_ids = property_ids if property_ids else None
     duplicates_suppressed += suppress_duplicate_sms_automation_queue_items(db, property_ids=cleanup_property_ids)
     suppressed += revalidate_sms_automation_queue(db, property_ids=cleanup_property_ids)
@@ -37071,6 +37077,7 @@ def refresh_reisift_prospect_segment_cache(
     status_exit_checks = 0
     status_exit_unsubscribed = 0
     prepared_rows = []
+    sms_queue_property_ids = set()
     for row in rows:
         scanned += 1
         property_uuid = normalize_uuid(row.get("uuid") or "")
@@ -37132,6 +37139,9 @@ def refresh_reisift_prospect_segment_cache(
             )
             if local_sync.get("local_property_id") and local_sync.get("before") != local_sync.get("after"):
                 local_updates += 1
+            local_property_id = int(local_sync.get("local_property_id") or 0)
+            if local_property_id > 0:
+                sms_queue_property_ids.add(local_property_id)
             if local_sync.get("automation_eligible"):
                 automation_eligible_count += 1
             else:
@@ -37168,8 +37178,10 @@ def refresh_reisift_prospect_segment_cache(
                 )
                 status_exit_checks += 1
                 unsub = local_sync.get("emailoctopus_unsubscribe") if isinstance(local_sync.get("emailoctopus_unsubscribe"), dict) else {}
+                segment_property_id = int((local_sync.get("local_property_id") or prior["local_property_id"] or 0))
+                if segment_property_id > 0:
+                    sms_queue_property_ids.add(segment_property_id)
                 if int(unsub.get("attempted") or 0) == 0:
-                    segment_property_id = int((local_sync.get("local_property_id") or prior["local_property_id"] or 0))
                     if segment_property_id > 0:
                         unsub = unsubscribe_emailoctopus_emails_for_new_record_segment_exit(
                             db,
@@ -37194,7 +37206,14 @@ def refresh_reisift_prospect_segment_cache(
         errors.append(f"cache_commit_before_sms_queue: {exc}")
     sms_queue = {"created": 0, "updated": 0, "skipped": 0, "suppressed": 0}
     try:
-        sms_queue = generate_sms_automation_queue_for_new_records(db, token=token)
+        queue_property_ids = sorted(sms_queue_property_ids)
+        if queue_property_ids:
+            sms_queue = generate_sms_automation_queue_for_new_records(
+                db,
+                token=token,
+                property_ids=queue_property_ids,
+                segment=segment,
+            )
         commit_with_retry(db)
     except Exception as exc:
         errors.append(f"sms_queue: {exc}")

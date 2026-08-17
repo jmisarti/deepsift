@@ -35401,8 +35401,12 @@ def revalidate_sms_automation_queue(db, property_ids=None):
         tuple(params),
     ).fetchall()
     suppressed = 0
+    property_reason_cache = {}
     for row in rows:
-        reason = sms_automation_property_suppression_reason(db, row["property_id"])
+        property_id = int(row["property_id"] or 0)
+        if property_id not in property_reason_cache:
+            property_reason_cache[property_id] = sms_automation_property_suppression_reason(db, property_id)
+        reason = property_reason_cache[property_id]
         if not reason:
             reason = stale_reisift_new_record_touchpoint_reason(db, row["property_id"], row["touchpoint_id"])
         if not reason:
@@ -35869,30 +35873,43 @@ def correct_owner_phone_for_property(db, property_id):
         clean_property_id = 0
     if clean_property_id <= 0:
         return None
+    owner_ids = []
+    prop = db.execute(
+        "SELECT owner_person_id FROM properties WHERE id = ? LIMIT 1",
+        (clean_property_id,),
+    ).fetchone()
+    owner_person_id = int((prop["owner_person_id"] if prop else 0) or 0)
+    if owner_person_id > 0:
+        owner_ids.append(owner_person_id)
+        co_owner_rows = db.execute(
+            """
+            SELECT CASE
+                     WHEN subject_person_id = ? THEN related_person_id
+                     ELSE subject_person_id
+                   END AS person_id
+            FROM person_relationships
+            WHERE lower(relationship_type) = 'co-owner'
+              AND (subject_person_id = ? OR related_person_id = ?)
+            """,
+            (owner_person_id, owner_person_id, owner_person_id),
+        ).fetchall()
+        owner_ids.extend([int(row["person_id"] or 0) for row in co_owner_rows])
+    owner_ids = sorted({pid for pid in owner_ids if pid > 0})
+    if not owner_ids:
+        return None
+    placeholders = ",".join(["?"] * len(owner_ids))
     rows = db.execute(
-        """
+        f"""
         SELECT t.id AS touchpoint_id, t.person_id, t.value, t.status,
                pe.first_name, pe.last_name
         FROM touchpoints t
         JOIN people pe ON pe.id = t.person_id
-        JOIN properties p ON p.id = ?
         WHERE lower(t.channel_type) = 'phone'
           AND lower(COALESCE(t.status, '')) IN ('correct', 'verified', 'confirmed', 'good number')
-          AND (
-            t.person_id = p.owner_person_id
-            OR EXISTS (
-                SELECT 1
-                FROM person_relationships pr
-                WHERE lower(pr.relationship_type) = 'co-owner'
-                  AND (
-                    (pr.subject_person_id = p.owner_person_id AND pr.related_person_id = t.person_id)
-                    OR (pr.related_person_id = p.owner_person_id AND pr.subject_person_id = t.person_id)
-                  )
-            )
-          )
+          AND t.person_id IN ({placeholders})
         ORDER BY t.id ASC
         """,
-        (clean_property_id,),
+        tuple(owner_ids),
     ).fetchall()
     for row in rows:
         phone_norm = normalize_phone(row["value"])

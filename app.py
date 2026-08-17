@@ -36152,7 +36152,6 @@ def sms_automation_inbound_reply_suppression_reason(db, row):
     phone_norm = normalize_phone(row["phone_number"] if row else "")
     if not phone_norm:
         return ""
-    created_at = parse_db_time(row["created_at"] if row else "") or datetime.utcnow() - timedelta(days=30)
     inbound = db.execute(
         """
         SELECT id, sent_at, created_at
@@ -36160,14 +36159,10 @@ def sms_automation_inbound_reply_suppression_reason(db, row):
         WHERE upper(channel) = 'SMS'
           AND lower(direction) = 'inbound'
           AND replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
-          AND datetime(COALESCE(NULLIF(sent_at, ''), NULLIF(created_at, ''))) >= datetime(?)
         ORDER BY datetime(COALESCE(NULLIF(sent_at, ''), NULLIF(created_at, ''))) DESC, id DESC
         LIMIT 1
         """,
-        (
-            f"%{phone_norm}",
-            format_db_time(created_at - timedelta(minutes=5)),
-        ),
+        (f"%{phone_norm}",),
     ).fetchone()
     if inbound:
         return "Inbound SMS received from this phone; follow-up sequence stopped."

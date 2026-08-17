@@ -11593,13 +11593,18 @@ def select_sms_automation_from_number(db, bucket="", contact_role="", seed=""):
 
 def select_sms_automation_send_from_number(db, preferred_from_number="", bucket="", contact_role="", seed=""):
     settings = get_sms_automation_settings(db)
+    preferred = normalize_phone(preferred_from_number)
+    candidates = []
+    if preferred:
+        candidates.append(preferred)
     if settings.get("number_strategy") == "default":
-        candidates = [normalize_phone(preferred_from_number) or select_sms_automation_from_number(db, bucket, contact_role, seed=seed)]
+        fallback = select_sms_automation_from_number(db, bucket, contact_role, seed=seed)
+        if fallback and fallback not in candidates:
+            candidates.append(fallback)
     else:
-        candidates = _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed)
-        preferred = normalize_phone(preferred_from_number)
-        if preferred and preferred not in candidates:
-            candidates.append(preferred)
+        for candidate in _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
     if not candidates:
         candidates = [normalize_phone(get_deep_dive_sms_number(db))]
     last_reason = ""
@@ -11617,16 +11622,19 @@ def select_sms_automation_send_from_number(db, preferred_from_number="", bucket=
 
 def select_sms_automation_schedule_from_number(settings, preferred_from_number="", bucket="", contact_role="", seed="", health_reasons=None):
     health_reasons = health_reasons if isinstance(health_reasons, dict) else {}
+    preferred = normalize_phone(preferred_from_number)
+    candidates = []
+    if preferred:
+        candidates.append(preferred)
     if settings.get("number_strategy") == "default":
-        candidates = [normalize_phone(preferred_from_number)]
-        if not candidates[0]:
-            ordered = _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed)
-            candidates = ordered[:1]
+        ordered = _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed)
+        for candidate in ordered[:1]:
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
     else:
-        candidates = _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed)
-        preferred = normalize_phone(preferred_from_number)
-        if preferred and preferred not in candidates:
-            candidates.append(preferred)
+        for candidate in _ordered_sms_automation_from_numbers(settings, bucket=bucket, contact_role=contact_role, seed=seed):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
     if not candidates:
         candidates = [normalize_phone(SMS_AUTOMATION_DEFAULT_FROM_NUMBER) or normalize_phone(SMRTPHONE_FROM_NUMBER)]
     clean_candidates = [num for num in candidates if normalize_phone(num)]
@@ -36476,7 +36484,7 @@ def ensure_sms_automation_followups_for_sent_row(db, sent_row, communication_id=
             "business_days_after_initial": followup_index,
         }
         message = _sms_automation_followup_message(db, sent_row, step_order)
-        from_number = select_sms_automation_from_number(
+        from_number = normalize_phone(sent_row["from_number"]) or select_sms_automation_from_number(
             db,
             bucket=sent_row["bucket"],
             contact_role=sent_row["contact_role"],

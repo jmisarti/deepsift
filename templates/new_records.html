@@ -330,10 +330,24 @@
     statusMessage.classList.toggle('notice-banner', !isError);
   }
 
+  async function readJsonResponse(res) {
+    const text = await res.text();
+    try {
+      return text ? JSON.parse(text) : {};
+    } catch (err) {
+      const snippet = (text || '').trim().slice(0, 180);
+      throw new Error(`Unexpected server response (${res.status || 'unknown'}): ${snippet || err.message}`);
+    }
+  }
+
   async function pollRefreshStatus() {
     try {
       const res = await fetch({{ (refresh_status_url or '/api/new-records/refresh-status')|tojson }});
-      const data = await res.json();
+      const data = await readJsonResponse(res);
+      if (!res.ok || !data.ok) {
+        setStatusMessage(`Refresh status check failed: ${(data && data.error) || res.statusText || 'Server error'}`, true);
+        return;
+      }
       const state = (data && data.state) || {};
       if (state.status === 'running') {
         setBusy(state.message || 'Refresh still running...');
@@ -364,7 +378,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       });
-      const data = await res.json();
+      const data = await readJsonResponse(res);
       if (!res.ok || !data.ok) {
         setStatusMessage(`Refresh failed: ${(data && data.error) || 'Unknown error'}`, true);
         return;

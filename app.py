@@ -452,6 +452,8 @@ EMAILOCTOPUS_WEBHOOK_PROCESSING_LOCK = threading.RLock()
 EMAILOCTOPUS_SYNC_QUEUE_LOCK = threading.RLock()
 ENSURE_DB_READY = False
 ENSURE_DB_LOCK = threading.Lock()
+REFRESH_STATE_MEMORY = {}
+REFRESH_STATE_MEMORY_LOCK = threading.Lock()
 PROVIDER_ALERT_DEDUPE_MINUTES = max(int((os.getenv("PROVIDER_ALERT_DEDUPE_MINUTES") or "60").strip() or "60"), 5)
 PROSPECT_TABLE_CACHE_REFRESH_SECONDS = max(int((os.getenv("PROSPECT_TABLE_CACHE_REFRESH_SECONDS") or "300").strip() or "300"), 60)
 REISIFT_REFRESH_STALE_MINUTES = max(int((os.getenv("REISIFT_REFRESH_STALE_MINUTES") or "180").strip() or "180"), 30)
@@ -11212,6 +11214,32 @@ def get_setting(db, key, default=""):
     if not row:
         return default
     return row["value"] if row["value"] is not None else default
+
+
+def get_setting_quick_readonly(key, default="", timeout_ms=250):
+    key = (key or "").strip()
+    if not key:
+        return default
+    conn = None
+    try:
+        db_uri_path = quote(str(DB_PATH).replace("\\", "/"), safe="/:")
+        uri = f"file:{db_uri_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=max(0.05, timeout_ms / 1000))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute(f"PRAGMA busy_timeout = {max(1, int(timeout_ms or 250))}")
+        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return default
+        return row["value"] if row["value"] is not None else default
+    except Exception:
+        return default
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def set_setting(db, key, value):
@@ -37392,6 +37420,38 @@ def run_reisift_phone_status_delta_sync_once(triggered_by="automation", start_ut
         REISIFT_PHONE_STATUS_DELTA_LOCK.release()
 
 
+def _normalize_reisift_refresh_state(data, lock=None):
+    if not isinstance(data, dict) or not data:
+        return {"status": "idle", "message": "", "updated_at": "", "result": {}}
+    status = str(data.get("status") or "idle").strip() or "idle"
+    if status == "running" and (_reisift_refresh_state_is_stale(data) or (lock is not None and not lock.locked())):
+        return {
+            "status": "idle",
+            "message": "Previous refresh state was stale; ready to retry." if _reisift_refresh_state_is_stale(data) else "",
+            "updated_at": str(data.get("updated_at") or "").strip(),
+            "result": data.get("result") if isinstance(data.get("result"), dict) else {},
+        }
+    return {
+        "status": status,
+        "message": str(data.get("message") or "").strip(),
+        "updated_at": str(data.get("updated_at") or "").strip(),
+        "result": data.get("result") if isinstance(data.get("result"), dict) else {},
+    }
+
+
+def _remember_reisift_refresh_state(setting_key, payload):
+    if not setting_key or not isinstance(payload, dict):
+        return
+    with REFRESH_STATE_MEMORY_LOCK:
+        REFRESH_STATE_MEMORY[setting_key] = dict(payload)
+
+
+def _get_remembered_reisift_refresh_state(setting_key):
+    with REFRESH_STATE_MEMORY_LOCK:
+        payload = REFRESH_STATE_MEMORY.get(setting_key)
+        return dict(payload) if isinstance(payload, dict) else {}
+
+
 def set_reisift_new_records_refresh_state(db, status, message="", result=None):
     payload = {
         "status": str(status or "").strip() or "unknown",
@@ -37400,6 +37460,7 @@ def set_reisift_new_records_refresh_state(db, status, message="", result=None):
         "result": result if isinstance(result, dict) else {},
     }
     set_setting(db, "reisift_new_records_refresh_state_json", json.dumps(payload))
+    _remember_reisift_refresh_state("reisift_new_records_refresh_state_json", payload)
     return payload
 
 
@@ -37415,25 +37476,19 @@ def _reisift_refresh_state_is_stale(data):
     return datetime.utcnow() - updated_at > timedelta(minutes=REISIFT_REFRESH_STALE_MINUTES)
 
 
-def get_reisift_new_records_refresh_state(db):
-    raw = get_setting(db, "reisift_new_records_refresh_state_json", "")
+def get_reisift_new_records_refresh_state(db=None):
+    setting_key = "reisift_new_records_refresh_state_json"
+    remembered = _get_remembered_reisift_refresh_state(setting_key)
+    if remembered and str(remembered.get("status") or "").strip() == "running":
+        return _normalize_reisift_refresh_state(remembered, REISIFT_NEW_RECORDS_REFRESH_LOCK)
+    raw = get_setting(db, setting_key, "") if db is not None else get_setting_quick_readonly(setting_key, "")
     data = parse_json_object(raw or "{}", default={})
-    if not isinstance(data, dict) or not data:
-        return {"status": "idle", "message": "", "updated_at": "", "result": {}}
-    status = str(data.get("status") or "idle").strip() or "idle"
-    if status == "running" and (_reisift_refresh_state_is_stale(data) or not REISIFT_NEW_RECORDS_REFRESH_LOCK.locked()):
-        return {
-            "status": "idle",
-            "message": "Previous refresh state was stale; ready to retry." if _reisift_refresh_state_is_stale(data) else "",
-            "updated_at": str(data.get("updated_at") or "").strip(),
-            "result": data.get("result") if isinstance(data.get("result"), dict) else {},
-        }
-    return {
-        "status": status,
-        "message": str(data.get("message") or "").strip(),
-        "updated_at": str(data.get("updated_at") or "").strip(),
-        "result": data.get("result") if isinstance(data.get("result"), dict) else {},
-    }
+    if isinstance(data, dict) and data:
+        _remember_reisift_refresh_state(setting_key, data)
+        return _normalize_reisift_refresh_state(data, REISIFT_NEW_RECORDS_REFRESH_LOCK)
+    if remembered:
+        return _normalize_reisift_refresh_state(remembered, REISIFT_NEW_RECORDS_REFRESH_LOCK)
+    return _normalize_reisift_refresh_state({}, REISIFT_NEW_RECORDS_REFRESH_LOCK)
 
 
 def start_reisift_new_records_refresh_job(triggered_by="manual"):
@@ -37507,28 +37562,23 @@ def set_reisift_deep_prospecting_refresh_state(db, status, message="", result=No
         "result": result if isinstance(result, dict) else {},
     }
     set_setting(db, "reisift_deep_prospecting_refresh_state_json", json.dumps(payload))
+    _remember_reisift_refresh_state("reisift_deep_prospecting_refresh_state_json", payload)
     return payload
 
 
-def get_reisift_deep_prospecting_refresh_state(db):
-    raw = get_setting(db, "reisift_deep_prospecting_refresh_state_json", "")
+def get_reisift_deep_prospecting_refresh_state(db=None):
+    setting_key = "reisift_deep_prospecting_refresh_state_json"
+    remembered = _get_remembered_reisift_refresh_state(setting_key)
+    if remembered and str(remembered.get("status") or "").strip() == "running":
+        return _normalize_reisift_refresh_state(remembered, REISIFT_DEEP_PROSPECTING_REFRESH_LOCK)
+    raw = get_setting(db, setting_key, "") if db is not None else get_setting_quick_readonly(setting_key, "")
     data = parse_json_object(raw or "{}", default={})
-    if not isinstance(data, dict) or not data:
-        return {"status": "idle", "message": "", "updated_at": "", "result": {}}
-    status = str(data.get("status") or "idle").strip() or "idle"
-    if status == "running" and (_reisift_refresh_state_is_stale(data) or not REISIFT_DEEP_PROSPECTING_REFRESH_LOCK.locked()):
-        return {
-            "status": "idle",
-            "message": "Previous refresh state was stale; ready to retry." if _reisift_refresh_state_is_stale(data) else "",
-            "updated_at": str(data.get("updated_at") or "").strip(),
-            "result": data.get("result") if isinstance(data.get("result"), dict) else {},
-        }
-    return {
-        "status": status,
-        "message": str(data.get("message") or "").strip(),
-        "updated_at": str(data.get("updated_at") or "").strip(),
-        "result": data.get("result") if isinstance(data.get("result"), dict) else {},
-    }
+    if isinstance(data, dict) and data:
+        _remember_reisift_refresh_state(setting_key, data)
+        return _normalize_reisift_refresh_state(data, REISIFT_DEEP_PROSPECTING_REFRESH_LOCK)
+    if remembered:
+        return _normalize_reisift_refresh_state(remembered, REISIFT_DEEP_PROSPECTING_REFRESH_LOCK)
+    return _normalize_reisift_refresh_state({}, REISIFT_DEEP_PROSPECTING_REFRESH_LOCK)
 
 
 def start_reisift_deep_prospecting_refresh_job(triggered_by="manual"):
@@ -46423,9 +46473,7 @@ def new_records_refresh_cache_api():
 
 @app.route("/api/new-records/refresh-status", methods=["GET"])
 def new_records_refresh_status_api():
-    ensure_db()
-    db = get_db()
-    return jsonify({"ok": True, "state": get_reisift_new_records_refresh_state(db)})
+    return jsonify({"ok": True, "state": get_reisift_new_records_refresh_state()})
 
 
 @app.route("/api/reisift/phone-status-delta-sync", methods=["POST"])
@@ -46485,9 +46533,7 @@ def deep_prospecting_refresh_cache_api():
 
 @app.route("/api/deep-prospecting/refresh-status", methods=["GET"])
 def deep_prospecting_refresh_status_api():
-    ensure_db()
-    db = get_db()
-    return jsonify({"ok": True, "state": get_reisift_deep_prospecting_refresh_state(db)})
+    return jsonify({"ok": True, "state": get_reisift_deep_prospecting_refresh_state()})
 
 
 def _sms_automation_today_window_utc():

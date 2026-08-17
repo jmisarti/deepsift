@@ -10162,6 +10162,8 @@ def infer_touchpoint_update_from_status(status_text):
         update["channel_label"] = "VoIP"
     if "fax" in s:
         update["channel_label"] = "Fax"
+    if any(x in s for x in ["wrong number", "not my number", "you have the wrong", "not this number"]):
+        update["status"] = "Wrong Number"
     if any(x in s for x in ["unknown and may no longer exist", "no longer exist", "not in service", "disconnected", "deactivated"]):
         update["status"] = "Dead"
     if any(x in s for x in ["undeliverable", "undelivered", "not deliver", "no route", "unable to receive", "unreachable carrier", "switched off", "otherwise unavailable", "failed", "failure"]):
@@ -36147,8 +36149,6 @@ def _sms_automation_followup_message(db, parent_row, step_order):
 
 
 def sms_automation_inbound_reply_suppression_reason(db, row):
-    if not _sms_automation_is_followup_row(row):
-        return ""
     phone_norm = normalize_phone(row["phone_number"] if row else "")
     if not phone_norm:
         return ""
@@ -36157,8 +36157,7 @@ def sms_automation_inbound_reply_suppression_reason(db, row):
         """
         SELECT id, sent_at, created_at
         FROM communications
-        WHERE property_id = ?
-          AND upper(channel) = 'SMS'
+        WHERE upper(channel) = 'SMS'
           AND lower(direction) = 'inbound'
           AND replace(replace(replace(replace(replace(COALESCE(from_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?
           AND datetime(COALESCE(NULLIF(sent_at, ''), NULLIF(created_at, ''))) >= datetime(?)
@@ -36166,7 +36165,6 @@ def sms_automation_inbound_reply_suppression_reason(db, row):
         LIMIT 1
         """,
         (
-            int(row["property_id"] or 0),
             f"%{phone_norm}",
             format_db_time(created_at - timedelta(minutes=5)),
         ),
@@ -36182,17 +36180,10 @@ def suppress_sms_automation_followups_for_reply(db, property_id, phone_number, p
         return 0
     clauses = [
         "status IN ('Draft', 'Queued', 'Approved', 'Scheduled')",
-        "(COALESCE(step_order, 1) > 1 OR lower(COALESCE(queue_key, '')) LIKE '%:fu:%')",
         "replace(replace(replace(replace(replace(COALESCE(phone_number,''),'+',''),'(',''),')',''),'-',''),' ','') LIKE ?",
     ]
     params = [f"%{phone_norm}"]
-    if int(property_id or 0) > 0:
-        clauses.append("property_id = ?")
-        params.append(int(property_id or 0))
-    if int(person_id or 0) > 0:
-        clauses.append("(person_id = ? OR COALESCE(person_id, 0) = 0)")
-        params.append(int(person_id or 0))
-    reason = "Inbound SMS received from this phone; follow-up sequence stopped."
+    reason = "Inbound SMS received from this phone; SMS automation stopped for this number."
     if communication_id:
         reason += f" Communication #{communication_id}."
     cur = db.execute(
@@ -46046,7 +46037,16 @@ def _sms_automation_within_send_window(db):
     eh, em = parse_hhmm(settings.get("send_window_end"), 16, 45)
     start = now_et.replace(hour=sh, minute=sm, second=0, microsecond=0)
     end = now_et.replace(hour=eh, minute=em, second=0, microsecond=0)
+    if now_et.weekday() >= 5:
+        return False, start, end
     return start <= now_et <= end, start, end
+
+
+def _sms_automation_next_weekday_start_et(candidate_et, start_hour, start_minute):
+    target = candidate_et.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    while target.weekday() >= 5:
+        target = (target + timedelta(days=1)).replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    return target
 
 
 def _sms_automation_adjust_to_send_window_utc(dt_utc, settings):
@@ -46056,10 +46056,12 @@ def _sms_automation_adjust_to_send_window_utc(dt_utc, settings):
     eh, em = parse_hhmm(settings.get("send_window_end"), 16, 45)
     start_et = candidate_et.replace(hour=sh, minute=sm, second=0, microsecond=0)
     end_et = candidate_et.replace(hour=eh, minute=em, second=0, microsecond=0)
-    if candidate_et < start_et:
+    if candidate_et.weekday() >= 5:
+        target_et = _sms_automation_next_weekday_start_et(candidate_et, sh, sm)
+    elif candidate_et < start_et:
         target_et = start_et
     elif candidate_et > end_et:
-        target_et = (candidate_et + timedelta(days=1)).replace(hour=sh, minute=sm, second=0, microsecond=0)
+        target_et = _sms_automation_next_weekday_start_et(candidate_et + timedelta(days=1), sh, sm)
     else:
         target_et = candidate_et
     return target_et.astimezone(timezone.utc).replace(tzinfo=None)
@@ -46067,6 +46069,8 @@ def _sms_automation_adjust_to_send_window_utc(dt_utc, settings):
 
 def _sms_automation_window_start_utc_for_et_date(et_date, settings):
     sh, sm = parse_hhmm(settings.get("send_window_start"), 9, 15)
+    while et_date.weekday() >= 5:
+        et_date = et_date + timedelta(days=1)
     start_et = datetime(et_date.year, et_date.month, et_date.day, sh, sm, tzinfo=EST_TZ)
     return start_et.astimezone(timezone.utc).replace(tzinfo=None)
 
@@ -54185,6 +54189,7 @@ def smrtphone_inbound_webhook(payload=None, db=None):
     if existing:
         if direction == "Inbound":
             update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+            apply_touchpoint_status_inference(db, from_number, message)
             suppress_sms_automation_followups_for_reply(
                 db,
                 property_id,
@@ -54232,6 +54237,7 @@ def smrtphone_inbound_webhook(payload=None, db=None):
     if recent:
         if direction == "Inbound":
             update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+            apply_touchpoint_status_inference(db, from_number, message)
             suppress_sms_automation_followups_for_reply(
                 db,
                 property_id,
@@ -54279,6 +54285,7 @@ def smrtphone_inbound_webhook(payload=None, db=None):
     )
     if direction == "Inbound":
         update_person_outreach_status_for_sms(db, person_id, "inbound_received")
+        apply_touchpoint_status_inference(db, from_number, message)
         suppress_sms_automation_followups_for_reply(
             db,
             property_id,

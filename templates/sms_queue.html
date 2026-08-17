@@ -24,7 +24,7 @@
     <p class="muted-text">
         Approving a draft moves it into AutoSend. Sender pool:
         <strong>{% for number in settings.from_numbers %}{{ number|fmt_phone }}{% if not loop.last %}, {% endif %}{% endfor %}</strong>.
-        Window: <strong>{{ settings.send_window_start }}-{{ settings.send_window_end }} ET</strong>.
+        Window: <strong>Monday-Friday {{ settings.send_window_start }}-{{ settings.send_window_end }} ET</strong>.
         Cap: <strong>{{ settings.max_daily_per_number }}/number/day</strong>.
         Send Now is still available as a manual override.
     </p>

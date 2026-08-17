@@ -1149,7 +1149,7 @@ document.addEventListener('change', async (e) => {
   }
   if (e.target.classList.contains('touch-status')) {
     const id = e.target.dataset.id;
-    const r = await patchJson(`/api/touchpoints/${id}/status`, {status:e.target.value});
+    const r = await patchJson(`/api/touchpoints/${id}/status`, {status:e.target.value, property_id: propertyId});
     if (r.ok) {
       flash(e.target.closest('tr'));
       await refreshOwnerCommTargets();

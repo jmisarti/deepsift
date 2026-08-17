@@ -35315,6 +35315,9 @@ def sms_automation_property_suppression_reason(db, property_id):
     ).fetchone()
     if int((new_record_state["total_rows"] if new_record_state else 0) or 0) > 0 and int((new_record_state["active_rows"] if new_record_state else 0) or 0) <= 0:
         return "Property is no longer active in the ReiSIFT prospect refresh."
+    correct_owner_reason = sms_automation_correct_owner_suppression_reason(db, property_id)
+    if correct_owner_reason:
+        return correct_owner_reason
     return ""
 
 
@@ -35852,6 +35855,139 @@ def purge_suppressed_sms_automation_queue(db, property_ids=None):
         tuple(params),
     )
     return int(cur.rowcount or 0)
+
+
+def _is_correct_phone_status_text(status):
+    key = normalize_whitespace(status).lower()
+    return key in {"correct", "verified", "confirmed", "good number"}
+
+
+def correct_owner_phone_for_property(db, property_id):
+    try:
+        clean_property_id = int(property_id or 0)
+    except Exception:
+        clean_property_id = 0
+    if clean_property_id <= 0:
+        return None
+    rows = db.execute(
+        """
+        SELECT t.id AS touchpoint_id, t.person_id, t.value, t.status,
+               pe.first_name, pe.last_name
+        FROM touchpoints t
+        JOIN people pe ON pe.id = t.person_id
+        JOIN properties p ON p.id = ?
+        WHERE lower(t.channel_type) = 'phone'
+          AND lower(COALESCE(t.status, '')) IN ('correct', 'verified', 'confirmed', 'good number')
+          AND (
+            t.person_id = p.owner_person_id
+            OR EXISTS (
+                SELECT 1
+                FROM person_relationships pr
+                WHERE lower(pr.relationship_type) = 'co-owner'
+                  AND (
+                    (pr.subject_person_id = p.owner_person_id AND pr.related_person_id = t.person_id)
+                    OR (pr.related_person_id = p.owner_person_id AND pr.subject_person_id = t.person_id)
+                  )
+            )
+          )
+        ORDER BY t.id ASC
+        """,
+        (clean_property_id,),
+    ).fetchall()
+    for row in rows:
+        phone_norm = normalize_phone(row["value"])
+        if not phone_norm:
+            continue
+        return {
+            "touchpoint_id": int(row["touchpoint_id"] or 0),
+            "person_id": int(row["person_id"] or 0),
+            "phone_number": phone_norm,
+            "status": row["status"] or "",
+            "person_name": f"{row['first_name'] or ''} {row['last_name'] or ''}".strip(),
+        }
+    return None
+
+
+def sms_automation_correct_owner_suppression_reason(db, property_id):
+    correct_phone = correct_owner_phone_for_property(db, property_id)
+    if not correct_phone:
+        return ""
+    return (
+        f"Owner phone {format_phone_display(correct_phone['phone_number'])} is marked "
+        f"{correct_phone['status'] or 'Correct'}; SMS automation stopped for this property."
+    )
+
+
+def suppress_sms_automation_queue_for_property(db, property_id, reason):
+    try:
+        clean_property_id = int(property_id or 0)
+    except Exception:
+        clean_property_id = 0
+    if clean_property_id <= 0:
+        return 0
+    cur = db.execute(
+        """
+        DELETE FROM sms_automation_queue
+        WHERE property_id = ?
+          AND status IN ('Draft', 'Queued', 'Approved', 'Scheduled')
+        """,
+        (clean_property_id,),
+    )
+    removed = int(cur.rowcount or 0)
+    if removed:
+        try:
+            db.execute(
+                """
+                INSERT INTO activity_log (property_id, activity_type, outcome, note)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    clean_property_id,
+                    "AutoSMS Queue Suppressed",
+                    "Property-level stop",
+                    f"{reason} Removed {removed} pending SMS queue row(s).",
+                ),
+            )
+        except Exception:
+            pass
+    return removed
+
+
+def suppress_sms_automation_queue_for_correct_owner_phone(db, property_id):
+    reason = sms_automation_correct_owner_suppression_reason(db, property_id)
+    if not reason:
+        return 0
+    return suppress_sms_automation_queue_for_property(db, property_id, reason)
+
+
+def _inbound_sms_indicates_wrong_number(message):
+    blob = normalize_whitespace(message).lower()
+    return any(
+        token in blob
+        for token in [
+            "wrong number",
+            "not my number",
+            "you have the wrong",
+            "not this number",
+            "wrong person",
+            "not the owner",
+            "not associated",
+        ]
+    )
+
+
+def suppress_sms_automation_queue_for_owner_reply(db, property_id, phone_number, person_id=None, message="", communication_id=None):
+    if _inbound_sms_indicates_wrong_number(message):
+        return 0
+    if _sms_route_role(_reisift_contact_role_for_person(db, property_id, person_id)) != "owner":
+        return 0
+    reason = "Owner inbound SMS received; SMS automation stopped for this property."
+    phone_norm = normalize_phone(phone_number)
+    if phone_norm:
+        reason += f" Reply from {format_phone_display(phone_norm)}."
+    if communication_id:
+        reason += f" Communication #{communication_id}."
+    return suppress_sms_automation_queue_for_property(db, property_id, reason)
 
 
 def collect_sms_automation_targets_for_property(db, property_id, active_property_uuid=None):
@@ -39464,6 +39600,9 @@ def sync_reisift_owner_contacts_to_local_property(db, property_id, property_uuid
         )
         for key in ["phones_created", "phones_updated", "phones_suppressed", "emails_created"]:
             out[key] += int(contact_counts.get(key) or 0)
+    removed_for_correct_owner = suppress_sms_automation_queue_for_correct_owner_phone(db, property_id)
+    if removed_for_correct_owner:
+        out["sms_queue_removed_for_correct_owner"] = removed_for_correct_owner
     return out
 
 
@@ -51931,8 +52070,53 @@ def update_touchpoint_status(touchpoint_id):
         return jsonify({"error": "status is required"}), 400
 
     db.execute("UPDATE touchpoints SET status = ? WHERE id = ?", (status, touchpoint_id))
-    db.commit()
-    return jsonify({"ok": True})
+    removed_for_correct_owner = 0
+    if _is_correct_phone_status_text(status):
+        row = db.execute(
+            "SELECT person_id, channel_type FROM touchpoints WHERE id = ? LIMIT 1",
+            (touchpoint_id,),
+        ).fetchone()
+        if row and str(row["channel_type"] or "").strip().lower() == "phone":
+            property_ids = []
+            requested_property_id = payload.get("property_id") or request.args.get("property_id")
+            try:
+                requested_property_id = int(requested_property_id or 0)
+            except Exception:
+                requested_property_id = 0
+            if requested_property_id > 0:
+                property_ids.append(requested_property_id)
+            else:
+                owner_rows = db.execute(
+                    """
+                    SELECT id
+                    FROM properties
+                    WHERE owner_person_id = ?
+                    """,
+                    (row["person_id"],),
+                ).fetchall()
+                property_ids.extend([int(prop["id"] or 0) for prop in owner_rows])
+                co_owner_rows = db.execute(
+                    """
+                    SELECT DISTINCT p.id
+                    FROM properties p
+                    JOIN person_relationships pr
+                      ON lower(pr.relationship_type) = 'co-owner'
+                     AND (
+                        (pr.subject_person_id = p.owner_person_id AND pr.related_person_id = ?)
+                        OR (pr.related_person_id = p.owner_person_id AND pr.subject_person_id = ?)
+                     )
+                    """,
+                    (row["person_id"], row["person_id"]),
+                ).fetchall()
+                property_ids.extend([int(prop["id"] or 0) for prop in co_owner_rows])
+            for property_id in sorted({pid for pid in property_ids if pid > 0}):
+                removed_for_correct_owner += suppress_sms_automation_queue_for_correct_owner_phone(db, property_id)
+                try:
+                    refresh_prospect_table_cache_for_property_id(db, property_id)
+                except Exception:
+                    pass
+    commit_with_retry(db)
+    return jsonify({"ok": True, "sms_queue_removed_for_correct_owner": removed_for_correct_owner})
 
 
 @app.route("/api/touchpoints/<int:touchpoint_id>/label", methods=["PATCH"])
@@ -54192,6 +54376,14 @@ def smrtphone_inbound_webhook(payload=None, db=None):
                 person_id=person_id,
                 communication_id=existing["id"],
             )
+            suppress_sms_automation_queue_for_owner_reply(
+                db,
+                property_id,
+                from_number,
+                person_id=person_id,
+                message=message,
+                communication_id=existing["id"],
+            )
         else:
             update_person_outreach_status_for_sms(db, person_id, "outbound_success")
         log_smrtphone_webhook_event(
@@ -54240,6 +54432,14 @@ def smrtphone_inbound_webhook(payload=None, db=None):
                 person_id=person_id,
                 communication_id=recent["id"],
             )
+            suppress_sms_automation_queue_for_owner_reply(
+                db,
+                property_id,
+                from_number,
+                person_id=person_id,
+                message=message,
+                communication_id=recent["id"],
+            )
         else:
             update_person_outreach_status_for_sms(db, person_id, "outbound_success")
         if sms_id and not (recent["external_id"] or "").strip():
@@ -54286,6 +54486,14 @@ def smrtphone_inbound_webhook(payload=None, db=None):
             property_id,
             from_number,
             person_id=person_id,
+            communication_id=cur.lastrowid,
+        )
+        suppress_sms_automation_queue_for_owner_reply(
+            db,
+            property_id,
+            from_number,
+            person_id=person_id,
+            message=message,
             communication_id=cur.lastrowid,
         )
     else:

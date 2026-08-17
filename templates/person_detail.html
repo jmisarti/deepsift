@@ -813,7 +813,7 @@ personMailProofSendBtn.addEventListener('click', async () => {
 
 document.addEventListener('change', async (e)=>{
   if(e.target.classList.contains('touch-label')){ const id=e.target.dataset.id; const r=await patchJson(`/api/touchpoints/${id}/label`, {channel_label:e.target.value}); if(r.ok){ sortPersonPhoneRows(); flash(e.target.closest('tr')); await refreshPersonCommTargets(); } }
-  if(e.target.classList.contains('touch-status')){ const id=e.target.dataset.id; const r=await patchJson(`/api/touchpoints/${id}/status`, {status:e.target.value}); if(r.ok){ flash(e.target.closest('tr')); await refreshPersonCommTargets(); } }
+  if(e.target.classList.contains('touch-status')){ const id=e.target.dataset.id; const payload={status:e.target.value}; if(personCommPropertyId) payload.property_id=personCommPropertyId; const r=await patchJson(`/api/touchpoints/${id}/status`, payload); if(r.ok){ flash(e.target.closest('tr')); await refreshPersonCommTargets(); } }
   if(e.target.classList.contains('social-status')){ const id=e.target.dataset.id; const r=await patchJson(`/api/socials/${id}/status`, {status:e.target.value}); if(r.ok) flash(e.target.closest('tr')); }
   if(e.target.classList.contains('relationship-status')){ const pid=e.target.dataset.personId; const r=await patchJson(`/api/people/${pid}/status`, {status:e.target.value}); if(r.ok) flash(e.target.closest('tr')); }
 });

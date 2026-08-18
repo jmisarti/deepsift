@@ -56878,7 +56878,10 @@ def _phone_activity_events_from_source_rows(event_rows, communication_rows, call
         payload = parse_json_object(row["payload_json"] or "{}", default={})
         if not isinstance(payload, dict):
             payload = {}
-        call_sid = _phone_activity_call_sid_from_payload(payload)
+        call_sid = (
+            str(row["sms_id"] or "").strip()
+            or _phone_activity_call_sid_from_payload(payload)
+        )
         event = _phone_activity_event_from_smrtphone_row(
             row,
             call_job=call_jobs_by_sid.get(call_sid),

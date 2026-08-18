@@ -56989,6 +56989,9 @@ def _phone_activity_rollups_from_events(events):
 
 
 def _phone_activity_event_from_smrtphone_row(row, call_job=None, communication_external_ids=None, parsed_payload=None):
+    processing_status = str(row["processing_status"] or "").strip().casefold()
+    if processing_status in {"deduped", "ignored", "error"}:
+        return None
     payload = parsed_payload if isinstance(parsed_payload, dict) else parse_json_object(row["payload_json"] or "{}", default={})
     if not isinstance(payload, dict):
         payload = {}

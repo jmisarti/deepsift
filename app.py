@@ -56872,7 +56872,8 @@ def _phone_activity_events_from_source_rows(event_rows, communication_rows, call
             call_jobs_by_sid[call_sid] = row
 
     events = []
-    seen_call_sids = set()
+    call_events_by_sid = {}
+    call_sid_order = []
     for row in event_rows:
         payload = parse_json_object(row["payload_json"] or "{}", default={})
         if not isinstance(payload, dict):
@@ -56887,8 +56888,16 @@ def _phone_activity_events_from_source_rows(event_rows, communication_rows, call
         if not event:
             continue
         if call_sid and event["channel"] == "call":
-            seen_call_sids.add(call_sid)
+            if call_sid not in call_events_by_sid:
+                call_sid_order.append(call_sid)
+                call_events_by_sid[call_sid] = event
+            else:
+                call_events_by_sid[call_sid] = _better_phone_activity_call_event(call_events_by_sid[call_sid], event)
+            continue
         events.append(event)
+
+    seen_call_sids = set(call_events_by_sid)
+    events.extend(call_events_by_sid[call_sid] for call_sid in call_sid_order)
 
     for row in call_job_rows:
         call_sid = str(row["call_sid"] or "").strip()
@@ -56903,6 +56912,33 @@ def _phone_activity_events_from_source_rows(event_rows, communication_rows, call
         if event:
             events.append(event)
     return events
+
+
+def _better_phone_activity_call_event(current, candidate):
+    if _phone_activity_call_event_score(candidate) >= _phone_activity_call_event_score(current):
+        return candidate
+    return current
+
+
+def _phone_activity_call_event_score(event):
+    disposition = str(event.get("disposition_bucket") or "")
+    disposition_scores = {
+        "Lead": 7,
+        "Follow Up": 6,
+        "Answered": 5,
+        "Correct #": 5,
+        "No Answer": 3,
+        "Out of Service": 2,
+        "Incorrect #": 2,
+        "Unknown": 0,
+    }
+    return (
+        int(event.get("duration_seconds") or 0) > 0,
+        disposition_scores.get(disposition, 1),
+        int(event.get("duration_seconds") or 0),
+        str(event.get("user_name") or "").strip().casefold() not in {"", "unknown"},
+        str(event.get("business_number") or "").strip().casefold() not in {"", "unknown"},
+    )
 
 
 def _phone_activity_rollups_from_events(events):

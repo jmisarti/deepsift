@@ -218,7 +218,7 @@
                     <th>Status</th>
                     <th>Priority</th>
                     <th>Owner Name(s)</th>
-                    <th>Date Added</th>
+                    <th>{{ date_column_label or "Date Added" }}</th>
                     <th>Mail Out</th>
                     <th>Call Out</th>
                     <th>Call In</th>
@@ -248,7 +248,7 @@
                         {% endif %}
                     </td>
                     <td>{{ row.owner_names or "-" }}</td>
-                    <td>{{ row.added_at|fmt_short_date }}</td>
+                    <td>{{ (row.display_added_at or row.added_at)|fmt_short_date }}</td>
                     <td>{{ row.mail_out }}</td>
                     <td>{{ row.call_out }}</td>
                     <td>{{ row.call_in }}</td>

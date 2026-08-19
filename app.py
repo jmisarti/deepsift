@@ -1560,6 +1560,7 @@ def migrate_db(db):
             no_good_numbers INTEGER NOT NULL DEFAULT 0,
             property_lists TEXT,
             property_lists_json TEXT,
+            source_first_seen_at TEXT,
             source_last_synced_at TEXT,
             projection_updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(segment, property_uuid)
@@ -1582,6 +1583,7 @@ def migrate_db(db):
     ensure_column(db, "prospect_table_cache", "is_llc_owner", "is_llc_owner INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "prospect_table_cache", "priority_preset", "priority_preset TEXT")
     ensure_column(db, "prospect_table_cache", "priority_match", "priority_match TEXT")
+    ensure_column(db, "prospect_table_cache", "source_first_seen_at", "source_first_seen_at TEXT")
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_priority ON prospect_table_cache(segment, priority_preset, is_llc_owner)"
     )
@@ -21279,19 +21281,20 @@ def build_reisift_skipsherpa_skiptrace_tags(when=None):
     return list(dict.fromkeys(tags))
 
 
-def _extract_reisift_property_tags(property_payload):
+def _extract_reisift_property_tags(property_payload, preserve_existing_text=False):
     payload = property_payload if isinstance(property_payload, dict) else {}
     raw = payload.get("tags")
     tags = []
     seen = set()
 
     def add_tag(value):
-        text = str(value or "").strip()
+        raw_text = str(value or "")
+        text = raw_text.strip()
         key = text.lower()
         if not text or key in seen:
             return
         seen.add(key)
-        tags.append(text)
+        tags.append(raw_text if preserve_existing_text else text)
 
     if isinstance(raw, list):
         for item in raw:
@@ -21394,25 +21397,29 @@ def reisift_sync_property_tags(token, property_uuid, tags_to_add=None, tags_to_r
     if not property_uuid or (not desired_tags and not tags_to_remove and not remove_prefixes):
         return {"ok": False, "skipped": True, "reason": "missing_property_uuid_or_tags"}
     current_payload = fetch_reisift_property_payload(token, property_uuid)
-    existing_tags = _extract_reisift_property_tags(current_payload)
+    existing_tags = _extract_reisift_property_tags(current_payload, preserve_existing_text=True)
     filtered_existing = []
     for tag in existing_tags:
-        clean = str(tag or "").strip()
-        clean_lower = clean.lower()
+        existing_value = str(tag or "")
+        clean_lower = existing_value.strip().lower()
+        if not clean_lower:
+            continue
         if clean_lower in tags_to_remove:
             continue
         if any(clean_lower.startswith(prefix) for prefix in remove_prefixes):
             continue
-        filtered_existing.append(clean)
+        # Preserve ReiSIFT's exact existing tag text. Normalizing old tags while
+        # appending a new tag can make ReiSIFT log old tags as newly added.
+        filtered_existing.append(existing_value)
     merged_tags = []
     seen = set()
     for tag in list(filtered_existing) + list(desired_tags):
-        clean = str(tag or "").strip()
-        key = clean.lower()
+        clean = str(tag or "")
+        key = clean.strip().lower()
         if not clean or key in seen:
             continue
         seen.add(key)
-        merged_tags.append(clean)
+        merged_tags.append(clean if tag in filtered_existing else clean.strip())
     if [tag.lower() for tag in merged_tags] == [tag.lower() for tag in existing_tags]:
         return {"ok": True, "skipped": True, "reason": "tags_already_present", "tags": existing_tags}
 
@@ -38686,8 +38693,8 @@ def rebuild_prospect_table_cache(
                  is_vacant, is_llc_owner, priority_preset, priority_match,
                  added_at, reisift_updated_at, local_property_id, local_status_after, deep_dive_property_id, deep_dive_status,
                  mail_out, call_out, call_in, sms_out, sms_in, email_out, email_in, emails_opened, inbound_responses,
-                 rei_skipped, deep_skipped, no_good_numbers, property_lists, property_lists_json, source_last_synced_at, projection_updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 rei_skipped, deep_skipped, no_good_numbers, property_lists, property_lists_json, source_first_seen_at, source_last_synced_at, projection_updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(segment, property_uuid) DO UPDATE SET
                 status = excluded.status,
                 full_address = excluded.full_address,
@@ -38721,6 +38728,7 @@ def rebuild_prospect_table_cache(
                 no_good_numbers = excluded.no_good_numbers,
                 property_lists = excluded.property_lists,
                 property_lists_json = excluded.property_lists_json,
+                source_first_seen_at = excluded.source_first_seen_at,
                 source_last_synced_at = excluded.source_last_synced_at,
                 projection_updated_at = excluded.projection_updated_at
             """,
@@ -38759,6 +38767,7 @@ def rebuild_prospect_table_cache(
                 int(item.get("no_good_numbers") or 0),
                 property_lists,
                 json.dumps(list_names, ensure_ascii=True),
+                item.get("first_seen_at") or "",
                 item.get("last_synced_at") or "",
                 now_text,
             ),
@@ -39607,13 +39616,18 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
     segment = str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip() or REISIFT_NEW_RECORDS_SEGMENT
     clauses = ["c.segment = ?"]
     params = [segment]
+    date_sql = (
+        "COALESCE(NULLIF(c.source_first_seen_at, ''), NULLIF(c.source_last_synced_at, ''), NULLIF(c.added_at, ''))"
+        if segment == REISIFT_DEEP_PROSPECTING_SEGMENT
+        else "c.added_at"
+    )
     date_from = _parse_iso_date_only(filters.get("date_from") or "")
     date_to = _parse_iso_date_only(filters.get("date_to") or "")
     if date_from:
-        clauses.append("date(c.added_at) >= date(?)")
+        clauses.append(f"date({date_sql}) >= date(?)")
         params.append(date_from.isoformat())
     if date_to:
-        clauses.append("date(c.added_at) <= date(?)")
+        clauses.append(f"date({date_sql}) <= date(?)")
         params.append(date_to.isoformat())
     status_filter = normalize_whitespace(filters.get("status") or "")
     if status_filter:
@@ -39716,7 +39730,7 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
         SELECT c.*
         FROM prospect_table_cache c
         {where_sql}
-        ORDER BY COALESCE(NULLIF(c.added_at, ''), '0001-01-01 00:00:00') {order_dir}, c.property_uuid {order_dir}
+        ORDER BY COALESCE(NULLIF({date_sql}, ''), '0001-01-01 00:00:00') {order_dir}, c.property_uuid {order_dir}
     """
     page_params = list(params)
     if clean_limit > 0:
@@ -39725,6 +39739,10 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
     page_rows = [dict(row) for row in db.execute(page_sql, tuple(page_params)).fetchall()]
     for item in page_rows:
         item["lp_added_at"] = item.get("added_at") or ""
+        if segment == REISIFT_DEEP_PROSPECTING_SEGMENT:
+            item["display_added_at"] = item.get("source_first_seen_at") or item.get("source_last_synced_at") or item.get("added_at") or ""
+        else:
+            item["display_added_at"] = item.get("added_at") or ""
         item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")
         item["local_status_after"] = item.get("deep_dive_status") or item.get("local_status_after") or ""
         item["owner_names"] = dedupe_owner_names(item.get("owner_names") or "")
@@ -46682,6 +46700,7 @@ def new_records_page():
         refresh_cache_url="/api/new-records/refresh-cache",
         page_title="New Records (ReiSift)",
         segment_label="New Records",
+        date_column_label="Date Added",
         requires_phone_label="Yes",
         reisift_filter_summary=f"{len(REISIFT_NEW_RECORDS_LIST_IDS)} lists / {len(REISIFT_NEW_RECORDS_ZIP5)} zips",
         refresh_button_label="Refresh New Records",
@@ -46998,6 +47017,7 @@ def deep_prospecting_page():
         refresh_cache_url="/api/deep-prospecting/refresh-cache",
         page_title="Deep Prospecting (ReiSift)",
         segment_label="Deep Prospecting",
+        date_column_label="First Seen",
         requires_phone_label="No",
         reisift_filter_summary="Status: Deep Prospecting",
         refresh_button_label="Refresh Deep Prospecting",

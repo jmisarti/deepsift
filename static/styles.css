@@ -772,6 +772,38 @@ body {
     margin-left: 0.18rem;
 }
 
+.email-clicks-table {
+    font-size: 0.82rem;
+    table-layout: auto;
+}
+
+.email-clicks-table th,
+.email-clicks-table td {
+    padding: 0.42rem 0.5rem;
+    vertical-align: middle;
+}
+
+.email-clicks-count {
+    color: #9f1239;
+    font-size: 1rem;
+    font-weight: 800;
+    text-align: right;
+    white-space: nowrap;
+}
+
+.email-clicks-subline {
+    font-size: 0.72rem;
+    margin-top: 0.15rem;
+    max-width: 24rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.email-clicks-links {
+    white-space: nowrap;
+}
+
 .help-text {
     color: var(--muted);
     display: block;

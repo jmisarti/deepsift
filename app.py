@@ -46725,6 +46725,195 @@ def new_records_page():
     )
 
 
+def _email_clicks_date_bound(value, end_of_day=False):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = None
+    try:
+        parsed_date = datetime.strptime(text[:10], "%Y-%m-%d").date()
+        hour, minute, second, microsecond = (23, 59, 59, 999999) if end_of_day else (0, 0, 0, 0)
+        parsed = datetime(
+            parsed_date.year,
+            parsed_date.month,
+            parsed_date.day,
+            hour,
+            minute,
+            second,
+            microsecond,
+            tzinfo=EST_TZ,
+        )
+    except Exception:
+        dt = parse_flexible_datetime(text)
+        if dt:
+            parsed = dt.replace(tzinfo=timezone.utc)
+    if not parsed:
+        return ""
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_email_click_engagement_rows(db, filters=None):
+    filters = filters or {}
+    min_clicks = max(1, _safe_int(filters.get("min_clicks"), 2))
+    search = normalize_whitespace(filters.get("q") or "")
+    date_from = _email_clicks_date_bound(filters.get("date_from"), end_of_day=False)
+    date_to = _email_clicks_date_bound(filters.get("date_to"), end_of_day=True)
+    where = [
+        "(lower(COALESCE(e.event_action, '')) = 'clicked' OR lower(COALESCE(e.event_type, '')) LIKE '%click%')",
+        "COALESCE(e.property_id, 0) > 0",
+    ]
+    params = []
+    if date_from:
+        where.append("datetime(COALESCE(NULLIF(e.occurred_at, ''), e.received_at)) >= datetime(?)")
+        params.append(date_from)
+    if date_to:
+        where.append("datetime(COALESCE(NULLIF(e.occurred_at, ''), e.received_at)) <= datetime(?)")
+        params.append(date_to)
+    if search:
+        like = f"%{search.lower()}%"
+        where.append(
+            """
+            (
+                lower(COALESCE(e.contact_email, '')) LIKE ?
+             OR lower(COALESCE(pe.first_name, '') || ' ' || COALESCE(pe.last_name, '')) LIKE ?
+             OR lower(COALESCE(a.street, '') || ' ' || COALESCE(a.city, '') || ' ' || COALESCE(a.postal_code, '')) LIKE ?
+            )
+            """
+        )
+        params.extend([like, like, like])
+    query = f"""
+        SELECT
+            COALESCE(NULLIF(e.contact_id, ''), NULLIF(e.contact_email, ''), 'event:' || e.id) AS contact_key,
+            e.contact_email,
+            e.contact_id,
+            e.property_id,
+            e.person_id,
+            COALESCE(NULLIF(e.reisift_property_uuid, ''), NULLIF(p.reisift_property_uuid, '')) AS reisift_property_uuid,
+            pe.first_name,
+            pe.middle_name,
+            pe.last_name,
+            pe.primary_phone,
+            pe.primary_email,
+            a.street,
+            a.city,
+            a.state,
+            a.postal_code,
+            COUNT(*) AS click_count,
+            MIN(datetime(COALESCE(NULLIF(e.occurred_at, ''), e.received_at))) AS first_click_at,
+            MAX(datetime(COALESCE(NULLIF(e.occurred_at, ''), e.received_at))) AS last_click_at,
+            (
+                SELECT GROUP_CONCAT(value, ', ')
+                FROM (
+                    SELECT DISTINCT t.value
+                    FROM touchpoints t
+                    WHERE t.person_id = e.person_id
+                      AND lower(COALESCE(t.channel_type, '')) = 'phone'
+                      AND COALESCE(t.value, '') <> ''
+                    ORDER BY t.id DESC
+                    LIMIT 5
+                )
+            ) AS phones,
+            (
+                SELECT GROUP_CONCAT(value, ', ')
+                FROM (
+                    SELECT DISTINCT t.value
+                    FROM touchpoints t
+                    WHERE t.person_id = e.person_id
+                      AND lower(COALESCE(t.channel_type, '')) = 'email'
+                      AND COALESCE(t.value, '') <> ''
+                    ORDER BY t.id DESC
+                    LIMIT 5
+                )
+            ) AS emails
+        FROM emailoctopus_webhook_events e
+        LEFT JOIN people pe ON pe.id = e.person_id
+        LEFT JOIN properties p ON p.id = e.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE {" AND ".join(where)}
+        GROUP BY contact_key, e.contact_email, e.contact_id, e.property_id, e.person_id
+        HAVING COUNT(*) >= ?
+        ORDER BY click_count DESC, last_click_at DESC, e.property_id DESC
+    """
+    rows = db.execute(query, (*params, min_clicks)).fetchall()
+    output = []
+    for row in rows:
+        name = " ".join(
+            part
+            for part in [
+                str(row["first_name"] or "").strip(),
+                str(row["middle_name"] or "").strip(),
+                str(row["last_name"] or "").strip(),
+            ]
+            if part
+        ).strip()
+        address_tail = " ".join(part for part in [row["state"], row["postal_code"]] if part).strip()
+        full_address = ", ".join(part for part in [row["street"], row["city"], address_tail] if part).strip()
+        reisift_uuid = str(row["reisift_property_uuid"] or "").strip()
+        output.append(
+            {
+                "name": name or "ReiSIFT Owner",
+                "email": normalize_email_identity(row["contact_email"] or row["primary_email"] or ""),
+                "other_emails": row["emails"] or "",
+                "phones": row["phones"] or row["primary_phone"] or "",
+                "address": full_address,
+                "clicks": int(row["click_count"] or 0),
+                "first_click_at": row["first_click_at"] or "",
+                "last_click_at": row["last_click_at"] or "",
+                "property_id": int(row["property_id"] or 0),
+                "person_id": int(row["person_id"] or 0),
+                "reisift_property_uuid": reisift_uuid,
+                "sift_record_url": f"https://app.reisift.io/records/properties/{reisift_uuid}/details?page=1" if reisift_uuid else "",
+            }
+        )
+    return output
+
+
+@app.route("/email-clicks")
+def email_clicks_page():
+    ensure_db()
+    db = get_db()
+    filters = {
+        "q": (request.args.get("q") or "").strip(),
+        "date_from": (request.args.get("date_from") or "").strip(),
+        "date_to": (request.args.get("date_to") or "").strip(),
+        "min_clicks": (request.args.get("min_clicks") or "2").strip(),
+    }
+    rows = get_email_click_engagement_rows(db, filters=filters)
+    total_clicks = sum(int(row["clicks"] or 0) for row in rows)
+    if (request.args.get("format") or "").strip().lower() == "csv":
+        buffer = io.StringIO()
+        fieldnames = [
+            "name",
+            "email",
+            "other_emails",
+            "phones",
+            "address",
+            "clicks",
+            "first_click_at",
+            "last_click_at",
+            "property_id",
+            "person_id",
+            "reisift_property_uuid",
+            "sift_record_url",
+        ]
+        writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        response = app.response_class(buffer.getvalue(), mimetype="text/csv")
+        response.headers["Content-Disposition"] = "attachment; filename=emailoctopus-clicks.csv"
+        return response
+    return render_template(
+        "email_clicks.html",
+        rows=rows,
+        filters=filters,
+        summary={
+            "record_count": len(rows),
+            "total_clicks": total_clicks,
+            "top_clicks": rows[0]["clicks"] if rows else 0,
+        },
+    )
+
+
 @app.route("/deep-prospecting")
 def deep_prospecting_page():
     ensure_db()

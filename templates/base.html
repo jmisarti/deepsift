@@ -25,6 +25,7 @@
                     <a class="sidebar-link {% if request.path.startswith('/deep-prospecting') %}active{% endif %}" href="{{ url_for('deep_prospecting_page') }}">Deep Prospecting</a>
                     <a class="sidebar-link {% if request.path == '/sms-queue' %}active{% endif %}" href="{{ url_for('sms_queue_page') }}">SMS Queue</a>
                     <a class="sidebar-link {% if request.path.startswith('/sms-queue/schedule') %}active{% endif %}" href="{{ url_for('sms_queue_schedule_page') }}">SMS Schedule</a>
+                    <a class="sidebar-link {% if request.path.startswith('/email-clicks') %}active{% endif %}" href="{{ url_for('email_clicks_page') }}">Email Clicks</a>
                 </div>
 
                 <div class="sidebar-group">

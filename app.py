@@ -2602,6 +2602,34 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_property ON emailoctopus_webhook_events(property_id, event_action)")
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS emailoctopus_contact_tag_syncs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            queue_key TEXT NOT NULL UNIQUE,
+            event_db_id INTEGER,
+            event_key TEXT,
+            event_action TEXT NOT NULL,
+            list_id TEXT,
+            contact_id TEXT,
+            contact_email TEXT,
+            tag_name TEXT NOT NULL,
+            property_id INTEGER,
+            person_id INTEGER,
+            sync_status TEXT NOT NULL DEFAULT 'pending',
+            provider_response_json TEXT,
+            last_error TEXT,
+            synced_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(event_db_id) REFERENCES emailoctopus_webhook_events(id) ON DELETE SET NULL,
+            FOREIGN KEY(property_id) REFERENCES properties(id) ON DELETE SET NULL,
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_contact_tag_syncs_status ON emailoctopus_contact_tag_syncs(sync_status, updated_at DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_contact_tag_syncs_contact ON emailoctopus_contact_tag_syncs(list_id, contact_email, contact_id)")
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS reisift_webhook_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_key TEXT NOT NULL UNIQUE,
@@ -17774,6 +17802,53 @@ def emailoctopus_set_contact_status(api_key, list_id, email_address, status="UNS
     )
 
 
+def emailoctopus_update_contact_tags(api_key, list_id, email_address="", contact_id="", tags_add=None, tags_remove=None):
+    email_address = normalize_email_identity(email_address)
+    contact_id = str(contact_id or "").strip()
+    if not api_key or not list_id:
+        return {"ok": False, "skipped": "missing_config"}
+    if not email_address and not contact_id:
+        return {"ok": False, "skipped": "missing_contact"}
+    tag_updates = {}
+    for tag in tags_add or []:
+        clean = str(tag or "").strip()
+        if clean:
+            tag_updates[clean] = True
+    for tag in tags_remove or []:
+        clean = str(tag or "").strip()
+        if clean and clean not in tag_updates:
+            tag_updates[clean] = False
+    if not tag_updates:
+        return {"ok": True, "skipped": "no_tags"}
+    member_id = contact_id or _emailoctopus_member_id(email_address)
+    request_payload = {"api_key": api_key, "tags": tag_updates}
+    if email_address:
+        request_payload["email_address"] = email_address
+    response = requests.put(
+        f"{EMAILOCTOPUS_BASE_URL.rstrip('/')}/lists/{quote_plus(list_id)}/contacts/{quote_plus(member_id)}",
+        headers={"Content-Type": "application/json"},
+        json=request_payload,
+        timeout=20,
+    )
+    payload = _safe_response_payload(response)
+    if response.ok:
+        payload_dict = payload if isinstance(payload, dict) else {}
+        return {
+            "ok": True,
+            "action": "updated_tags",
+            "contact_id": str(payload_dict.get("id") or payload_dict.get("contact_id") or member_id),
+            "email": normalize_email_identity(payload_dict.get("email_address") or email_address),
+            "tags_added": [tag for tag, enabled in tag_updates.items() if enabled],
+            "tags_removed": [tag for tag, enabled in tag_updates.items() if not enabled],
+            "response": payload,
+        }
+    if _emailoctopus_error_code(payload) in {"MEMBER_NOT_FOUND", "CONTACT_NOT_FOUND"}:
+        return {"ok": False, "skipped": "contact_not_found", "contact_id": member_id, "response": payload}
+    raise ValueError(
+        f"EmailOctopus tag update failed ({response.status_code}): {json.dumps(payload) if isinstance(payload, dict) else payload}"
+    )
+
+
 def emailoctopus_update_contacts_bulk(api_key, list_id, contact_updates):
     if not api_key or not list_id:
         return {"ok": False, "skipped": "missing_config"}
@@ -19338,6 +19413,7 @@ EMAILOCTOPUS_REISIFT_EVENT_TAGS = {
     "clicked": "EmailOctopus:Clicked",
     "opened": "EmailOctopus:Opened",
 }
+EMAILOCTOPUS_CLICKED_CONTACT_TAG = "EmailClicked"
 
 
 def _emailoctopus_safe_header_map(req):
@@ -19680,6 +19756,128 @@ def _sync_emailoctopus_event_to_reisift(db, event_db_id, fields, resolution):
         raise
 
 
+def _emailoctopus_contact_tag_queue_key(list_id, contact_id, contact_email, tag_name):
+    contact_key = str(contact_id or "").strip() or normalize_email_identity(contact_email)
+    return ":".join([
+        "emailoctopus_contact_tag",
+        str(list_id or "").strip(),
+        contact_key,
+        str(tag_name or "").strip(),
+    ])
+
+
+def _sync_emailoctopus_click_tag_to_contact(db, event_db_id, fields, resolution=None, settings=None):
+    action = str(fields.get("event_action") or "").strip().lower()
+    if action != "clicked":
+        return {"ok": True, "skipped": "not_click_event"}
+    settings = settings or get_anonymous_email_marketing_settings(db)
+    api_key = (settings.get("emailoctopus_api_key") or "").strip()
+    configured_list_id = (settings.get("emailoctopus_list_id") or "").strip()
+    list_id = str(fields.get("list_id") or "").strip() or configured_list_id
+    contact_id = str(fields.get("contact_id") or "").strip()
+    contact_email = normalize_email_identity(fields.get("contact_email") or "")
+    if not api_key or not list_id:
+        return {"ok": False, "skipped": "awaiting_emailoctopus_config"}
+    if not contact_id and not contact_email:
+        return {"ok": False, "skipped": "missing_contact"}
+
+    tag_name = EMAILOCTOPUS_CLICKED_CONTACT_TAG
+    queue_key = _emailoctopus_contact_tag_queue_key(list_id, contact_id, contact_email, tag_name)
+    property_id = int((resolution or {}).get("property_id") or 0)
+    person_id = int((resolution or {}).get("person_id") or 0)
+    event_key = str(fields.get("event_key") or "").strip()
+    db.execute(
+        """
+        INSERT INTO emailoctopus_contact_tag_syncs (
+            queue_key, event_db_id, event_key, event_action, list_id, contact_id,
+            contact_email, tag_name, property_id, person_id, sync_status, last_error,
+            created_at, updated_at
+        )
+        VALUES (?, NULLIF(?, 0), ?, ?, ?, ?, ?, ?, NULLIF(?, 0), NULLIF(?, 0), 'pending', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(queue_key) DO UPDATE SET
+            event_db_id = COALESCE(excluded.event_db_id, emailoctopus_contact_tag_syncs.event_db_id),
+            event_key = COALESCE(NULLIF(excluded.event_key, ''), emailoctopus_contact_tag_syncs.event_key),
+            event_action = excluded.event_action,
+            contact_id = COALESCE(NULLIF(excluded.contact_id, ''), emailoctopus_contact_tag_syncs.contact_id),
+            contact_email = COALESCE(NULLIF(excluded.contact_email, ''), emailoctopus_contact_tag_syncs.contact_email),
+            property_id = COALESCE(excluded.property_id, emailoctopus_contact_tag_syncs.property_id),
+            person_id = COALESCE(excluded.person_id, emailoctopus_contact_tag_syncs.person_id),
+            sync_status = CASE
+                WHEN lower(COALESCE(emailoctopus_contact_tag_syncs.sync_status, '')) = 'synced' THEN emailoctopus_contact_tag_syncs.sync_status
+                ELSE 'pending'
+            END,
+            last_error = CASE
+                WHEN lower(COALESCE(emailoctopus_contact_tag_syncs.sync_status, '')) = 'synced' THEN emailoctopus_contact_tag_syncs.last_error
+                ELSE ''
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            queue_key,
+            int(event_db_id or 0),
+            event_key,
+            action,
+            list_id,
+            contact_id,
+            contact_email,
+            tag_name,
+            property_id,
+            person_id,
+        ),
+    )
+    row = db.execute(
+        "SELECT * FROM emailoctopus_contact_tag_syncs WHERE queue_key = ? LIMIT 1",
+        (queue_key,),
+    ).fetchone()
+    if row and str(row["sync_status"] or "").strip().lower() == "synced":
+        return {"ok": True, "skipped": "already_synced_contact_tag", "tag": tag_name, "email": contact_email}
+
+    sync_row_id = int(row["id"] or 0) if row else 0
+    try:
+        commit_with_retry(db)
+        result = emailoctopus_update_contact_tags(
+            api_key,
+            list_id,
+            email_address=contact_email,
+            contact_id=contact_id,
+            tags_add=[tag_name],
+        )
+        synced_at = format_db_time(datetime.utcnow())
+        status = "synced" if result.get("ok") else f"skipped_{result.get('skipped') or 'not_synced'}"
+        db.execute(
+            """
+            UPDATE emailoctopus_contact_tag_syncs
+            SET sync_status = ?,
+                provider_response_json = ?,
+                last_error = ?,
+                synced_at = CASE WHEN ? = 'synced' THEN ? ELSE synced_at END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                status,
+                json.dumps(result, ensure_ascii=True, sort_keys=True, default=str),
+                "" if result.get("ok") else str(result.get("skipped") or "EmailOctopus tag update did not complete"),
+                status,
+                synced_at,
+                sync_row_id,
+            ),
+        )
+        return {"ok": bool(result.get("ok")), "tag": tag_name, "email": contact_email, "result": result}
+    except Exception as exc:
+        db.execute(
+            """
+            UPDATE emailoctopus_contact_tag_syncs
+            SET sync_status = 'error',
+                last_error = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (str(exc)[:500], sync_row_id),
+        )
+        raise
+
+
 def process_emailoctopus_event(db, event, safe_headers=None):
     fields = _emailoctopus_event_fields(event)
     safe_payload = _redact_clever_log_value("root", event)
@@ -19778,13 +19976,15 @@ def process_emailoctopus_event(db, event, safe_headers=None):
         """,
         (property_id, person_id, property_uuid, event_db_id),
     )
+    sync_result = {"ok": True, "skipped": "not_attempted"}
+    click_tag_result = {"ok": True, "skipped": "not_click_event"}
+    sync_error = ""
+    click_tag_error = ""
     try:
         sync_result = _sync_emailoctopus_event_to_reisift(db, event_db_id, fields, resolution)
-        final_status = "processed" if sync_result.get("ok") else "processed_reisift_pending"
-        error_text = str(sync_result.get("skipped") or "")
     except Exception as exc:
-        final_status = "processed_reisift_error"
-        error_text = str(exc)[:500]
+        sync_result = {"ok": False, "error": str(exc)[:500]}
+        sync_error = str(exc)[:500]
         log_app_error(
             db,
             source="emailoctopus_webhook_reisift_sync",
@@ -19793,6 +19993,33 @@ def process_emailoctopus_event(db, event, safe_headers=None):
             route="/webhooks/emailoctopus/events",
             status_code=500,
         )
+    try:
+        click_tag_result = _sync_emailoctopus_click_tag_to_contact(db, event_db_id, fields, resolution)
+    except Exception as exc:
+        click_tag_result = {"ok": False, "error": str(exc)[:500]}
+        click_tag_error = str(exc)[:500]
+        log_app_error(
+            db,
+            source="emailoctopus_webhook_contact_tag_sync",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="/webhooks/emailoctopus/events",
+            status_code=500,
+        )
+    if sync_result.get("ok") and click_tag_result.get("ok"):
+        final_status = "processed"
+    elif not click_tag_result.get("ok"):
+        final_status = "processed_emailoctopus_tag_error"
+    else:
+        final_status = "processed_reisift_error"
+    error_text = "; ".join(
+        part
+        for part in (
+            str(sync_result.get("skipped") or sync_error or ""),
+            str(click_tag_result.get("skipped") or click_tag_error or ""),
+        )
+        if part and part not in {"not_attempted", "not_click_event"}
+    )
     db.execute(
         """
         UPDATE emailoctopus_webhook_events
@@ -19817,6 +20044,78 @@ def process_emailoctopus_event(db, event, safe_headers=None):
         "processing_status": final_status,
         "match_source": resolution.get("match_source"),
     }
+
+
+def backfill_emailoctopus_clicked_contact_tags(db, limit=1000):
+    settings = get_anonymous_email_marketing_settings(db)
+    if not settings.get("emailoctopus_api_key") or not (settings.get("emailoctopus_list_id") or "").strip():
+        return {"ok": False, "skipped": "awaiting_emailoctopus_config", "attempted": 0, "synced": 0, "errors": 0}
+    try:
+        limit = max(1, min(5000, int(limit or 1000)))
+    except Exception:
+        limit = 1000
+    rows = db.execute(
+        """
+        SELECT e.*
+        FROM emailoctopus_webhook_events e
+        LEFT JOIN emailoctopus_contact_tag_syncs s
+          ON s.queue_key = (
+            'emailoctopus_contact_tag:' ||
+            COALESCE(NULLIF(e.list_id, ''), ?) || ':' ||
+            COALESCE(NULLIF(e.contact_id, ''), e.contact_email, '') || ':' ||
+            ?
+          )
+        WHERE lower(COALESCE(e.event_action, '')) = 'clicked'
+          AND COALESCE(NULLIF(e.contact_id, ''), NULLIF(e.contact_email, '')) IS NOT NULL
+          AND lower(COALESCE(s.sync_status, '')) <> 'synced'
+        ORDER BY COALESCE(e.occurred_at, e.received_at) ASC, e.id ASC
+        LIMIT ?
+        """,
+        ((settings.get("emailoctopus_list_id") or "").strip(), EMAILOCTOPUS_CLICKED_CONTACT_TAG, limit),
+    ).fetchall()
+    attempted = 0
+    synced = 0
+    errors = 0
+    skipped = 0
+    details = []
+    for row in rows:
+        attempted += 1
+        fields = {
+            "event_key": str(row["event_key"] or "").strip(),
+            "event_type": str(row["event_type"] or "").strip(),
+            "event_action": "clicked",
+            "list_id": str(row["list_id"] or "").strip(),
+            "contact_id": str(row["contact_id"] or "").strip(),
+            "contact_email": normalize_email_identity(row["contact_email"] or ""),
+            "campaign_id": str(row["campaign_id"] or "").strip(),
+            "occurred_at": str(row["occurred_at"] or "").strip(),
+        }
+        resolution = {
+            "person_id": int(row["person_id"] or 0),
+            "property_id": int(row["property_id"] or 0),
+            "reisift_property_uuid": str(row["reisift_property_uuid"] or "").strip(),
+        }
+        if resolution["property_id"] <= 0:
+            resolution = _resolve_emailoctopus_event_record(db, fields)
+        try:
+            result = _sync_emailoctopus_click_tag_to_contact(db, int(row["id"] or 0), fields, resolution, settings=settings)
+            if result.get("ok") and not result.get("skipped"):
+                synced += 1
+            elif result.get("ok"):
+                skipped += 1
+            else:
+                errors += 1
+            details.append({
+                "event_id": int(row["id"] or 0),
+                "email": fields["contact_email"],
+                "contact_id": fields["contact_id"],
+                "result": result.get("skipped") or result.get("result", {}).get("action") or result.get("tag") or "ok",
+            })
+        except Exception as exc:
+            errors += 1
+            details.append({"event_id": int(row["id"] or 0), "email": fields["contact_email"], "error": str(exc)[:240]})
+        commit_with_retry(db)
+    return {"ok": errors == 0, "attempted": attempted, "synced": synced, "skipped": skipped, "errors": errors, "details": details[:25]}
 
 
 def _import_emailoctopus_export_reader(db, reader, source="emailoctopus_export", source_label=""):

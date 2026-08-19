@@ -38268,6 +38268,13 @@ def _new_record_yes_no_filter_value(value):
     return None
 
 
+def _clean_optional_db_text(value):
+    text = str(value or "").strip()
+    if text.lower() in {"none", "null", "nan"}:
+        return ""
+    return text
+
+
 def _new_record_has_reisift_skiptrace(payload, fallback_payload=None):
     payloads = [p for p in [payload, fallback_payload] if isinstance(p, dict)]
     skip_texts = []
@@ -38767,8 +38774,8 @@ def rebuild_prospect_table_cache(
                 int(item.get("no_good_numbers") or 0),
                 property_lists,
                 json.dumps(list_names, ensure_ascii=True),
-                item.get("first_seen_at") or "",
-                item.get("last_synced_at") or "",
+                _clean_optional_db_text(item.get("first_seen_at")),
+                _clean_optional_db_text(item.get("last_synced_at")),
                 now_text,
             ),
         )
@@ -39617,7 +39624,19 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
     clauses = ["c.segment = ?"]
     params = [segment]
     date_sql = (
-        "COALESCE(NULLIF(c.source_first_seen_at, ''), NULLIF(c.source_last_synced_at, ''), NULLIF(c.added_at, ''))"
+        """
+        COALESCE(
+            CASE
+                WHEN lower(trim(COALESCE(c.source_first_seen_at, ''))) IN ('', 'none', 'null', 'nan') THEN NULL
+                ELSE c.source_first_seen_at
+            END,
+            CASE
+                WHEN lower(trim(COALESCE(c.source_last_synced_at, ''))) IN ('', 'none', 'null', 'nan') THEN NULL
+                ELSE c.source_last_synced_at
+            END,
+            NULLIF(c.added_at, '')
+        )
+        """
         if segment == REISIFT_DEEP_PROSPECTING_SEGMENT
         else "c.added_at"
     )
@@ -39740,7 +39759,11 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
     for item in page_rows:
         item["lp_added_at"] = item.get("added_at") or ""
         if segment == REISIFT_DEEP_PROSPECTING_SEGMENT:
-            item["display_added_at"] = item.get("source_first_seen_at") or item.get("source_last_synced_at") or item.get("added_at") or ""
+            item["display_added_at"] = (
+                _clean_optional_db_text(item.get("source_first_seen_at"))
+                or _clean_optional_db_text(item.get("source_last_synced_at"))
+                or _clean_optional_db_text(item.get("added_at"))
+            )
         else:
             item["display_added_at"] = item.get("added_at") or ""
         item["sift_record_url"] = _sift_record_url(item.get("property_uuid") or "")

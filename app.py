@@ -48190,6 +48190,26 @@ def get_sms_automation_schedule_rows(db):
     return out
 
 
+def sms_automation_schedule_date_summary(rows, max_days=7):
+    counts = {}
+    for row in rows or []:
+        projected_dt = parse_db_time((row or {}).get("projected_send_at") or "")
+        if not projected_dt:
+            continue
+        projected_date = projected_dt.replace(tzinfo=timezone.utc).astimezone(EST_TZ).date()
+        counts[projected_date] = counts.get(projected_date, 0) + 1
+    out = []
+    for projected_date in sorted(counts)[: max(1, int(max_days or 7))]:
+        out.append(
+            {
+                "date": projected_date.isoformat(),
+                "date_label": f"{projected_date.month}/{projected_date.day}",
+                "count": counts[projected_date],
+            }
+        )
+    return out
+
+
 def _sms_queue_wants_json():
     return (
         request.headers.get("X-Requested-With") == "XMLHttpRequest"
@@ -48222,11 +48242,13 @@ def sms_queue_schedule_page():
         GROUP BY status
         """
     ).fetchall()
+    schedule_rows = get_sms_automation_schedule_rows(db)
     return render_template(
         "sms_schedule.html",
-        rows=get_sms_automation_schedule_rows(db),
+        rows=schedule_rows,
         summary={r["status"]: int(r["c"] or 0) for r in summary_rows},
         settings=sms_settings,
+        schedule_date_summary=sms_automation_schedule_date_summary(schedule_rows),
         sender_health=get_sms_sender_health_rows(db, days=sms_health_days, delivery_breakdown=delivery_breakdown),
         sms_delivery_summary=delivery_breakdown.get("summary") or {},
     )

@@ -25,12 +25,17 @@
         AutoSend mode is active. Approved rows send automatically during
         <strong>Monday-Friday {{ settings.send_window_start }}-{{ settings.send_window_end }} ET</strong>.
         The worker respects sender rotation, the per-number daily cap, and the minimum gap between sends.
+        {% if schedule_date_summary %}
+        Scheduled forecast:
+        {% for item in schedule_date_summary %}
+        <strong>{{ item.count }}</strong> record{% if item.count != 1 %}s{% endif %} on <strong>{{ item.date_label }}</strong>{% if not loop.last %}, {% else %}.{% endif %}
+        {% endfor %}
+        {% else %}
+        No approved/scheduled sends are currently projected.
+        {% endif %}
     </p>
     <div class="panel-actions">
         <a class="button-link secondary" href="{{ url_for('sms_queue_page') }}">Back to SMS Queue</a>
-        <form method="post" action="{{ url_for('sms_queue_revalidate') }}">
-            <button type="submit">Revalidate + Find New Numbers</button>
-        </form>
     </div>
 
     <h3>Sender Health</h3>

@@ -47703,6 +47703,22 @@ def get_sms_automation_queue_rows(db, filters=None):
             continue
         clauses.append(f"COALESCE(n.{column}, 0) = ?")
         params.append(1 if expected else 0)
+    email_clicked_filter = (filters.get("email_clicked") or "").strip().lower()
+    email_click_count_sql = """
+        SELECT COUNT(*)
+        FROM emailoctopus_webhook_events e
+        WHERE e.property_id = q.property_id
+          AND (
+              lower(COALESCE(e.event_action, '')) = 'clicked'
+              OR lower(COALESCE(e.event_type, '')) LIKE '%click%'
+          )
+    """
+    if email_clicked_filter == "yes":
+        clauses.append(f"({email_click_count_sql}) > 0")
+    elif email_clicked_filter == "repeat":
+        clauses.append(f"({email_click_count_sql}) >= 2")
+    elif email_clicked_filter == "no":
+        clauses.append(f"({email_click_count_sql}) = 0")
     where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
     from_sql = """
         FROM sms_automation_queue q
@@ -48229,6 +48245,7 @@ def sms_queue_page():
         "bucket": (request.args.get("bucket") or "").strip(),
         "contact_role": (request.args.get("contact_role") or "").strip(),
         "prospect_segment": (request.args.get("prospect_segment") or "").strip(),
+        "email_clicked": (request.args.get("email_clicked") or "").strip(),
     }
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()

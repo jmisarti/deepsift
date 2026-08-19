@@ -38,7 +38,7 @@
 
     <div class="panel-actions">
         <form method="get" action="{{ url_for('sms_queue_page') }}" class="inline-form">
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.county or filters.city or filters.prospect_segment or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.is_vacant or filters.priority_preset or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers or filters.status or filters.bucket or filters.contact_role %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.county or filters.city or filters.prospect_segment or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.is_vacant or filters.priority_preset or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers or filters.email_clicked or filters.status or filters.bucket or filters.contact_role %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>Numbers From
@@ -137,6 +137,14 @@
                             <option value="">All</option>
                             <option value="yes" {% if filters.no_good_numbers == 'yes' %}selected{% endif %}>Yes</option>
                             <option value="no" {% if filters.no_good_numbers == 'no' %}selected{% endif %}>No</option>
+                        </select>
+                    </label>
+                    <label>Email Clicked?
+                        <select name="email_clicked">
+                            <option value="">All</option>
+                            <option value="repeat" {% if filters.email_clicked == 'repeat' %}selected{% endif %}>2+ Clicks</option>
+                            <option value="yes" {% if filters.email_clicked == 'yes' %}selected{% endif %}>Any Click</option>
+                            <option value="no" {% if filters.email_clicked == 'no' %}selected{% endif %}>No Clicks</option>
                         </select>
                     </label>
                     <label>Status

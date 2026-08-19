@@ -21425,6 +21425,15 @@ def reisift_sync_property_tags(token, property_uuid, tags_to_add=None, tags_to_r
 
     raw_current = current_payload.get("tags")
     request_bodies = []
+    if not tags_to_remove and not remove_prefixes:
+        existing_tag_keys = {str(existing or "").strip().lower() for existing in existing_tags}
+        missing_desired_tags = [
+            tag
+            for tag in desired_tags
+            if tag.strip().lower() not in existing_tag_keys
+        ]
+        if missing_desired_tags:
+            request_bodies.append({"tags": {tag: True for tag in missing_desired_tags}})
     if isinstance(raw_current, dict):
         request_bodies.append({"tags": {tag: True for tag in merged_tags}})
         request_bodies.append({"tags": merged_tags})

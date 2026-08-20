@@ -21323,6 +21323,20 @@ def _extract_reisift_property_tags(property_payload, preserve_existing_text=Fals
     return tags
 
 
+def _is_reisift_boolean_payload_tag_for(value, desired_tags):
+    text = normalize_whitespace(value)
+    if not text.startswith("{") or not text.endswith("}"):
+        return False
+    for desired_tag in desired_tags or []:
+        tag = str(desired_tag or "").strip()
+        if not tag:
+            continue
+        pattern = r"^\{\s*['\"]?" + re.escape(tag) + r"['\"]?\s*:\s*(true|1)\s*\}$"
+        if re.match(pattern, text, flags=re.IGNORECASE):
+            return True
+    return False
+
+
 def _extract_reisift_property_list_names(property_payload):
     payload = property_payload if isinstance(property_payload, dict) else {}
     raw = payload.get("lists")
@@ -21408,6 +21422,8 @@ def reisift_sync_property_tags(token, property_uuid, tags_to_add=None, tags_to_r
             continue
         if any(clean_lower.startswith(prefix) for prefix in remove_prefixes):
             continue
+        if _is_reisift_boolean_payload_tag_for(existing_value, desired_tags):
+            continue
         # Preserve ReiSIFT's exact existing tag text. Normalizing old tags while
         # appending a new tag can make ReiSIFT log old tags as newly added.
         filtered_existing.append(existing_value)
@@ -21423,23 +21439,7 @@ def reisift_sync_property_tags(token, property_uuid, tags_to_add=None, tags_to_r
     if [tag.lower() for tag in merged_tags] == [tag.lower() for tag in existing_tags]:
         return {"ok": True, "skipped": True, "reason": "tags_already_present", "tags": existing_tags}
 
-    raw_current = current_payload.get("tags")
-    request_bodies = []
-    if not tags_to_remove and not remove_prefixes:
-        existing_tag_keys = {str(existing or "").strip().lower() for existing in existing_tags}
-        missing_desired_tags = [
-            tag
-            for tag in desired_tags
-            if tag.strip().lower() not in existing_tag_keys
-        ]
-        if missing_desired_tags:
-            request_bodies.append({"tags": {tag: True for tag in missing_desired_tags}})
-    if isinstance(raw_current, dict):
-        request_bodies.append({"tags": {tag: True for tag in merged_tags}})
-        request_bodies.append({"tags": merged_tags})
-    else:
-        request_bodies.append({"tags": merged_tags})
-        request_bodies.append({"tags": {tag: True for tag in merged_tags}})
+    request_bodies = [{"tags": merged_tags}]
 
     errors = []
     attempted = []

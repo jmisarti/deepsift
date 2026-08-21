@@ -1,18 +1,26 @@
 {% extends "base.html" %}
 {% block content %}
+{% set is_email = result and result.kind == 'email' %}
 <section class="panel">
-    <h2>Phone Search</h2>
-    <p class="muted-text">Search any phone number to find matching people, related properties, SMS queue status, and recent communications.</p>
+    <h2>Customer Lookup</h2>
+    <p class="muted-text">Search a phone number or email address to find matching people, properties, queues, submitted leads, EmailOctopus activity, and recent communications.</p>
     <form method="get" action="{{ url_for('phone_search_page') }}" class="inline-form">
-        <input type="text" name="q" value="{{ q }}" placeholder="973-555-1212" autofocus>
+        <input type="text" name="q" value="{{ q }}" placeholder="973-555-1212 or seller@example.com" autofocus>
         <button type="submit">Search</button>
         {% if q %}<a href="{{ url_for('phone_search_page') }}">Clear</a>{% endif %}
     </form>
     {% if result and not result.normalized %}
-    <p class="warn-line">Enter a valid phone number.</p>
+    <p class="warn-line">Enter a valid phone number or email address.</p>
     {% endif %}
     {% if result and result.normalized %}
-    <p class="muted-text">Normalized search: <strong>{{ result.normalized|fmt_phone }}</strong></p>
+    <p class="muted-text">
+        Search type: <strong>{{ 'Email' if is_email else 'Phone' }}</strong>.
+        Normalized search:
+        <strong>{% if is_email %}{{ result.normalized }}{% else %}{{ result.normalized|fmt_phone }}{% endif %}</strong>
+        {% if is_email and result.identity and result.identity != result.normalized %}
+        <span class="muted-text">Identity match: {{ result.identity }}</span>
+        {% endif %}
+    </p>
     {% endif %}
 </section>
 
@@ -22,6 +30,20 @@
         <h3>People</h3>
         <p>{{ result.matches|length }}</p>
     </article>
+    {% if is_email %}
+    <article>
+        <h3>EmailOctopus</h3>
+        <p>{{ result.emailoctopus_events|length }}</p>
+    </article>
+    <article>
+        <h3>Submitted Leads</h3>
+        <p>{{ result.lead_rows|length }}</p>
+    </article>
+    <article>
+        <h3>Email</h3>
+        <p class="small-text">{{ result.normalized }}</p>
+    </article>
+    {% else %}
     <article>
         <h3>SMS Queue</h3>
         <p>{{ result.queue_rows|length }}</p>
@@ -34,17 +56,18 @@
         <h3>Number</h3>
         <p>{{ result.normalized|fmt_phone }}</p>
     </article>
+    {% endif %}
 </section>
 
 <section class="panel">
-    <h3>Local Phone Matches</h3>
+    <h3>{{ 'Local Email Matches' if is_email else 'Local Phone Matches' }}</h3>
     {% if result.matches %}
     <div class="table-wrap">
         <table class="crm-table">
             <thead>
                 <tr>
                     <th>Person</th>
-                    <th>Phone</th>
+                    <th>{{ 'Email' if is_email else 'Phone' }}</th>
                     <th>Status</th>
                     <th>Related Properties</th>
                 </tr>
@@ -58,10 +81,15 @@
                         {% if row.deceased %}<div class="warn-line">Deceased</div>{% endif %}
                     </td>
                     <td>
-                        {{ row.phone_value|fmt_phone }}
-                        <div class="muted-text">{{ row.phone_label or 'Unknown' }}</div>
+                        {% if is_email %}
+                            {{ row.email_value }}
+                            {% if row.email_label %}<div class="muted-text">{{ row.email_label }}</div>{% endif %}
+                        {% else %}
+                            {{ row.phone_value|fmt_phone }}
+                            <div class="muted-text">{{ row.phone_label or 'Unknown' }}</div>
+                        {% endif %}
                     </td>
-                    <td><span class="pill">{{ row.phone_status or '-' }}</span></td>
+                    <td><span class="pill">{{ (row.email_status if is_email else row.phone_status) or '-' }}</span></td>
                     <td>
                         {% if row.properties %}
                             {% for prop in row.properties %}
@@ -80,10 +108,191 @@
         </table>
     </div>
     {% else %}
-    <p class="muted-text">No local touchpoints matched this phone number.</p>
+    <p class="muted-text">No local {{ 'email' if is_email else 'phone' }} touchpoints matched this search.</p>
     {% endif %}
 </section>
 
+{% if is_email %}
+<section class="panel">
+    <h3>EmailOctopus Activity</h3>
+    {% if result.emailoctopus_events %}
+    <div class="table-wrap">
+        <table class="crm-table">
+            <thead>
+                <tr>
+                    <th>When</th>
+                    <th>Action</th>
+                    <th>Person / Property</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in result.emailoctopus_events %}
+                <tr>
+                    <td>
+                        {{ (row.occurred_at or row.received_at)|fmt_est_datetime }}
+                        {% if row.received_at and row.received_at != row.occurred_at %}<div class="muted-text">Received: {{ row.received_at|fmt_est_datetime }}</div>{% endif %}
+                    </td>
+                    <td>
+                        {{ row.event_type or '-' }}
+                        {% if row.event_action %}<div class="muted-text">{{ row.event_action }}</div>{% endif %}
+                        {% if row.campaign_id %}<div class="muted-text">Campaign: {{ row.campaign_id }}</div>{% endif %}
+                    </td>
+                    <td>
+                        {% if row.person_id %}
+                            {% if row.property_id %}
+                            <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">{{ row.person_name or ('Person #' ~ row.person_id) }}</a>
+                            {% else %}
+                            <a href="{{ url_for('person_detail', person_id=row.person_id) }}">{{ row.person_name or ('Person #' ~ row.person_id) }}</a>
+                            {% endif %}
+                        {% else %}
+                        <span class="muted-text">No person</span>
+                        {% endif %}
+                        {% if row.property_id %}
+                        <div><a href="{{ url_for('property_detail', property_id=row.property_id) }}">{{ row.property_address or ('Property #' ~ row.property_id) }}</a></div>
+                        {% elif row.reisift_property_uuid %}
+                        <div class="muted-text">ReiSIFT: {{ row.reisift_property_uuid }}</div>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <span class="pill">{{ row.processing_status or '-' }}</span>
+                        {% if row.error_text %}<div class="warn-line">{{ row.error_text }}</div>{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="muted-text">No EmailOctopus webhook events matched this email.</p>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <h3>Submitted / Web Leads</h3>
+    {% if result.lead_rows %}
+    <div class="table-wrap">
+        <table class="crm-table">
+            <thead>
+                <tr>
+                    <th>When</th>
+                    <th>Source</th>
+                    <th>Lead Detail</th>
+                    <th>Linked Property</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in result.lead_rows %}
+                <tr>
+                    <td>
+                        {{ row.last_received_at|fmt_est_datetime if row.last_received_at else '-' }}
+                        {% if row.processed_at %}<div class="muted-text">Processed: {{ row.processed_at|fmt_est_datetime }}</div>{% endif %}
+                    </td>
+                    <td>
+                        {{ row.source }}
+                        {% if row.latest_stage %}<div class="muted-text">Stage {{ row.latest_stage }}</div>{% endif %}
+                    </td>
+                    <td>
+                        <strong>{{ row.latest_email }}</strong>
+                        {% if row.latest_name %}<div>{{ row.latest_name }}</div>{% endif %}
+                        {% if row.latest_phone %}<div class="muted-text">{{ row.latest_phone|fmt_phone }}</div>{% endif %}
+                        {% if row.source_url %}<div class="muted-text">{{ row.source_url }}</div>{% endif %}
+                    </td>
+                    <td>
+                        {% if row.local_property_id %}
+                        <a href="{{ url_for('property_detail', property_id=row.local_property_id) }}">{{ row.property_address or ('Property #' ~ row.local_property_id) }}</a>
+                        {% elif row.reisift_property_uuid %}
+                        <span class="muted-text">ReiSIFT: {{ row.reisift_property_uuid }}</span>
+                        {% else %}
+                        <span class="muted-text">-</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <span class="pill">{{ row.status or '-' }}</span>
+                        {% if row.reisift_status %}<div class="muted-text">{{ row.reisift_status }}</div>{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="muted-text">No submitted lead records matched this email.</p>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <h3>Email Campaign / Validation</h3>
+    {% if result.campaign_syncs or result.validation_rows %}
+    {% if result.campaign_syncs %}
+    <h4>EmailOctopus Sync</h4>
+    <div class="table-wrap">
+        <table class="crm-table">
+            <thead>
+                <tr><th>Email</th><th>Person / Property</th><th>Sync</th><th>Updated</th></tr>
+            </thead>
+            <tbody>
+                {% for row in result.campaign_syncs %}
+                <tr>
+                    <td>{{ row.normalized_email }}</td>
+                    <td>
+                        {% if row.person_id %}
+                            {% if row.property_id %}
+                            <a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">{{ row.person_name or ('Person #' ~ row.person_id) }}</a>
+                            {% else %}
+                            <a href="{{ url_for('person_detail', person_id=row.person_id) }}">{{ row.person_name or ('Person #' ~ row.person_id) }}</a>
+                            {% endif %}
+                        {% else %}
+                        <span class="muted-text">No person</span>
+                        {% endif %}
+                        {% if row.property_id %}<div><a href="{{ url_for('property_detail', property_id=row.property_id) }}">{{ row.property_address or ('Property #' ~ row.property_id) }}</a></div>{% endif %}
+                    </td>
+                    <td>
+                        <span class="pill">{{ row.sync_status or '-' }}</span>
+                        <div class="muted-text">{{ row.provider or '-' }}{% if row.validation_status %} / {{ row.validation_status }}{% endif %}</div>
+                        {% if row.last_error %}<div class="warn-line">{{ row.last_error }}</div>{% endif %}
+                    </td>
+                    <td>{{ row.updated_at|fmt_est_datetime if row.updated_at else '-' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+    {% if result.validation_rows %}
+    <h4>EmailListVerify</h4>
+    <div class="table-wrap">
+        <table class="crm-table">
+            <thead>
+                <tr><th>Source</th><th>Email</th><th>Status</th><th>Timing</th></tr>
+            </thead>
+            <tbody>
+                {% for row in result.validation_rows %}
+                <tr>
+                    <td>{{ row.source }}</td>
+                    <td>{{ row.email_value }}</td>
+                    <td>
+                        <span class="pill">{{ row.queue_status or '-' }}</span>
+                        {% if row.validation_status %}<div class="muted-text">{{ row.validation_status }}</div>{% endif %}
+                        {% if row.provider_status %}<div class="muted-text">{{ row.provider_status }}</div>{% endif %}
+                    </td>
+                    <td>
+                        {% if row.processed_at %}<div>Processed: {{ row.processed_at|fmt_est_datetime }}</div>{% endif %}
+                        {% if row.run_after %}<div class="muted-text">Run after: {{ row.run_after|fmt_est_datetime }}</div>{% endif %}
+                        {% if row.updated_at %}<div class="muted-text">Updated: {{ row.updated_at|fmt_est_datetime }}</div>{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+    {% else %}
+    <p class="muted-text">No EmailOctopus sync or EmailListVerify records matched this email.</p>
+    {% endif %}
+</section>
+{% else %}
 <section class="panel">
     <h3>SMS Queue</h3>
     {% if result.queue_rows %}
@@ -139,6 +348,7 @@
     <p class="muted-text">No SMS queue rows matched this number.</p>
     {% endif %}
 </section>
+{% endif %}
 
 <section class="panel">
     <h3>Recent Communications</h3>
@@ -150,7 +360,7 @@
                     <th>When</th>
                     <th>Type</th>
                     <th>Person / Property</th>
-                    <th>Numbers</th>
+                    <th>{{ 'Addresses' if is_email else 'Numbers' }}</th>
                     <th>Body</th>
                 </tr>
             </thead>
@@ -174,8 +384,13 @@
                         {% endif %}
                     </td>
                     <td>
+                        {% if is_email %}
+                        <div>From: {{ row.from_number or '-' }}</div>
+                        <div>To: {{ row.to_number or '-' }}</div>
+                        {% else %}
                         <div>From: {{ row.from_number|fmt_phone if row.from_number else '-' }}</div>
                         <div>To: {{ row.to_number|fmt_phone if row.to_number else '-' }}</div>
+                        {% endif %}
                     </td>
                     <td>{{ row.body or '-' }}</td>
                 </tr>
@@ -184,7 +399,7 @@
         </table>
     </div>
     {% else %}
-    <p class="muted-text">No recent communications matched this number.</p>
+    <p class="muted-text">No recent communications matched this {{ 'email' if is_email else 'number' }}.</p>
     {% endif %}
 </section>
 {% endif %}

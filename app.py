@@ -9149,10 +9149,15 @@ def search_phone_number_context(db, phone_raw):
     target = normalize_phone(phone_raw)
     result = {
         "query": phone_raw or "",
+        "kind": "phone",
         "normalized": target,
         "matches": [],
         "queue_rows": [],
         "communications": [],
+        "emailoctopus_events": [],
+        "lead_rows": [],
+        "campaign_syncs": [],
+        "validation_rows": [],
     }
     if not target:
         return result
@@ -9268,6 +9273,317 @@ def search_phone_number_context(db, phone_raw):
         )
 
     return result
+
+
+def _email_search_targets(email_raw):
+    normalized = normalize_email(email_raw)
+    if not normalized:
+        return []
+    identity = normalize_email_identity(normalized)
+    targets = []
+    for value in (normalized, identity):
+        if value and value not in targets:
+            targets.append(value)
+    return targets
+
+
+def _email_search_match(value, targets):
+    if not value or not targets:
+        return False
+    normalized = normalize_email(value)
+    identity = normalize_email_identity(value)
+    return normalized in targets or identity in targets
+
+
+def _decode_lead_source_url(payload_json):
+    if not payload_json:
+        return ""
+    try:
+        payload = json.loads(payload_json)
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return (
+        payload.get("source_url")
+        or payload.get("url")
+        or payload.get("landing_page")
+        or payload.get("page_url")
+        or ""
+    )
+
+
+def _search_customer_lead_rows_by_email(db, targets):
+    if not targets:
+        return []
+    placeholders = ",".join("?" for _ in targets)
+    lead_specs = [
+        ("Website", "website_lead_submissions"),
+        ("Clever", "clever_lead_submissions"),
+        ("Property Leads", "propertyleads_lead_submissions"),
+        ("Manual", "manual_lead_submissions"),
+    ]
+    out = []
+    for source_label, table_name in lead_specs:
+        try:
+            rows = db.execute(
+                f"""
+                SELECT l.id, l.lead_key, l.reisift_property_uuid, l.reisift_owner_uuid,
+                       l.latest_address, l.latest_phone, l.latest_email, l.latest_name,
+                       l.latest_stage, l.status, l.reisift_status, l.local_property_id,
+                       l.first_received_at, l.last_received_at, l.processed_at, l.latest_payload_json,
+                       a.street, a.city, a.state, a.postal_code
+                FROM {table_name} l
+                LEFT JOIN properties p ON p.id = l.local_property_id
+                LEFT JOIN addresses a ON a.id = p.property_address_id
+                WHERE lower(COALESCE(l.latest_email, '')) IN ({placeholders})
+                ORDER BY COALESCE(l.last_received_at, l.first_received_at) DESC, l.id DESC
+                LIMIT 25
+                """,
+                tuple(targets),
+            ).fetchall()
+        except Exception:
+            continue
+        for row in rows:
+            out.append(
+                {
+                    "source": source_label,
+                    "id": row["id"],
+                    "lead_key": row["lead_key"] or "",
+                    "reisift_property_uuid": row["reisift_property_uuid"] or "",
+                    "reisift_owner_uuid": row["reisift_owner_uuid"] or "",
+                    "latest_address": row["latest_address"] or "",
+                    "latest_phone": row["latest_phone"] or "",
+                    "latest_email": row["latest_email"] or "",
+                    "latest_name": row["latest_name"] or "",
+                    "latest_stage": row["latest_stage"] or "",
+                    "status": row["status"] or "",
+                    "reisift_status": row["reisift_status"] or "",
+                    "local_property_id": row["local_property_id"] or 0,
+                    "first_received_at": row["first_received_at"] or "",
+                    "last_received_at": row["last_received_at"] or "",
+                    "processed_at": row["processed_at"] or "",
+                    "source_url": _decode_lead_source_url(row["latest_payload_json"] or ""),
+                    "property_address": format_property_address_line(row["street"], row["city"], row["state"], row["postal_code"]),
+                }
+            )
+    out.sort(key=lambda item: item.get("last_received_at") or item.get("first_received_at") or "", reverse=True)
+    return out[:50]
+
+
+def search_email_context(db, email_raw):
+    targets = _email_search_targets(email_raw)
+    normalized = targets[0] if targets else ""
+    result = {
+        "query": email_raw or "",
+        "kind": "email",
+        "normalized": normalized,
+        "identity": targets[-1] if targets else "",
+        "matches": [],
+        "queue_rows": [],
+        "communications": [],
+        "emailoctopus_events": [],
+        "lead_rows": [],
+        "campaign_syncs": [],
+        "validation_rows": [],
+    }
+    if not normalized:
+        return result
+
+    placeholders = ",".join("?" for _ in targets)
+    touchpoint_rows = db.execute(
+        f"""
+        SELECT t.id AS touchpoint_id, t.person_id, t.value, t.channel_label, t.status AS email_status,
+               t.note, t.created_at AS touchpoint_created_at,
+               p.first_name, p.middle_name, p.last_name, p.outreach_status, p.deceased
+        FROM touchpoints t
+        JOIN people p ON p.id = t.person_id
+        WHERE lower(t.channel_type) = 'email'
+          AND lower(COALESCE(t.value, '')) IN ({placeholders})
+        ORDER BY t.id DESC
+        """,
+        tuple(targets),
+    ).fetchall()
+    for row in touchpoint_rows:
+        if not _email_search_match(row["value"], targets):
+            continue
+        result["matches"].append(
+            {
+                "touchpoint_id": row["touchpoint_id"],
+                "person_id": row["person_id"],
+                "person_name": person_name(row),
+                "person_status": row["outreach_status"] or "",
+                "deceased": int(row["deceased"] or 0),
+                "email_value": normalize_email(row["value"] or "") or (row["value"] or ""),
+                "email_label": row["channel_label"] or "",
+                "email_status": row["email_status"] or "",
+                "touchpoint_created_at": row["touchpoint_created_at"] or "",
+                "properties": _phone_search_property_links_for_person(db, row["person_id"]),
+            }
+        )
+
+    comm_rows = db.execute(
+        f"""
+        SELECT c.id, c.property_id, c.person_id, c.channel, c.direction, c.from_number, c.to_number,
+               c.status, c.sent_at, c.created_at, c.body,
+               pe.first_name, pe.middle_name, pe.last_name,
+               a.street, a.city, a.state, a.postal_code
+        FROM communications c
+        LEFT JOIN people pe ON pe.id = c.person_id
+        LEFT JOIN properties p ON p.id = c.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE upper(COALESCE(c.channel, '')) = 'EMAIL'
+          AND (
+              lower(COALESCE(c.from_number, '')) IN ({placeholders})
+              OR lower(COALESCE(c.to_number, '')) IN ({placeholders})
+          )
+        ORDER BY COALESCE(c.sent_at, c.created_at) DESC, c.id DESC
+        LIMIT 30
+        """,
+        tuple(targets + targets),
+    ).fetchall()
+    for row in comm_rows:
+        result["communications"].append(
+            {
+                "id": row["id"],
+                "property_id": row["property_id"],
+                "person_id": row["person_id"],
+                "channel": row["channel"] or "",
+                "direction": row["direction"] or "",
+                "from_number": row["from_number"] or "",
+                "to_number": row["to_number"] or "",
+                "status": row["status"] or "",
+                "sent_at": row["sent_at"] or row["created_at"] or "",
+                "body": _short_text(row["body"] or "", 160),
+                "person_name": person_name(row),
+                "property_address": format_property_address_line(row["street"], row["city"], row["state"], row["postal_code"]),
+            }
+        )
+
+    eo_rows = db.execute(
+        f"""
+        SELECT e.id, e.event_type, e.event_action, e.contact_email, e.campaign_id,
+               e.property_id, e.person_id, e.reisift_property_uuid, e.verification_status,
+               e.processing_status, e.error_text, e.occurred_at, e.received_at,
+               pe.first_name, pe.middle_name, pe.last_name,
+               a.street, a.city, a.state, a.postal_code
+        FROM emailoctopus_webhook_events e
+        LEFT JOIN people pe ON pe.id = e.person_id
+        LEFT JOIN properties p ON p.id = e.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE lower(COALESCE(e.contact_email, '')) IN ({placeholders})
+        ORDER BY COALESCE(e.occurred_at, e.received_at) DESC, e.id DESC
+        LIMIT 50
+        """,
+        tuple(targets),
+    ).fetchall()
+    for row in eo_rows:
+        result["emailoctopus_events"].append(
+            {
+                "id": row["id"],
+                "event_type": row["event_type"] or "",
+                "event_action": row["event_action"] or "",
+                "contact_email": row["contact_email"] or "",
+                "campaign_id": row["campaign_id"] or "",
+                "property_id": row["property_id"],
+                "person_id": row["person_id"],
+                "reisift_property_uuid": row["reisift_property_uuid"] or "",
+                "verification_status": row["verification_status"] or "",
+                "processing_status": row["processing_status"] or "",
+                "error_text": row["error_text"] or "",
+                "occurred_at": row["occurred_at"] or "",
+                "received_at": row["received_at"] or "",
+                "person_name": person_name(row),
+                "property_address": format_property_address_line(row["street"], row["city"], row["state"], row["postal_code"]),
+            }
+        )
+
+    sync_rows = db.execute(
+        f"""
+        SELECT s.id, s.normalized_email, s.touchpoint_id, s.person_id, s.property_id,
+               s.source, s.provider, s.provider_contact_id, s.sync_status, s.validation_status,
+               s.last_error, s.synced_at, s.created_at, s.updated_at,
+               pe.first_name, pe.middle_name, pe.last_name,
+               a.street, a.city, a.state, a.postal_code
+        FROM email_campaign_syncs s
+        LEFT JOIN people pe ON pe.id = s.person_id
+        LEFT JOIN properties p ON p.id = s.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE lower(COALESCE(s.normalized_email, '')) IN ({placeholders})
+        ORDER BY COALESCE(s.updated_at, s.created_at) DESC, s.id DESC
+        LIMIT 25
+        """,
+        tuple(targets),
+    ).fetchall()
+    for row in sync_rows:
+        result["campaign_syncs"].append(
+            {
+                "id": row["id"],
+                "normalized_email": row["normalized_email"] or "",
+                "touchpoint_id": row["touchpoint_id"],
+                "person_id": row["person_id"],
+                "property_id": row["property_id"],
+                "source": row["source"] or "",
+                "provider": row["provider"] or "",
+                "provider_contact_id": row["provider_contact_id"] or "",
+                "sync_status": row["sync_status"] or "",
+                "validation_status": row["validation_status"] or "",
+                "last_error": row["last_error"] or "",
+                "synced_at": row["synced_at"] or "",
+                "updated_at": row["updated_at"] or row["created_at"] or "",
+                "person_name": person_name(row),
+                "property_address": format_property_address_line(row["street"], row["city"], row["state"], row["postal_code"]),
+            }
+        )
+
+    validation_rows = []
+    registry_rows = db.execute(
+        f"""
+        SELECT id, normalized_email AS email_value, queue_status, validation_status, provider_status,
+               run_after, processed_at, updated_at, '' AS last_error
+        FROM email_validation_registry
+        WHERE lower(COALESCE(normalized_email, '')) IN ({placeholders})
+        ORDER BY COALESCE(updated_at, processed_at, run_after) DESC, id DESC
+        LIMIT 10
+        """,
+        tuple(targets),
+    ).fetchall()
+    queue_rows = db.execute(
+        f"""
+        SELECT id, email_value, queue_status, validation_status, '' AS provider_status,
+               run_after, processed_at, updated_at, '' AS last_error
+        FROM email_validation_queue
+        WHERE lower(COALESCE(email_value, '')) IN ({placeholders})
+        ORDER BY COALESCE(updated_at, processed_at, run_after) DESC, id DESC
+        LIMIT 10
+        """,
+        tuple(targets),
+    ).fetchall()
+    for source_label, rows in (("Registry", registry_rows), ("Queue", queue_rows)):
+        for row in rows:
+            validation_rows.append(
+                {
+                    "source": source_label,
+                    "id": row["id"],
+                    "email_value": row["email_value"] or "",
+                    "queue_status": row["queue_status"] or "",
+                    "validation_status": row["validation_status"] or "",
+                    "provider_status": row["provider_status"] or "",
+                    "run_after": row["run_after"] or "",
+                    "processed_at": row["processed_at"] or "",
+                    "updated_at": row["updated_at"] or "",
+                    "last_error": row["last_error"] or "",
+                }
+            )
+    result["validation_rows"] = validation_rows
+    result["lead_rows"] = _search_customer_lead_rows_by_email(db, targets)
+    return result
+
+
+def search_customer_context(db, query_raw):
+    if normalize_email(query_raw):
+        return search_email_context(db, query_raw)
+    return search_phone_number_context(db, query_raw)
 
 
 def find_person_id_by_recent_outbound_to_number(db, property_id, inbound_from_number):
@@ -48306,13 +48622,18 @@ def sms_queue_page():
     )
 
 
-@app.route("/phone-search")
+@app.route("/customer-lookup")
 def phone_search_page():
     ensure_db()
     db = get_db()
     q = (request.args.get("q") or "").strip()
-    result = search_phone_number_context(db, q) if q else None
+    result = search_customer_context(db, q) if q else None
     return render_template("phone_search.html", q=q, result=result)
+
+
+@app.route("/phone-search")
+def phone_search_legacy_page():
+    return redirect(url_for("phone_search_page", **request.args.to_dict(flat=True)))
 
 
 @app.route("/sms-queue/generate", methods=["POST"])

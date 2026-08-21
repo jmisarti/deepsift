@@ -21024,6 +21024,9 @@ def _extract_website_lead_fields(payload):
         # Step-2 schema currently uses: 2=email, 3=phone
         phone = _payload_value_by_keys(payload, ["phone", "phone_number", "mobile"]) or raw_phone_3
         email = _payload_value_by_keys(payload, ["email", "email_address"]) or raw_phone_2
+    if phone and not normalize_phone(phone):
+        phone = ""
+    email = normalize_email(email) if "@" in str(email or "") else ""
     seller_name = _payload_value_by_keys(payload, ["seller_name", "name", "full_name", "owner_name", "customer_name"])
     first_name = _payload_value_by_keys(
         payload,
@@ -21057,6 +21060,7 @@ def _extract_website_lead_fields(payload):
     state = normalized.get("state") or ""
     postal_code = normalized.get("postal_code") or ""
     address = normalized.get("address") or address
+    newsletter_email = _website_newsletter_email_from_payload(payload)
     return {
         "address": address,
         "street": street,
@@ -21070,6 +21074,7 @@ def _extract_website_lead_fields(payload):
         "first_name": first_name,
         "last_name": last_name,
         "stage": stage,
+        "newsletter_email": newsletter_email,
     }
 
 
@@ -21090,6 +21095,7 @@ def _website_merge_fields(step1_fields, step2_fields):
         "first_name",
         "last_name",
         "stage",
+        "newsletter_email",
     ]:
         merged[key] = (step2_fields.get(key) or step1_fields.get(key) or "").strip()
     if merged["address"] and (not merged["street"] or not merged["city"]):
@@ -21792,6 +21798,7 @@ def _build_website_lead_notes(payload, fields, source_label="webhook"):
         ("Address", fields.get("address")),
         ("Phone", fields.get("phone")),
         ("Email", fields.get("email")),
+        ("Newsletter Email", fields.get("newsletter_email")),
     ]
     for label, value in standard:
         if value:
@@ -21809,6 +21816,8 @@ def _build_website_lead_notes(payload, fields, source_label="webhook"):
             lines.append(f"Campaign: {campaign_label}")
         if attribution.get("utm_campaign"):
             lines.append(f"UTM Campaign: {attribution.get('utm_campaign')}")
+        if attribution.get("utm_term"):
+            lines.append(f"UTM Term: {attribution.get('utm_term')}")
         if attribution.get("gad_campaignid"):
             lines.append(f"GAD Campaign ID: {attribution.get('gad_campaignid')}")
         if attribution.get("gclid"):
@@ -21873,7 +21882,7 @@ def extract_website_campaign_attribution(payload):
         "utm_campaign": "utm_campaign",
         "utm_medium": "utm_medium",
         "utm_keyword": "utm_keyword",
-        "utm_term": "utm_keyword",
+        "utm_term": "utm_term",
         "utm_placement": "utm_placement",
         "gad_source": "gad_source",
         "gad_campaignid": "gad_campaignid",
@@ -21911,9 +21920,180 @@ def extract_website_campaign_attribution(payload):
         "utm_campaign": first_value("utm_campaign"),
         "utm_medium": first_value("utm_medium"),
         "utm_keyword": first_value("utm_keyword", "utm_term"),
+        "utm_term": first_value("utm_term"),
         "utm_placement": first_value("utm_placement"),
         "gad_source": first_value("gad_source"),
         "gad_campaignid": first_value("gad_campaignid"),
+    }
+
+
+def _website_newsletter_email_from_payload(payload):
+    attribution = extract_website_campaign_attribution(payload if isinstance(payload, dict) else {})
+    raw_email = str(attribution.get("utm_term") or "").strip()
+    if not raw_email:
+        return ""
+    # EmailOctopus replaces {{EmailAddress}} in utm_term for newsletter clicks.
+    if "@" not in raw_email:
+        return ""
+    return normalize_email(raw_email)
+
+
+def _website_newsletter_property_context(db, *, newsletter_email="", match_source="", person_id=0, property_id=0, sync_id=0, touchpoint_id=0):
+    try:
+        person_id = int(person_id or 0)
+    except Exception:
+        person_id = 0
+    try:
+        property_id = int(property_id or 0)
+    except Exception:
+        property_id = 0
+    if property_id <= 0 and person_id > 0:
+        property_id = int(find_property_id_for_person(db, person_id) or 0)
+
+    person_row = None
+    if person_id > 0:
+        person_row = db.execute(
+            "SELECT id, first_name, middle_name, last_name FROM people WHERE id = ? LIMIT 1",
+            (person_id,),
+        ).fetchone()
+
+    property_row = None
+    if property_id > 0:
+        property_row = db.execute(
+            """
+            SELECT p.id, p.owner_person_id, p.resident_person_id, p.status,
+                   p.reisift_property_uuid, p.reisift_owner_uuid,
+                   a.street, a.city, a.state, a.postal_code
+            FROM properties p
+            LEFT JOIN addresses a ON a.id = p.property_address_id
+            WHERE p.id = ?
+            LIMIT 1
+            """,
+            (property_id,),
+        ).fetchone()
+
+    role = ""
+    if property_row and person_id > 0:
+        if int(property_row["owner_person_id"] or 0) == person_id:
+            role = "Owner"
+        elif int(property_row["resident_person_id"] or 0) == person_id:
+            role = "Resident"
+        else:
+            role = "Related"
+
+    return {
+        "matched": bool(property_row or person_row),
+        "newsletter_email": normalize_email(newsletter_email),
+        "newsletter_email_identity": normalize_email_identity(newsletter_email),
+        "match_source": match_source,
+        "sync_id": int(sync_id or 0),
+        "touchpoint_id": int(touchpoint_id or 0),
+        "person_id": person_id,
+        "person_name": person_name(person_row) if person_row else "",
+        "property_id": property_id if property_row else 0,
+        "contact_role": role,
+        "property_status": property_row["status"] if property_row else "",
+        "property_address": format_property_address_line(
+            property_row["street"], property_row["city"], property_row["state"], property_row["postal_code"]
+        ) if property_row else "",
+        "reisift_property_uuid": normalize_uuid(property_row["reisift_property_uuid"] or "") if property_row else "",
+        "reisift_owner_uuid": normalize_uuid(property_row["reisift_owner_uuid"] or "") if property_row else "",
+    }
+
+
+def resolve_website_newsletter_email_context(db, newsletter_email):
+    normalized = normalize_email(newsletter_email)
+    identity = normalize_email_identity(normalized)
+    if not identity:
+        return {}
+    targets = []
+    for value in [normalized, identity]:
+        value = str(value or "").strip().lower()
+        if value and value not in targets:
+            targets.append(value)
+
+    placeholders = ",".join(["?"] * len(targets))
+    rows = db.execute(
+        f"""
+        SELECT id, normalized_email, touchpoint_id, person_id, property_id, source,
+               provider_contact_id, sync_status, updated_at
+        FROM email_campaign_syncs
+        WHERE lower(COALESCE(provider, 'emailoctopus')) = 'emailoctopus'
+          AND lower(COALESCE(normalized_email, '')) IN ({placeholders})
+        ORDER BY CASE WHEN COALESCE(property_id, 0) > 0 THEN 1 ELSE 0 END DESC,
+                 updated_at DESC,
+                 id DESC
+        LIMIT 10
+        """,
+        tuple(targets),
+    ).fetchall()
+    if rows:
+        best = rows[0]
+        return _website_newsletter_property_context(
+            db,
+            newsletter_email=normalized,
+            match_source="email_campaign_syncs",
+            person_id=int(best["person_id"] or 0),
+            property_id=int(best["property_id"] or 0),
+            sync_id=int(best["id"] or 0),
+            touchpoint_id=int(best["touchpoint_id"] or 0),
+        )
+
+    rows = db.execute(
+        """
+        SELECT t.id AS touchpoint_id, t.person_id, t.value
+        FROM touchpoints t
+        WHERE lower(COALESCE(t.channel_type, '')) = 'email'
+          AND COALESCE(t.value, '') <> ''
+        ORDER BY t.id DESC
+        LIMIT 10000
+        """
+    ).fetchall()
+    for row in rows:
+        if normalize_email_identity(row["value"] or "") != identity:
+            continue
+        return _website_newsletter_property_context(
+            db,
+            newsletter_email=normalized,
+            match_source="touchpoints",
+            person_id=int(row["person_id"] or 0),
+            touchpoint_id=int(row["touchpoint_id"] or 0),
+        )
+
+    event_rows = db.execute(
+        f"""
+        SELECT id, contact_email, person_id, property_id, reisift_property_uuid
+        FROM emailoctopus_webhook_events
+        WHERE lower(COALESCE(contact_email, '')) IN ({placeholders})
+        ORDER BY COALESCE(occurred_at, received_at) DESC, id DESC
+        LIMIT 10
+        """,
+        tuple(targets),
+    ).fetchall()
+    if event_rows:
+        best = event_rows[0]
+        ctx = _website_newsletter_property_context(
+            db,
+            newsletter_email=normalized,
+            match_source="emailoctopus_webhook_events",
+            person_id=int(best["person_id"] or 0),
+            property_id=int(best["property_id"] or 0),
+        )
+        if not ctx.get("reisift_property_uuid"):
+            ctx["reisift_property_uuid"] = normalize_uuid(best["reisift_property_uuid"] or "")
+        if ctx.get("reisift_property_uuid"):
+            ctx["matched"] = True
+        return ctx
+
+    return {
+        "matched": False,
+        "newsletter_email": normalized,
+        "newsletter_email_identity": identity,
+        "match_source": "unmatched",
+        "person_id": 0,
+        "property_id": 0,
+        "reisift_property_uuid": "",
+        "reisift_owner_uuid": "",
     }
 
 
@@ -23314,6 +23494,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
     form_payload = _website_payload_data(payload)
     form_id = str(form_payload.get("form_id") or "").strip()
     step_type = "step2" if is_step2 else "step1"
+    newsletter_context = resolve_website_newsletter_email_context(db, fields.get("newsletter_email") or "")
 
     add_website_webhook_note(
         db,
@@ -23328,10 +23509,12 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 f"Address: {address or '-'}",
                 f"Phone: {phone or '-'}",
                 f"Email: {email or '-'}",
+                f"Newsletter Email: {fields.get('newsletter_email') or '-'}",
+                f"Newsletter Match: {newsletter_context.get('match_source') or '-'}",
                 f"Event Key: {event_key}",
             ]
         ),
-        payload,
+        {"payload": payload, "newsletter_context": newsletter_context},
     )
     db.commit()
     if not is_new:
@@ -23353,6 +23536,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             "event_key": event_key,
             "lead_key": lead_key,
             "created_uuid": existing_uuid,
+            "newsletter_context": newsletter_context,
             "slack_sent": False,
         }
 
@@ -23373,6 +23557,10 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
     local_property_id = int((current["local_property_id"] if current and "local_property_id" in current.keys() else 0) or 0)
     current_property_uuid = normalize_uuid((current["reisift_property_uuid"] if current else "") or "")
     current_owner_uuid = normalize_uuid((current["reisift_owner_uuid"] if current else "") or "")
+    if newsletter_context.get("matched"):
+        local_property_id = int(newsletter_context.get("property_id") or local_property_id or 0)
+        current_property_uuid = current_property_uuid or normalize_uuid(newsletter_context.get("reisift_property_uuid") or "")
+        current_owner_uuid = current_owner_uuid or normalize_uuid(newsletter_context.get("reisift_owner_uuid") or "")
     try:
         local_ctx = ensure_local_property_for_submitted_lead(
             db,
@@ -23473,7 +23661,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                     f"Hold Expires At (UTC): {hold_expires_at}",
                 ]
             ),
-            {"lead_key": lead_key, "hold_expires_at": hold_expires_at},
+            {"lead_key": lead_key, "hold_expires_at": hold_expires_at, "newsletter_context": newsletter_context},
         )
         db.commit()
         return {
@@ -23482,6 +23670,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             "lead_key": lead_key,
             "mode": mode,
             "created_uuid": "",
+            "newsletter_context": newsletter_context,
             "slack_sent": False,
         }
 
@@ -23498,6 +23687,8 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             f"Name: {fields.get('seller_name') or '-'}",
             f"Phone: {phone or '-'}",
             f"Email: {email or '-'}",
+            f"Newsletter Email: {fields.get('newsletter_email') or '-'}",
+            f"Newsletter Match: {newsletter_context.get('match_source') or '-'}",
             "SIFT Record: -",
             "Error: Step-2 received without matching Step-1.",
         ]
@@ -23507,7 +23698,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             event_key,
             lead_key,
             "Website lead processing result\nResult: failed\nMode: step2_without_step1",
-            {"payload": payload},
+            {"payload": payload, "newsletter_context": newsletter_context},
         )
         db.commit()
         return {
@@ -23522,6 +23713,8 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
     step1_payload = parse_json_object(current["step1_payload_json"] or "{}")
     step1_fields = _extract_website_lead_fields(step1_payload) if isinstance(step1_payload, dict) else {}
     merged_fields = _website_merge_fields(step1_fields, fields)
+    if not newsletter_context.get("matched") and merged_fields.get("newsletter_email"):
+        newsletter_context = resolve_website_newsletter_email_context(db, merged_fields.get("newsletter_email") or "")
     owner_name_split = _parse_seller_name_for_owner(merged_fields.get("seller_name") or "")
     if not owner_name_split.get("first_name") and merged_fields.get("first_name"):
         owner_name_split["first_name"] = merged_fields.get("first_name")
@@ -23550,6 +23743,10 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
     recovered_uuid, recovered_owner_uuid = _website_submission_reisift_ids(current)
     created_uuid = created_uuid or recovered_uuid
     owner_uuid = owner_uuid or recovered_owner_uuid
+    if newsletter_context.get("matched"):
+        local_property_id = int(newsletter_context.get("property_id") or local_property_id or 0)
+        created_uuid = created_uuid or normalize_uuid(newsletter_context.get("reisift_property_uuid") or "")
+        owner_uuid = owner_uuid or normalize_uuid(newsletter_context.get("reisift_owner_uuid") or "")
     contact_sync = None
     note_sync = None
     list_sync = None
@@ -23571,7 +23768,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
         )
 
     try:
-        if not merged_fields.get("address"):
+        if not merged_fields.get("address") and not created_uuid:
             raise ValueError("Missing address after Step-1/Step-2 merge.")
         if not created_uuid:
             create_payload = {
@@ -23686,6 +23883,8 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             f"Name: {merged_fields.get('seller_name') or '-'}",
             f"Phone: {merged_fields.get('phone') or '-'}",
             f"Email: {merged_fields.get('email') or '-'}",
+            f"Newsletter Email: {merged_fields.get('newsletter_email') or '-'}",
+            f"Newsletter Match: {newsletter_context.get('match_source') or '-'}",
             f"SIFT Record: {sift_link or '-'}",
         ]
         if duplicate_reason:
@@ -23704,6 +23903,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             "ack_sms": ack_sms_result,
             "duplicate_existing": duplicate_existing,
             "duplicate_reason": duplicate_reason,
+            "newsletter_context": newsletter_context,
         }
         db.execute(
             """
@@ -23775,7 +23975,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
             event_key,
             lead_key,
             f"Website lead processing result\nResult: failed\nError: {err}",
-            {"payload": payload, "create_result": create_result},
+            {"payload": payload, "create_result": create_result, "newsletter_context": newsletter_context},
         )
         db.execute(
             """
@@ -23794,7 +23994,7 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 event_key,
                 local_property_id,
                 format_db_time(datetime.utcnow()),
-                json.dumps({"error": err, "create_result": create_result}),
+                json.dumps({"error": err, "create_result": create_result, "newsletter_context": newsletter_context}),
                 lead_key,
             ),
         )
@@ -23817,6 +24017,8 @@ def process_website_lead_payload(db, payload, source_label="webhook"):
                 f"Name: {merged_fields.get('seller_name') or '-'}",
                 f"Phone: {merged_fields.get('phone') or '-'}",
                 f"Email: {merged_fields.get('email') or '-'}",
+                f"Newsletter Email: {merged_fields.get('newsletter_email') or '-'}",
+                f"Newsletter Match: {newsletter_context.get('match_source') or '-'}",
                 f"SIFT Record: {sift_link or '-'}",
                 f"Error: {err}",
             ]
@@ -27861,10 +28063,16 @@ def run_website_step1_hold_once():
                 "seller_name": (fields.get("seller_name") or row["latest_name"] or "").strip(),
                 "phone": (fields.get("phone") or row["latest_phone"] or "").strip(),
                 "email": (fields.get("email") or row["latest_email"] or "").strip(),
+                "newsletter_email": (fields.get("newsletter_email") or "").strip(),
             }
             created_uuid = str(row["reisift_property_uuid"] or "").strip()
             owner_uuid = str(row["reisift_owner_uuid"] or "").strip()
             local_property_id = int((row["local_property_id"] if "local_property_id" in row.keys() else 0) or 0)
+            newsletter_context = resolve_website_newsletter_email_context(db, merged_fields.get("newsletter_email") or "")
+            if newsletter_context.get("matched"):
+                local_property_id = int(newsletter_context.get("property_id") or local_property_id or 0)
+                created_uuid = created_uuid or normalize_uuid(newsletter_context.get("reisift_property_uuid") or "")
+                owner_uuid = owner_uuid or normalize_uuid(newsletter_context.get("reisift_owner_uuid") or "")
             create_result = None
             contact_sync = None
             note_sync = None
@@ -27881,6 +28089,7 @@ def run_website_step1_hold_once():
                 "latest_address": merged_fields.get("address") or "",
                 "latest_phone": merged_fields.get("phone") or "",
                 "latest_email": merged_fields.get("email") or "",
+                "newsletter_context": newsletter_context,
                 "hold_expires_at": row["hold_expires_at"],
             }
             processing_result = {
@@ -27897,6 +28106,7 @@ def run_website_step1_hold_once():
                 "list_sync": list_sync,
                 "tag_sync": tag_sync,
                 "ack_sms": ack_sms_result,
+                "newsletter_context": newsletter_context,
             }
             should_notify = False
             slack_result = {"sent": False, "error": ""}
@@ -28001,6 +28211,7 @@ def run_website_step1_hold_once():
                     "list_sync": list_sync,
                     "tag_sync": tag_sync,
                     "ack_sms": ack_sms_result,
+                    "newsletter_context": newsletter_context,
                 }
                 log_app_error(
                     db,
@@ -28062,6 +28273,8 @@ def run_website_step1_hold_once():
                     f"Name: {merged_fields.get('seller_name') or '-'}",
                     f"Phone: {merged_fields.get('phone') or '-'}",
                     f"Email: {merged_fields.get('email') or '-'}",
+                    f"Newsletter Email: {merged_fields.get('newsletter_email') or '-'}",
+                    f"Newsletter Match: {newsletter_context.get('match_source') or '-'}",
                     f"SIFT Record: {sift_link or '-'}",
                     "Reason: Step-2 not received within 10 minutes.",
                 ]
@@ -28098,6 +28311,7 @@ def run_website_step1_hold_once():
                     "tag_sync": tag_sync,
                     "ack_sms": ack_sms_result,
                     "slack_result": slack_result,
+                    "newsletter_context": newsletter_context,
                 }
             )
             db.execute(

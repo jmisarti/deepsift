@@ -394,17 +394,27 @@ DATABASE_MAINTENANCE_START_DELAY_SECONDS = max(
 APP_ERROR_DEDUPE_MINUTES = max(int((os.getenv("APP_ERROR_DEDUPE_MINUTES") or "15").strip() or "15"), 1)
 APP_ERROR_RETENTION_DAYS = max(int((os.getenv("APP_ERROR_RETENTION_DAYS") or "7").strip() or "7"), 1)
 WEBHOOK_EVENT_RETENTION_DAYS = max(int((os.getenv("WEBHOOK_EVENT_RETENTION_DAYS") or "14").strip() or "14"), 1)
+# The active prospect cache stores normalized fields locally. Keeping the full
+# ReiSIFT response duplicates those fields and grows the production volume quickly.
+REISIFT_NEW_RECORDS_PAYLOAD_RETENTION_DAYS = max(
+    int((os.getenv("REISIFT_NEW_RECORDS_PAYLOAD_RETENTION_DAYS") or "0").strip() or "0"),
+    0,
+)
 AGENT_SIGNAL_RETENTION_DAYS = max(int((os.getenv("AGENT_SIGNAL_RETENTION_DAYS") or "0").strip() or "0"), 0)
 CALL_RECORDING_JOB_RETENTION_DAYS = max(
     int((os.getenv("CALL_RECORDING_JOB_RETENTION_DAYS") or "0").strip() or "0"),
     0,
 )
-PERSON_NOTE_PAYLOAD_RETENTION_DAYS = max(int((os.getenv("PERSON_NOTE_PAYLOAD_RETENTION_DAYS") or "0").strip() or "0"), 0)
+PERSON_NOTE_PAYLOAD_RETENTION_DAYS = max(int((os.getenv("PERSON_NOTE_PAYLOAD_RETENTION_DAYS") or "14").strip() or "14"), 0)
 EMAIL_CAMPAIGN_SYNC_PAYLOAD_RETENTION_DAYS = max(
-    int((os.getenv("EMAIL_CAMPAIGN_SYNC_PAYLOAD_RETENTION_DAYS") or "0").strip() or "0"),
+    int((os.getenv("EMAIL_CAMPAIGN_SYNC_PAYLOAD_RETENTION_DAYS") or "14").strip() or "14"),
     0,
 )
-SMS_QUEUE_JSON_RETENTION_DAYS = max(int((os.getenv("SMS_QUEUE_JSON_RETENTION_DAYS") or "0").strip() or "0"), 0)
+SMS_QUEUE_JSON_RETENTION_DAYS = max(int((os.getenv("SMS_QUEUE_JSON_RETENTION_DAYS") or "14").strip() or "14"), 0)
+EMAIL_VALIDATION_RAW_RETENTION_DAYS = max(
+    int((os.getenv("EMAIL_VALIDATION_RAW_RETENTION_DAYS") or "14").strip() or "14"),
+    0,
+)
 JOB_QUEUE_RETENTION_DAYS = max(int((os.getenv("JOB_QUEUE_RETENTION_DAYS") or "45").strip() or "45"), 1)
 SHEET_CHANGE_RETENTION_DAYS = max(int((os.getenv("SHEET_CHANGE_RETENTION_DAYS") or "90").strip() or "90"), 1)
 REFERRAL_MARKET_AUTO_REFRESH_ENABLED = env_flag("REFERRAL_MARKET_AUTO_REFRESH_ENABLED", False)
@@ -18719,21 +18729,7 @@ def _email_campaign_property_context(db, property_id):
             ).fetchall()
             if normalize_whitespace(item["list_name"] or "")
         ])
-    payload_rows = db.execute(
-        """
-        SELECT payload_json
-        FROM reisift_new_records
-        WHERE local_property_id = ?
-           OR (COALESCE(?, '') <> '' AND lower(property_uuid) = lower(?))
-        ORDER BY COALESCE(last_synced_at, '') DESC, id DESC
-        LIMIT 3
-        """,
-        (property_id, property_uuid, property_uuid),
-    ).fetchall()
     source_terms = list(list_names)
-    for payload_row in payload_rows:
-        payload = parse_json_object(payload_row["payload_json"] or "{}", default={})
-        source_terms.extend(_sms_source_terms_from_payload(payload))
     category_tag = _emailoctopus_category_from_terms(source_terms)
     return {
         "property_id": property_id,
@@ -37667,6 +37663,10 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
         """,
         tuple(params + [REISIFT_NEW_RECORDS_MAX_ROWS]),
     ).fetchall()
+    list_names_by_uuid = reisift_new_record_list_names_for_properties(
+        db,
+        [row["property_uuid"] for row in rows],
+    )
     created = updated = skipped = suppressed = duplicates_suppressed = 0
     touched_property_ids = set()
     for index, row in enumerate(rows, start=1):
@@ -37679,8 +37679,12 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
         if reason:
             skipped += 1
             continue
-        payload = parse_json_object(row["payload_json"] or "{}", default={})
-        source_terms = _sms_source_terms_from_payload(payload)
+        source_terms = list(list_names_by_uuid.get(row["property_uuid"], []))
+        if normalize_whitespace(row["priority_match"] or ""):
+            source_terms.append(normalize_whitespace(row["priority_match"] or ""))
+        # Routing only needs the normalized list signals, not a stored full
+        # ReiSIFT property snapshot.
+        payload = {"lists": source_terms}
         has_sheriff_source = _sms_source_terms_match_token(source_terms, "sheriff")
         source_info = {}
         if has_sheriff_source and token:
@@ -37955,7 +37959,7 @@ def upsert_reisift_new_record(
             first_seen_at = COALESCE(NULLIF(reisift_new_records.first_seen_at, ''), excluded.first_seen_at),
             automation_eligible = excluded.automation_eligible,
             automation_hold_reason = excluded.automation_hold_reason,
-            payload_json = excluded.payload_json,
+            payload_json = NULL,
             is_active = excluded.is_active,
             last_synced_at = excluded.last_synced_at
         """,
@@ -37995,7 +37999,7 @@ def upsert_reisift_new_record(
             first_seen_at,
             1 if automation_eligible else 0,
             automation_hold_reason,
-            json.dumps(payload or search_row),
+            None,
             int(bool(is_active)),
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         ),
@@ -39589,6 +39593,18 @@ def run_database_maintenance_once(force=False):
         except Exception as exc:
             result["errors"].append({"table": "person_notes.payload_json", "error": str(exc)})
         try:
+            result.setdefault("compacted", {})["reisift_new_records_payload_json"] = _maintenance_update_older_than(
+                db,
+                "reisift_new_records",
+                "payload_json = NULL",
+                "last_synced_at",
+                REISIFT_NEW_RECORDS_PAYLOAD_RETENTION_DAYS,
+                "COALESCE(payload_json, '') <> ''",
+                (),
+            )
+        except Exception as exc:
+            result["errors"].append({"table": "reisift_new_records.payload_json", "error": str(exc)})
+        try:
             result.setdefault("compacted", {})["email_campaign_syncs_payload_json"] = _maintenance_update_older_than(
                 db,
                 "email_campaign_syncs",
@@ -39612,6 +39628,18 @@ def run_database_maintenance_once(force=False):
             )
         except Exception as exc:
             result["errors"].append({"table": "sms_automation_queue.json", "error": str(exc)})
+        try:
+            result.setdefault("compacted", {})["email_validation_registry_raw"] = _maintenance_update_older_than(
+                db,
+                "email_validation_registry",
+                "validation_raw = NULL",
+                "COALESCE(processed_at, updated_at, created_at)",
+                EMAIL_VALIDATION_RAW_RETENTION_DAYS,
+                "lower(COALESCE(queue_status, '')) IN ('completed', 'failed', 'skipped') AND COALESCE(validation_raw, '') <> ''",
+                (),
+            )
+        except Exception as exc:
+            result["errors"].append({"table": "email_validation_registry.validation_raw", "error": str(exc)})
         set_setting(db, "database_maintenance_last_completed_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         set_setting(db, "database_maintenance_last_result_json", json.dumps(result, ensure_ascii=True, sort_keys=True)[:10000])
         commit_with_retry(db)

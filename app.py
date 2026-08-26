@@ -57,6 +57,17 @@ except Exception:
     service_account = None
     GoogleAuthRequest = None
 
+from database import (
+    database_savepoint,
+    database_table_columns,
+    install_postgres_compatibility,
+    is_postgres_backend,
+    is_postgres_connection,
+    is_retryable_database_error,
+    open_database_connection,
+    recover_failed_database_transaction,
+)
+
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("CRM_DB_PATH", str(BASE_DIR / "crm.db"))).expanduser()
 SCHEMA_PATH = BASE_DIR / "schema.sql"
@@ -91,15 +102,19 @@ def sqlite_busy_timeout_ms():
 
 def open_sqlite_connection():
     busy_timeout_ms = sqlite_busy_timeout_ms()
-    conn = sqlite3.connect(DB_PATH, timeout=busy_timeout_ms / 1000)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA wal_autocheckpoint = 1000")
-    journal_limit_mb = max(8, int((os.getenv("CRM_SQLITE_JOURNAL_SIZE_LIMIT_MB") or "64").strip() or "64"))
-    conn.execute(f"PRAGMA journal_size_limit = {journal_limit_mb * 1024 * 1024}")
-    return conn
+    try:
+        journal_limit_mb = max(8, int((os.getenv("CRM_SQLITE_JOURNAL_SIZE_LIMIT_MB") or "64").strip() or "64"))
+    except ValueError:
+        journal_limit_mb = 64
+    return open_database_connection(
+        DB_PATH,
+        sqlite_busy_timeout_ms=busy_timeout_ms,
+        sqlite_journal_size_limit_mb=journal_limit_mb,
+    )
+
+
+def database_storage_is_available():
+    return is_postgres_backend() or DB_PATH.exists()
 
 
 def env_flag(name, default=False):
@@ -987,7 +1002,7 @@ def app_auth_is_configured():
         return False
     if APP_AUTH_USERNAME and (APP_AUTH_PASSWORD_HASH or APP_AUTH_PASSWORD):
         return True
-    if not DB_PATH.exists():
+    if not database_storage_is_available():
         return False
     try:
         db = open_sqlite_connection()
@@ -1146,10 +1161,10 @@ def inject_auth_state():
 
 def start_background_workers_async():
     global BACKGROUND_WORKERS_BOOTSTRAP_STARTED
-    start_emailoctopus_sync_queue_worker()
-    start_email_validation_queue_worker()
     if not RUN_BACKGROUND_WORKERS:
         return
+    start_emailoctopus_sync_queue_worker()
+    start_email_validation_queue_worker()
     with BACKGROUND_WORKERS_BOOTSTRAP_LOCK:
         if BACKGROUND_WORKERS_BOOTSTRAP_STARTED:
             return
@@ -1284,8 +1299,8 @@ def execute_with_retry(db, sql, params=(), retries=8, base_delay=0.2):
     for attempt in range(retries):
         try:
             return db.execute(sql, params)
-        except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or attempt >= retries - 1:
+        except Exception as exc:
+            if is_postgres_connection(db) or not is_retryable_database_error(exc) or attempt >= retries - 1:
                 raise
             time.sleep(base_delay * (attempt + 1))
 
@@ -1295,8 +1310,8 @@ def commit_with_retry(db, retries=8, base_delay=0.2):
         try:
             db.commit()
             return
-        except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or attempt >= retries - 1:
+        except Exception as exc:
+            if is_postgres_connection(db) or not is_retryable_database_error(exc) or attempt >= retries - 1:
                 raise
             time.sleep(base_delay * (attempt + 1))
 
@@ -1331,8 +1346,11 @@ def close_db(_error):
 
 
 def ensure_column(db, table_name, column_name, definition):
-    cols = [r["name"] for r in db.execute(f"PRAGMA table_info({table_name})").fetchall()]
+    cols = database_table_columns(db, table_name)
     if column_name not in cols:
+        if is_postgres_connection(db):
+            db.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {definition}")
+            return
         try:
             db.execute(f"ALTER TABLE {table_name} ADD COLUMN {definition}")
         except sqlite3.OperationalError as exc:
@@ -1386,6 +1404,7 @@ def seed_app_users(db):
 
 
 def migrate_db(db):
+    install_postgres_compatibility(db)
     with SCHEMA_PATH.open("r", encoding="utf-8") as schema_file:
         db.executescript(schema_file.read())
 
@@ -2863,6 +2882,8 @@ def migrate_db(db):
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_authority_ideas_run ON authority_research_ideas(run_id, id DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_authority_ideas_status ON authority_research_ideas(status, id DESC)")
+    if is_postgres_connection(db):
+        db.refresh_identity_tables()
 
 
 def log_app_error(db, source, error_message, details="", route="", status_code=None):
@@ -2870,62 +2891,66 @@ def log_app_error(db, source, error_message, details="", route="", status_code=N
     route_text = (route or "")[:255]
     message_text = str(error_message or "")[:2000]
     details_text = str(details or "")[:20000]
+    recover_failed_database_transaction(db)
     try:
-        updated = db.execute(
-            """
-            UPDATE app_errors
-            SET occurrence_count = COALESCE(occurrence_count, 1) + 1,
-                last_seen_at = CURRENT_TIMESTAMP,
-                details = CASE WHEN ? <> '' THEN ? ELSE details END
-            WHERE id = (
-                SELECT id
-                FROM app_errors
-                WHERE source = ?
-                  AND route = ?
-                  AND COALESCE(status_code, -1) = COALESCE(?, -1)
-                  AND error_message = ?
-                  AND datetime(COALESCE(last_seen_at, created_at)) >= datetime('now', ?)
-                ORDER BY id DESC
-                LIMIT 1
-            )
-            """,
-            (
-                details_text,
-                details_text,
-                source_text,
-                route_text,
-                status_code,
-                message_text,
-                f"-{int(APP_ERROR_DEDUPE_MINUTES)} minutes",
-            ),
-        ).rowcount
+        with database_savepoint(db, "log_app_error_update"):
+            updated = db.execute(
+                """
+                UPDATE app_errors
+                SET occurrence_count = COALESCE(occurrence_count, 1) + 1,
+                    last_seen_at = CURRENT_TIMESTAMP,
+                    details = CASE WHEN ? <> '' THEN ? ELSE details END
+                WHERE id = (
+                    SELECT id
+                    FROM app_errors
+                    WHERE source = ?
+                      AND route = ?
+                      AND COALESCE(status_code, -1) = COALESCE(?, -1)
+                      AND error_message = ?
+                      AND datetime(COALESCE(last_seen_at, created_at)) >= datetime('now', ?)
+                    ORDER BY id DESC
+                    LIMIT 1
+                )
+                """,
+                (
+                    details_text,
+                    details_text,
+                    source_text,
+                    route_text,
+                    status_code,
+                    message_text,
+                    f"-{int(APP_ERROR_DEDUPE_MINUTES)} minutes",
+                ),
+            ).rowcount
         if updated:
             return
     except Exception:
         pass
     try:
-        db.execute(
-            """
-            INSERT INTO app_errors (source, route, status_code, error_message, details, occurrence_count, last_seen_at)
-            VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
-            """,
-            (
-                source_text,
-                route_text,
-                status_code,
-                message_text,
-                details_text,
-            ),
-        )
-    except Exception:
-        try:
+        with database_savepoint(db, "log_app_error_insert"):
             db.execute(
                 """
-                INSERT INTO app_errors (source, route, status_code, error_message, details)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO app_errors (source, route, status_code, error_message, details, occurrence_count, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
                 """,
-                (source_text, route_text, status_code, message_text, details_text),
+                (
+                    source_text,
+                    route_text,
+                    status_code,
+                    message_text,
+                    details_text,
+                ),
             )
+    except Exception:
+        try:
+            with database_savepoint(db, "log_app_error_fallback"):
+                db.execute(
+                    """
+                    INSERT INTO app_errors (source, route, status_code, error_message, details)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (source_text, route_text, status_code, message_text, details_text),
+                )
         except Exception:
             pass
 
@@ -3024,7 +3049,17 @@ def emit_provider_alert(source, error_message, details="", route="", status_code
             route=route,
             status_code=status_code,
         )
-        alert_id = int(alert_db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        alert_row = alert_db.execute(
+            """
+            SELECT id
+            FROM app_errors
+            WHERE source = ? AND error_message = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (source_text, message_text),
+        ).fetchone()
+        alert_id = int(alert_row["id"] if alert_row else 0)
         if owns_db:
             alert_db.commit()
         provider_label = _provider_alert_label(source_text)
@@ -3149,12 +3184,12 @@ def ensure_sms_delivery_classification_backfill(db):
 
 def ensure_db(force=False):
     global ENSURE_DB_READY
-    if ENSURE_DB_READY and DB_PATH.exists() and not force:
+    if ENSURE_DB_READY and database_storage_is_available() and not force:
         return
     with ENSURE_DB_LOCK:
-        if ENSURE_DB_READY and DB_PATH.exists() and not force:
+        if ENSURE_DB_READY and database_storage_is_available() and not force:
             return
-        if not DB_PATH.exists():
+        if not database_storage_is_available():
             init_db()
             ENSURE_DB_READY = True
             return
@@ -4452,7 +4487,12 @@ def upsert_cached_contact_context(
             person_id = COALESCE(excluded.person_id, external_contact_context.person_id),
             classification = COALESCE(NULLIF(excluded.classification, ''), external_contact_context.classification),
             source = COALESCE(NULLIF(excluded.source, ''), external_contact_context.source),
-            confidence = MAX(excluded.confidence, external_contact_context.confidence),
+            confidence = CASE
+                WHEN external_contact_context.confidence IS NULL THEN excluded.confidence
+                WHEN excluded.confidence IS NULL THEN external_contact_context.confidence
+                WHEN excluded.confidence > external_contact_context.confidence THEN excluded.confidence
+                ELSE external_contact_context.confidence
+            END,
             notes = COALESCE(NULLIF(excluded.notes, ''), external_contact_context.notes),
             reisift_property_uuid = COALESCE(NULLIF(excluded.reisift_property_uuid, ''), external_contact_context.reisift_property_uuid),
             reisift_full_address = COALESCE(NULLIF(excluded.reisift_full_address, ''), external_contact_context.reisift_full_address),
@@ -4513,14 +4553,11 @@ def _best_reisift_phone_match(results):
 
 def _table_has_column(db, table_name, column_name):
     try:
-        rows = db.execute(f"PRAGMA table_info({table_name})").fetchall()
+        columns = database_table_columns(db, table_name)
     except Exception:
         return False
     wanted = str(column_name or "").strip().lower()
-    for r in rows or []:
-        if str(r["name"] if isinstance(r, sqlite3.Row) else r[1]).strip().lower() == wanted:
-            return True
-    return False
+    return any(str(name).strip().lower() == wanted for name in columns)
 
 
 def _get_local_property_uuid(db, property_id):
@@ -8291,7 +8328,7 @@ def merge_people_records(db, winner_id, loser_id, reason=""):
                 stopped_reason = COALESCE(NULLIF(stopped_reason, ''), NULLIF(?, ''), stopped_reason),
                 completed_at = CASE
                     WHEN completed_at IS NULL THEN ?
-                    WHEN ? IS NULL THEN completed_at
+                    WHEN COALESCE(?, '') = '' THEN completed_at
                     WHEN completed_at <= ? THEN completed_at
                     ELSE ?
                 END
@@ -11222,7 +11259,7 @@ def record_sms_delivery_status(db, payload, sms_id="", status="", from_number=""
                 delivery_last_event_at = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE (? != '' AND external_id = ?)
-               OR (? IS NOT NULL AND communication_id = ?)
+               OR (COALESCE(?, 0) > 0 AND communication_id = ?)
             """,
             (
                 status_text.lower(),
@@ -11710,6 +11747,12 @@ def get_setting_quick_readonly(key, default="", timeout_ms=250):
         return default
     conn = None
     try:
+        if is_postgres_backend():
+            conn = open_sqlite_connection()
+            row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+            if not row:
+                return default
+            return row["value"] if row["value"] is not None else default
         db_uri_path = quote(str(DB_PATH).replace("\\", "/"), safe="/:")
         uri = f"file:{db_uri_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=max(0.05, timeout_ms / 1000))
@@ -14967,10 +15010,11 @@ def get_latest_ad_refresh_run(db):
 def get_ad_status_filter_options(db):
     rows = db.execute(
         """
-        SELECT DISTINCT campaign_status
+        SELECT DISTINCT campaign_status,
+                        lower(campaign_status) AS campaign_status_sort
         FROM ad_campaign_current
         WHERE COALESCE(campaign_status, '') <> ''
-        ORDER BY lower(campaign_status) ASC
+        ORDER BY campaign_status_sort ASC, campaign_status ASC
         """
     ).fetchall()
     return [str(row["campaign_status"] or "").strip() for row in rows if str(row["campaign_status"] or "").strip()]
@@ -18968,7 +19012,12 @@ def enqueue_emailoctopus_sync(
                 WHEN lower(COALESCE(emailoctopus_sync_queue.queue_status, '')) = 'inflight' THEN emailoctopus_sync_queue.queue_status
                 ELSE 'Queued'
             END,
-            priority = MIN(emailoctopus_sync_queue.priority, excluded.priority),
+            priority = CASE
+                WHEN emailoctopus_sync_queue.priority IS NULL THEN excluded.priority
+                WHEN excluded.priority IS NULL THEN emailoctopus_sync_queue.priority
+                WHEN emailoctopus_sync_queue.priority <= excluded.priority THEN emailoctopus_sync_queue.priority
+                ELSE excluded.priority
+            END,
             run_after = CURRENT_TIMESTAMP,
             last_error = '',
             updated_at = CURRENT_TIMESTAMP
@@ -19611,26 +19660,38 @@ def backfill_emailoctopus_contact_profiles(db, limit=2000):
         limit = 2000
     rows = db.execute(
         """
-        SELECT s.normalized_email,
-               COALESCE(s.touchpoint_id, t.id, 0) AS touchpoint_id,
-               COALESCE(s.person_id, t.person_id, 0) AS person_id,
-               COALESCE(s.property_id, 0) AS property_id,
-               COALESCE(s.source, 'emailoctopus_profile_backfill') AS source,
-               COALESCE(s.validation_status, 'valid') AS validation_status
-        FROM email_campaign_syncs s
-        LEFT JOIN touchpoints t
-               ON lower(trim(t.value)) = lower(trim(s.normalized_email))
-              AND lower(COALESCE(t.channel_type, '')) = 'email'
-        WHERE lower(COALESCE(s.provider, 'emailoctopus')) = 'emailoctopus'
-          AND (
-                lower(COALESCE(s.sync_status, '')) IN ('synced', 'already_synced', 'already_sent_emailoctopus')
-             OR lower(COALESCE(s.sync_status, '')) LIKE 'created_%'
-             OR lower(COALESCE(s.sync_status, '')) LIKE 'updated_%'
-          )
-          AND lower(COALESCE(s.sync_status, '')) NOT LIKE 'unsubscribed%'
-          AND COALESCE(trim(s.normalized_email), '') <> ''
-        GROUP BY s.normalized_email
-        ORDER BY COALESCE(s.synced_at, s.updated_at, s.created_at) ASC, s.id ASC
+        WITH ranked AS (
+            SELECT s.normalized_email,
+                   COALESCE(s.touchpoint_id, t.id, 0) AS touchpoint_id,
+                   COALESCE(s.person_id, t.person_id, 0) AS person_id,
+                   COALESCE(s.property_id, 0) AS property_id,
+                   COALESCE(s.source, 'emailoctopus_profile_backfill') AS source,
+                   COALESCE(s.validation_status, 'valid') AS validation_status,
+                   COALESCE(s.synced_at, s.updated_at, s.created_at) AS sort_at,
+                   s.id AS sync_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY lower(trim(s.normalized_email))
+                       ORDER BY COALESCE(s.synced_at, s.updated_at, s.created_at) ASC,
+                                s.id ASC,
+                                COALESCE(t.id, 0) ASC
+                   ) AS row_number
+            FROM email_campaign_syncs s
+            LEFT JOIN touchpoints t
+                   ON lower(trim(t.value)) = lower(trim(s.normalized_email))
+                  AND lower(COALESCE(t.channel_type, '')) = 'email'
+            WHERE lower(COALESCE(s.provider, 'emailoctopus')) = 'emailoctopus'
+              AND (
+                    lower(COALESCE(s.sync_status, '')) IN ('synced', 'already_synced', 'already_sent_emailoctopus')
+                 OR lower(COALESCE(s.sync_status, '')) LIKE 'created_%'
+                 OR lower(COALESCE(s.sync_status, '')) LIKE 'updated_%'
+              )
+              AND lower(COALESCE(s.sync_status, '')) NOT LIKE 'unsubscribed%'
+              AND COALESCE(trim(s.normalized_email), '') <> ''
+        )
+        SELECT normalized_email, touchpoint_id, person_id, property_id, source, validation_status
+        FROM ranked
+        WHERE row_number = 1
+        ORDER BY sort_at ASC, sync_id ASC
         LIMIT ?
         """,
         (limit,),
@@ -29291,7 +29352,7 @@ def _infer_system_numbers_from_smrt_events(db, cutoff=None):
         SELECT event_type, from_number, to_number, payload_json, received_at
         FROM smrtphone_webhook_events
         WHERE event_type IN ('inbound', 'outbound')
-          AND (? IS NULL OR received_at >= ?)
+          AND (COALESCE(?, '') = '' OR received_at >= ?)
         ORDER BY id DESC
         LIMIT 1200
         """,
@@ -39115,7 +39176,7 @@ def reisift_new_record_list_names_for_properties(db, property_uuids):
             SELECT property_uuid, list_name
             FROM reisift_new_record_lists
             WHERE property_uuid IN ({placeholders})
-            ORDER BY list_name COLLATE NOCASE ASC
+            ORDER BY lower(list_name) ASC, list_name ASC
             """,
             tuple(chunk),
         ).fetchall()
@@ -39676,10 +39737,13 @@ def run_database_maintenance_once(force=False):
         set_setting(db, "database_maintenance_last_completed_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         set_setting(db, "database_maintenance_last_result_json", json.dumps(result, ensure_ascii=True, sort_keys=True)[:10000])
         commit_with_retry(db)
-        try:
-            result["checkpoint"] = [list(row) for row in db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()]
-        except Exception as exc:
-            result["checkpoint_error"] = str(exc)
+        if is_postgres_connection(db):
+            result["checkpoint"] = {"backend": "postgres", "status": "not_applicable"}
+        else:
+            try:
+                result["checkpoint"] = [list(row) for row in db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()]
+            except Exception as exc:
+                result["checkpoint_error"] = str(exc)
         result["ok"] = not bool(result["errors"])
         return result
     except Exception as exc:
@@ -39818,11 +39882,12 @@ def get_new_record_filter_options(db, segment=REISIFT_NEW_RECORDS_SEGMENT):
     owner_types = sorted({normalize_whitespace(row["owner_type"] or "") for row in rows if normalize_whitespace(row["owner_type"] or "")})
     list_rows = db.execute(
         """
-        SELECT DISTINCT list_name
+        SELECT DISTINCT list_name,
+                        lower(list_name) AS list_name_sort
         FROM prospect_table_cache_lists
         WHERE segment = ?
           AND COALESCE(list_name, '') <> ''
-        ORDER BY list_name COLLATE NOCASE ASC
+        ORDER BY list_name_sort ASC, list_name ASC
         """
         ,
         (segment,),
@@ -45348,7 +45413,7 @@ def anon_dashboard():
             SELECT DISTINCT lower(COALESCE(lead_category, '')) AS lead_category
             FROM untitled_sheet_current
             WHERE trim(COALESCE(lead_category, '')) <> ''
-            ORDER BY lower(lead_category) ASC
+            ORDER BY lead_category ASC
             """
         ).fetchall()
         if row["lead_category"]
@@ -45750,25 +45815,20 @@ def authority_page():
                     raise ValueError("Feed name is required.")
                 if not (url.startswith("http://") or url.startswith("https://")):
                     raise ValueError("Feed URL must start with http:// or https://")
-                try:
-                    db.execute(
-                        """
-                        INSERT INTO authority_feeds (name, url, feed_type, notes, is_active, updated_at)
-                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        """,
-                        (name[:120], url[:700], feed_type, notes[:1200], is_active),
-                    )
-                    notice = "Feed added."
-                except sqlite3.IntegrityError:
-                    db.execute(
-                        """
-                        UPDATE authority_feeds
-                        SET name = ?, feed_type = ?, notes = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
-                        WHERE url = ?
-                        """,
-                        (name[:120], feed_type, notes[:1200], is_active, url[:700]),
-                    )
-                    notice = "Feed already existed. Existing feed updated."
+                db.execute(
+                    """
+                    INSERT INTO authority_feeds (name, url, feed_type, notes, is_active, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(url) DO UPDATE SET
+                        name = excluded.name,
+                        feed_type = excluded.feed_type,
+                        notes = excluded.notes,
+                        is_active = excluded.is_active,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (name[:120], url[:700], feed_type, notes[:1200], is_active),
+                )
+                notice = "Feed saved."
             elif action == "toggle_feed":
                 feed_id_raw = (request.form.get("feed_id") or "").strip()
                 next_state_raw = (request.form.get("next_state") or "").strip().lower()
@@ -47446,24 +47506,26 @@ def get_email_click_engagement_rows(db, filters=None):
             (
                 SELECT GROUP_CONCAT(value, ', ')
                 FROM (
-                    SELECT DISTINCT t.value
+                    SELECT t.value
                     FROM touchpoints t
                     WHERE t.person_id = e.person_id
                       AND lower(COALESCE(t.channel_type, '')) = 'phone'
                       AND COALESCE(t.value, '') <> ''
-                    ORDER BY t.id DESC
+                    GROUP BY t.value
+                    ORDER BY MAX(t.id) DESC
                     LIMIT 5
                 )
             ) AS phones,
             (
                 SELECT GROUP_CONCAT(value, ', ')
                 FROM (
-                    SELECT DISTINCT t.value
+                    SELECT t.value
                     FROM touchpoints t
                     WHERE t.person_id = e.person_id
                       AND lower(COALESCE(t.channel_type, '')) = 'email'
                       AND COALESCE(t.value, '') <> ''
-                    ORDER BY t.id DESC
+                    GROUP BY t.value
+                    ORDER BY MAX(t.id) DESC
                     LIMIT 5
                 )
             ) AS emails
@@ -47472,7 +47534,21 @@ def get_email_click_engagement_rows(db, filters=None):
         LEFT JOIN properties p ON p.id = e.property_id
         LEFT JOIN addresses a ON a.id = p.property_address_id
         WHERE {" AND ".join(where)}
-        GROUP BY contact_key, e.contact_email, e.contact_id, e.property_id, e.person_id
+        GROUP BY contact_key,
+                 e.contact_email,
+                 e.contact_id,
+                 e.property_id,
+                 e.person_id,
+                 COALESCE(NULLIF(e.reisift_property_uuid, ''), NULLIF(p.reisift_property_uuid, '')),
+                 pe.first_name,
+                 pe.middle_name,
+                 pe.last_name,
+                 pe.primary_phone,
+                 pe.primary_email,
+                 a.street,
+                 a.city,
+                 a.state,
+                 a.postal_code
         HAVING COUNT(*) >= ?
         ORDER BY click_count DESC, last_click_at DESC, e.property_id DESC
     """
@@ -51888,9 +51964,9 @@ def enroll_property_network_sequence(property_id):
                     skipped += 1
             db.commit()
             return redirect(url_for("property_detail", property_id=property_id, seq_notice=f"Sequence enrolled for {created} contact(s). Skipped: {skipped}."))
-        except sqlite3.OperationalError as exc:
+        except Exception as exc:
             db.rollback()
-            if "locked" in str(exc).lower() and attempt < 2:
+            if is_retryable_database_error(exc) and attempt < 2:
                 time.sleep(0.35 * (attempt + 1))
                 continue
             raise
@@ -51911,9 +51987,9 @@ def enroll_property_person_sequence(property_id):
             except ValueError as exc:
                 db.rollback()
                 return redirect(url_for("property_detail", property_id=property_id, seq_notice=str(exc)))
-            except sqlite3.OperationalError as exc:
+            except Exception as exc:
                 db.rollback()
-                if "locked" in str(exc).lower() and attempt < 2:
+                if is_retryable_database_error(exc) and attempt < 2:
                     time.sleep(0.35 * (attempt + 1))
                     continue
                 raise
@@ -51935,9 +52011,9 @@ def enroll_person_sequence_route(person_id):
             except ValueError as exc:
                 db.rollback()
                 return redirect(url_for("person_detail", person_id=person_id, property_id=property_id, seq_notice=str(exc)))
-            except sqlite3.OperationalError as exc:
+            except Exception as exc:
                 db.rollback()
-                if "locked" in str(exc).lower() and attempt < 2:
+                if is_retryable_database_error(exc) and attempt < 2:
                     time.sleep(0.35 * (attempt + 1))
                     continue
                 raise
@@ -52744,7 +52820,7 @@ def property_detail(property_id):
         SELECT c.*
         FROM communications c
         WHERE c.property_id = ?
-          AND (? IS NULL OR c.person_id = ?)
+          AND (COALESCE(?, 0) = 0 OR c.person_id = ?)
         ORDER BY c.sent_at ASC, c.id ASC
         """,
         (property_id, prop["owner_person_id"], prop["owner_person_id"]),
@@ -56558,9 +56634,10 @@ def smrtphone_call_completed_webhook(payload=None, db=None):
 
     cur = db.execute(
         """
-        INSERT OR IGNORE INTO call_recording_jobs
+        INSERT INTO call_recording_jobs
         (call_sid, from_number, to_number, property_id, person_id, recording_url, fetch_status, analysis_status, payload_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?)
+        ON CONFLICT(call_sid) DO NOTHING
         """,
         (
             call_sid,

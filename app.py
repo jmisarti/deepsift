@@ -38060,15 +38060,42 @@ def refresh_reisift_prospect_segment_cache(
     status_exit_unsubscribed = 0
     prepared_rows = []
     sms_queue_property_ids = set()
+    sms_generation_property_ids = set()
+    unchanged_count = 0
+    detail_fetches = 0
+
+    # The search response is sufficient to reconcile membership, but does not
+    # contain the complete owner/contact data needed for a local import.
+    # Load the current segment first so detail requests are limited to new UUIDs.
+    if not search_failed:
+        previous_active_rows = db.execute(
+            """
+            SELECT property_uuid, local_property_id, status
+            FROM reisift_new_records
+            WHERE COALESCE(is_active, 1) = 1
+              AND COALESCE(segment, 'new_records') = ?
+              AND COALESCE(property_uuid, '') <> ''
+            """,
+            (segment,),
+        ).fetchall()
+    previous_active_by_uuid = {
+        normalize_uuid(prior["property_uuid"] or ""): prior
+        for prior in previous_active_rows
+        if normalize_uuid(prior["property_uuid"] or "")
+    }
     for row in rows:
         scanned += 1
         property_uuid = normalize_uuid(row.get("uuid") or "")
         if not property_uuid:
             continue
         returned_property_uuids.add(property_uuid)
+        if property_uuid in previous_active_by_uuid:
+            unchanged_count += 1
+            continue
         details = row
         try:
             details = fetch_reisift_property_payload(token, property_uuid)
+            detail_fetches += 1
         except Exception as exc:
             errors.append(f"{property_uuid}: detail fallback used ({exc})")
         sift_rollup = None
@@ -38086,17 +38113,6 @@ def refresh_reisift_prospect_segment_cache(
             }
         )
     if not search_failed:
-        previous_active_rows = db.execute(
-            """
-            SELECT property_uuid, local_property_id, status
-            FROM reisift_new_records
-            WHERE COALESCE(is_active, 1) = 1
-              AND COALESCE(segment, 'new_records') = ?
-              AND COALESCE(property_uuid, '') <> ''
-            """
-            ,
-            (segment,),
-        ).fetchall()
         missing_active_rows = [
             prior for prior in previous_active_rows
             if normalize_uuid(prior["property_uuid"] or "") not in returned_property_uuids
@@ -38119,6 +38135,7 @@ def refresh_reisift_prospect_segment_cache(
             local_property_id = int(local_sync.get("local_property_id") or 0)
             if local_property_id > 0:
                 sms_queue_property_ids.add(local_property_id)
+                sms_generation_property_ids.add(local_property_id)
             if local_sync.get("automation_eligible"):
                 automation_eligible_count += 1
             else:
@@ -38145,31 +38162,24 @@ def refresh_reisift_prospect_segment_cache(
             if not property_uuid:
                 continue
             try:
-                details = fetch_reisift_property_payload(token, property_uuid)
-                summary = summarize_reisift_property(details, fallback_payload={})
-                local_sync = sync_local_property_status_from_reisift_new_record(
-                    db,
-                    property_uuid,
-                    details,
-                    summary.get("status") or "",
-                )
+                # A status-change webhook handles the normal exit path.  This
+                # reconciliation fallback only knows that the UUID no longer
+                # matches the configured source query, so do not make a second
+                # per-property ReiSIFT request just to discover its new status.
                 status_exit_checks += 1
-                unsub = local_sync.get("emailoctopus_unsubscribe") if isinstance(local_sync.get("emailoctopus_unsubscribe"), dict) else {}
-                segment_property_id = int((local_sync.get("local_property_id") or prior["local_property_id"] or 0))
+                segment_property_id = int(prior["local_property_id"] or 0)
                 if segment_property_id > 0:
                     sms_queue_property_ids.add(segment_property_id)
-                if int(unsub.get("attempted") or 0) == 0:
-                    if segment_property_id > 0:
-                        unsub = unsubscribe_emailoctopus_emails_for_new_record_segment_exit(
-                            db,
-                            segment_property_id,
-                            prior_status=prior["status"] or REISIFT_NEW_RECORDS_STATUS,
-                            current_status=summary.get("status") or "",
-                            source="reisift_new_records_segment_exit",
-                        )
+                unsub = {}
+                if segment_property_id > 0 and segment == REISIFT_NEW_RECORDS_SEGMENT:
+                    unsub = unsubscribe_emailoctopus_emails_for_new_record_segment_exit(
+                        db,
+                        segment_property_id,
+                        prior_status=prior["status"] or REISIFT_NEW_RECORDS_STATUS,
+                        current_status="",
+                        source="reisift_new_records_reconciliation_exit",
+                    )
                 status_exit_unsubscribed += int(unsub.get("unsubscribed") or 0)
-                if local_sync.get("local_property_id") and local_sync.get("before") != local_sync.get("after"):
-                    local_updates += 1
                 execute_with_retry(
                     db,
                     """
@@ -38194,20 +38204,39 @@ def refresh_reisift_prospect_segment_cache(
         errors.append(f"cache_commit_before_sms_queue: {exc}")
     sms_queue = {"created": 0, "updated": 0, "skipped": 0, "suppressed": 0}
     try:
-        queue_property_ids = sorted(sms_queue_property_ids)
-        if queue_property_ids:
+        generation_property_ids = sorted(sms_generation_property_ids)
+        if generation_property_ids:
             sms_queue = generate_sms_automation_queue_for_new_records(
                 db,
                 token=token,
-                property_ids=queue_property_ids,
+                property_ids=generation_property_ids,
                 segment=segment,
+            )
+        queue_property_ids = sorted(sms_queue_property_ids)
+        if queue_property_ids:
+            sms_queue["suppressed"] = int(sms_queue.get("suppressed") or 0) + revalidate_sms_automation_queue(
+                db,
+                property_ids=queue_property_ids,
+            )
+            sms_queue["suppressed"] += purge_suppressed_sms_automation_queue(
+                db,
+                property_ids=queue_property_ids,
             )
         commit_refresh_batch(db)
     except Exception as exc:
         errors.append(f"sms_queue: {exc}")
     prospect_table_cache = {"rows": 0}
     try:
-        prospect_table_cache = rebuild_prospect_table_cache(db, segment=segment, update_signature=True)
+        cache_property_ids = sorted(sms_queue_property_ids)
+        if cache_property_ids:
+            prospect_table_cache = rebuild_prospect_table_cache(
+                db,
+                segment=segment,
+                property_ids=cache_property_ids,
+                update_signature=False,
+            )
+        set_setting(db, _prospect_cache_setting_key(segment), prospect_table_source_signature(db, segment))
+        set_setting(db, f"{_prospect_cache_setting_key(segment)}_rebuilt_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
     except Exception as exc:
         errors.append(f"prospect_table_cache: {exc}")
     set_setting(db, last_refresh_setting, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
@@ -38224,6 +38253,8 @@ def refresh_reisift_prospect_segment_cache(
         "total": total,
         "scanned": scanned,
         "synced": synced,
+        "unchanged": unchanged_count,
+        "detail_fetches": detail_fetches,
         "skipped_county": skipped_county,
         "local_updates": local_updates,
         "local_imports": local_imports,

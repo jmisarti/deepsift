@@ -38548,9 +38548,11 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
             commit_with_retry(db)
             result = refresh_reisift_new_records_cache(db)
             message = (
-                f"Cached {result.get('synced', 0)} row(s) from {result.get('scanned', 0)} scanned; "
+                f"Reconciliation complete: {result.get('scanned', 0)} scanned, "
+                f"{result.get('unchanged', 0)} unchanged, "
+                f"{result.get('synced', 0)} imported/updated, "
+                f"{result.get('status_exit_checks', 0)} removed from this segment; "
                 f"created/imported {result.get('local_imports', 0)} local record(s); "
-                f"updated {result.get('local_updates', 0)} local status value(s); "
                 f"SMS drafts created {((result.get('sms_queue') or {}).get('created', 0))}, "
                 f"suppressed {((result.get('sms_queue') or {}).get('suppressed', 0))}."
             )

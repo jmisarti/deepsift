@@ -16673,7 +16673,10 @@ def _attach_email_validation_touchpoint(db, registry_id, touchpoint_id, person_i
         VALUES (?, ?, ?, ?)
         ON CONFLICT(touchpoint_id) DO UPDATE SET
             registry_id = excluded.registry_id,
-            person_id = COALESCE(excluded.person_id, person_id),
+            person_id = COALESCE(
+                excluded.person_id,
+                email_validation_registry_touchpoints.person_id
+            ),
             source = excluded.source,
             updated_at = CURRENT_TIMESTAMP
         """,

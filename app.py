@@ -397,6 +397,11 @@ APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD", "")
 APP_AUTH_PASSWORD_HASH = os.getenv("APP_AUTH_PASSWORD_HASH", "").strip()
 OMAR_INITIAL_PASSWORD = os.getenv("OMAR_INITIAL_PASSWORD", "Omar2026!").strip() or "Omar2026!"
 RUN_BACKGROUND_WORKERS = env_flag("RUN_BACKGROUND_WORKERS", True)
+CRM_WRITE_PAUSED = env_flag("CRM_WRITE_PAUSED", False)
+CRM_WRITE_PAUSE_RETRY_AFTER_SECONDS = max(
+    int((os.getenv("CRM_WRITE_PAUSE_RETRY_AFTER_SECONDS") or "120").strip() or "120"),
+    1,
+)
 DATABASE_MAINTENANCE_WORKER_ENABLED = env_flag("DATABASE_MAINTENANCE_WORKER_ENABLED", True)
 DATABASE_MAINTENANCE_POLL_SECONDS = max(
     int((os.getenv("DATABASE_MAINTENANCE_POLL_SECONDS") or "21600").strip() or "21600"),
@@ -1201,6 +1206,16 @@ def start_background_workers_async():
 
 @app.before_request
 def require_login_if_enabled():
+    if CRM_WRITE_PAUSED and request.path != "/healthz":
+        response = jsonify(
+            {
+                "ok": False,
+                "error": "database_cutover_in_progress",
+                "retry": True,
+            }
+        )
+        response.headers["Retry-After"] = str(CRM_WRITE_PAUSE_RETRY_AFTER_SECONDS)
+        return response, 503
     if request.path.startswith("/static/") or request.path == "/healthz":
         return None
     start_background_workers_async()

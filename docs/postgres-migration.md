@@ -71,6 +71,8 @@ python -m scripts.postgres_app_smoke `
 
 Application PostgreSQL mode requires `CRM_DB_BACKEND=postgres`, `CRM_POSTGRES_URL`, and `CRM_POSTGRES_SCHEMA`. Pooling is enabled by default and can be tuned with `CRM_POSTGRES_POOL_MIN_SIZE`, `CRM_POSTGRES_POOL_MAX_SIZE`, and `CRM_POSTGRES_POOL_TIMEOUT_SECONDS`.
 
+For the final write freeze, set both `RUN_BACKGROUND_WORKERS=false` and `CRM_WRITE_PAUSED=true`. The application continues to answer `/healthz`, while all other requests receive `503 Service Unavailable` with a `Retry-After` header. Clear `CRM_WRITE_PAUSED` only after the PostgreSQL deployment and post-cutover checks pass.
+
 ## Staged Rollout
 
 1. Build and unit-test the shadow copy tooling.

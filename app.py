@@ -304,7 +304,11 @@ REISIFT_NEW_RECORDS_EXCLUDED_STATUSES = tuple(
 REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED = env_flag("REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED", False)
 REISIFT_NEW_RECORDS_MAX_ROWS = max(
     1,
-    int((os.getenv("REISIFT_NEW_RECORDS_MAX_ROWS") or "10000").strip() or "10000"),
+    int((os.getenv("REISIFT_NEW_RECORDS_MAX_ROWS") or "50000").strip() or "50000"),
+)
+REISIFT_PROPERTY_SEARCH_PAGE_SIZE = max(
+    10,
+    min(1000, int((os.getenv("REISIFT_PROPERTY_SEARCH_PAGE_SIZE") or "1000").strip() or "1000")),
 )
 REISIFT_NEW_RECORD_ACTIONABLE_MAX_AGE_DAYS = max(
     0,
@@ -345,7 +349,7 @@ EMAIL_VALIDATION_QUEUE_WORKER_ENABLED = env_flag("EMAIL_VALIDATION_QUEUE_WORKER_
 EMAIL_VALIDATION_QUEUE_POLL_SECONDS = max(int((os.getenv("EMAIL_VALIDATION_QUEUE_POLL_SECONDS") or "30").strip() or "30"), 5)
 EMAILOCTOPUS_SYNC_QUEUE_WORKER_ENABLED = env_flag("EMAILOCTOPUS_SYNC_QUEUE_WORKER_ENABLED", True)
 EMAILOCTOPUS_SYNC_QUEUE_POLL_SECONDS = max(int((os.getenv("EMAILOCTOPUS_SYNC_QUEUE_POLL_SECONDS") or "60").strip() or "60"), 15)
-EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT = max(int((os.getenv("EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT") or "20").strip() or "20"), 1)
+EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT = max(int((os.getenv("EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT") or "100").strip() or "100"), 1)
 REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED = env_flag("REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED", True)
 GMAIL_WATCH_RENEWAL_WORKER_ENABLED = env_flag("GMAIL_WATCH_RENEWAL_WORKER_ENABLED", True)
 GMAIL_WATCH_RENEWAL_POLL_SECONDS = max(int((os.getenv("GMAIL_WATCH_RENEWAL_POLL_SECONDS") or "86400").strip() or "86400"), 3600)
@@ -1567,6 +1571,11 @@ def migrate_db(db):
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_reisift_new_records_segment_active_added ON reisift_new_records(segment, is_active, added_at)"
     )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_touchpoints_channel_person ON touchpoints(channel_type, person_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_person_relationships_subject ON person_relationships(subject_person_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_person_relationships_related ON person_relationships(related_person_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_properties_owner_person ON properties(owner_person_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_properties_resident_person ON properties(resident_person_id)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS prospect_table_cache (
@@ -18344,7 +18353,13 @@ def _property_email_identities(db, property_id):
 def collect_emailoctopus_syncs_for_property(db, property_id):
     property_emails = _property_email_identities(db, property_id)
     candidates = {}
-    for row in db.execute("SELECT * FROM email_campaign_syncs").fetchall():
+    for row in db.execute(
+        """
+        SELECT normalized_email, touchpoint_id, person_id, property_id,
+               provider_contact_id, sync_status, validation_status
+        FROM email_campaign_syncs
+        """
+    ).fetchall():
         email = normalize_email_identity(row["normalized_email"] or "")
         if not email:
             continue
@@ -18406,6 +18421,202 @@ def _email_identity_related_property_ids(db, email_address):
     except Exception:
         pass
     return {pid for pid in property_ids if int(pid or 0) > 0}
+
+
+def _bulk_email_identity_related_property_ids(db, email_addresses):
+    identities = sorted(
+        {
+            normalize_email_identity(value)
+            for value in (email_addresses or [])
+            if normalize_email_identity(value)
+        }
+    )
+    related_by_email = {email: set() for email in identities}
+    if not identities:
+        return related_by_email
+
+    identity_set = set(identities)
+    for chunk in iter_query_chunks(identities):
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = db.execute(
+            f"""
+            SELECT normalized_email, property_id
+            FROM email_campaign_syncs
+            WHERE normalized_email IN ({placeholders})
+              AND COALESCE(property_id, 0) > 0
+            """,
+            tuple(chunk),
+        ).fetchall()
+        for row in rows:
+            email = normalize_email_identity(row["normalized_email"] or "")
+            property_id = int(row["property_id"] or 0)
+            if email in identity_set and property_id > 0:
+                related_by_email[email].add(property_id)
+
+    identities_by_person = {}
+    non_gmail_identities = [email for email in identities if not email.endswith("@gmail.com")]
+    for chunk in iter_query_chunks(non_gmail_identities):
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = db.execute(
+            f"""
+            SELECT person_id, value
+            FROM touchpoints
+            WHERE lower(COALESCE(channel_type, '')) = 'email'
+              AND lower(COALESCE(value, '')) IN ({placeholders})
+            """,
+            tuple(email.lower() for email in chunk),
+        ).fetchall()
+        for row in rows:
+            email = normalize_email_identity(row["value"] or "")
+            person_id = int(row["person_id"] or 0)
+            if email in identity_set and person_id > 0:
+                identities_by_person.setdefault(person_id, set()).add(email)
+
+    if any(email.endswith("@gmail.com") for email in identities):
+        rows = db.execute(
+            """
+            SELECT person_id, value
+            FROM touchpoints
+            WHERE lower(COALESCE(channel_type, '')) = 'email'
+              AND (
+                    lower(COALESCE(value, '')) LIKE '%@gmail.com'
+                 OR lower(COALESCE(value, '')) LIKE '%@googlemail.com'
+              )
+            """
+        ).fetchall()
+        for row in rows:
+            email = normalize_email_identity(row["value"] or "")
+            person_id = int(row["person_id"] or 0)
+            if email in identity_set and person_id > 0:
+                identities_by_person.setdefault(person_id, set()).add(email)
+
+    direct_person_ids = sorted(identities_by_person)
+    network_identities_by_person = {
+        person_id: set(person_identities)
+        for person_id, person_identities in identities_by_person.items()
+    }
+    for chunk in iter_query_chunks(direct_person_ids, chunk_size=450):
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = db.execute(
+            f"""
+            SELECT subject_person_id, related_person_id
+            FROM person_relationships
+            WHERE subject_person_id IN ({placeholders})
+               OR related_person_id IN ({placeholders})
+            """,
+            tuple(chunk) + tuple(chunk),
+        ).fetchall()
+        for row in rows:
+            subject_id = int(row["subject_person_id"] or 0)
+            related_id = int(row["related_person_id"] or 0)
+            if subject_id in identities_by_person and related_id > 0:
+                network_identities_by_person.setdefault(related_id, set()).update(identities_by_person[subject_id])
+            if related_id in identities_by_person and subject_id > 0:
+                network_identities_by_person.setdefault(subject_id, set()).update(identities_by_person[related_id])
+
+    for chunk in iter_query_chunks(sorted(network_identities_by_person)):
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = db.execute(
+            f"""
+            SELECT id AS property_id, owner_person_id AS person_id
+            FROM properties
+            WHERE owner_person_id IN ({placeholders})
+            UNION ALL
+            SELECT id AS property_id, resident_person_id AS person_id
+            FROM properties
+            WHERE resident_person_id IN ({placeholders})
+            """,
+            tuple(chunk) + tuple(chunk),
+        ).fetchall()
+        for row in rows:
+            property_id = int(row["property_id"] or 0)
+            person_id = int(row["person_id"] or 0)
+            if property_id <= 0:
+                continue
+            for email in network_identities_by_person.get(person_id, set()):
+                related_by_email[email].add(property_id)
+    return related_by_email
+
+
+def _build_emailoctopus_eligibility_context(db, email_addresses, related_by_email=None):
+    identities = sorted(
+        {
+            normalize_email_identity(value)
+            for value in (email_addresses or [])
+            if normalize_email_identity(value)
+        }
+    )
+    related_by_email = related_by_email or _bulk_email_identity_related_property_ids(db, identities)
+    active_property_ids = set()
+    for row in db.execute("SELECT id, status FROM properties").fetchall():
+        if is_strict_new_record_status(row["status"] or "") or is_deep_prospecting_status(row["status"] or ""):
+            active_property_ids.add(int(row["id"] or 0))
+    for row in db.execute(
+        """
+        SELECT DISTINCT local_property_id
+        FROM reisift_new_records
+        WHERE COALESCE(is_active, 1) = 1
+          AND COALESCE(segment, 'new_records') IN (?, ?)
+          AND COALESCE(local_property_id, 0) > 0
+        """,
+        (REISIFT_NEW_RECORDS_SEGMENT, REISIFT_DEEP_PROSPECTING_SEGMENT),
+    ).fetchall():
+        active_property_ids.add(int(row["local_property_id"] or 0))
+
+    submitted_email_identities = set()
+    submitted_property_ids = set()
+    inactive_statuses = {"failed", "timed_out_step1_only_failed"}
+    for table_name in (
+        "website_lead_submissions",
+        "clever_lead_submissions",
+        "propertyleads_lead_submissions",
+        "manual_lead_submissions",
+    ):
+        try:
+            if not _table_has_column(db, table_name, "latest_email"):
+                continue
+            rows = db.execute(
+                f"SELECT latest_email, local_property_id, status FROM {table_name}"
+            ).fetchall()
+        except Exception:
+            continue
+        for row in rows:
+            if normalize_whitespace(row["status"] or "").lower() in inactive_statuses:
+                continue
+            email = normalize_email_identity(row["latest_email"] or "")
+            if email:
+                submitted_email_identities.add(email)
+            property_id = int(row["local_property_id"] or 0)
+            if property_id > 0:
+                submitted_property_ids.add(property_id)
+    return {
+        "related_by_email": related_by_email,
+        "active_property_ids": active_property_ids,
+        "submitted_email_identities": submitted_email_identities,
+        "submitted_property_ids": submitted_property_ids,
+    }
+
+
+def _email_identity_is_eligible_from_context(context, email_address, exclude_property_ids=None):
+    email = normalize_email_identity(email_address)
+    if not email:
+        return False
+    context = context if isinstance(context, dict) else {}
+    related_property_ids = set((context.get("related_by_email") or {}).get(email, set()))
+    if email in set(context.get("submitted_email_identities") or set()):
+        return True
+    if related_property_ids.intersection(set(context.get("submitted_property_ids") or set())):
+        return True
+    excluded = set()
+    for value in exclude_property_ids or []:
+        try:
+            property_id = int(value or 0)
+        except Exception:
+            property_id = 0
+        if property_id > 0:
+            excluded.add(property_id)
+    active_property_ids = set(context.get("active_property_ids") or set()).difference(excluded)
+    return bool(related_property_ids.intersection(active_property_ids))
 
 
 def _email_identity_has_active_prospect_property(db, email_address, exclude_property_id=0):
@@ -18967,6 +19178,7 @@ def enqueue_emailoctopus_sync(
     contact_profile=None,
     payload=None,
     priority=None,
+    eligibility_prechecked=False,
 ):
     action = normalize_whitespace(action or "").lower()
     if action not in {"subscribe", "unsubscribe"}:
@@ -18978,7 +19190,12 @@ def enqueue_emailoctopus_sync(
         property_id = int(property_id or 0)
     except Exception:
         property_id = 0
-    if action == "unsubscribe" and property_id and email_identity_has_other_new_record_property(db, normalized_email, property_id):
+    if (
+        action == "unsubscribe"
+        and property_id
+        and not eligibility_prechecked
+        and email_identity_has_other_new_record_property(db, normalized_email, property_id)
+    ):
         return {"ok": True, "skipped": "active_emailoctopus_eligible_elsewhere", "email": normalized_email}
     if action == "unsubscribe":
         db.execute(
@@ -19061,6 +19278,185 @@ def enqueue_emailoctopus_sync(
     return {"ok": True, "queued": True, "queue_key": queue_key, "email": normalized_email, "action": action}
 
 
+def enqueue_emailoctopus_unsubscribes_for_property_exits(
+    db,
+    property_ids,
+    *,
+    source="reisift_prospect_reconciliation_exit",
+    before_status="New Record",
+    after_status="removed_from_prospect_segment",
+):
+    exit_property_ids = set()
+    for value in property_ids or []:
+        try:
+            property_id = int(value or 0)
+        except Exception:
+            property_id = 0
+        if property_id > 0:
+            exit_property_ids.add(property_id)
+    if not exit_property_ids:
+        return {
+            "ok": True,
+            "candidate_emails": 0,
+            "attempted": 0,
+            "queued": 0,
+            "skipped_active_elsewhere": 0,
+            "errors": 0,
+        }
+
+    settings = get_anonymous_email_marketing_settings(db)
+    list_id = (settings.get("emailoctopus_list_id") or "").strip()
+    if not settings.get("emailoctopus_api_key") or not list_id:
+        return {
+            "ok": False,
+            "skipped": "awaiting_emailoctopus_config",
+            "candidate_emails": 0,
+            "attempted": 0,
+            "queued": 0,
+            "skipped_active_elsewhere": 0,
+            "errors": 0,
+        }
+
+    active_sync_rows = []
+    for row in db.execute("SELECT * FROM email_campaign_syncs").fetchall():
+        item = dict(row)
+        email = normalize_email_identity(item.get("normalized_email") or "")
+        status = normalize_whitespace(item.get("sync_status") or "")
+        if not email or _email_campaign_sync_unsubscribed(status):
+            continue
+        if not _email_campaign_sync_success(status) and not _email_campaign_sync_queued(status):
+            continue
+        item["normalized_email"] = email
+        active_sync_rows.append(item)
+    if not active_sync_rows:
+        return {
+            "ok": True,
+            "candidate_emails": 0,
+            "attempted": 0,
+            "queued": 0,
+            "skipped_active_elsewhere": 0,
+            "errors": 0,
+        }
+
+    sync_by_email = {row["normalized_email"]: row for row in active_sync_rows}
+    related_by_email = _bulk_email_identity_related_property_ids(db, sync_by_email)
+    candidates = {
+        email: row
+        for email, row in sync_by_email.items()
+        if set(related_by_email.get(email, set())).intersection(exit_property_ids)
+    }
+    if not candidates:
+        return {
+            "ok": True,
+            "candidate_emails": 0,
+            "attempted": 0,
+            "queued": 0,
+            "skipped_active_elsewhere": 0,
+            "errors": 0,
+        }
+
+    eligibility_context = _build_emailoctopus_eligibility_context(
+        db,
+        candidates,
+        related_by_email=related_by_email,
+    )
+    attempted = 0
+    queued = 0
+    skipped_active_elsewhere = 0
+    errors = 0
+    timestamp = format_db_time(datetime.utcnow())
+    for email, sync_row in candidates.items():
+        if _email_identity_is_eligible_from_context(
+            eligibility_context,
+            email,
+            exclude_property_ids=exit_property_ids,
+        ):
+            skipped_active_elsewhere += 1
+            continue
+        related_exit_ids = sorted(set(related_by_email.get(email, set())).intersection(exit_property_ids))
+        sync_property_id = int(sync_row.get("property_id") or 0)
+        property_id = sync_property_id if sync_property_id in exit_property_ids else related_exit_ids[0]
+        attempted += 1
+        try:
+            queue_result = enqueue_emailoctopus_sync(
+                db,
+                "unsubscribe",
+                email,
+                touchpoint_id=sync_row.get("touchpoint_id"),
+                person_id=sync_row.get("person_id"),
+                property_id=property_id,
+                source=source,
+                provider_list_id=list_id,
+                contact_status="UNSUBSCRIBED",
+                validation_status=sync_row.get("validation_status") or "",
+                payload={
+                    "property_ids": related_exit_ids,
+                    "before_status": before_status,
+                    "after_status": after_status,
+                    "source": source,
+                    "eligibility_prechecked": True,
+                },
+                priority=0,
+                eligibility_prechecked=True,
+            )
+            if queue_result.get("skipped"):
+                skipped_active_elsewhere += 1
+                continue
+            db.execute(
+                """
+                UPDATE email_campaign_syncs
+                SET sync_status = 'queued_emailoctopus_unsubscribe',
+                    last_error = '',
+                    payload_json = ?,
+                    synced_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE normalized_email = ?
+                """,
+                (
+                    json.dumps(
+                        {
+                            "emailoctopus_queue": queue_result,
+                            "property_ids": related_exit_ids,
+                            "before_status": before_status,
+                            "after_status": after_status,
+                            "source": source,
+                        },
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                    email,
+                ),
+            )
+            upsert_anonymous_email_campaign_registry(
+                db,
+                email,
+                source="deepsift_property_status_exit",
+                source_identifier=str(sync_row.get("provider_contact_id") or ""),
+                status="queued_emailoctopus_unsubscribe",
+                notes=f"Queued unsubscribe after {len(related_exit_ids)} prospect property membership exit(s).",
+            )
+            queued += 1
+        except Exception as exc:
+            errors += 1
+            log_app_error(
+                db,
+                source="email_campaign_unsubscribe",
+                error_message=str(exc),
+                details=traceback.format_exc(),
+                route="enqueue_emailoctopus_unsubscribes_for_property_exits",
+                status_code=500,
+            )
+    return {
+        "ok": errors == 0,
+        "candidate_emails": len(candidates),
+        "attempted": attempted,
+        "queued": queued,
+        "skipped_active_elsewhere": skipped_active_elsewhere,
+        "errors": errors,
+    }
+
+
 def _emailoctopus_queue_should_skip_subscribe(db, row):
     source = normalize_whitespace(row["source"] or "").lower()
     if "new_record" not in source and "reisift_new" not in source:
@@ -19114,6 +19510,15 @@ def process_emailoctopus_unsubscribe_queue_bulk(db, rows, settings=None):
     list_id = (settings.get("emailoctopus_list_id") or "").strip()
     if not api_key or not list_id:
         return {"ok": True, "skipped": "awaiting_emailoctopus_config", "attempted": 0, "completed": 0, "errors": 0}
+    normalized_rows = []
+    for row in rows or []:
+        normalized_email = normalize_email_identity(row["normalized_email"] or "")
+        if normalized_email:
+            normalized_rows.append((row, normalized_email))
+    eligibility_context = _build_emailoctopus_eligibility_context(
+        db,
+        [normalized_email for _, normalized_email in normalized_rows],
+    )
     valid_rows = []
     skipped = 0
     for row in rows or []:
@@ -19123,7 +19528,15 @@ def process_emailoctopus_unsubscribe_queue_bulk(db, rows, settings=None):
             skipped += 1
             continue
         property_id = int(row["property_id"] or 0)
-        if property_id and email_identity_has_other_new_record_property(db, normalized_email, property_id):
+        payload = parse_json_object(row["payload_json"] or "{}", default={})
+        excluded_property_ids = list(payload.get("property_ids") or []) if isinstance(payload, dict) else []
+        if property_id > 0:
+            excluded_property_ids.append(property_id)
+        if _email_identity_is_eligible_from_context(
+            eligibility_context,
+            normalized_email,
+            exclude_property_ids=excluded_property_ids,
+        ):
             _mark_emailoctopus_queue_item(db, row["id"], "Skipped", "active_emailoctopus_eligible_elsewhere", processed=True)
             skipped += 1
             continue
@@ -27992,10 +28405,29 @@ def run_reisift_new_records_refresh_once(triggered_by="automation"):
         last_run_date = (get_setting(db, "reisift_new_records_last_run_date", "") or "").strip()
         if triggered_by == "automation" and last_run_date == today_et:
             return {"ok": True, "skipped": "already_ran_today", "date": today_et}
-        result = refresh_reisift_new_records_cache(db)
+        set_reisift_new_records_refresh_state(
+            db,
+            "running",
+            f"Scheduled New Records reconciliation started ({triggered_by}).",
+            stage="starting",
+            reset_started_at=True,
+        )
+        commit_with_retry(db)
+        result = refresh_reisift_new_records_cache(
+            db,
+            progress_callback=_reisift_refresh_progress_writer(db, set_reisift_new_records_refresh_state),
+        )
+        message = (
+            f"Scheduled reconciliation complete in {result.get('duration_seconds', 0)} seconds: "
+            f"{result.get('scanned', 0)} scanned, {result.get('synced', 0)} imported/updated, "
+            f"{result.get('status_exit_checks', 0)} removed, "
+            f"SMS drafts created {((result.get('sms_queue') or {}).get('created', 0))}, "
+            f"EmailOctopus removals queued {result.get('status_exit_unsubscribe_queued', 0)}."
+        )
+        set_reisift_new_records_refresh_state(db, "complete", message, result=result, stage="complete")
         if triggered_by == "automation":
             set_setting(db, "reisift_new_records_last_run_date", today_et)
-            db.commit()
+        commit_with_retry(db)
         return {"ok": True, "result": result, "date": today_et}
     except Exception as exc:
         db.rollback()
@@ -28007,7 +28439,14 @@ def run_reisift_new_records_refresh_once(triggered_by="automation"):
             route="run_reisift_new_records_refresh_once",
             status_code=500,
         )
-        db.commit()
+        set_reisift_new_records_refresh_state(
+            db,
+            "error",
+            str(exc),
+            result={"error": str(exc)},
+            stage="error",
+        )
+        commit_with_retry(db)
         return {"ok": False, "error": str(exc)}
     finally:
         db.close()
@@ -33673,7 +34112,7 @@ def _prospect_segment_for_reisift_status(status):
     return REISIFT_NEW_RECORDS_SEGMENT
 
 
-def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering="-list_count"):
+def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering="-list_count", progress_callback=None):
     if not isinstance(query, dict) or not query:
         return [], 0
     headers = reisift_auth_headers(token, {"x-http-method-override": "GET"})
@@ -33683,7 +34122,7 @@ def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering=
     rows = []
     total = 0
 
-    def _post_search(body, allow_limit_fallback=True):
+    def _post_search(body):
         last_exc = None
         for attempt in range(3):
             response = requests.post(
@@ -33697,15 +34136,14 @@ def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering=
                 return response
             last_exc = requests.HTTPError(f"{response.status_code} Server Error: {response.reason} for url: {response.url}", response=response)
             time.sleep(1.5 * (attempt + 1))
-        if allow_limit_fallback and "limit" not in body:
-            fallback_body = dict(body)
-            fallback_body["limit"] = 100
-            return _post_search(fallback_body, allow_limit_fallback=False)
         raise last_exc or ValueError("ReiSift property search failed")
 
     while offset < max_rows:
+        page_limit = min(REISIFT_PROPERTY_SEARCH_PAGE_SIZE, max_rows - offset)
         body = {
             "offset": offset,
+            # This is a transport page size, not a cap on the full result set.
+            "limit": page_limit,
             "ordering": ordering,
             "query": copy.deepcopy(query_body),
         }
@@ -33718,6 +34156,18 @@ def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering=
         dict_rows = [row for row in page_rows if isinstance(row, dict)]
         rows.extend(dict_rows)
         offset += len(page_rows)
+        if callable(progress_callback):
+            try:
+                progress_callback(
+                    {
+                        "stage": "searching",
+                        "message": f"Reading matching ReiSIFT properties: {min(offset, total or offset):,} of {total or offset:,}.",
+                        "scanned": min(offset, total or offset),
+                        "total": total or offset,
+                    }
+                )
+            except Exception:
+                pass
         if total and offset >= total:
             break
         if not dict_rows:
@@ -38094,6 +38544,71 @@ def upsert_reisift_new_record(
     return local_sync
 
 
+def _deactivate_reisift_prospect_rows(db, rows, segment):
+    property_uuids = []
+    local_property_ids = set()
+    for row in rows or []:
+        property_uuid = normalize_uuid(row["property_uuid"] or "")
+        if not property_uuid:
+            continue
+        property_uuids.append(property_uuid)
+        property_id = int(row["local_property_id"] or 0)
+        if property_id > 0:
+            local_property_ids.add(property_id)
+    property_uuids = list(dict.fromkeys(property_uuids))
+    deactivated = 0
+    for chunk in iter_query_chunks(property_uuids):
+        placeholders = ",".join(["?"] * len(chunk))
+        cur = execute_with_retry(
+            db,
+            f"""
+            UPDATE reisift_new_records
+            SET is_active = 0,
+                last_synced_at = CURRENT_TIMESTAMP
+            WHERE property_uuid IN ({placeholders})
+              AND COALESCE(segment, 'new_records') = ?
+              AND COALESCE(is_active, 1) = 1
+            """,
+            tuple(chunk) + (segment,),
+        )
+        deactivated += int(cur.rowcount or 0)
+    return {
+        "deactivated": deactivated,
+        "property_uuids": property_uuids,
+        "local_property_ids": sorted(local_property_ids),
+    }
+
+
+def _merge_sms_queue_results(target, source):
+    target = target if isinstance(target, dict) else {}
+    source = source if isinstance(source, dict) else {}
+    for key in (
+        "records",
+        "created",
+        "updated",
+        "skipped",
+        "suppressed",
+        "duplicates_suppressed",
+        "purged",
+    ):
+        target[key] = int(target.get(key) or 0) + int(source.get(key) or 0)
+    return target
+
+
+def _emit_reisift_refresh_progress(callback, stage, message, **progress):
+    if not callable(callback):
+        return
+    payload = {
+        "stage": normalize_whitespace(stage or "working") or "working",
+        "message": normalize_whitespace(message or ""),
+    }
+    payload.update(progress)
+    try:
+        callback(payload)
+    except Exception:
+        pass
+
+
 def refresh_reisift_prospect_segment_cache(
     db,
     *,
@@ -38103,19 +38618,41 @@ def refresh_reisift_prospect_segment_cache(
     max_rows=None,
     force_automation_eligible=False,
     last_refresh_setting="reisift_new_records_last_refresh_at",
+    progress_callback=None,
 ):
+    started_at = datetime.utcnow()
     token = reisift_get_access_token()
     segment = str(segment or REISIFT_NEW_RECORDS_SEGMENT).strip() or REISIFT_NEW_RECORDS_SEGMENT
     segment_label = reisift_prospect_segment_label(segment)
     search_query = search_query if isinstance(search_query, dict) and search_query else build_reisift_new_records_search_query()
     max_rows = int(max_rows or REISIFT_NEW_RECORDS_MAX_ROWS)
+    prior_completed_refresh_at = normalize_whitespace(get_setting(db, last_refresh_setting, "") or "")
     errors = []
     search_failed = False
+    _emit_reisift_refresh_progress(
+        progress_callback,
+        "searching",
+        f"Reading all matching {segment_label} properties from ReiSIFT...",
+        scanned=0,
+        total=0,
+    )
+
+    def search_progress(payload):
+        payload = payload if isinstance(payload, dict) else {}
+        _emit_reisift_refresh_progress(
+            progress_callback,
+            payload.get("stage") or "searching",
+            payload.get("message") or f"Reading matching {segment_label} properties from ReiSIFT...",
+            scanned=int(payload.get("scanned") or 0),
+            total=int(payload.get("total") or 0),
+        )
+
     try:
         rows, total = reisift_search_property_rows_by_query(
             token,
             search_query,
             max_rows=max_rows,
+            progress_callback=search_progress,
         )
     except Exception as exc:
         rows, total = [], 0
@@ -38137,11 +38674,21 @@ def refresh_reisift_prospect_segment_cache(
     returned_property_uuids = set()
     status_exit_checks = 0
     status_exit_unsubscribed = 0
+    status_exit_unsubscribe_queued = 0
+    emailoctopus_unsubscribe_queue = {
+        "candidate_emails": 0,
+        "attempted": 0,
+        "queued": 0,
+        "skipped_active_elsewhere": 0,
+        "errors": 0,
+    }
     prepared_rows = []
     sms_queue_property_ids = set()
     sms_generation_property_ids = set()
     unchanged_count = 0
     detail_fetches = 0
+    missing_property_uuids = []
+    missing_property_ids = set()
 
     # The search response is sufficient to reconcile membership, but does not
     # contain the complete owner/contact data needed for a local import.
@@ -38171,6 +38718,14 @@ def refresh_reisift_prospect_segment_cache(
         if property_uuid in previous_active_by_uuid:
             unchanged_count += 1
             continue
+        _emit_reisift_refresh_progress(
+            progress_callback,
+            "enriching",
+            f"Loading contact details for {len(prepared_rows) + 1:,} of {max(1, len(rows) - unchanged_count):,} new or changed properties...",
+            scanned=scanned,
+            total=total,
+            detail_fetches=detail_fetches,
+        )
         details = row
         try:
             details = fetch_reisift_property_payload(token, property_uuid)
@@ -38196,6 +38751,16 @@ def refresh_reisift_prospect_segment_cache(
             prior for prior in previous_active_rows
             if normalize_uuid(prior["property_uuid"] or "") not in returned_property_uuids
         ]
+    _emit_reisift_refresh_progress(
+        progress_callback,
+        "syncing",
+        f"Saving {len(prepared_rows):,} new or changed {segment_label} properties locally...",
+        scanned=scanned,
+        total=total,
+        unchanged=unchanged_count,
+        pending_sync=len(prepared_rows),
+        pending_removal=len(missing_active_rows),
+    )
     for prepared in prepared_rows:
         property_uuid = prepared["property_uuid"]
         try:
@@ -38231,95 +38796,205 @@ def refresh_reisift_prospect_segment_cache(
             if synced % REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE == 0:
                 try:
                     commit_refresh_batch(db)
+                    _emit_reisift_refresh_progress(
+                        progress_callback,
+                        "syncing",
+                        f"Saved {synced:,} of {len(prepared_rows):,} new or changed properties...",
+                        scanned=scanned,
+                        total=total,
+                        synced=synced,
+                        pending_sync=max(0, len(prepared_rows) - synced),
+                        pending_removal=len(missing_active_rows),
+                    )
                 except Exception as exc:
                     errors.append(f"{property_uuid}: cache_batch_commit failed ({exc})")
         except Exception as exc:
             errors.append(f"{property_uuid}: {exc}")
-    if not search_failed and missing_active_rows:
-        for prior in missing_active_rows:
-            property_uuid = normalize_uuid(prior["property_uuid"] or "")
-            if not property_uuid:
-                continue
-            try:
-                # A status-change webhook handles the normal exit path.  This
-                # reconciliation fallback only knows that the UUID no longer
-                # matches the configured source query, so do not make a second
-                # per-property ReiSIFT request just to discover its new status.
-                status_exit_checks += 1
-                segment_property_id = int(prior["local_property_id"] or 0)
-                if segment_property_id > 0:
-                    sms_queue_property_ids.add(segment_property_id)
-                unsub = {}
-                if segment_property_id > 0 and segment == REISIFT_NEW_RECORDS_SEGMENT:
-                    unsub = unsubscribe_emailoctopus_emails_for_new_record_segment_exit(
-                        db,
-                        segment_property_id,
-                        prior_status=prior["status"] or REISIFT_NEW_RECORDS_STATUS,
-                        current_status="",
-                        source="reisift_new_records_reconciliation_exit",
-                    )
-                status_exit_unsubscribed += int(unsub.get("unsubscribed") or 0)
-                execute_with_retry(
-                    db,
-                    """
-                    UPDATE reisift_new_records
-                    SET is_active = 0,
-                        last_synced_at = CURRENT_TIMESTAMP
-                    WHERE property_uuid = ?
-                      AND COALESCE(segment, 'new_records') = ?
-                    """,
-                    (property_uuid, segment),
-                )
-                if status_exit_checks % REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE == 0:
-                    try:
-                        commit_refresh_batch(db)
-                    except Exception as exc:
-                        errors.append(f"{property_uuid}: status_exit_batch_commit failed ({exc})")
-            except Exception as exc:
-                errors.append(f"{property_uuid}: status exit check failed ({exc})")
+
     try:
         commit_refresh_batch(db)
     except Exception as exc:
-        errors.append(f"cache_commit_before_sms_queue: {exc}")
-    sms_queue = {"created": 0, "updated": 0, "skipped": 0, "suppressed": 0}
+        errors.append(f"cache_commit_before_deactivation: {exc}")
+
+    if not search_failed and missing_active_rows:
+        _emit_reisift_refresh_progress(
+            progress_callback,
+            "deactivating",
+            f"Removing {len(missing_active_rows):,} properties that no longer match {segment_label}...",
+            pending_removal=len(missing_active_rows),
+        )
+        try:
+            deactivation = _deactivate_reisift_prospect_rows(db, missing_active_rows, segment)
+            missing_property_uuids = list(deactivation.get("property_uuids") or [])
+            missing_property_ids = set(deactivation.get("local_property_ids") or [])
+            status_exit_checks = int(deactivation.get("deactivated") or 0)
+            sms_queue_property_ids.update(missing_property_ids)
+            commit_refresh_batch(db)
+        except Exception as exc:
+            errors.append(f"status_exit_bulk_deactivation: {exc}")
+
+        if missing_property_ids:
+            _emit_reisift_refresh_progress(
+                progress_callback,
+                "queueing_email_removals",
+                f"Checking EmailOctopus eligibility for {len(missing_property_ids):,} removed properties in one batch...",
+                removed=status_exit_checks,
+            )
+            try:
+                emailoctopus_unsubscribe_queue = enqueue_emailoctopus_unsubscribes_for_property_exits(
+                    db,
+                    missing_property_ids,
+                    source=f"reisift_{segment}_reconciliation_exit",
+                    before_status=status_slug,
+                    after_status=f"removed_from_{segment}_segment",
+                )
+                status_exit_unsubscribe_queued = int(emailoctopus_unsubscribe_queue.get("queued") or 0)
+                if int(emailoctopus_unsubscribe_queue.get("errors") or 0):
+                    errors.append(
+                        f"emailoctopus_unsubscribe_queue: {emailoctopus_unsubscribe_queue.get('errors')} error(s)"
+                    )
+                commit_refresh_batch(db)
+            except Exception as exc:
+                errors.append(f"emailoctopus_unsubscribe_queue: {exc}")
+
+    if prior_completed_refresh_at:
+        try:
+            recovery_rows = db.execute(
+                """
+                SELECT DISTINCT local_property_id
+                FROM reisift_new_records
+                WHERE COALESCE(is_active, 1) = 1
+                  AND COALESCE(segment, 'new_records') = ?
+                  AND COALESCE(automation_eligible, 0) = 1
+                  AND COALESCE(local_property_id, 0) > 0
+                  AND COALESCE(last_synced_at, '') > ?
+                """,
+                (segment, prior_completed_refresh_at),
+            ).fetchall()
+            for row in recovery_rows:
+                property_id = int(row["local_property_id"] or 0)
+                if property_id > 0:
+                    sms_generation_property_ids.add(property_id)
+                    sms_queue_property_ids.add(property_id)
+        except Exception as exc:
+            errors.append(f"sms_recovery_candidates: {exc}")
+
+    sms_queue = {
+        "records": 0,
+        "created": 0,
+        "updated": 0,
+        "skipped": 0,
+        "suppressed": 0,
+        "duplicates_suppressed": 0,
+        "purged": 0,
+    }
     try:
         generation_property_ids = sorted(sms_generation_property_ids)
         if generation_property_ids:
-            sms_queue = generate_sms_automation_queue_for_new_records(
-                db,
-                token=token,
-                property_ids=generation_property_ids,
-                segment=segment,
+            _emit_reisift_refresh_progress(
+                progress_callback,
+                "sms_queue",
+                f"Reconciling SMS drafts for {len(generation_property_ids):,} new or changed properties...",
+                sms_processed=0,
+                sms_total=len(generation_property_ids),
             )
+            processed_sms_properties = 0
+            for chunk in iter_query_chunks(
+                generation_property_ids,
+                chunk_size=REISIFT_REFRESH_DB_COMMIT_BATCH_SIZE,
+            ):
+                chunk_result = generate_sms_automation_queue_for_new_records(
+                    db,
+                    token=token,
+                    property_ids=chunk,
+                    segment=segment,
+                )
+                _merge_sms_queue_results(sms_queue, chunk_result)
+                processed_sms_properties += len(chunk)
+                commit_refresh_batch(db)
+                _emit_reisift_refresh_progress(
+                    progress_callback,
+                    "sms_queue",
+                    f"Reconciled SMS drafts for {processed_sms_properties:,} of {len(generation_property_ids):,} properties...",
+                    sms_processed=processed_sms_properties,
+                    sms_total=len(generation_property_ids),
+                )
         queue_property_ids = sorted(sms_queue_property_ids)
-        if queue_property_ids:
-            sms_queue["suppressed"] = int(sms_queue.get("suppressed") or 0) + revalidate_sms_automation_queue(
-                db,
-                property_ids=queue_property_ids,
-            )
-            sms_queue["suppressed"] += purge_suppressed_sms_automation_queue(
-                db,
-                property_ids=queue_property_ids,
-            )
+        for chunk in iter_query_chunks(queue_property_ids, chunk_size=250):
+            sms_queue["suppressed"] += revalidate_sms_automation_queue(db, property_ids=chunk)
+            sms_queue["purged"] += purge_suppressed_sms_automation_queue(db, property_ids=chunk)
+            commit_refresh_batch(db)
         commit_refresh_batch(db)
     except Exception as exc:
         errors.append(f"sms_queue: {exc}")
-    prospect_table_cache = {"rows": 0}
+
+    prospect_table_cache = {"rows": 0, "partial": True, "chunks": 0}
     try:
-        cache_property_ids = sorted(sms_queue_property_ids)
-        if cache_property_ids:
-            prospect_table_cache = rebuild_prospect_table_cache(
+        cache_property_ids = sorted(set(sms_queue_property_ids).difference(missing_property_ids))
+        cache_work_total = len(cache_property_ids) + len(missing_property_uuids)
+        if cache_work_total:
+            _emit_reisift_refresh_progress(
+                progress_callback,
+                "table_cache",
+                f"Updating the fast table cache for {cache_work_total:,} changed properties...",
+                cache_processed=0,
+                cache_total=cache_work_total,
+            )
+        cache_processed = 0
+        for chunk in iter_query_chunks(missing_property_uuids, chunk_size=250):
+            cache_result = rebuild_prospect_table_cache(
                 db,
                 segment=segment,
-                property_ids=cache_property_ids,
+                property_uuids=chunk,
                 update_signature=False,
+            )
+            prospect_table_cache["rows"] += int(cache_result.get("rows") or 0)
+            prospect_table_cache["chunks"] += 1
+            cache_processed += len(chunk)
+            commit_refresh_batch(db)
+            _emit_reisift_refresh_progress(
+                progress_callback,
+                "table_cache",
+                f"Updated the fast table cache for {cache_processed:,} of {cache_work_total:,} changed properties...",
+                cache_processed=cache_processed,
+                cache_total=cache_work_total,
+            )
+        for chunk in iter_query_chunks(cache_property_ids, chunk_size=250):
+            cache_result = rebuild_prospect_table_cache(
+                db,
+                segment=segment,
+                property_ids=chunk,
+                update_signature=False,
+            )
+            prospect_table_cache["rows"] += int(cache_result.get("rows") or 0)
+            prospect_table_cache["chunks"] += 1
+            cache_processed += len(chunk)
+            commit_refresh_batch(db)
+            _emit_reisift_refresh_progress(
+                progress_callback,
+                "table_cache",
+                f"Updated the fast table cache for {cache_processed:,} of {cache_work_total:,} changed properties...",
+                cache_processed=cache_processed,
+                cache_total=cache_work_total,
             )
         set_setting(db, _prospect_cache_setting_key(segment), prospect_table_source_signature(db, segment))
         set_setting(db, f"{_prospect_cache_setting_key(segment)}_rebuilt_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
     except Exception as exc:
         errors.append(f"prospect_table_cache: {exc}")
-    set_setting(db, last_refresh_setting, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+
+    completed_at = datetime.utcnow()
+    if not search_failed:
+        set_setting(db, last_refresh_setting, completed_at.strftime("%Y-%m-%d %H:%M:%S"))
     commit_refresh_batch(db)
+    _emit_reisift_refresh_progress(
+        progress_callback,
+        "finalizing",
+        f"Finalizing {segment_label} reconciliation...",
+        scanned=scanned,
+        synced=synced,
+        unchanged=unchanged_count,
+        removed=status_exit_checks,
+    )
     return {
         "segment": segment,
         "segment_label": segment_label,
@@ -38345,15 +39020,20 @@ def refresh_reisift_prospect_segment_cache(
         "automation_held": automation_held_count,
         "status_exit_checks": status_exit_checks,
         "status_exit_unsubscribed": status_exit_unsubscribed,
+        "status_exit_unsubscribe_queued": status_exit_unsubscribe_queued,
+        "emailoctopus_unsubscribe_queue": emailoctopus_unsubscribe_queue,
         "sms_queue": sms_queue,
         "prospect_table_cache": prospect_table_cache,
         "search_failed": search_failed,
         "log_rollup_enabled": REISIFT_NEW_RECORDS_LOG_ROLLUP_ENABLED,
+        "started_at": started_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "completed_at": completed_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "duration_seconds": int(max(0, (completed_at - started_at).total_seconds())),
         "errors": errors,
     }
 
 
-def refresh_reisift_new_records_cache(db):
+def refresh_reisift_new_records_cache(db, progress_callback=None):
     return refresh_reisift_prospect_segment_cache(
         db,
         segment=REISIFT_NEW_RECORDS_SEGMENT,
@@ -38362,10 +39042,11 @@ def refresh_reisift_new_records_cache(db):
         max_rows=REISIFT_NEW_RECORDS_MAX_ROWS,
         force_automation_eligible=False,
         last_refresh_setting="reisift_new_records_last_refresh_at",
+        progress_callback=progress_callback,
     )
 
 
-def refresh_reisift_deep_prospecting_cache(db):
+def refresh_reisift_deep_prospecting_cache(db, progress_callback=None):
     return refresh_reisift_prospect_segment_cache(
         db,
         segment=REISIFT_DEEP_PROSPECTING_SEGMENT,
@@ -38374,6 +39055,7 @@ def refresh_reisift_deep_prospecting_cache(db):
         max_rows=REISIFT_NEW_RECORDS_MAX_ROWS,
         force_automation_eligible=True,
         last_refresh_setting="reisift_deep_prospecting_last_refresh_at",
+        progress_callback=progress_callback,
     )
 
 
@@ -38539,19 +39221,47 @@ def run_reisift_phone_status_delta_sync_once(triggered_by="automation", start_ut
 
 def _normalize_reisift_refresh_state(data, lock=None):
     if not isinstance(data, dict) or not data:
-        return {"status": "idle", "message": "", "updated_at": "", "result": {}}
+        return {
+            "status": "idle",
+            "stage": "idle",
+            "message": "",
+            "started_at": "",
+            "updated_at": "",
+            "completed_at": "",
+            "elapsed_seconds": 0,
+            "progress": {},
+            "result": {},
+        }
     status = str(data.get("status") or "idle").strip() or "idle"
+    started_at = str(data.get("started_at") or "").strip()
+    completed_at = str(data.get("completed_at") or "").strip()
+    started_dt = parse_db_time(started_at)
+    ended_dt = parse_db_time(completed_at) if completed_at else None
+    if started_dt:
+        elapsed_seconds = int(max(0, ((ended_dt or datetime.utcnow()) - started_dt).total_seconds()))
+    else:
+        elapsed_seconds = 0
     if status == "running" and (_reisift_refresh_state_is_stale(data) or (lock is not None and not lock.locked())):
         return {
             "status": "idle",
+            "stage": "interrupted",
             "message": "Previous refresh state was stale; ready to retry." if _reisift_refresh_state_is_stale(data) else "",
+            "started_at": started_at,
             "updated_at": str(data.get("updated_at") or "").strip(),
+            "completed_at": completed_at,
+            "elapsed_seconds": elapsed_seconds,
+            "progress": data.get("progress") if isinstance(data.get("progress"), dict) else {},
             "result": data.get("result") if isinstance(data.get("result"), dict) else {},
         }
     return {
         "status": status,
+        "stage": str(data.get("stage") or status).strip() or status,
         "message": str(data.get("message") or "").strip(),
+        "started_at": started_at,
         "updated_at": str(data.get("updated_at") or "").strip(),
+        "completed_at": completed_at,
+        "elapsed_seconds": elapsed_seconds,
+        "progress": data.get("progress") if isinstance(data.get("progress"), dict) else {},
         "result": data.get("result") if isinstance(data.get("result"), dict) else {},
     }
 
@@ -38569,16 +39279,59 @@ def _get_remembered_reisift_refresh_state(setting_key):
         return dict(payload) if isinstance(payload, dict) else {}
 
 
-def set_reisift_new_records_refresh_state(db, status, message="", result=None):
+def _set_reisift_refresh_state(
+    db,
+    setting_key,
+    status,
+    message="",
+    result=None,
+    *,
+    stage="",
+    progress=None,
+    reset_started_at=False,
+):
+    now_text = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    current = _get_remembered_reisift_refresh_state(setting_key)
+    clean_status = str(status or "").strip() or "unknown"
+    if reset_started_at or clean_status == "running" and str(current.get("status") or "").lower() != "running":
+        started_at = now_text
+    else:
+        started_at = str(current.get("started_at") or "").strip() or now_text
     payload = {
-        "status": str(status or "").strip() or "unknown",
+        "status": clean_status,
+        "stage": str(stage or clean_status).strip() or clean_status,
         "message": str(message or "").strip(),
-        "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "started_at": started_at,
+        "updated_at": now_text,
+        "completed_at": now_text if clean_status in {"complete", "error"} else "",
+        "progress": progress if isinstance(progress, dict) else {},
         "result": result if isinstance(result, dict) else {},
     }
-    set_setting(db, "reisift_new_records_refresh_state_json", json.dumps(payload))
-    _remember_reisift_refresh_state("reisift_new_records_refresh_state_json", payload)
+    set_setting(db, setting_key, json.dumps(payload))
+    _remember_reisift_refresh_state(setting_key, payload)
     return payload
+
+
+def set_reisift_new_records_refresh_state(
+    db,
+    status,
+    message="",
+    result=None,
+    *,
+    stage="",
+    progress=None,
+    reset_started_at=False,
+):
+    return _set_reisift_refresh_state(
+        db,
+        "reisift_new_records_refresh_state_json",
+        status,
+        message,
+        result,
+        stage=stage,
+        progress=progress,
+        reset_started_at=reset_started_at,
+    )
 
 
 def _reisift_refresh_state_is_stale(data):
@@ -38608,6 +39361,29 @@ def get_reisift_new_records_refresh_state(db=None):
     return _normalize_reisift_refresh_state({}, REISIFT_NEW_RECORDS_REFRESH_LOCK)
 
 
+def _reisift_refresh_progress_writer(db, state_setter):
+    last_write = {"at": 0.0, "stage": ""}
+
+    def write(payload):
+        payload = payload if isinstance(payload, dict) else {}
+        stage = normalize_whitespace(payload.get("stage") or "working") or "working"
+        now = time.monotonic()
+        if stage == last_write["stage"] and now - last_write["at"] < 2.5:
+            return
+        state_setter(
+            db,
+            "running",
+            payload.get("message") or "Refresh in progress...",
+            stage=stage,
+            progress=payload,
+        )
+        commit_with_retry(db)
+        last_write["at"] = now
+        last_write["stage"] = stage
+
+    return write
+
+
 def start_reisift_new_records_refresh_job(triggered_by="manual"):
     if not REISIFT_NEW_RECORDS_REFRESH_LOCK.acquire(blocking=False):
         db = open_sqlite_connection()
@@ -38623,23 +39399,31 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
     def worker():
         db = open_sqlite_connection()
         try:
-            set_reisift_new_records_refresh_state(db, "running", "Refreshing New Records from ReiSift...")
+            set_reisift_new_records_refresh_state(
+                db,
+                "running",
+                "Reading all matching New Records from ReiSIFT...",
+                stage="searching",
+            )
             commit_with_retry(db)
-            result = refresh_reisift_new_records_cache(db)
+            result = refresh_reisift_new_records_cache(
+                db,
+                progress_callback=_reisift_refresh_progress_writer(db, set_reisift_new_records_refresh_state),
+            )
             message = (
-                f"Reconciliation complete: {result.get('scanned', 0)} scanned, "
-                f"{result.get('unchanged', 0)} unchanged, "
-                f"{result.get('synced', 0)} imported/updated, "
-                f"{result.get('status_exit_checks', 0)} removed from this segment; "
+                f"Reconciliation complete in {result.get('duration_seconds', 0)} seconds: "
+                f"{result.get('scanned', 0)} scanned, {result.get('unchanged', 0)} unchanged, "
+                f"{result.get('synced', 0)} imported/updated, {result.get('status_exit_checks', 0)} removed; "
                 f"created/imported {result.get('local_imports', 0)} local record(s); "
                 f"SMS drafts created {((result.get('sms_queue') or {}).get('created', 0))}, "
-                f"suppressed {((result.get('sms_queue') or {}).get('suppressed', 0))}."
+                f"removed {((result.get('sms_queue') or {}).get('suppressed', 0))}; "
+                f"EmailOctopus removals queued {result.get('status_exit_unsubscribe_queued', 0)}."
             )
             if result.get("search_failed"):
                 message = "ReiSift search is temporarily unavailable; existing cache was preserved. " + message
             elif result.get("errors"):
                 message += f" Warnings: {len(result.get('errors') or [])}."
-            set_reisift_new_records_refresh_state(db, "complete", message, result=result)
+            set_reisift_new_records_refresh_state(db, "complete", message, result=result, stage="complete")
             commit_with_retry(db)
         except Exception as exc:
             db.rollback()
@@ -38651,7 +39435,13 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
                 route="start_reisift_new_records_refresh_job",
                 status_code=500,
             )
-            state = set_reisift_new_records_refresh_state(db, "error", str(exc), result={"error": str(exc)})
+            state = set_reisift_new_records_refresh_state(
+                db,
+                "error",
+                str(exc),
+                result={"error": str(exc)},
+                stage="error",
+            )
             commit_with_retry(db)
             return state
         finally:
@@ -38664,6 +39454,8 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
             starter_db,
             "running",
             f"Refresh started ({triggered_by}).",
+            stage="starting",
+            reset_started_at=True,
         )
         commit_with_retry(starter_db)
     finally:
@@ -38673,16 +39465,26 @@ def start_reisift_new_records_refresh_job(triggered_by="manual"):
     return {"ok": True, "started": True, "running": True, "state": state}
 
 
-def set_reisift_deep_prospecting_refresh_state(db, status, message="", result=None):
-    payload = {
-        "status": str(status or "").strip() or "unknown",
-        "message": str(message or "").strip(),
-        "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "result": result if isinstance(result, dict) else {},
-    }
-    set_setting(db, "reisift_deep_prospecting_refresh_state_json", json.dumps(payload))
-    _remember_reisift_refresh_state("reisift_deep_prospecting_refresh_state_json", payload)
-    return payload
+def set_reisift_deep_prospecting_refresh_state(
+    db,
+    status,
+    message="",
+    result=None,
+    *,
+    stage="",
+    progress=None,
+    reset_started_at=False,
+):
+    return _set_reisift_refresh_state(
+        db,
+        "reisift_deep_prospecting_refresh_state_json",
+        status,
+        message,
+        result,
+        stage=stage,
+        progress=progress,
+        reset_started_at=reset_started_at,
+    )
 
 
 def get_reisift_deep_prospecting_refresh_state(db=None):
@@ -38715,21 +39517,31 @@ def start_reisift_deep_prospecting_refresh_job(triggered_by="manual"):
     def worker():
         db = open_sqlite_connection()
         try:
-            set_reisift_deep_prospecting_refresh_state(db, "running", "Refreshing Deep Prospecting from ReiSift...")
+            set_reisift_deep_prospecting_refresh_state(
+                db,
+                "running",
+                "Reading all matching Deep Prospecting properties from ReiSIFT...",
+                stage="searching",
+            )
             commit_with_retry(db)
-            result = refresh_reisift_deep_prospecting_cache(db)
+            result = refresh_reisift_deep_prospecting_cache(
+                db,
+                progress_callback=_reisift_refresh_progress_writer(db, set_reisift_deep_prospecting_refresh_state),
+            )
             message = (
-                f"Cached {result.get('synced', 0)} row(s) from {result.get('scanned', 0)} scanned; "
+                f"Reconciliation complete in {result.get('duration_seconds', 0)} seconds: "
+                f"{result.get('scanned', 0)} scanned, {result.get('unchanged', 0)} unchanged, "
+                f"{result.get('synced', 0)} imported/updated, {result.get('status_exit_checks', 0)} removed; "
                 f"created/imported {result.get('local_imports', 0)} local record(s); "
-                f"updated {result.get('local_updates', 0)} local status value(s); "
                 f"SMS drafts created {((result.get('sms_queue') or {}).get('created', 0))}, "
-                f"suppressed {((result.get('sms_queue') or {}).get('suppressed', 0))}."
+                f"removed {((result.get('sms_queue') or {}).get('suppressed', 0))}; "
+                f"EmailOctopus removals queued {result.get('status_exit_unsubscribe_queued', 0)}."
             )
             if result.get("search_failed"):
                 message = "ReiSift search is temporarily unavailable; existing cache was preserved. " + message
             elif result.get("errors"):
                 message += f" Warnings: {len(result.get('errors') or [])}."
-            set_reisift_deep_prospecting_refresh_state(db, "complete", message, result=result)
+            set_reisift_deep_prospecting_refresh_state(db, "complete", message, result=result, stage="complete")
             commit_with_retry(db)
         except Exception as exc:
             db.rollback()
@@ -38741,7 +39553,13 @@ def start_reisift_deep_prospecting_refresh_job(triggered_by="manual"):
                 route="start_reisift_deep_prospecting_refresh_job",
                 status_code=500,
             )
-            state = set_reisift_deep_prospecting_refresh_state(db, "error", str(exc), result={"error": str(exc)})
+            state = set_reisift_deep_prospecting_refresh_state(
+                db,
+                "error",
+                str(exc),
+                result={"error": str(exc)},
+                stage="error",
+            )
             commit_with_retry(db)
             return state
         finally:
@@ -38754,6 +39572,8 @@ def start_reisift_deep_prospecting_refresh_job(triggered_by="manual"):
             starter_db,
             "running",
             f"Refresh started ({triggered_by}).",
+            stage="starting",
+            reset_started_at=True,
         )
         commit_with_retry(starter_db)
     finally:

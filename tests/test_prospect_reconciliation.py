@@ -237,6 +237,70 @@ class ProspectReconciliationTests(unittest.TestCase):
             {"must": {"any_property_status": ["New Record"]}},
         )
 
+    def test_reisift_search_splits_zip_query_above_api_window(self):
+        requests_seen = []
+
+        class FakeResponse:
+            status_code = 200
+            reason = "OK"
+            url = "https://example.test/property/"
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        def fake_post(url, headers, json, timeout):
+            requests_seen.append(json)
+            zip_values = json["query"]["must"]["any_zip5"]
+            offset = int(json["offset"])
+            if len(zip_values) == 2:
+                total = 10001
+                uuid_group = "9000"
+            elif zip_values == ["07001"]:
+                total = 5001
+                uuid_group = "8001"
+            else:
+                total = 5000
+                uuid_group = "8002"
+            page_size = max(0, min(int(json["limit"]), total - offset))
+            return FakeResponse(
+                {
+                    "count": total,
+                    "results": [
+                        {"uuid": f"00000000-0000-4000-{uuid_group}-{offset + index:012d}"}
+                        for index in range(page_size)
+                    ],
+                }
+            )
+
+        query = {
+            "must": {
+                "any_property_status": ["New Record"],
+                "any_zip5": ["07001", "07002"],
+            }
+        }
+        with mock.patch.object(app.requests, "post", side_effect=fake_post):
+            rows, total = app.reisift_search_property_rows_by_query(
+                "token",
+                query,
+                max_rows=50000,
+            )
+
+        self.assertEqual(total, 10001)
+        self.assertEqual(len(rows), 10001)
+        self.assertEqual(requests_seen[0]["query"], query)
+        self.assertTrue(all(request["offset"] + request["limit"] <= 10000 for request in requests_seen))
+        partition_zip_sets = {
+            tuple(request["query"]["must"]["any_zip5"])
+            for request in requests_seen[1:]
+        }
+        self.assertEqual(partition_zip_sets, {("07001",), ("07002",)})
+
 
 if __name__ == "__main__":
     unittest.main()

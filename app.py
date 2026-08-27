@@ -310,6 +310,7 @@ REISIFT_PROPERTY_SEARCH_PAGE_SIZE = max(
     10,
     min(1000, int((os.getenv("REISIFT_PROPERTY_SEARCH_PAGE_SIZE") or "1000").strip() or "1000")),
 )
+REISIFT_PROPERTY_SEARCH_WINDOW_MAX = 10000
 REISIFT_NEW_RECORD_ACTIONABLE_MAX_AGE_DAYS = max(
     0,
     int((os.getenv("REISIFT_NEW_RECORD_ACTIONABLE_MAX_AGE_DAYS") or "3").strip() or "3"),
@@ -34118,9 +34119,6 @@ def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering=
     headers = reisift_auth_headers(token, {"x-http-method-override": "GET"})
     max_rows = max(1, min(50000, int(max_rows or 1000)))
     query_body = copy.deepcopy(query.get("query") if isinstance(query.get("query"), dict) else query)
-    offset = 0
-    rows = []
-    total = 0
 
     def _post_search(body):
         last_exc = None
@@ -34132,47 +34130,134 @@ def reisift_search_property_rows_by_query(token, query, max_rows=1000, ordering=
                 timeout=45,
             )
             if response.status_code not in {502, 503, 504}:
+                if response.status_code >= 400:
+                    try:
+                        error_detail = normalize_whitespace(response.text or "")[:500]
+                    except Exception:
+                        error_detail = ""
+                    if error_detail:
+                        raise requests.HTTPError(
+                            f"{response.status_code} Client Error from ReiSIFT property search: {error_detail}",
+                            response=response,
+                        )
                 response.raise_for_status()
                 return response
             last_exc = requests.HTTPError(f"{response.status_code} Server Error: {response.reason} for url: {response.url}", response=response)
             time.sleep(1.5 * (attempt + 1))
         raise last_exc or ValueError("ReiSift property search failed")
 
-    while offset < max_rows:
-        page_limit = min(REISIFT_PROPERTY_SEARCH_PAGE_SIZE, max_rows - offset)
-        body = {
-            "offset": offset,
-            # This is a transport page size, not a cap on the full result set.
-            "limit": page_limit,
-            "ordering": ordering,
-            "query": copy.deepcopy(query_body),
-        }
-        response = _post_search(body)
-        payload = response.json()
-        page_rows = payload.get("results") or payload.get("data") or []
-        total = int(payload.get("count") or total or len(page_rows))
-        if not page_rows:
-            break
-        dict_rows = [row for row in page_rows if isinstance(row, dict)]
-        rows.extend(dict_rows)
-        offset += len(page_rows)
-        if callable(progress_callback):
-            try:
-                progress_callback(
-                    {
-                        "stage": "searching",
-                        "message": f"Reading matching ReiSIFT properties: {min(offset, total or offset):,} of {total or offset:,}.",
-                        "scanned": min(offset, total or offset),
-                        "total": total or offset,
-                    }
-                )
-            except Exception:
-                pass
-        if total and offset >= total:
-            break
-        if not dict_rows:
-            break
-    return rows[:max_rows], total or len(rows)
+    def _zip_partitions(search_query):
+        must = search_query.get("must") if isinstance(search_query, dict) else None
+        zip_values = list(must.get("any_zip5") or []) if isinstance(must, dict) else []
+        if len(zip_values) < 2:
+            return []
+        midpoint = max(1, len(zip_values) // 2)
+        partitions = []
+        for zip_chunk in (zip_values[:midpoint], zip_values[midpoint:]):
+            if not zip_chunk:
+                continue
+            partition = copy.deepcopy(search_query)
+            partition["must"]["any_zip5"] = zip_chunk
+            partitions.append(partition)
+        return partitions
+
+    def _row_key(row):
+        property_uuid = normalize_uuid(row.get("uuid") or "")
+        if property_uuid:
+            return f"uuid:{property_uuid}"
+        return "row:" + json.dumps(row, ensure_ascii=True, sort_keys=True, default=str)
+
+    def _emit_search_progress(scanned, total):
+        if not callable(progress_callback):
+            return
+        try:
+            progress_callback(
+                {
+                    "stage": "searching",
+                    "message": f"Reading matching ReiSIFT properties: {min(scanned, total or scanned):,} of {total or scanned:,}.",
+                    "scanned": min(scanned, total or scanned),
+                    "total": total or scanned,
+                }
+            )
+        except Exception:
+            pass
+
+    def _fetch_search_rows(search_query, row_cap, progress_base=0, progress_total=0):
+        offset = 0
+        rows = []
+        total = 0
+        while offset < row_cap:
+            page_limit = min(
+                REISIFT_PROPERTY_SEARCH_PAGE_SIZE,
+                row_cap - offset,
+                REISIFT_PROPERTY_SEARCH_WINDOW_MAX - offset,
+            )
+            if page_limit <= 0:
+                break
+            body = {
+                "offset": offset,
+                # This is a transport page size, not a cap on the full result set.
+                "limit": page_limit,
+                "ordering": ordering,
+                "query": copy.deepcopy(search_query),
+            }
+            response = _post_search(body)
+            payload = response.json()
+            page_rows = payload.get("results") or payload.get("data") or []
+            total = int(payload.get("count") or total or len(page_rows))
+
+            if (
+                offset == 0
+                and total > REISIFT_PROPERTY_SEARCH_WINDOW_MAX
+                and row_cap > REISIFT_PROPERTY_SEARCH_WINDOW_MAX
+            ):
+                partitions = _zip_partitions(search_query)
+                if not partitions:
+                    raise ValueError(
+                        f"ReiSIFT returned {total:,} rows, above its 10,000-row search window, "
+                        "and the query cannot be split by ZIP code."
+                    )
+                combined = []
+                seen = set()
+                for partition in partitions:
+                    remaining = row_cap - len(combined)
+                    if remaining <= 0:
+                        break
+                    partition_rows, _ = _fetch_search_rows(
+                        partition,
+                        remaining,
+                        progress_base=progress_base + len(combined),
+                        progress_total=progress_total or total,
+                    )
+                    for row in partition_rows:
+                        key = _row_key(row)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        combined.append(row)
+                        if len(combined) >= row_cap:
+                            break
+                    _emit_search_progress(progress_base + len(combined), progress_total or total)
+                return combined, total
+
+            if not page_rows:
+                break
+            dict_rows = [row for row in page_rows if isinstance(row, dict)]
+            rows.extend(dict_rows)
+            offset += len(page_rows)
+            _emit_search_progress(progress_base + offset, progress_total or total)
+            if total and offset >= total:
+                break
+            if not dict_rows:
+                break
+        if total > REISIFT_PROPERTY_SEARCH_WINDOW_MAX and offset < min(total, row_cap):
+            raise ValueError(
+                f"ReiSIFT returned {total:,} rows but its API allows only the first "
+                f"{REISIFT_PROPERTY_SEARCH_WINDOW_MAX:,} for this query."
+            )
+        return rows[:row_cap], total or len(rows)
+
+    return _fetch_search_rows(query_body, max_rows)
 
 
 def reisift_search_property_rows_by_status(token, status_slug, counties=None, max_rows=1000):

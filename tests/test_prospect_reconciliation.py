@@ -345,6 +345,38 @@ class ProspectReconciliationTests(unittest.TestCase):
         self.assertEqual(statuses["old@example.com"], "Retry")
         self.assertEqual(statuses["recent@example.com"], "InFlight")
 
+    def test_lis_pendens_related_lists_share_foreclosure_bucketing(self):
+        list_names = [
+            "Pre-Foreclosures - Lis Pendens",
+            "Notice of Lis-Pendens",
+            "LisPendens",
+            "PreForeclosure",
+            "ForeclosureComplaint",
+            "Pre-Foreclosures - Notice of Default",
+        ]
+        sms_rule = {
+            "bucket": "Foreclosure",
+            "list_contains": "foreclosure,lis pendens,preforeclosure",
+        }
+
+        for list_name in list_names:
+            with self.subTest(list_name=list_name):
+                self.assertEqual(app._emailoctopus_category_from_terms([list_name]), "foreclosure")
+                self.assertEqual(app._sms_bucket_from_payload({"lists": [list_name]}), "Foreclosure")
+                self.assertTrue(app._sms_rule_source_matches(sms_rule, [list_name]))
+
+    def test_sheriff_sale_keeps_precedence_over_foreclosure(self):
+        list_names = ["Pre-Foreclosures - Lis Pendens", "Sheriff Sale"]
+
+        self.assertEqual(app._emailoctopus_category_from_terms(list_names), "sheriff sale")
+        self.assertEqual(app._sms_bucket_from_payload({"lists": list_names}), "Sheriff Sale")
+
+    def test_foreclosure_keeps_precedence_over_probate(self):
+        list_names = ["Probate", "Pre-Foreclosures - Lis Pendens"]
+
+        self.assertEqual(app._emailoctopus_category_from_terms(list_names), "foreclosure")
+        self.assertEqual(app._sms_bucket_from_payload({"lists": list_names}), "Foreclosure")
+
 
 if __name__ == "__main__":
     unittest.main()

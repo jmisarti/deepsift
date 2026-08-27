@@ -18943,11 +18943,27 @@ def _email_campaign_tags(source):
     return list(dict.fromkeys(tags))
 
 
+def _outreach_terms_include_foreclosure(terms):
+    for term in terms or []:
+        spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(term or ""))
+        words = re.findall(r"[a-z0-9]+", spaced.lower())
+        if not words:
+            continue
+        compact = "".join(words)
+        if any(word.startswith("foreclos") for word in words):
+            return True
+        if "preforeclos" in compact or "lispendens" in compact:
+            return True
+        if "notice" in words and "default" in words:
+            return True
+    return False
+
+
 def _emailoctopus_category_from_terms(terms):
     haystack = " ".join(normalize_whitespace(term) for term in (terms or []) if normalize_whitespace(term)).lower()
     if "sheriff" in haystack:
         return "sheriff sale"
-    if "foreclosure" in haystack or "lis pendens" in haystack or "preforeclosure" in haystack:
+    if _outreach_terms_include_foreclosure(terms):
         return "foreclosure"
     if "probate" in haystack or "obituary" in haystack or "estate" in haystack:
         return "probate"
@@ -36572,14 +36588,10 @@ def _sms_bucket_from_payload(payload):
     texts = _sms_source_terms_from_payload(payload)
     if _sms_source_terms_match_token(texts, "sheriff"):
         return "Sheriff Sale"
+    if _outreach_terms_include_foreclosure(texts):
+        return "Foreclosure"
     if _sms_source_terms_match_token(texts, "probate"):
         return "Probate"
-    if (
-        _sms_source_terms_match_token(texts, "foreclosure")
-        or _sms_source_terms_match_token(texts, "lis pendens")
-        or _sms_source_terms_match_token(texts, "preforeclosure")
-    ):
-        return "Foreclosure"
     return "General New Record"
 
 
@@ -36654,6 +36666,9 @@ def _sms_source_terms_match_token(source_terms, token):
 def _sms_rule_source_matches(rule, source_terms):
     tokens = _sms_rule_tokens(rule)
     if not tokens:
+        return True
+    bucket = str((rule.get("bucket") if isinstance(rule, dict) else rule["bucket"]) or "").strip().lower()
+    if bucket == "foreclosure" and _outreach_terms_include_foreclosure(source_terms):
         return True
     return any(_sms_source_terms_match_token(source_terms, token) for token in tokens)
 
@@ -41772,7 +41787,7 @@ def prospect_signal_set(list_names=None, owner_out_of_state=False, is_vacant=Non
     signals = set()
     if _prospect_text_has_any(haystack, ["judgment lien", "judgement lien"]):
         signals.add("judgment_lien")
-    if _prospect_text_has_any(haystack, ["foreclosure", "lis pendens", "lispendens"]):
+    if _outreach_terms_include_foreclosure(list_names or []):
         signals.add("lis_pendens")
     if _prospect_text_has_any(haystack, ["senior"]):
         signals.add("senior")

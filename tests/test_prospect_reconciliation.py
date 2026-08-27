@@ -305,8 +305,10 @@ class ProspectReconciliationTests(unittest.TestCase):
         class RecordingDb:
             def __init__(self):
                 self.params = None
+                self.sql = ""
 
             def execute(self, sql, params=()):
+                self.sql = sql
                 self.params = params
                 return self
 
@@ -314,6 +316,34 @@ class ProspectReconciliationTests(unittest.TestCase):
         app._mark_emailoctopus_queue_item(db, 42, "Completed", processed=True)
 
         self.assertIs(db.params[2], True)
+        self.assertIn("CAST(CURRENT_TIMESTAMP AS TEXT)", db.sql)
+
+    def test_stale_emailoctopus_inflight_rows_are_requeued(self):
+        old_stamp = app.format_db_time(app.datetime.utcnow() - app.timedelta(minutes=30))
+        recent_stamp = app.format_db_time(app.datetime.utcnow() - app.timedelta(minutes=2))
+        self.db.executemany(
+            """
+            INSERT INTO emailoctopus_sync_queue
+                (queue_key, action, normalized_email, queue_status, updated_at)
+            VALUES (?, 'unsubscribe', ?, 'InFlight', ?)
+            """,
+            [
+                ("old", "old@example.com", old_stamp),
+                ("recent", "recent@example.com", recent_stamp),
+            ],
+        )
+
+        recovered = app._requeue_stale_emailoctopus_inflight(self.db, stale_minutes=10)
+        statuses = {
+            row["normalized_email"]: row["queue_status"]
+            for row in self.db.execute(
+                "SELECT normalized_email, queue_status FROM emailoctopus_sync_queue"
+            ).fetchall()
+        }
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(statuses["old@example.com"], "Retry")
+        self.assertEqual(statuses["recent@example.com"], "InFlight")
 
 
 if __name__ == "__main__":

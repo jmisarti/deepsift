@@ -351,6 +351,10 @@ EMAIL_VALIDATION_QUEUE_POLL_SECONDS = max(int((os.getenv("EMAIL_VALIDATION_QUEUE
 EMAILOCTOPUS_SYNC_QUEUE_WORKER_ENABLED = env_flag("EMAILOCTOPUS_SYNC_QUEUE_WORKER_ENABLED", True)
 EMAILOCTOPUS_SYNC_QUEUE_POLL_SECONDS = max(int((os.getenv("EMAILOCTOPUS_SYNC_QUEUE_POLL_SECONDS") or "60").strip() or "60"), 15)
 EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT = max(int((os.getenv("EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT") or "100").strip() or "100"), 1)
+EMAILOCTOPUS_SYNC_QUEUE_INFLIGHT_STALE_MINUTES = max(
+    int((os.getenv("EMAILOCTOPUS_SYNC_QUEUE_INFLIGHT_STALE_MINUTES") or "15").strip() or "15"),
+    5,
+)
 REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED = env_flag("REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED", True)
 GMAIL_WATCH_RENEWAL_WORKER_ENABLED = env_flag("GMAIL_WATCH_RENEWAL_WORKER_ENABLED", True)
 GMAIL_WATCH_RENEWAL_POLL_SECONDS = max(int((os.getenv("GMAIL_WATCH_RENEWAL_POLL_SECONDS") or "86400").strip() or "86400"), 3600)
@@ -19478,7 +19482,7 @@ def _mark_emailoctopus_queue_item(db, row_id, queue_status, last_error="", proce
         UPDATE emailoctopus_sync_queue
         SET queue_status = ?,
             last_error = ?,
-            processed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE processed_at END,
+            processed_at = CASE WHEN ? THEN CAST(CURRENT_TIMESTAMP AS TEXT) ELSE processed_at END,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
@@ -19503,6 +19507,44 @@ def _schedule_emailoctopus_queue_retry(db, row_id, error_text, attempts):
             int(row_id or 0),
         ),
     )
+
+
+def _requeue_stale_emailoctopus_inflight(db, stale_minutes=None):
+    try:
+        stale_minutes = max(
+            5,
+            int(stale_minutes or EMAILOCTOPUS_SYNC_QUEUE_INFLIGHT_STALE_MINUTES),
+        )
+    except Exception:
+        stale_minutes = EMAILOCTOPUS_SYNC_QUEUE_INFLIGHT_STALE_MINUTES
+    cutoff = datetime.utcnow() - timedelta(minutes=stale_minutes)
+    run_after = format_db_time(datetime.utcnow())
+    recovered = 0
+    rows = db.execute(
+        """
+        SELECT id, updated_at
+        FROM emailoctopus_sync_queue
+        WHERE lower(COALESCE(queue_status, '')) = 'inflight'
+        """
+    ).fetchall()
+    for row in rows:
+        updated_at = parse_db_time(row["updated_at"] or "")
+        if updated_at and updated_at > cutoff:
+            continue
+        db.execute(
+            """
+            UPDATE emailoctopus_sync_queue
+            SET queue_status = 'Retry',
+                run_after = ?,
+                last_error = 'Recovered stale InFlight job after an interrupted worker.',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND lower(COALESCE(queue_status, '')) = 'inflight'
+            """,
+            (run_after, int(row["id"] or 0)),
+        )
+        recovered += 1
+    return recovered
 
 
 def process_emailoctopus_unsubscribe_queue_bulk(db, rows, settings=None):
@@ -19838,11 +19880,15 @@ def run_emailoctopus_sync_queue_once(limit=None):
     completed = 0
     skipped = 0
     errors = 0
+    recovered_stale = 0
     try:
         try:
             limit = max(1, min(100, int(limit or EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT)))
         except Exception:
             limit = EMAILOCTOPUS_SYNC_QUEUE_BATCH_LIMIT
+        recovered_stale = _requeue_stale_emailoctopus_inflight(db)
+        if recovered_stale:
+            commit_with_retry(db)
         now_stamp = format_db_time(datetime.utcnow())
         rows = db.execute(
             """
@@ -19890,6 +19936,7 @@ def run_emailoctopus_sync_queue_once(limit=None):
             "completed": completed,
             "skipped": skipped,
             "errors": errors,
+            "recovered_stale": recovered_stale,
             "remaining_due": int(remaining["c"] if remaining else 0),
         }
     finally:

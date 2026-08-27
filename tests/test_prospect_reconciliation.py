@@ -301,6 +301,20 @@ class ProspectReconciliationTests(unittest.TestCase):
         }
         self.assertEqual(partition_zip_sets, {("07001",), ("07002",)})
 
+    def test_emailoctopus_queue_completion_uses_boolean_case_parameter(self):
+        class RecordingDb:
+            def __init__(self):
+                self.params = None
+
+            def execute(self, sql, params=()):
+                self.params = params
+                return self
+
+        db = RecordingDb()
+        app._mark_emailoctopus_queue_item(db, 42, "Completed", processed=True)
+
+        self.assertIs(db.params[2], True)
+
 
 if __name__ == "__main__":
     unittest.main()

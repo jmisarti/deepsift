@@ -19482,7 +19482,7 @@ def _mark_emailoctopus_queue_item(db, row_id, queue_status, last_error="", proce
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        (queue_status, last_error or "", 1 if processed else 0, int(row_id or 0)),
+        (queue_status, last_error or "", bool(processed), int(row_id or 0)),
     )
 
 

@@ -38,7 +38,7 @@
                     {% endfor %}
                 </select>
             </label>
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.email_type %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>From
@@ -47,6 +47,13 @@
                     <label>To
                         <input type="date" name="date_to" value="{{ filters.date_to }}">
                     </label>
+                    <label>Email Type
+                        <select name="email_type">
+                            <option value="" {% if not filters.email_type %}selected{% endif %}>All email domains</option>
+                            <option value="public_free" {% if filters.email_type == 'public_free' %}selected{% endif %}>Public / free provider</option>
+                            <option value="work_organization" {% if filters.email_type == 'work_organization' %}selected{% endif %}>Work / organization</option>
+                        </select>
+                    </label>
                     <div class="filter-dropdown-actions">
                         <button type="submit">Apply Filters</button>
                         <a class="button-link secondary" href="{{ url_for('email_clicks_page') }}">Clear</a>
@@ -54,7 +61,7 @@
                 </div>
             </details>
             <button type="submit">Apply</button>
-            <a class="button-link secondary" href="{{ url_for('email_clicks_page', q=filters.q, date_from=filters.date_from, date_to=filters.date_to, min_clicks=filters.min_clicks, format='csv') }}">Export CSV</a>
+            <a class="button-link secondary" href="{{ url_for('email_clicks_page', q=filters.q, date_from=filters.date_from, date_to=filters.date_to, min_clicks=filters.min_clicks, email_type=filters.email_type, format='csv') }}">Export CSV</a>
         </form>
     </div>
 

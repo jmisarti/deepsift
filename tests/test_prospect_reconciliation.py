@@ -139,6 +139,11 @@ class ProspectReconciliationTests(unittest.TestCase):
     def tearDown(self):
         self.db.close()
 
+    def test_email_domain_type_classifies_public_and_organization_addresses(self):
+        self.assertEqual(app.classify_email_domain_type("john.smith+test@googlemail.com"), "public_free")
+        self.assertEqual(app.classify_email_domain_type("owner@examplecompany.com"), "work_organization")
+        self.assertEqual(app.classify_email_domain_type(""), "missing")
+
     def test_bulk_eligibility_preserves_gmail_identity_on_another_active_property(self):
         self.db.executemany(
             "INSERT INTO properties (id, owner_person_id, status) VALUES (?, ?, ?)",

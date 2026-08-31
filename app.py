@@ -758,6 +758,35 @@ BUYER_PROPERTY_TYPE_ALIASES = {
 AUTHORITY_AUDIENCES = ["General Investors", "Accredited Investors", "Operators", "Brokers", "Title Agents"]
 AUTHORITY_CHANNELS = ["LinkedIn Long-Form", "X", "BiggerPockets", "Reddit"]
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-']+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
+PUBLIC_FREE_EMAIL_DOMAINS = frozenset(
+    {
+        "aol.com",
+        "aim.com",
+        "att.net",
+        "bellsouth.net",
+        "comcast.net",
+        "earthlink.net",
+        "gmail.com",
+        "googlemail.com",
+        "hotmail.com",
+        "icloud.com",
+        "live.com",
+        "mac.com",
+        "mail.com",
+        "me.com",
+        "msn.com",
+        "netzero.net",
+        "optonline.net",
+        "outlook.com",
+        "proton.me",
+        "protonmail.com",
+        "rocketmail.com",
+        "sbcglobal.net",
+        "verizon.net",
+        "yahoo.com",
+        "ymail.com",
+    }
+)
 AUTHORITY_IDEA_STATUSES = ["Draft", "Review", "Approved", "Rejected", "Backlog"]
 LEAD_STOP_STATUSES = {"not interested", "dnc", "opt out", "dead"}
 LEAD_NEGATIVE_INTENT_TOKENS = [
@@ -3953,6 +3982,15 @@ def normalize_email_identity(value):
         local = local.split("+", 1)[0].replace(".", "")
         domain = "gmail.com"
     return f"{local}@{domain}" if local and domain else email
+
+
+def classify_email_domain_type(value):
+    """Classify an email for click-review triage without changing its identity."""
+    email = normalize_email_identity(value)
+    if "@" not in email:
+        return "missing"
+    domain = email.rsplit("@", 1)[1].strip().lower()
+    return "public_free" if domain in PUBLIC_FREE_EMAIL_DOMAINS else "work_organization"
 
 
 def est_day_start_utc(now_dt=None):
@@ -48516,6 +48554,9 @@ def get_email_click_engagement_rows(db, filters=None):
     filters = filters or {}
     min_clicks = max(1, _safe_int(filters.get("min_clicks"), 2))
     search = normalize_whitespace(filters.get("q") or "")
+    email_type = str(filters.get("email_type") or "").strip().lower()
+    if email_type not in {"", "public_free", "work_organization"}:
+        email_type = ""
     date_from = _email_clicks_date_bound(filters.get("date_from"), end_of_day=False)
     date_to = _email_clicks_date_bound(filters.get("date_to"), end_of_day=True)
     where = [
@@ -48625,22 +48666,25 @@ def get_email_click_engagement_rows(db, filters=None):
         address_tail = " ".join(part for part in [row["state"], row["postal_code"]] if part).strip()
         full_address = ", ".join(part for part in [row["street"], row["city"], address_tail] if part).strip()
         reisift_uuid = str(row["reisift_property_uuid"] or "").strip()
-        output.append(
-            {
-                "name": name or "ReiSIFT Owner",
-                "email": normalize_email_identity(row["contact_email"] or row["primary_email"] or ""),
-                "other_emails": row["emails"] or "",
-                "phones": row["phones"] or row["primary_phone"] or "",
-                "address": full_address,
-                "clicks": int(row["click_count"] or 0),
-                "first_click_at": row["first_click_at"] or "",
-                "last_click_at": row["last_click_at"] or "",
-                "property_id": int(row["property_id"] or 0),
-                "person_id": int(row["person_id"] or 0),
-                "reisift_property_uuid": reisift_uuid,
-                "sift_record_url": f"https://app.reisift.io/records/properties/{reisift_uuid}/details?page=1" if reisift_uuid else "",
-            }
-        )
+        email = normalize_email_identity(row["contact_email"] or row["primary_email"] or "")
+        row_data = {
+            "name": name or "ReiSIFT Owner",
+            "email": email,
+            "email_type": classify_email_domain_type(email),
+            "other_emails": row["emails"] or "",
+            "phones": row["phones"] or row["primary_phone"] or "",
+            "address": full_address,
+            "clicks": int(row["click_count"] or 0),
+            "first_click_at": row["first_click_at"] or "",
+            "last_click_at": row["last_click_at"] or "",
+            "property_id": int(row["property_id"] or 0),
+            "person_id": int(row["person_id"] or 0),
+            "reisift_property_uuid": reisift_uuid,
+            "sift_record_url": f"https://app.reisift.io/records/properties/{reisift_uuid}/details?page=1" if reisift_uuid else "",
+        }
+        if email_type and row_data["email_type"] != email_type:
+            continue
+        output.append(row_data)
     return output
 
 
@@ -48653,6 +48697,7 @@ def email_clicks_page():
         "date_from": (request.args.get("date_from") or "").strip(),
         "date_to": (request.args.get("date_to") or "").strip(),
         "min_clicks": (request.args.get("min_clicks") or "2").strip(),
+        "email_type": (request.args.get("email_type") or "").strip().lower(),
     }
     rows = get_email_click_engagement_rows(db, filters=filters)
     total_clicks = sum(int(row["clicks"] or 0) for row in rows)
@@ -48661,6 +48706,7 @@ def email_clicks_page():
         fieldnames = [
             "name",
             "email",
+            "email_type",
             "other_emails",
             "phones",
             "address",

@@ -123,6 +123,10 @@ class ProspectReconciliationTests(unittest.TestCase):
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE anonymous_email_campaign_registry (
+                normalized_email TEXT PRIMARY KEY,
+                status TEXT
+            );
             CREATE TABLE website_lead_submissions (
                 id INTEGER PRIMARY KEY,
                 latest_email TEXT,

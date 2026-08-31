@@ -80,6 +80,49 @@ class ProspectReconciliationTests(unittest.TestCase):
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 processed_at TEXT
             );
+            CREATE TABLE email_validation_registry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                normalized_email TEXT NOT NULL UNIQUE,
+                provider TEXT NOT NULL DEFAULT 'emaillistverify',
+                queue_status TEXT NOT NULL DEFAULT 'Queued',
+                validation_status TEXT,
+                provider_status TEXT,
+                validation_raw TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                first_source TEXT,
+                last_source TEXT,
+                first_touchpoint_id INTEGER,
+                last_touchpoint_id INTEGER,
+                run_after TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                requested_at TEXT,
+                processed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE email_validation_registry_touchpoints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                registry_id INTEGER NOT NULL,
+                touchpoint_id INTEGER NOT NULL UNIQUE,
+                person_id INTEGER,
+                source TEXT NOT NULL DEFAULT 'email_validation',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE email_validation_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                touchpoint_id INTEGER NOT NULL UNIQUE,
+                person_id INTEGER,
+                email_value TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'skiptrace',
+                queue_status TEXT NOT NULL DEFAULT 'Queued',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                run_after TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                validation_status TEXT,
+                validation_raw TEXT,
+                processed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE website_lead_submissions (
                 id INTEGER PRIMARY KEY,
                 latest_email TEXT,
@@ -300,6 +343,59 @@ class ProspectReconciliationTests(unittest.TestCase):
             for request in requests_seen[1:]
         }
         self.assertEqual(partition_zip_sets, {("07001",), ("07002",)})
+
+    def test_bulk_reisift_email_import_never_queues_a_paid_validation(self):
+        queue_id = app.queue_touchpoint_email_validation(
+            self.db,
+            touchpoint_id=701,
+            person_id=71,
+            email_value="backfill@example.com",
+            source="reisift_new_record_backfill",
+        )
+        registry = self.db.execute(
+            "SELECT queue_status, validation_status, provider_status, attempts FROM email_validation_registry"
+        ).fetchone()
+        queued = self.db.execute(
+            "SELECT queue_status, validation_status FROM email_validation_queue WHERE id = ?",
+            (queue_id,),
+        ).fetchone()
+
+        self.assertEqual(registry["queue_status"], "Known")
+        self.assertEqual(registry["validation_status"], "bulk_import_not_validated")
+        self.assertEqual(registry["provider_status"], "not_requested")
+        self.assertEqual(registry["attempts"], 0)
+        self.assertEqual(queued["queue_status"], "Skipped")
+        self.assertEqual(queued["validation_status"], "already_seen")
+
+        reused_queue_id = app.queue_touchpoint_email_validation(
+            self.db,
+            touchpoint_id=702,
+            person_id=72,
+            email_value="backfill@example.com",
+            source="skipsherpa_property_owner",
+        )
+        reused = self.db.execute(
+            "SELECT queue_status, validation_status FROM email_validation_queue WHERE id = ?",
+            (reused_queue_id,),
+        ).fetchone()
+        attempts = self.db.execute(
+            "SELECT attempts FROM email_validation_registry WHERE normalized_email = 'backfill@example.com'"
+        ).fetchone()["attempts"]
+        self.assertEqual(reused["queue_status"], "Skipped")
+        self.assertEqual(attempts, 0)
+
+        incremental_queue_id = app.queue_touchpoint_email_validation(
+            self.db,
+            touchpoint_id=703,
+            person_id=73,
+            email_value="new-skiptrace@example.com",
+            source="skipsherpa_property_owner",
+        )
+        incremental = self.db.execute(
+            "SELECT queue_status FROM email_validation_queue WHERE id = ?",
+            (incremental_queue_id,),
+        ).fetchone()
+        self.assertEqual(incremental["queue_status"], "Queued")
 
     def test_emailoctopus_queue_completion_uses_boolean_case_parameter(self):
         class RecordingDb:

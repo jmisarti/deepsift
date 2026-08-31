@@ -2532,8 +2532,6 @@ def migrate_db(db):
     if REISIFT_NEW_RECORD_EMAIL_VALIDATION_AUTO_ENABLED:
         reisift_email_sources = (
             "reisift_new_record",
-            "reisift_new_record_backfill",
-            "reisift_new_record_repair",
             "reisift_deep_prospecting",
         )
         placeholders = ",".join("?" for _ in reisift_email_sources)
@@ -16617,6 +16615,15 @@ EMAIL_VALIDATION_REGISTRY_ACTIVE_STATUSES = {"queued", "retry", "inflight", "in_
 EMAIL_VALIDATION_REGISTRY_BACKFILL_SETTING = "email_validation_registry_backfilled_at"
 EMAIL_VALIDATION_REGISTRY_TOUCHPOINT_BACKFILL_SETTING = "email_validation_registry_touchpoints_backfilled_at"
 EMAIL_VALIDATION_REGISTRY_PASSIVE_STATUSES = {"known", "discovered", "skipped"}
+EMAIL_VALIDATION_BULK_IMPORT_SOURCES = {
+    "reisift_new_record_backfill",
+    "reisift_new_record_repair",
+}
+EMAIL_VALIDATION_BULK_IMPORT_STATUS = "bulk_import_not_validated"
+
+
+def email_validation_source_is_bulk_import(source):
+    return str(source or "").strip().lower() in EMAIL_VALIDATION_BULK_IMPORT_SOURCES
 
 
 def _email_validation_registry_row(db, email_value):
@@ -16696,6 +16703,63 @@ def _attach_email_validation_touchpoint(db, registry_id, touchpoint_id, person_i
         """,
         (registry_id, touchpoint_id, person_id, source or "email_validation"),
     )
+
+
+def register_email_validation_bulk_import(db, email_value, touchpoint_id=0, person_id=None, source=""):
+    """Attach a bulk-imported email to the ledger without authorizing a paid lookup."""
+    normalized_email = normalize_email_identity(email_value)
+    if not normalized_email:
+        return None
+    now_stamp = format_db_time(datetime.utcnow())
+    source_value = (source or "reisift_new_record_backfill").strip() or "reisift_new_record_backfill"
+    row = _email_validation_registry_row(db, normalized_email)
+    if row:
+        db.execute(
+            """
+            UPDATE email_validation_registry
+            SET last_source = ?,
+                last_touchpoint_id = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (source_value, int(touchpoint_id or 0), int(row["id"] or 0)),
+        )
+        _attach_email_validation_touchpoint(db, int(row["id"] or 0), touchpoint_id, person_id, source_value)
+        return _email_validation_registry_row(db, normalized_email)
+
+    payload = json.dumps(
+        {
+            "source": source_value,
+            "reason": "Bulk ReiSIFT import is ledger-only and does not call EmailListVerify.",
+            "provider": "emaillistverify",
+            "provider_call_made": False,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+    cur = db.execute(
+        """
+        INSERT INTO email_validation_registry (
+            normalized_email, provider, queue_status, validation_status, provider_status, validation_raw,
+            attempts, first_source, last_source, first_touchpoint_id, last_touchpoint_id,
+            run_after, requested_at, processed_at
+        )
+        VALUES (?, 'emaillistverify', 'Known', ?, 'not_requested', ?, 0, ?, ?, ?, ?, ?, NULL, NULL)
+        """,
+        (
+            normalized_email,
+            EMAIL_VALIDATION_BULK_IMPORT_STATUS,
+            payload,
+            source_value,
+            source_value,
+            int(touchpoint_id or 0),
+            int(touchpoint_id or 0),
+            now_stamp,
+        ),
+    )
+    registry_id = int(cur.lastrowid or 0)
+    _attach_email_validation_touchpoint(db, registry_id, touchpoint_id, person_id, source_value)
+    return _email_validation_registry_row(db, normalized_email)
 
 
 def _ensure_email_validation_registry(db, email_value, touchpoint_id=0, person_id=None, source="email_validation", hold_reason=""):
@@ -17181,14 +17245,23 @@ def queue_touchpoint_email_validation(db, touchpoint_id, person_id, email_value,
     source_value = (source or "skiptrace").strip() or "skiptrace"
     hold_reason = email_validation_source_hold_reason(source_value)
     now_stamp = format_db_time(datetime.utcnow())
-    registry_row = _ensure_email_validation_registry(
-        db,
-        email_value,
-        touchpoint_id=touchpoint_id,
-        person_id=person_id,
-        source=source_value,
-        hold_reason=hold_reason,
-    )
+    if email_validation_source_is_bulk_import(source_value):
+        registry_row = register_email_validation_bulk_import(
+            db,
+            email_value,
+            touchpoint_id=touchpoint_id,
+            person_id=person_id,
+            source=source_value,
+        )
+    else:
+        registry_row = _ensure_email_validation_registry(
+            db,
+            email_value,
+            touchpoint_id=touchpoint_id,
+            person_id=person_id,
+            source=source_value,
+            hold_reason=hold_reason,
+        )
     registry_decision = _email_validation_registry_decision(
         registry_row,
         exclude_touchpoint_id=touchpoint_id,

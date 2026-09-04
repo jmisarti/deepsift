@@ -482,6 +482,73 @@ class ProspectReconciliationTests(unittest.TestCase):
         self.assertEqual(app._emailoctopus_category_from_terms(list_names), "foreclosure")
         self.assertEqual(app._sms_bucket_from_payload({"lists": list_names}), "Foreclosure")
 
+    def test_canonical_sms_activity_uses_one_provider_id_and_latest_delivery(self):
+        self.db.executescript(
+            """
+            CREATE TABLE communications (
+                id INTEGER PRIMARY KEY,
+                channel TEXT,
+                direction TEXT,
+                from_number TEXT,
+                to_number TEXT,
+                sent_at TEXT,
+                created_at TEXT,
+                external_id TEXT
+            );
+            CREATE TABLE sms_delivery_events (
+                id INTEGER PRIMARY KEY,
+                sms_id TEXT,
+                provider_status TEXT,
+                failure_bucket TEXT,
+                is_final INTEGER,
+                received_at TEXT
+            );
+            """
+        )
+        self.db.executemany(
+            """
+            INSERT INTO communications
+                (id, channel, direction, from_number, to_number, sent_at, created_at, external_id)
+            VALUES (?, 'SMS', ?, '9735550100', '9735550111', ?, ?, ?)
+            """,
+            [
+                (1, "Outbound", "2026-09-01 14:00:00", "2026-09-01 14:00:00", "SM-delivered"),
+                (2, "Outbound", "2026-09-01 14:00:01", "2026-09-01 14:00:01", "SM-delivered"),
+                (3, "Outbound", "2026-09-01 15:00:00", "2026-09-01 15:00:00", "SM-undelivered"),
+                (4, "Outbound", "2026-09-01 16:00:00", "2026-09-01 16:00:00", "SM-pending"),
+                (5, "Inbound", "2026-09-01 17:00:00", "2026-09-01 17:00:00", "SM-inbound"),
+                (6, "Inbound", "2026-09-01 17:00:01", "2026-09-01 17:00:01", "SM-inbound"),
+            ],
+        )
+        self.db.executemany(
+            """
+            INSERT INTO sms_delivery_events
+                (id, sms_id, provider_status, failure_bucket, is_final, received_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "SM-delivered", "Sent", "", 0, "2026-09-01 14:00:02"),
+                (2, "SM-delivered", "Delivered", "", 1, "2026-09-01 14:00:03"),
+                (3, "SM-undelivered", "Undelivered", "recipient_unreachable", 1, "2026-09-01 15:00:02"),
+            ],
+        )
+
+        events, source_rows = app._canonical_sms_activity_events(
+            self.db,
+            app.datetime(2026, 9, 1, 4, 0, 0),
+            app.datetime(2026, 9, 2, 4, 0, 0),
+        )
+        rollups = app._phone_activity_rollups_from_events(events)
+        outbound = [row for row in rollups if row["channel"] == "sms" and row["direction"] == "outbound"]
+        inbound = [row for row in rollups if row["channel"] == "sms" and row["direction"] == "inbound"]
+
+        self.assertEqual(source_rows, {"outbound_sms": 3, "inbound_sms": 1})
+        self.assertEqual(sum(row["event_count"] for row in outbound), 3)
+        self.assertEqual(sum(row["event_count"] for row in outbound if row["disposition_bucket"] == "Delivered"), 1)
+        self.assertEqual(sum(row["event_count"] for row in outbound if row["disposition_bucket"] == "Undelivered"), 1)
+        self.assertEqual(sum(row["event_count"] for row in outbound if row["disposition_bucket"] == "Pending"), 1)
+        self.assertEqual(sum(row["event_count"] for row in inbound), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -59145,17 +59145,147 @@ def phone_activity_export_auth_ok(db, req):
     return integration_auth_ok(db, req)
 
 
-def phone_activity_rollup_export(days):
-    ensure_db()
-    db = get_db()
-    if not phone_activity_export_auth_ok(db, request):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+def _phone_activity_export_datetime(value, label):
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(f"{label} is required")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = parse_flexible_datetime(raw)
+    if not parsed:
+        raise ValueError(f"{label} must be an ISO UTC datetime")
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc).replace(tzinfo=None)
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _phone_activity_export_window(days):
+    start_raw = request.args.get("start")
+    end_raw = request.args.get("end")
+    if start_raw or end_raw:
+        if not start_raw or not end_raw:
+            raise ValueError("start and end must be provided together")
+        start_at = _phone_activity_export_datetime(start_raw, "start")
+        end_at = _phone_activity_export_datetime(end_raw, "end")
+        if end_at <= start_at:
+            raise ValueError("end must be later than start")
+        return start_at, end_at
     try:
         window_days = max(1, min(31, int(days or request.args.get("days") or 7)))
     except (TypeError, ValueError):
         window_days = 7
     end_at = datetime.utcnow().replace(microsecond=0)
-    start_at = end_at - timedelta(days=window_days)
+    return end_at - timedelta(days=window_days), end_at
+
+
+def _phone_activity_sms_delivery_disposition(provider_status, failure_bucket=""):
+    status = normalize_whitespace(provider_status).lower()
+    failure = normalize_whitespace(failure_bucket).lower()
+    if status == "delivered":
+        return "Delivered"
+    if status in {"undelivered", "failed", "error"}:
+        return "Undelivered"
+    if failure in {"recipient_unreachable", "sender_filter", "unknown_undelivered"}:
+        return "Undelivered"
+    return "Pending"
+
+
+def _phone_activity_event_from_canonical_sms_row(row, direction="outbound"):
+    from_number = normalize_phone(row["from_number"] or "")
+    to_number = normalize_phone(row["to_number"] or "")
+    happened_at = parse_flexible_datetime(row["sent_at"] or row["created_at"] or "") or datetime.utcnow()
+    if happened_at.tzinfo is None:
+        happened_at = happened_at.replace(tzinfo=timezone.utc)
+    else:
+        happened_at = happened_at.astimezone(timezone.utc)
+    disposition = (
+        _phone_activity_sms_delivery_disposition(row["provider_status"], row["failure_bucket"])
+        if direction == "outbound"
+        else "Received"
+    )
+    return {
+        "bucket_start": happened_at.replace(minute=0, second=0, microsecond=0),
+        "user_key": "unknown",
+        "user_name": "Unknown",
+        "business_number": _phone_activity_business_number(direction, from_number, to_number),
+        "channel": "sms",
+        "direction": direction,
+        "disposition_bucket": disposition,
+        "duration_seconds": 0,
+    }
+
+
+def _canonical_sms_activity_events(db, start_at, end_at):
+    start_text = start_at.strftime("%Y-%m-%d %H:%M:%S")
+    end_text = end_at.strftime("%Y-%m-%d %H:%M:%S")
+    outbound_rows = db.execute(
+        """
+        WITH sent_candidates AS (
+            SELECT id, channel, direction, from_number, to_number, sent_at, created_at, external_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY external_id
+                       ORDER BY COALESCE(NULLIF(sent_at, ''), created_at) ASC, id ASC
+                   ) AS sms_rank
+            FROM communications
+            WHERE upper(COALESCE(channel, '')) = 'SMS'
+              AND lower(COALESCE(direction, '')) = 'outbound'
+              AND COALESCE(external_id, '') != ''
+              AND COALESCE(NULLIF(sent_at, ''), created_at) >= ?
+              AND COALESCE(NULLIF(sent_at, ''), created_at) < ?
+        ), delivery_ranked AS (
+            SELECT e.sms_id, e.provider_status, e.failure_bucket, e.received_at, e.id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY e.sms_id
+                       ORDER BY COALESCE(e.is_final, 0) DESC, COALESCE(e.received_at, '') DESC, e.id DESC
+                   ) AS delivery_rank
+            FROM sms_delivery_events e
+            JOIN (SELECT DISTINCT external_id FROM sent_candidates) s ON s.external_id = e.sms_id
+        )
+        SELECT s.*, d.provider_status, d.failure_bucket
+        FROM sent_candidates s
+        LEFT JOIN delivery_ranked d ON d.sms_id = s.external_id AND d.delivery_rank = 1
+        WHERE s.sms_rank = 1
+        ORDER BY COALESCE(NULLIF(s.sent_at, ''), s.created_at) ASC, s.id ASC
+        LIMIT 50000
+        """,
+        (start_text, end_text),
+    ).fetchall()
+    inbound_rows = db.execute(
+        """
+        SELECT id, channel, direction, from_number, to_number, sent_at, created_at, external_id,
+               '' AS provider_status, '' AS failure_bucket
+        FROM communications
+        WHERE upper(COALESCE(channel, '')) = 'SMS'
+          AND lower(COALESCE(direction, '')) = 'inbound'
+          AND COALESCE(NULLIF(sent_at, ''), created_at) >= ?
+          AND COALESCE(NULLIF(sent_at, ''), created_at) < ?
+        ORDER BY COALESCE(NULLIF(sent_at, ''), created_at) ASC, id ASC
+        LIMIT 50000
+        """,
+        (start_text, end_text),
+    ).fetchall()
+    inbound_seen = set()
+    canonical_inbound = []
+    for row in inbound_rows:
+        key = str(row["external_id"] or "").strip() or f"communication:{int(row['id'] or 0)}"
+        if key not in inbound_seen:
+            inbound_seen.add(key)
+            canonical_inbound.append(row)
+    events = [_phone_activity_event_from_canonical_sms_row(row, "outbound") for row in outbound_rows]
+    events.extend(_phone_activity_event_from_canonical_sms_row(row, "inbound") for row in canonical_inbound)
+    return events, {"outbound_sms": len(outbound_rows), "inbound_sms": len(canonical_inbound)}
+
+
+def phone_activity_rollup_export(days=None):
+    ensure_db()
+    db = get_db()
+    if not phone_activity_export_auth_ok(db, request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    try:
+        start_at, end_at = _phone_activity_export_window(days)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     event_rows = db.execute(
         """
         SELECT id, event_type, processing_status, sms_id, from_number, to_number, communication_id, payload_json, received_at
@@ -59173,7 +59303,7 @@ def phone_activity_rollup_export(days):
         FROM communications
         WHERE COALESCE(NULLIF(sent_at, ''), created_at) >= ?
           AND COALESCE(NULLIF(sent_at, ''), created_at) < ?
-          AND upper(COALESCE(channel, '')) IN ('SMS', 'CALL')
+          AND upper(COALESCE(channel, '')) = 'CALL'
         ORDER BY COALESCE(NULLIF(sent_at, ''), created_at) ASC
         LIMIT 50000
         """,
@@ -59190,16 +59320,27 @@ def phone_activity_rollup_export(days):
         """,
         (start_at.strftime("%Y-%m-%d %H:%M:%S"), end_at.strftime("%Y-%m-%d %H:%M:%S")),
     ).fetchall()
-    events = _phone_activity_events_from_source_rows(event_rows, communication_rows, call_job_rows)
+    legacy_events = _phone_activity_events_from_source_rows(
+        event_rows,
+        communication_rows,
+        call_job_rows,
+        include_sms=False,
+    )
+    sms_events, sms_source_rows = _canonical_sms_activity_events(db, start_at, end_at)
+    events = legacy_events + sms_events
     rollups = _phone_activity_rollups_from_events(events)
     return jsonify(
         {
             "ok": True,
+            "window_start": start_at.replace(tzinfo=timezone.utc).isoformat(),
+            "window_end": end_at.replace(tzinfo=timezone.utc).isoformat(),
+            "sms_delivery_source": "sms_delivery_events_latest",
             "rows_scanned": len(event_rows) + len(communication_rows) + len(call_job_rows),
             "source_rows": {
                 "smrtphone_webhook_events": len(event_rows),
                 "communications": len(communication_rows),
                 "call_recording_jobs": len(call_job_rows),
+                **sms_source_rows,
             },
             "events_scanned": len(events),
             "rollups": rollups,
@@ -59215,7 +59356,7 @@ def phone_activity_rollups_api():
     return phone_activity_rollup_export(request.args.get("days"))
 
 
-def _phone_activity_events_from_source_rows(event_rows, communication_rows, call_job_rows):
+def _phone_activity_events_from_source_rows(event_rows, communication_rows, call_job_rows, include_sms=True):
     communication_external_ids = {
         str(row["external_id"] or "").strip()
         for row in communication_rows
@@ -59245,6 +59386,8 @@ def _phone_activity_events_from_source_rows(event_rows, communication_rows, call
             parsed_payload=payload,
         )
         if not event:
+            continue
+        if event["channel"] == "sms" and not include_sms:
             continue
         if call_sid and event["channel"] == "call":
             if call_sid not in call_events_by_sid:

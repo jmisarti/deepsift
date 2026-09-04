@@ -51,7 +51,7 @@
                 </select>
             </label>
             <button type="submit">Apply</button>
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.is_vacant or filters.priority_preset or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.is_vacant or filters.priority_preset or filters.engagement_audience or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>From
@@ -131,6 +131,15 @@
                         </select>
                         <span class="help-text">LLC owners are excluded from priority presets.</span>
                     </label>
+                    <label>Engagement Audience
+                        <select name="engagement_audience">
+                            <option value="">All</option>
+                            <option value="conversation_stalled" {% if filters.engagement_audience == 'conversation_stalled' %}selected{% endif %}>Conversation Stalled</option>
+                            <option value="no_response" {% if filters.engagement_audience == 'no_response' %}selected{% endif %}>No SMS Response</option>
+                            <option value="email_engaged" {% if filters.engagement_audience == 'email_engaged' %}selected{% endif %}>Email Opened / Clicked</option>
+                        </select>
+                        <span class="help-text">Only properties still active in this prospecting segment are included.</span>
+                    </label>
                     <label>ReiSkipped?
                         <select name="rei_skipped">
                             <option value="">All</option>
@@ -174,6 +183,7 @@
             <input type="hidden" name="owner_out_of_state" value="{{ filters.owner_out_of_state }}">
             <input type="hidden" name="is_vacant" value="{{ filters.is_vacant }}">
             <input type="hidden" name="priority_preset" value="{{ filters.priority_preset }}">
+            <input type="hidden" name="engagement_audience" value="{{ filters.engagement_audience }}">
             <input type="hidden" name="rei_skipped" value="{{ filters.rei_skipped }}">
             <input type="hidden" name="deep_skipped" value="{{ filters.deep_skipped }}">
             <input type="hidden" name="no_good_numbers" value="{{ filters.no_good_numbers }}">

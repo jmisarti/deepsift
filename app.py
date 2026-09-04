@@ -381,6 +381,10 @@ SMS_AUTOMATION_AUTO_SEND_BATCH_LIMIT = max(
     1,
 )
 SMS_AUTOMATION_FOLLOWUP_COUNT = max(int((os.getenv("SMS_AUTOMATION_FOLLOWUP_COUNT") or "3").strip() or "3"), 0)
+PROSPECT_CONVERSATION_STALLED_BUSINESS_DAYS = max(
+    int((os.getenv("PROSPECT_CONVERSATION_STALLED_BUSINESS_DAYS") or "2").strip() or "2"),
+    1,
+)
 SMS_AUTOMATION_REISIFT_SENT_TAG = "AutoSMS:Sent"
 WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or "600").strip() or "600"), 60)
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
@@ -1642,6 +1646,9 @@ def migrate_db(db):
             email_in INTEGER NOT NULL DEFAULT 0,
             emails_opened INTEGER NOT NULL DEFAULT 0,
             inbound_responses INTEGER NOT NULL DEFAULT 0,
+            conversation_stalled INTEGER NOT NULL DEFAULT 0,
+            no_sms_response INTEGER NOT NULL DEFAULT 0,
+            email_engaged INTEGER NOT NULL DEFAULT 0,
             rei_skipped INTEGER NOT NULL DEFAULT 0,
             deep_skipped INTEGER NOT NULL DEFAULT 0,
             no_good_numbers INTEGER NOT NULL DEFAULT 0,
@@ -1671,11 +1678,17 @@ def migrate_db(db):
     ensure_column(db, "prospect_table_cache", "priority_preset", "priority_preset TEXT")
     ensure_column(db, "prospect_table_cache", "priority_match", "priority_match TEXT")
     ensure_column(db, "prospect_table_cache", "source_first_seen_at", "source_first_seen_at TEXT")
+    ensure_column(db, "prospect_table_cache", "conversation_stalled", "conversation_stalled INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "prospect_table_cache", "no_sms_response", "no_sms_response INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "prospect_table_cache", "email_engaged", "email_engaged INTEGER NOT NULL DEFAULT 0")
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_priority ON prospect_table_cache(segment, priority_preset, is_llc_owner)"
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_local_property ON prospect_table_cache(local_property_id)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_audiences ON prospect_table_cache(segment, conversation_stalled, no_sms_response, email_engaged)"
     )
     db.execute(
         """
@@ -40346,6 +40359,162 @@ def _prospect_table_source_rows(db, segment, property_uuids=None, property_ids=N
     return [dict(row) for row in rows]
 
 
+def _prospect_audience_business_days_elapsed(started_at, now_utc=None):
+    """Count completed weekday boundaries after an outreach event in Eastern time."""
+    started_at = started_at if isinstance(started_at, datetime) else parse_db_time(started_at or "")
+    if not started_at:
+        return 0
+    now_utc = now_utc or datetime.utcnow()
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    cursor = started_at.astimezone(EST_TZ).date()
+    today = now_utc.astimezone(EST_TZ).date()
+    completed = 0
+    while cursor < today:
+        cursor += timedelta(days=1)
+        if cursor.weekday() < 5:
+            completed += 1
+    return completed
+
+
+def _prospect_audience_non_stop_inbound_sms(body):
+    message = normalize_whitespace(body or "").lower()
+    if not message or _inbound_sms_indicates_wrong_number(message):
+        return False
+    return not any(token in message for token in LEAD_NEGATIVE_INTENT_TOKENS)
+
+
+def _prospect_audience_form_submission_property_ids(db, property_ids):
+    """A submitted form is a conversion signal even before its ReiSIFT status changes."""
+    matched = set()
+    for chunk in iter_query_chunks(property_ids):
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = db.execute(
+            f"""
+            SELECT local_property_id FROM website_lead_submissions WHERE local_property_id IN ({placeholders})
+            UNION
+            SELECT local_property_id FROM clever_lead_submissions WHERE local_property_id IN ({placeholders})
+            UNION
+            SELECT local_property_id FROM propertyleads_lead_submissions WHERE local_property_id IN ({placeholders})
+            UNION
+            SELECT local_property_id FROM manual_lead_submissions WHERE local_property_id IN ({placeholders})
+            """,
+            tuple(chunk) * 4,
+        ).fetchall()
+        matched.update(int(row["local_property_id"] or 0) for row in rows if int(row["local_property_id"] or 0) > 0)
+    return matched
+
+
+def bulk_prospect_audience_flags(db, rows):
+    """Build property-level re-engagement audiences once for the cached prospect tables."""
+    defaults = {
+        id(item): {"conversation_stalled": 0, "no_sms_response": 0, "email_engaged": 0}
+        for item in rows
+        if isinstance(item, dict)
+    }
+    property_ids = sorted(
+        {
+            int(item.get("deep_dive_property_id") or item.get("local_property_id") or 0)
+            for item in rows
+            if isinstance(item, dict) and int(item.get("deep_dive_property_id") or item.get("local_property_id") or 0) > 0
+        }
+    )
+    if not property_ids:
+        return defaults
+
+    communications_by_property = {property_id: [] for property_id in property_ids}
+    queue_by_property = {property_id: [] for property_id in property_ids}
+    email_engaged_property_ids = set()
+    for chunk in iter_query_chunks(property_ids):
+        placeholders = ",".join(["?"] * len(chunk))
+        for row in db.execute(
+            f"""
+            SELECT property_id, channel, direction, body, sent_at, created_at
+            FROM communications
+            WHERE property_id IN ({placeholders})
+              AND upper(COALESCE(channel, '')) = 'SMS'
+            """,
+            tuple(chunk),
+        ).fetchall():
+            communications_by_property.setdefault(int(row["property_id"] or 0), []).append(dict(row))
+        for row in db.execute(
+            f"""
+            SELECT property_id, queue_key, step_order, status, sent_at
+            FROM sms_automation_queue
+            WHERE property_id IN ({placeholders})
+            """,
+            tuple(chunk),
+        ).fetchall():
+            queue_by_property.setdefault(int(row["property_id"] or 0), []).append(dict(row))
+        for row in db.execute(
+            f"""
+            SELECT DISTINCT property_id
+            FROM emailoctopus_webhook_events
+            WHERE property_id IN ({placeholders})
+              AND (
+                  lower(COALESCE(event_action, '')) IN ('opened', 'clicked')
+                  OR lower(COALESCE(event_type, '')) LIKE '%open%'
+                  OR lower(COALESCE(event_type, '')) LIKE '%click%'
+              )
+              AND lower(COALESCE(processing_status, '')) NOT IN ('unauthorized', 'ignored', 'unmatched', 'error')
+            """,
+            tuple(chunk),
+        ).fetchall():
+            if int(row["property_id"] or 0) > 0:
+                email_engaged_property_ids.add(int(row["property_id"] or 0))
+
+    form_submission_property_ids = _prospect_audience_form_submission_property_ids(db, property_ids)
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        property_id = int(item.get("deep_dive_property_id") or item.get("local_property_id") or 0)
+        if property_id <= 0 or property_id in form_submission_property_ids:
+            continue
+        target = defaults[id(item)]
+        target["email_engaged"] = 1 if property_id in email_engaged_property_ids else 0
+        communications = communications_by_property.get(property_id) or []
+        inbound = []
+        outbound = []
+        for communication in communications:
+            occurred_at = parse_db_time(communication.get("sent_at") or communication.get("created_at") or "")
+            if not occurred_at:
+                continue
+            direction = str(communication.get("direction") or "").strip().lower()
+            if direction == "inbound":
+                inbound.append((occurred_at, communication))
+            elif direction == "outbound":
+                outbound.append((occurred_at, communication))
+        inbound.sort(key=lambda value: value[0])
+        outbound.sort(key=lambda value: value[0])
+
+        # A reply that we answered and then heard nothing further is worth a deliberate human follow-up.
+        meaningful_inbound = [value for value in inbound if _prospect_audience_non_stop_inbound_sms(value[1].get("body"))]
+        if meaningful_inbound:
+            last_inbound_at = meaningful_inbound[-1][0]
+            replies_after_inbound = [value for value in outbound if value[0] > last_inbound_at]
+            if replies_after_inbound:
+                last_reply_at = replies_after_inbound[-1][0]
+                later_inbound = any(value[0] > last_reply_at for value in inbound)
+                if not later_inbound and _prospect_audience_business_days_elapsed(last_reply_at) >= PROSPECT_CONVERSATION_STALLED_BUSINESS_DAYS:
+                    target["conversation_stalled"] = 1
+
+        # No-response is reserved for a genuinely exhausted initial + follow-up SMS sequence.
+        if not inbound:
+            steps_by_sequence = {}
+            for queue_row in queue_by_property.get(property_id) or []:
+                if str(queue_row.get("status") or "").strip() != "Sent":
+                    continue
+                queue_key = str(queue_row.get("queue_key") or "")
+                sequence_key = queue_key.split(":fu:", 1)[0] or queue_key
+                steps_by_sequence.setdefault(sequence_key, set()).add(int(queue_row.get("step_order") or 1))
+            final_step = 1 + SMS_AUTOMATION_FOLLOWUP_COUNT
+            if any(1 in steps and final_step in steps for steps in steps_by_sequence.values()):
+                target["no_sms_response"] = 1
+    return defaults
+
+
 def rebuild_prospect_table_cache(
     db,
     segment=REISIFT_NEW_RECORDS_SEGMENT,
@@ -40416,6 +40585,7 @@ def rebuild_prospect_table_cache(
     rows = _prospect_table_source_rows(db, segment, property_uuids=clean_uuids, property_ids=clean_property_ids)
     list_names_by_uuid = reisift_new_record_list_names_for_properties(db, [row["property_uuid"] for row in rows])
     activity_counts = bulk_property_activity_counts_for_new_records(db, rows)
+    audience_flags = bulk_prospect_audience_flags(db, rows)
     now_text = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     inserted = 0
     for item in rows:
@@ -40433,8 +40603,9 @@ def rebuild_prospect_table_cache(
                  is_vacant, is_llc_owner, priority_preset, priority_match,
                  added_at, reisift_updated_at, local_property_id, local_status_after, deep_dive_property_id, deep_dive_status,
                  mail_out, call_out, call_in, sms_out, sms_in, email_out, email_in, emails_opened, inbound_responses,
+                 conversation_stalled, no_sms_response, email_engaged,
                  rei_skipped, deep_skipped, no_good_numbers, property_lists, property_lists_json, source_first_seen_at, source_last_synced_at, projection_updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(segment, property_uuid) DO UPDATE SET
                 status = excluded.status,
                 full_address = excluded.full_address,
@@ -40460,10 +40631,13 @@ def rebuild_prospect_table_cache(
                 sms_out = excluded.sms_out,
                 sms_in = excluded.sms_in,
                 email_out = excluded.email_out,
-                email_in = excluded.email_in,
-                emails_opened = excluded.emails_opened,
-                inbound_responses = excluded.inbound_responses,
-                rei_skipped = excluded.rei_skipped,
+                 email_in = excluded.email_in,
+                 emails_opened = excluded.emails_opened,
+                 inbound_responses = excluded.inbound_responses,
+                 conversation_stalled = excluded.conversation_stalled,
+                 no_sms_response = excluded.no_sms_response,
+                 email_engaged = excluded.email_engaged,
+                 rei_skipped = excluded.rei_skipped,
                 deep_skipped = excluded.deep_skipped,
                 no_good_numbers = excluded.no_good_numbers,
                 property_lists = excluded.property_lists,
@@ -40502,6 +40676,9 @@ def rebuild_prospect_table_cache(
                 int(counts.get("email_in") or 0),
                 int(counts.get("emails_opened") or 0),
                 int(item.get("inbound_responses") or 0),
+                int((audience_flags.get(id(item)) or {}).get("conversation_stalled") or 0),
+                int((audience_flags.get(id(item)) or {}).get("no_sms_response") or 0),
+                int((audience_flags.get(id(item)) or {}).get("email_engaged") or 0),
                 int(item.get("rei_skipped") or 0),
                 int(item.get("deep_skipped") or 0),
                 int(item.get("no_good_numbers") or 0),
@@ -41441,6 +41618,14 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
     if priority_filter in {"1", "2", "3"}:
         clauses.append("COALESCE(c.priority_preset, '') = ?")
         params.append(priority_filter)
+    audience_filter = normalize_whitespace(filters.get("engagement_audience") or "").lower()
+    audience_columns = {
+        "conversation_stalled": "conversation_stalled",
+        "no_response": "no_sms_response",
+        "email_engaged": "email_engaged",
+    }
+    if audience_filter in audience_columns:
+        clauses.append(f"COALESCE(c.{audience_columns[audience_filter]}, 0) = 1")
     for filter_key, column in [
         ("rei_skipped", "rei_skipped"),
         ("deep_skipped", "deep_skipped"),
@@ -41540,6 +41725,8 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
             item[count_key] = int(item.get(count_key) or 0)
         for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
             item[flag_key] = 1 if int(item.get(flag_key) or 0) else 0
+        for audience_key in ["conversation_stalled", "no_sms_response", "email_engaged"]:
+            item[audience_key] = 1 if int(item.get(audience_key) or 0) else 0
         item["is_vacant"] = None if item.get("is_vacant") is None else (1 if int(item.get("is_vacant") or 0) else 0)
         item["is_llc_owner"] = 1 if int(item.get("is_llc_owner") or 0) else 0
         item["priority_preset"] = normalize_whitespace(item.get("priority_preset") or "")
@@ -48428,6 +48615,7 @@ def new_records_page():
         "owner_out_of_state": (request.args.get("owner_out_of_state") or "").strip(),
         "is_vacant": (request.args.get("is_vacant") or "").strip(),
         "priority_preset": (request.args.get("priority_preset") or "").strip(),
+        "engagement_audience": (request.args.get("engagement_audience") or "").strip(),
         "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),
@@ -48755,6 +48943,7 @@ def deep_prospecting_page():
         "owner_out_of_state": (request.args.get("owner_out_of_state") or "").strip(),
         "is_vacant": (request.args.get("is_vacant") or "").strip(),
         "priority_preset": (request.args.get("priority_preset") or "").strip(),
+        "engagement_audience": (request.args.get("engagement_audience") or "").strip(),
         "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),
@@ -48882,6 +49071,7 @@ def new_records_refresh():
         "owner_out_of_state": (request.form.get("owner_out_of_state") or request.args.get("owner_out_of_state") or "").strip(),
         "is_vacant": (request.form.get("is_vacant") or request.args.get("is_vacant") or "").strip(),
         "priority_preset": (request.form.get("priority_preset") or request.args.get("priority_preset") or "").strip(),
+        "engagement_audience": (request.form.get("engagement_audience") or request.args.get("engagement_audience") or "").strip(),
         "rei_skipped": (request.form.get("rei_skipped") or request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.form.get("deep_skipped") or request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.form.get("no_good_numbers") or request.args.get("no_good_numbers") or "").strip(),
@@ -48916,6 +49106,7 @@ def deep_prospecting_refresh():
         "owner_out_of_state": (request.form.get("owner_out_of_state") or request.args.get("owner_out_of_state") or "").strip(),
         "is_vacant": (request.form.get("is_vacant") or request.args.get("is_vacant") or "").strip(),
         "priority_preset": (request.form.get("priority_preset") or request.args.get("priority_preset") or "").strip(),
+        "engagement_audience": (request.form.get("engagement_audience") or request.args.get("engagement_audience") or "").strip(),
         "rei_skipped": (request.form.get("rei_skipped") or request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.form.get("deep_skipped") or request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.form.get("no_good_numbers") or request.args.get("no_good_numbers") or "").strip(),
@@ -57310,6 +57501,11 @@ def smrtphone_inbound_webhook(payload=None, db=None):
             to_number=to_number,
             communication_id=existing["id"],
         )
+        if direction == "Inbound":
+            try:
+                refresh_prospect_table_cache_for_property_id(db, property_id)
+            except Exception:
+                pass
         db.commit()
         return jsonify({"ok": True, "deduped": True, "communication_id": existing["id"]})
 
@@ -57371,6 +57567,11 @@ def smrtphone_inbound_webhook(payload=None, db=None):
             to_number=to_number,
             communication_id=recent["id"],
         )
+        if direction == "Inbound":
+            try:
+                refresh_prospect_table_cache_for_property_id(db, property_id)
+            except Exception:
+                pass
         db.commit()
         return jsonify({"ok": True, "deduped": True, "communication_id": recent["id"]})
 
@@ -57422,6 +57623,11 @@ def smrtphone_inbound_webhook(payload=None, db=None):
         to_number=to_number,
         communication_id=cur.lastrowid,
     )
+    if direction == "Inbound":
+        try:
+            refresh_prospect_table_cache_for_property_id(db, property_id)
+        except Exception:
+            pass
     db.commit()
     return jsonify({"ok": True, "communication_id": cur.lastrowid}), 201
 

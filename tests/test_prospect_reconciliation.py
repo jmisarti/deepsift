@@ -549,6 +549,89 @@ class ProspectReconciliationTests(unittest.TestCase):
         self.assertEqual(sum(row["event_count"] for row in outbound if row["disposition_bucket"] == "Pending"), 1)
         self.assertEqual(sum(row["event_count"] for row in inbound), 1)
 
+    def test_prospect_audiences_use_local_engagement_and_exclude_form_submissions(self):
+        self.db.executescript(
+            """
+            CREATE TABLE communications (
+                id INTEGER PRIMARY KEY,
+                property_id INTEGER,
+                channel TEXT,
+                direction TEXT,
+                body TEXT,
+                sent_at TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE sms_automation_queue (
+                id INTEGER PRIMARY KEY,
+                property_id INTEGER,
+                queue_key TEXT,
+                step_order INTEGER,
+                status TEXT,
+                sent_at TEXT
+            );
+            CREATE TABLE emailoctopus_webhook_events (
+                id INTEGER PRIMARY KEY,
+                property_id INTEGER,
+                event_action TEXT,
+                event_type TEXT,
+                processing_status TEXT
+            );
+            CREATE TABLE clever_lead_submissions (id INTEGER PRIMARY KEY, local_property_id INTEGER);
+            CREATE TABLE propertyleads_lead_submissions (id INTEGER PRIMARY KEY, local_property_id INTEGER);
+            CREATE TABLE manual_lead_submissions (id INTEGER PRIMARY KEY, local_property_id INTEGER);
+            """
+        )
+        rows = [
+            {"local_property_id": 1},
+            {"local_property_id": 2},
+            {"local_property_id": 3},
+            {"local_property_id": 4},
+        ]
+        self.db.executemany(
+            """
+            INSERT INTO communications (id, property_id, channel, direction, body, sent_at, created_at)
+            VALUES (?, ?, 'SMS', ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, "Inbound", "Yes, tell me more", "2026-08-31 14:00:00", "2026-08-31 14:00:00"),
+                (2, 1, "Outbound", "Happy to help", "2026-08-31 15:00:00", "2026-08-31 15:00:00"),
+            ],
+        )
+        self.db.executemany(
+            """
+            INSERT INTO sms_automation_queue (id, property_id, queue_key, step_order, status, sent_at)
+            VALUES (?, 2, ?, ?, 'Sent', '2026-08-31 15:00:00')
+            """,
+            [
+                (1, "sequence-2", 1),
+                (2, "sequence-2:fu:2", 2),
+                (3, "sequence-2:fu:3", 3),
+                (4, "sequence-2:fu:4", 4),
+            ],
+        )
+        self.db.executemany(
+            """
+            INSERT INTO emailoctopus_webhook_events (id, property_id, event_action, event_type, processing_status)
+            VALUES (?, ?, ?, ?, 'processed')
+            """,
+            [
+                (1, 3, "opened", "contact.opened"),
+                (2, 4, "clicked", "contact.clicked"),
+            ],
+        )
+        self.db.execute(
+            "INSERT INTO website_lead_submissions (id, local_property_id, latest_email, status) VALUES (1, 4, 'form@example.com', 'processed')"
+        )
+
+        with mock.patch.object(app, "_prospect_audience_business_days_elapsed", return_value=2):
+            flags = app.bulk_prospect_audience_flags(self.db, rows)
+
+        self.assertEqual(flags[id(rows[0])]["conversation_stalled"], 1)
+        self.assertEqual(flags[id(rows[0])]["no_sms_response"], 0)
+        self.assertEqual(flags[id(rows[1])]["no_sms_response"], 1)
+        self.assertEqual(flags[id(rows[2])]["email_engaged"], 1)
+        self.assertEqual(flags[id(rows[3])]["email_engaged"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

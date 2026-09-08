@@ -37091,6 +37091,27 @@ def parse_reisift_source_info_text(text):
     }
 
 
+def normalize_reisift_auction_date(value):
+    """Normalize ReiSift's auction_date field into the date format used by SMS."""
+    if isinstance(value, dict):
+        for key in ("date", "value", "raw"):
+            if value.get(key) not in (None, ""):
+                return normalize_reisift_auction_date(value.get(key))
+        return ""
+    raw = normalize_whitespace(value)
+    if not raw:
+        return ""
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return ""
+
+
 def fetch_reisift_property_messages(token, property_uuid, max_pages=2):
     property_uuid = normalize_uuid(property_uuid)
     if not token or not property_uuid:
@@ -37140,30 +37161,45 @@ def refresh_property_source_info_from_reisift(db, token, property_id, property_u
     property_uuid = normalize_uuid(property_uuid)
     if property_id <= 0 or not property_uuid:
         return {}
-    messages = fetch_reisift_property_messages(token, property_uuid)
+    # auction_date is the authoritative ReiSift field for Sheriff Sale dates.
+    # Message parsing remains a fallback for older records where it is blank.
+    property_payload = {}
+    try:
+        property_payload = fetch_reisift_property_payload(token, property_uuid) or {}
+    except Exception:
+        property_payload = {}
+    auction_date = normalize_reisift_auction_date(property_payload.get("auction_date"))
+
+    messages = [] if auction_date else fetch_reisift_property_messages(token, property_uuid)
     parsed = {}
     matched_text = ""
-    for item in messages:
-        fragments = _extract_text_fragments(item)
-        for text in fragments:
-            candidate = parse_reisift_source_info_text(text)
-            if candidate:
-                parsed = candidate
-                matched_text = text
+    if not auction_date:
+        for item in messages:
+            fragments = _extract_text_fragments(item)
+            for text in fragments:
+                candidate = parse_reisift_source_info_text(text)
+                if candidate:
+                    parsed = candidate
+                    matched_text = text
+                    break
+            if parsed:
                 break
-        if parsed:
-            break
     existing = db.execute(
         "SELECT source_info_bucket, sheriff_sale_date, source_info_raw FROM property_source_info WHERE property_id = ?",
         (property_id,),
     ).fetchone()
     source_info = {
         "source_info_bucket": parsed.get("source_info_bucket") or (existing["source_info_bucket"] if existing else ""),
-        "sheriff_sale_date": parsed.get("sheriff_sale_date") or (existing["sheriff_sale_date"] if existing else ""),
-        "source_info_raw": parsed.get("source_info_raw") or (existing["source_info_raw"] if existing else ""),
+        "sheriff_sale_date": auction_date or parsed.get("sheriff_sale_date") or (existing["sheriff_sale_date"] if existing else ""),
+        "source_info_raw": (
+            f"ReiSift auction_date: {auction_date}"
+            if auction_date
+            else parsed.get("source_info_raw") or (existing["source_info_raw"] if existing else "")
+        ),
         "matched_text": matched_text,
         "message_count": len(messages),
-        "parsed": bool(parsed),
+        "parsed": bool(auction_date or parsed),
+        "auction_date_source": "reisift.auction_date" if auction_date else ("message_fallback" if parsed else ""),
     }
     db.execute(
         """

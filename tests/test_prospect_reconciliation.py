@@ -632,6 +632,11 @@ class ProspectReconciliationTests(unittest.TestCase):
         self.assertEqual(flags[id(rows[2])]["email_engaged"], 1)
         self.assertEqual(flags[id(rows[3])]["email_engaged"], 0)
 
+    def test_sms_followups_include_property_relatives(self):
+        self.assertTrue(app.sms_automation_followup_contact_role_allowed("owner"))
+        self.assertTrue(app.sms_automation_followup_contact_role_allowed("relative"))
+        self.assertFalse(app.sms_automation_followup_contact_role_allowed("unknown"))
+
 
 if __name__ == "__main__":
     unittest.main()

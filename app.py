@@ -38245,6 +38245,11 @@ def _sms_automation_followup_message(db, parent_row, step_order):
     return normalize_whitespace(message)
 
 
+def sms_automation_followup_contact_role_allowed(contact_role):
+    """Keep property-network follow-ups limited to owner and relative contacts."""
+    return _sms_route_role(contact_role) in {"owner", "relative"}
+
+
 def sms_automation_inbound_reply_suppression_reason(db, row):
     phone_norm = normalize_phone(row["phone_number"] if row else "")
     if not phone_norm:
@@ -38293,8 +38298,8 @@ def ensure_sms_automation_followups_for_sent_row(db, sent_row, communication_id=
         return {"created": 0, "skipped": "disabled"}
     if _sms_automation_is_followup_row(sent_row):
         return {"created": 0, "skipped": "followup_row"}
-    if _sms_route_role(sent_row["contact_role"]) != "owner":
-        return {"created": 0, "skipped": "phase_1_owner_followups_only"}
+    if not sms_automation_followup_contact_role_allowed(sent_row["contact_role"]):
+        return {"created": 0, "skipped": "unsupported_contact_role"}
     try:
         parent_id = int(sent_row["id"] or 0)
         property_id = int(sent_row["property_id"] or 0)

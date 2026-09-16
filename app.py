@@ -38246,12 +38246,14 @@ def _sms_automation_followup_message(db, parent_row, step_order):
 
 
 def sms_automation_followup_contact_role_allowed(contact_role):
-    """Keep property-network follow-ups limited to owner and relative contacts."""
+    """Allow follow-ups for every classified or unclassified property contact."""
     return normalize_whitespace(contact_role).lower() in {
         "owner",
         "co-owner",
         "co owner",
         "relative",
+        "unknown",
+        "",
     }
 
 

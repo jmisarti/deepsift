@@ -635,7 +635,8 @@ class ProspectReconciliationTests(unittest.TestCase):
     def test_sms_followups_include_property_relatives(self):
         self.assertTrue(app.sms_automation_followup_contact_role_allowed("owner"))
         self.assertTrue(app.sms_automation_followup_contact_role_allowed("relative"))
-        self.assertFalse(app.sms_automation_followup_contact_role_allowed("unknown"))
+        self.assertTrue(app.sms_automation_followup_contact_role_allowed("unknown"))
+        self.assertTrue(app.sms_automation_followup_contact_role_allowed(""))
 
 
 if __name__ == "__main__":

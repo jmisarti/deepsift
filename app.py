@@ -386,6 +386,20 @@ PROSPECT_CONVERSATION_STALLED_BUSINESS_DAYS = max(
     1,
 )
 SMS_AUTOMATION_REISIFT_SENT_TAG = "AutoSMS:Sent"
+SMS_ATTEMPT_COUNTER_ENABLED = env_flag("SMS_ATTEMPT_COUNTER_ENABLED", True)
+SMS_ATTEMPT_SYNC_IN_APP_WORKER_ENABLED = env_flag("SMS_ATTEMPT_SYNC_IN_APP_WORKER_ENABLED", False)
+SMS_ATTEMPT_SYNC_POLL_SECONDS = max(
+    int((os.getenv("SMS_ATTEMPT_SYNC_POLL_SECONDS") or "60").strip() or "60"),
+    30,
+)
+SMS_ATTEMPT_SYNC_AFTER_HOUR_ET = max(
+    min(int((os.getenv("SMS_ATTEMPT_SYNC_AFTER_HOUR_ET") or "17").strip() or "17"), 23),
+    0,
+)
+SMS_ATTEMPT_SYNC_AFTER_MINUTE_ET = max(
+    min(int((os.getenv("SMS_ATTEMPT_SYNC_AFTER_MINUTE_ET") or "5").strip() or "5"), 59),
+    0,
+)
 WEBSITE_STEP2_WAIT_SECONDS = max(int((os.getenv("WEBSITE_STEP2_WAIT_SECONDS") or "600").strip() or "600"), 60)
 WEBSITE_STEP1_HOLD_POLL_SECONDS = max(int((os.getenv("WEBSITE_STEP1_HOLD_POLL_SECONDS") or "60").strip() or "60"), 15)
 WEBSITE_LEAD_ACK_SMS_FROM_NUMBER = (os.getenv("WEBSITE_LEAD_ACK_SMS_FROM_NUMBER", "19083410891") or "19083410891").strip()
@@ -482,6 +496,7 @@ ADS_DASHBOARD_WORKER_STARTED = False
 CALL_RECORDING_WORKER_STARTED = False
 SMS_ANALYSIS_WORKER_STARTED = False
 SMS_AUTOMATION_SEND_WORKER_STARTED = False
+SMS_ATTEMPT_SYNC_WORKER_STARTED = False
 WEBSITE_LEADS_HOLD_WORKER_STARTED = False
 AGENT_REFRESH_WORKER_STARTED = False
 UNTITLED_LEADS_WORKER_STARTED = False
@@ -1236,6 +1251,8 @@ def start_background_workers_async():
             start_call_recording_worker()
             start_sms_analysis_worker()
             start_sms_automation_send_worker()
+            if SMS_ATTEMPT_SYNC_IN_APP_WORKER_ENABLED:
+                start_reisift_sms_attempt_sync_worker()
             start_agent_refresh_worker()
         except Exception:
             # Worker startup should never be part of a user's page-load latency.
@@ -1844,6 +1861,84 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_property ON sms_automation_queue(property_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_status_approved ON sms_automation_queue(status, approved_at, created_at)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_sent_from ON sms_automation_queue(status, from_number, sent_at)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sms_property_attempt_state (
+            property_id INTEGER PRIMARY KEY,
+            property_uuid TEXT,
+            baseline_attempts INTEGER,
+            baseline_status TEXT NOT NULL DEFAULT 'Pending',
+            completed_wave_count INTEGER NOT NULL DEFAULT 0,
+            reisift_last_synced_attempts INTEGER,
+            baseline_error TEXT,
+            baseline_loaded_at TEXT,
+            last_synced_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(property_id) REFERENCES properties(id)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sms_property_attempt_waves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wave_key TEXT NOT NULL UNIQUE,
+            property_id INTEGER NOT NULL,
+            step_order INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'Open',
+            cohort_size INTEGER NOT NULL DEFAULT 0,
+            cohort_json TEXT,
+            completed_at TEXT,
+            cancelled_at TEXT,
+            cancellation_reason TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(property_id) REFERENCES properties(id)
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sms_property_attempt_waves_open ON sms_property_attempt_waves(property_id, step_order, status)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sms_property_attempt_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wave_id INTEGER NOT NULL,
+            queue_id INTEGER,
+            touchpoint_id INTEGER,
+            person_id INTEGER,
+            phone_number TEXT NOT NULL,
+            contact_role TEXT,
+            member_status TEXT NOT NULL DEFAULT 'Pending',
+            sent_at TEXT,
+            ineligible_at TEXT,
+            ineligible_reason TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(wave_id, queue_id),
+            FOREIGN KEY(wave_id) REFERENCES sms_property_attempt_waves(id),
+            FOREIGN KEY(queue_id) REFERENCES sms_automation_queue(id)
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sms_property_attempt_members_wave ON sms_property_attempt_members(wave_id, member_status)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reisift_sms_attempt_sync_queue (
+            property_id INTEGER PRIMARY KEY,
+            property_uuid TEXT,
+            desired_attempts INTEGER,
+            queue_status TEXT NOT NULL DEFAULT 'Pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            run_after TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(property_id) REFERENCES properties(id)
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_reisift_sms_attempt_sync_queue_ready ON reisift_sms_attempt_sync_queue(queue_status, run_after)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS sms_delivery_events (
@@ -37259,9 +37354,6 @@ def sms_automation_property_suppression_reason(db, property_id):
     ).fetchone()
     if int((new_record_state["total_rows"] if new_record_state else 0) or 0) > 0 and int((new_record_state["active_rows"] if new_record_state else 0) or 0) <= 0:
         return "Property is no longer active in the ReiSIFT prospect refresh."
-    correct_owner_reason = sms_automation_correct_owner_suppression_reason(db, property_id)
-    if correct_owner_reason:
-        return correct_owner_reason
     return ""
 
 
@@ -42447,9 +42539,6 @@ def sync_reisift_owner_contacts_to_local_property(db, property_id, property_uuid
         )
         for key in ["phones_created", "phones_updated", "phones_suppressed", "emails_created"]:
             out[key] += int(contact_counts.get(key) or 0)
-    removed_for_correct_owner = suppress_sms_automation_queue_for_correct_owner_phone(db, property_id)
-    if removed_for_correct_owner:
-        out["sms_queue_removed_for_correct_owner"] = removed_for_correct_owner
     return out
 
 
@@ -49336,6 +49425,458 @@ def _sms_automation_rate_limit_reason(db, from_number):
     return ""
 
 
+def sms_attempt_sync_window_is_open(now=None):
+    """ReiSIFT counter writes run after the AutoSMS sending day has closed."""
+    now_et = now or datetime.now(EST_TZ)
+    if now_et.tzinfo is None:
+        now_et = now_et.replace(tzinfo=EST_TZ)
+    else:
+        now_et = now_et.astimezone(EST_TZ)
+    if now_et.weekday() >= 5:
+        return False
+    return (now_et.hour, now_et.minute) >= (
+        SMS_ATTEMPT_SYNC_AFTER_HOUR_ET,
+        SMS_ATTEMPT_SYNC_AFTER_MINUTE_ET,
+    )
+
+
+def _sms_attempt_property_uuid(db, property_id):
+    return normalize_uuid(_get_local_property_uuid(db, property_id) or "")
+
+
+def _ensure_sms_attempt_state(db, property_id):
+    property_id = int(property_id or 0)
+    if property_id <= 0:
+        return None
+    property_uuid = _sms_attempt_property_uuid(db, property_id)
+    db.execute(
+        """
+        INSERT INTO sms_property_attempt_state (property_id, property_uuid)
+        VALUES (?, ?)
+        ON CONFLICT(property_id) DO UPDATE SET
+            property_uuid = COALESCE(NULLIF(excluded.property_uuid, ''), sms_property_attempt_state.property_uuid),
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (property_id, property_uuid),
+    )
+    return db.execute(
+        "SELECT * FROM sms_property_attempt_state WHERE property_id = ? LIMIT 1",
+        (property_id,),
+    ).fetchone()
+
+
+def _sms_attempt_eligible_queue_rows(db, property_id, step_order, current_queue_id):
+    rows = db.execute(
+        """
+        SELECT id, property_id, person_id, touchpoint_id, phone_number, contact_role, status
+        FROM sms_automation_queue
+        WHERE property_id = ?
+          AND COALESCE(step_order, 1) = ?
+          AND status IN ('Draft', 'Queued', 'Approved', 'Scheduled', 'Sending', 'Failed', 'Sent')
+        ORDER BY id ASC
+        """,
+        (int(property_id or 0), int(step_order or 1)),
+    ).fetchall()
+    out = []
+    for row in rows:
+        queue_id = int(row["id"] or 0)
+        # Earlier sequences are historical. A new property wave starts from the
+        # message being sent now plus work that was pending alongside it.
+        if queue_id != int(current_queue_id or 0) and str(row["status"] or "") == "Sent":
+            continue
+        if sms_automation_touchpoint_suppression_reason(db, row["touchpoint_id"]):
+            continue
+        out.append(row)
+    return out
+
+
+def _create_sms_attempt_wave(db, sent_row):
+    property_id = int(sent_row["property_id"] or 0)
+    step_order = int(sent_row["step_order"] or 1)
+    current_queue_id = int(sent_row["id"] or 0)
+    candidates = _sms_attempt_eligible_queue_rows(db, property_id, step_order, current_queue_id)
+    if not any(int(item["id"] or 0) == current_queue_id for item in candidates):
+        candidates.append(sent_row)
+    wave_key = f"sms-attempt:{property_id}:{step_order}:{secrets.token_hex(8)}"
+    cohort = []
+    seen_queue_ids = set()
+    for item in candidates:
+        queue_id = int(item["id"] or 0)
+        if queue_id <= 0 or queue_id in seen_queue_ids:
+            continue
+        seen_queue_ids.add(queue_id)
+        cohort.append(
+            {
+                "queue_id": queue_id,
+                "touchpoint_id": int(item["touchpoint_id"] or 0),
+                "person_id": int(item["person_id"] or 0),
+                "phone_number": normalize_phone(item["phone_number"] or ""),
+                "contact_role": item["contact_role"] or "unknown",
+            }
+        )
+    cur = db.execute(
+        """
+        INSERT INTO sms_property_attempt_waves
+            (wave_key, property_id, step_order, cohort_size, cohort_json)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (wave_key, property_id, step_order, len(cohort), json.dumps(cohort, ensure_ascii=True, sort_keys=True)),
+    )
+    wave_id = cur.lastrowid
+    for member in cohort:
+        db.execute(
+            """
+            INSERT INTO sms_property_attempt_members
+                (wave_id, queue_id, touchpoint_id, person_id, phone_number, contact_role)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                wave_id,
+                member["queue_id"],
+                member["touchpoint_id"] or None,
+                member["person_id"] or None,
+                member["phone_number"],
+                member["contact_role"],
+            ),
+        )
+    return db.execute("SELECT * FROM sms_property_attempt_waves WHERE id = ? LIMIT 1", (wave_id,)).fetchone()
+
+
+def _queue_reisift_sms_attempt_sync(db, property_id):
+    state = _ensure_sms_attempt_state(db, property_id)
+    if not state:
+        return
+    db.execute(
+        """
+        INSERT INTO reisift_sms_attempt_sync_queue (property_id, property_uuid, queue_status, run_after, last_error)
+        VALUES (?, ?, 'Pending', CURRENT_TIMESTAMP, '')
+        ON CONFLICT(property_id) DO UPDATE SET
+            property_uuid = COALESCE(NULLIF(excluded.property_uuid, ''), reisift_sms_attempt_sync_queue.property_uuid),
+            desired_attempts = NULL,
+            queue_status = 'Pending',
+            run_after = CURRENT_TIMESTAMP,
+            last_error = '',
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (int(property_id), state["property_uuid"] or ""),
+    )
+
+
+def _complete_sms_attempt_wave_if_ready(db, wave_id):
+    wave = db.execute(
+        "SELECT * FROM sms_property_attempt_waves WHERE id = ? LIMIT 1",
+        (int(wave_id or 0),),
+    ).fetchone()
+    if not wave or str(wave["status"] or "") != "Open":
+        return {"completed": False}
+    property_reason = sms_automation_property_suppression_reason(db, wave["property_id"])
+    if property_reason:
+        db.execute(
+            """
+            UPDATE sms_property_attempt_waves
+            SET status = 'Cancelled', cancelled_at = CURRENT_TIMESTAMP,
+                cancellation_reason = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'Open'
+            """,
+            (property_reason, wave["id"]),
+        )
+        return {"completed": False, "cancelled": True, "reason": property_reason}
+    members = db.execute(
+        "SELECT * FROM sms_property_attempt_members WHERE wave_id = ? ORDER BY id ASC",
+        (wave["id"],),
+    ).fetchall()
+    pending = 0
+    for member in members:
+        status = str(member["member_status"] or "Pending")
+        if status in {"Sent", "Ineligible"}:
+            continue
+        reason = sms_automation_touchpoint_suppression_reason(db, member["touchpoint_id"])
+        if reason:
+            db.execute(
+                """
+                UPDATE sms_property_attempt_members
+                SET member_status = 'Ineligible', ineligible_at = CURRENT_TIMESTAMP,
+                    ineligible_reason = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (reason, member["id"]),
+            )
+        else:
+            pending += 1
+    if pending:
+        return {"completed": False, "pending": pending}
+    completed = db.execute(
+        """
+        UPDATE sms_property_attempt_waves
+        SET status = 'Complete', completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'Open'
+        """,
+        (wave["id"],),
+    )
+    if completed.rowcount != 1:
+        return {"completed": False}
+    _ensure_sms_attempt_state(db, wave["property_id"])
+    db.execute(
+        """
+        UPDATE sms_property_attempt_state
+        SET completed_wave_count = completed_wave_count + 1, updated_at = CURRENT_TIMESTAMP
+        WHERE property_id = ?
+        """,
+        (wave["property_id"],),
+    )
+    _queue_reisift_sms_attempt_sync(db, wave["property_id"])
+    return {"completed": True, "property_id": int(wave["property_id"] or 0), "wave_id": int(wave["id"] or 0)}
+
+
+def record_sms_property_attempt_send(db, sent_row, sent_at=None):
+    """Add one accepted AutoSMS message to its local property wave.
+
+    This performs no network I/O. The post-5 PM worker owns ReiSIFT reads and
+    writes, keeping provider failure separate from the delivery transaction.
+    """
+    if not SMS_ATTEMPT_COUNTER_ENABLED or not sent_row:
+        return {"tracked": False, "reason": "disabled"}
+    try:
+        property_id = int(sent_row["property_id"] or 0)
+        queue_id = int(sent_row["id"] or 0)
+        if not property_id or not queue_id:
+            return {"tracked": False, "reason": "invalid_queue_row"}
+        if sms_automation_property_suppression_reason(db, property_id):
+            return {"tracked": False, "reason": "property_ineligible"}
+        _ensure_sms_attempt_state(db, property_id)
+        step_order = int(sent_row["step_order"] or 1)
+        wave = db.execute(
+            """
+            SELECT * FROM sms_property_attempt_waves
+            WHERE property_id = ? AND step_order = ? AND status = 'Open'
+            ORDER BY id ASC LIMIT 1
+            """,
+            (property_id, step_order),
+        ).fetchone()
+        if not wave:
+            wave = _create_sms_attempt_wave(db, sent_row)
+        if not wave:
+            return {"tracked": False, "reason": "wave_not_created"}
+        member = db.execute(
+            """
+            SELECT id FROM sms_property_attempt_members
+            WHERE wave_id = ? AND queue_id = ? LIMIT 1
+            """,
+            (wave["id"], queue_id),
+        ).fetchone()
+        if not member:
+            db.execute(
+                """
+                INSERT INTO sms_property_attempt_members
+                    (wave_id, queue_id, touchpoint_id, person_id, phone_number, contact_role)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    wave["id"],
+                    queue_id,
+                    sent_row["touchpoint_id"],
+                    sent_row["person_id"],
+                    normalize_phone(sent_row["phone_number"] or ""),
+                    sent_row["contact_role"] or "unknown",
+                ),
+            )
+        db.execute(
+            """
+            UPDATE sms_property_attempt_members
+            SET member_status = 'Sent', sent_at = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE wave_id = ? AND queue_id = ?
+            """,
+            (sent_at or format_db_time(datetime.utcnow()), wave["id"], queue_id),
+        )
+        completion = _complete_sms_attempt_wave_if_ready(db, wave["id"])
+        return {"tracked": True, "wave_id": int(wave["id"] or 0), **completion}
+    except Exception as exc:
+        # The SMS already reached the provider. A counter bug must never turn a
+        # successful send into a failed communication.
+        return {"tracked": False, "error": str(exc)}
+
+
+def extract_reisift_sms_attempts(payload):
+    if not isinstance(payload, dict):
+        return 0
+    for key in ("sms_attempts", "smsAttempts"):
+        value = payload.get(key)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+    for key in ("property", "data", "results"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return extract_reisift_sms_attempts(value)
+    return 0
+
+
+def reisift_update_sms_attempts(token, property_uuid, sms_attempts):
+    property_uuid = normalize_uuid(property_uuid)
+    if not property_uuid:
+        raise ValueError("property_uuid is required for SMS attempt sync")
+    attempts = max(0, int(sms_attempts or 0))
+    response = requests.post(
+        f"{REISIFT_BASE_URL}/api/internal/property/{property_uuid}/sms-attempts/",
+        headers=reisift_auth_headers(token),
+        json={"sms_attempts": attempts},
+        timeout=30,
+    )
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_text": response.text}
+    if not response.ok:
+        raise ValueError(f"ReiSIFT SMS attempt update failed ({response.status_code}): {body}")
+    return {"request": {"sms_attempts": attempts}, "response": body}
+
+
+def run_reisift_sms_attempt_sync_once(limit=25, now=None):
+    """Read baselines anytime; write coalesced property counts after 5 PM ET."""
+    if not SMS_ATTEMPT_COUNTER_ENABLED:
+        return {"ok": True, "skipped": "disabled"}
+    db = open_sqlite_connection()
+    baseline_loaded = synced = errors = 0
+    try:
+        states = db.execute(
+            """
+            SELECT property_id, property_uuid
+            FROM sms_property_attempt_state
+            WHERE baseline_status IN ('Pending', 'Retry')
+            ORDER BY updated_at ASC
+            LIMIT ?
+            """,
+            (max(1, int(limit or 25)),),
+        ).fetchall()
+        for state in states:
+            property_id = int(state["property_id"] or 0)
+            property_uuid = normalize_uuid(state["property_uuid"] or "") or _sms_attempt_property_uuid(db, property_id)
+            if not property_uuid:
+                db.execute(
+                    "UPDATE sms_property_attempt_state SET baseline_status = 'Retry', baseline_error = ?, updated_at = CURRENT_TIMESTAMP WHERE property_id = ?",
+                    ("missing_reisift_property_uuid", property_id),
+                )
+                continue
+            db.commit()
+            try:
+                payload = fetch_reisift_property_payload(reisift_get_access_token(), property_uuid)
+                baseline = extract_reisift_sms_attempts(payload)
+                db.execute(
+                    """
+                    UPDATE sms_property_attempt_state
+                    SET property_uuid = ?, baseline_attempts = ?, baseline_status = 'Ready',
+                        baseline_error = '', baseline_loaded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                    WHERE property_id = ?
+                    """,
+                    (property_uuid, baseline, property_id),
+                )
+                baseline_loaded += 1
+            except Exception as exc:
+                db.execute(
+                    "UPDATE sms_property_attempt_state SET baseline_status = 'Retry', baseline_error = ?, updated_at = CURRENT_TIMESTAMP WHERE property_id = ?",
+                    (str(exc)[:1000], property_id),
+                )
+                errors += 1
+            db.commit()
+        if not sms_attempt_sync_window_is_open(now):
+            return {"ok": True, "baseline_loaded": baseline_loaded, "synced": 0, "errors": errors, "skipped": "before_5pm_et"}
+        jobs = db.execute(
+            """
+            SELECT q.*, s.baseline_attempts, s.baseline_status, s.completed_wave_count,
+                   s.reisift_last_synced_attempts
+            FROM reisift_sms_attempt_sync_queue q
+            JOIN sms_property_attempt_state s ON s.property_id = q.property_id
+            WHERE q.queue_status IN ('Pending', 'Retry')
+              AND s.baseline_status = 'Ready'
+              AND datetime(q.run_after) <= datetime('now')
+            ORDER BY q.updated_at ASC
+            LIMIT ?
+            """,
+            (max(1, int(limit or 25)),),
+        ).fetchall()
+        for job in jobs:
+            property_id = int(job["property_id"] or 0)
+            property_uuid = normalize_uuid(job["property_uuid"] or "") or _sms_attempt_property_uuid(db, property_id)
+            desired = int(job["baseline_attempts"] or 0) + int(job["completed_wave_count"] or 0)
+            if not property_uuid:
+                db.execute(
+                    "UPDATE reisift_sms_attempt_sync_queue SET queue_status = 'Retry', attempts = attempts + 1, last_error = ?, run_after = ?, updated_at = CURRENT_TIMESTAMP WHERE property_id = ?",
+                    ("missing_reisift_property_uuid", format_db_time(datetime.utcnow() + timedelta(minutes=10)), property_id),
+                )
+                errors += 1
+                continue
+            db.commit()
+            try:
+                current_payload = fetch_reisift_property_payload(reisift_get_access_token(), property_uuid)
+                current = extract_reisift_sms_attempts(current_payload)
+                if current > desired:
+                    # Preserve a higher value changed elsewhere rather than ever
+                    # writing a counter backwards.
+                    desired = current
+                    db.execute(
+                        "UPDATE sms_property_attempt_state SET baseline_attempts = ?, updated_at = CURRENT_TIMESTAMP WHERE property_id = ?",
+                        (current - int(job["completed_wave_count"] or 0), property_id),
+                    )
+                if current != desired:
+                    reisift_update_sms_attempts(reisift_get_access_token(), property_uuid, desired)
+                db.execute(
+                    """
+                    UPDATE sms_property_attempt_state
+                    SET property_uuid = ?, reisift_last_synced_attempts = ?, last_synced_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE property_id = ?
+                    """,
+                    (property_uuid, desired, property_id),
+                )
+                db.execute(
+                    """
+                    UPDATE reisift_sms_attempt_sync_queue
+                    SET property_uuid = ?, desired_attempts = ?, queue_status = 'Synced',
+                        last_error = '', updated_at = CURRENT_TIMESTAMP
+                    WHERE property_id = ?
+                    """,
+                    (property_uuid, desired, property_id),
+                )
+                synced += 1
+            except Exception as exc:
+                db.execute(
+                    """
+                    UPDATE reisift_sms_attempt_sync_queue
+                    SET queue_status = 'Retry', attempts = attempts + 1, last_error = ?,
+                        run_after = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE property_id = ?
+                    """,
+                    (str(exc)[:1000], format_db_time(datetime.utcnow() + timedelta(minutes=10)), property_id),
+                )
+                errors += 1
+            db.commit()
+        return {"ok": True, "baseline_loaded": baseline_loaded, "synced": synced, "errors": errors}
+    except Exception as exc:
+        db.rollback()
+        return {"ok": False, "baseline_loaded": baseline_loaded, "synced": synced, "errors": errors + 1, "error": str(exc)}
+    finally:
+        db.close()
+
+
+def start_reisift_sms_attempt_sync_worker():
+    global SMS_ATTEMPT_SYNC_WORKER_STARTED
+    if SMS_ATTEMPT_SYNC_WORKER_STARTED or not SMS_ATTEMPT_COUNTER_ENABLED:
+        return
+    SMS_ATTEMPT_SYNC_WORKER_STARTED = True
+
+    def worker():
+        while True:
+            try:
+                run_reisift_sms_attempt_sync_once()
+            except Exception:
+                pass
+            time.sleep(SMS_ATTEMPT_SYNC_POLL_SECONDS)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
 def sync_autosms_sent_tag_to_reisift(db, property_id):
     property_uuid = _get_local_property_uuid(db, property_id)
     if not property_uuid:
@@ -49432,6 +49973,7 @@ def _sms_automation_send_queue_item(db, queue_id):
             communication_id=cur.lastrowid,
             sent_at=sent_at,
         )
+        attempt_counter = record_sms_property_attempt_send(db, row, sent_at=sent_at)
         tag_sync = None
         try:
             tag_sync = sync_autosms_sent_tag_to_reisift(db, row["property_id"])
@@ -49455,6 +49997,7 @@ def _sms_automation_send_queue_item(db, queue_id):
             "external_id": external_id,
             "reisift_tag_sync": tag_sync,
             "followups": followups,
+            "attempt_counter": attempt_counter,
         }
     except Exception as exc:
         apply_touchpoint_status_inference(db, to_number, str(exc))
@@ -55202,53 +55745,8 @@ def update_touchpoint_status(touchpoint_id):
         return jsonify({"error": "status is required"}), 400
 
     db.execute("UPDATE touchpoints SET status = ? WHERE id = ?", (status, touchpoint_id))
-    removed_for_correct_owner = 0
-    if _is_correct_phone_status_text(status):
-        row = db.execute(
-            "SELECT person_id, channel_type FROM touchpoints WHERE id = ? LIMIT 1",
-            (touchpoint_id,),
-        ).fetchone()
-        if row and str(row["channel_type"] or "").strip().lower() == "phone":
-            property_ids = []
-            requested_property_id = payload.get("property_id") or request.args.get("property_id")
-            try:
-                requested_property_id = int(requested_property_id or 0)
-            except Exception:
-                requested_property_id = 0
-            if requested_property_id > 0:
-                property_ids.append(requested_property_id)
-            else:
-                owner_rows = db.execute(
-                    """
-                    SELECT id
-                    FROM properties
-                    WHERE owner_person_id = ?
-                    """,
-                    (row["person_id"],),
-                ).fetchall()
-                property_ids.extend([int(prop["id"] or 0) for prop in owner_rows])
-                co_owner_rows = db.execute(
-                    """
-                    SELECT DISTINCT p.id
-                    FROM properties p
-                    JOIN person_relationships pr
-                      ON lower(pr.relationship_type) = 'co-owner'
-                     AND (
-                        (pr.subject_person_id = p.owner_person_id AND pr.related_person_id = ?)
-                        OR (pr.related_person_id = p.owner_person_id AND pr.subject_person_id = ?)
-                     )
-                    """,
-                    (row["person_id"], row["person_id"]),
-                ).fetchall()
-                property_ids.extend([int(prop["id"] or 0) for prop in co_owner_rows])
-            for property_id in sorted({pid for pid in property_ids if pid > 0}):
-                removed_for_correct_owner += suppress_sms_automation_queue_for_correct_owner_phone(db, property_id)
-                try:
-                    refresh_prospect_table_cache_for_property_id(db, property_id)
-                except Exception:
-                    pass
     commit_with_retry(db)
-    return jsonify({"ok": True, "sms_queue_removed_for_correct_owner": removed_for_correct_owner})
+    return jsonify({"ok": True, "sms_queue_removed_for_correct_owner": 0})
 
 
 @app.route("/api/touchpoints/<int:touchpoint_id>/label", methods=["PATCH"])

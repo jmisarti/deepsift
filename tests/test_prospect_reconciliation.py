@@ -1,3 +1,4 @@
+import datetime
 import sqlite3
 import unittest
 from unittest import mock
@@ -637,6 +638,84 @@ class ProspectReconciliationTests(unittest.TestCase):
         self.assertTrue(app.sms_automation_followup_contact_role_allowed("relative"))
         self.assertTrue(app.sms_automation_followup_contact_role_allowed("unknown"))
         self.assertTrue(app.sms_automation_followup_contact_role_allowed(""))
+
+    def test_sms_attempt_counter_completes_only_after_the_property_wave(self):
+        self.db.executescript(
+            """
+            CREATE TABLE addresses (id INTEGER PRIMARY KEY, street TEXT, city TEXT, state TEXT, postal_code TEXT);
+            CREATE TABLE sms_property_attempt_state (
+                property_id INTEGER PRIMARY KEY, property_uuid TEXT, baseline_attempts INTEGER,
+                baseline_status TEXT DEFAULT 'Pending', completed_wave_count INTEGER DEFAULT 0,
+                reisift_last_synced_attempts INTEGER, baseline_error TEXT, baseline_loaded_at TEXT,
+                last_synced_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE sms_property_attempt_waves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, wave_key TEXT UNIQUE, property_id INTEGER,
+                step_order INTEGER, status TEXT DEFAULT 'Open', cohort_size INTEGER DEFAULT 0,
+                cohort_json TEXT, completed_at TEXT, cancelled_at TEXT, cancellation_reason TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE sms_property_attempt_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, wave_id INTEGER, queue_id INTEGER,
+                touchpoint_id INTEGER, person_id INTEGER, phone_number TEXT, contact_role TEXT,
+                member_status TEXT DEFAULT 'Pending', sent_at TEXT, ineligible_at TEXT,
+                ineligible_reason TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(wave_id, queue_id)
+            );
+            CREATE TABLE reisift_sms_attempt_sync_queue (
+                property_id INTEGER PRIMARY KEY, property_uuid TEXT, desired_attempts INTEGER,
+                queue_status TEXT DEFAULT 'Pending', attempts INTEGER DEFAULT 0,
+                run_after TEXT DEFAULT CURRENT_TIMESTAMP, last_error TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            ALTER TABLE properties ADD COLUMN reisift_property_uuid TEXT;
+            ALTER TABLE properties ADD COLUMN property_address_id INTEGER;
+            ALTER TABLE touchpoints ADD COLUMN channel_label TEXT;
+            ALTER TABLE touchpoints ADD COLUMN status TEXT;
+            CREATE TABLE sms_automation_queue (
+                id INTEGER PRIMARY KEY, property_id INTEGER, queue_key TEXT,
+                step_order INTEGER, status TEXT, person_id INTEGER,
+                touchpoint_id INTEGER, phone_number TEXT, contact_role TEXT
+            );
+            """
+        )
+        self.db.execute("INSERT INTO addresses VALUES (1, '1 Main St', 'Newark', 'NJ', '07101')")
+        self.db.execute(
+            "INSERT INTO properties (id, owner_person_id, status, reisift_property_uuid, property_address_id) VALUES (1, 1, 'New Record', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 1)"
+        )
+        self.db.executemany(
+            "INSERT INTO touchpoints (id, person_id, channel_type, value, channel_label, status) VALUES (?, 1, 'Phone', ?, 'Mobile', ?)",
+            [(1, '2015550001', 'Unknown'), (2, '2015550002', 'Correct')],
+        )
+        self.db.executemany(
+            """
+            INSERT INTO sms_automation_queue
+                (id, property_id, queue_key, step_order, status, person_id, touchpoint_id, phone_number, contact_role)
+            VALUES (?, 1, ?, 1, ?, 1, ?, ?, ?)
+            """,
+            [(1, 'wave-one', 'Sent', 1, '2015550001', 'owner'), (2, 'wave-two', 'Approved', 2, '2015550002', 'relative')],
+        )
+        first = self.db.execute("SELECT * FROM sms_automation_queue WHERE id = 1").fetchone()
+        first_result = app.record_sms_property_attempt_send(self.db, first, sent_at='2026-09-16 15:00:00')
+        self.assertTrue(first_result['tracked'])
+        self.assertFalse(first_result['completed'])
+
+        self.db.execute("UPDATE sms_automation_queue SET status = 'Sent' WHERE id = 2")
+        second = self.db.execute("SELECT * FROM sms_automation_queue WHERE id = 2").fetchone()
+        second_result = app.record_sms_property_attempt_send(self.db, second, sent_at='2026-09-16 15:01:00')
+        self.assertTrue(second_result['completed'])
+        state = self.db.execute("SELECT completed_wave_count FROM sms_property_attempt_state WHERE property_id = 1").fetchone()
+        self.assertEqual(state['completed_wave_count'], 1)
+        job = self.db.execute("SELECT queue_status FROM reisift_sms_attempt_sync_queue WHERE property_id = 1").fetchone()
+        self.assertEqual(job['queue_status'], 'Pending')
+
+    def test_sms_attempt_sync_waits_until_after_5pm_weekday(self):
+        before = datetime.datetime(2026, 9, 16, 17, 4, tzinfo=app.EST_TZ)
+        after = datetime.datetime(2026, 9, 16, 17, 5, tzinfo=app.EST_TZ)
+        weekend = datetime.datetime(2026, 9, 19, 18, 0, tzinfo=app.EST_TZ)
+        self.assertFalse(app.sms_attempt_sync_window_is_open(before))
+        self.assertTrue(app.sms_attempt_sync_window_is_open(after))
+        self.assertFalse(app.sms_attempt_sync_window_is_open(weekend))
 
 
 if __name__ == "__main__":

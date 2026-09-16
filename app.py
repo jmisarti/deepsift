@@ -390,7 +390,11 @@ SMS_ATTEMPT_COUNTER_ENABLED = env_flag("SMS_ATTEMPT_COUNTER_ENABLED", True)
 SMS_ATTEMPT_SYNC_IN_APP_WORKER_ENABLED = env_flag("SMS_ATTEMPT_SYNC_IN_APP_WORKER_ENABLED", False)
 SMS_ATTEMPT_SYNC_POLL_SECONDS = max(
     int((os.getenv("SMS_ATTEMPT_SYNC_POLL_SECONDS") or "60").strip() or "60"),
-    30,
+    5,
+)
+SMS_ATTEMPT_SYNC_BATCH_LIMIT = max(
+    min(int((os.getenv("SMS_ATTEMPT_SYNC_BATCH_LIMIT") or "25").strip() or "25"), 100),
+    1,
 )
 SMS_ATTEMPT_SYNC_AFTER_HOUR_ET = max(
     min(int((os.getenv("SMS_ATTEMPT_SYNC_AFTER_HOUR_ET") or "17").strip() or "17"), 23),
@@ -49465,6 +49469,46 @@ def _ensure_sms_attempt_state(db, property_id):
     ).fetchone()
 
 
+def bootstrap_sms_attempt_baselines(db):
+    """Seed one pending read per active prospect without changing ReiSIFT."""
+    rows = db.execute(
+        """
+        SELECT DISTINCT n.local_property_id AS property_id, p.reisift_property_uuid
+        FROM reisift_new_records n
+        JOIN properties p ON p.id = n.local_property_id
+        WHERE COALESCE(n.is_active, 1) = 1
+          AND n.segment IN (?, ?)
+          AND lower(trim(COALESCE(p.status, ''))) IN ('new record', 'deep prospecting')
+          AND COALESCE(n.local_property_id, 0) > 0
+          AND COALESCE(p.reisift_property_uuid, '') != ''
+        ORDER BY n.local_property_id ASC
+        """,
+        (REISIFT_NEW_RECORDS_SEGMENT, REISIFT_DEEP_PROSPECTING_SEGMENT),
+    ).fetchall()
+    created = existing = 0
+    for row in rows:
+        cur = db.execute(
+            """
+            INSERT INTO sms_property_attempt_state (property_id, property_uuid)
+            VALUES (?, ?)
+            ON CONFLICT(property_id) DO NOTHING
+            """,
+            (int(row["property_id"] or 0), normalize_uuid(row["reisift_property_uuid"] or "")),
+        )
+        if cur.rowcount:
+            created += 1
+        else:
+            existing += 1
+    result = {
+        "eligible_active_properties": len(rows),
+        "baseline_reads_queued": created,
+        "already_tracked": existing,
+    }
+    set_setting(db, "sms_attempt_baseline_bootstrap_last_result_json", json.dumps(result, ensure_ascii=True, sort_keys=True))
+    set_setting(db, "sms_attempt_baseline_bootstrap_last_run_at", format_db_time(datetime.utcnow()))
+    return result
+
+
 def _sms_attempt_eligible_queue_rows(db, property_id, step_order, current_queue_id):
     rows = db.execute(
         """
@@ -49868,7 +49912,7 @@ def start_reisift_sms_attempt_sync_worker():
     def worker():
         while True:
             try:
-                run_reisift_sms_attempt_sync_once()
+                run_reisift_sms_attempt_sync_once(limit=SMS_ATTEMPT_SYNC_BATCH_LIMIT)
             except Exception:
                 pass
             time.sleep(SMS_ATTEMPT_SYNC_POLL_SECONDS)

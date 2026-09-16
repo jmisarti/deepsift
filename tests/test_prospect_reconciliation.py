@@ -717,6 +717,46 @@ class ProspectReconciliationTests(unittest.TestCase):
         self.assertTrue(app.sms_attempt_sync_window_is_open(after))
         self.assertFalse(app.sms_attempt_sync_window_is_open(weekend))
 
+    def test_sms_attempt_baseline_bootstrap_only_seeds_active_prospects(self):
+        self.db.executescript(
+            """
+            ALTER TABLE properties ADD COLUMN reisift_property_uuid TEXT;
+            CREATE TABLE sms_property_attempt_state (
+                property_id INTEGER PRIMARY KEY, property_uuid TEXT, baseline_attempts INTEGER,
+                baseline_status TEXT DEFAULT 'Pending', completed_wave_count INTEGER DEFAULT 0,
+                reisift_last_synced_attempts INTEGER, baseline_error TEXT, baseline_loaded_at TEXT,
+                last_synced_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            """
+        )
+        self.db.executemany(
+            "INSERT INTO properties (id, status, reisift_property_uuid) VALUES (?, ?, ?)",
+            [
+                (1, 'New Record', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'),
+                (2, 'Deep Prospecting', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'),
+                (3, 'Default', 'cccccccc-cccc-cccc-cccc-cccccccccccc'),
+            ],
+        )
+        self.db.executemany(
+            """
+            INSERT INTO reisift_new_records (id, property_uuid, segment, local_property_id, is_active)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'new_records', 1, 1),
+                (2, 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'deep_prospecting', 2, 1),
+                (3, 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'new_records', 3, 0),
+            ],
+        )
+        result = app.bootstrap_sms_attempt_baselines(self.db)
+        self.assertEqual(result['eligible_active_properties'], 2)
+        self.assertEqual(result['baseline_reads_queued'], 2)
+        self.assertEqual(
+            self.db.execute("SELECT COUNT(*) AS c FROM sms_property_attempt_state").fetchone()['c'],
+            2,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

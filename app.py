@@ -1237,30 +1237,35 @@ def start_background_workers_async():
         BACKGROUND_WORKERS_BOOTSTRAP_STARTED = True
 
     def bootstrap():
-        try:
-            start_bulk_sms_worker()
-            start_email_validation_queue_worker()
-            start_emailoctopus_sync_queue_worker()
-            start_email_poll_worker()
-            start_clever_leads_worker()
-            start_untitled_leads_worker()
-            start_website_leads_hold_worker()
-            start_ads_dashboard_worker()
-            start_prospect_table_cache_worker()
-            start_database_maintenance_worker()
-            if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
-                start_referral_on_market_worker()
-            start_reisift_new_records_worker()
-            start_reisift_phone_status_delta_worker()
-            start_call_recording_worker()
-            start_sms_analysis_worker()
-            start_sms_automation_send_worker()
-            if SMS_ATTEMPT_SYNC_IN_APP_WORKER_ENABLED:
-                start_reisift_sms_attempt_sync_worker()
-            start_agent_refresh_worker()
-        except Exception:
-            # Worker startup should never be part of a user's page-load latency.
-            pass
+        # One optional worker must never prevent the AutoSMS sender from starting.
+        worker_starters = [
+            start_sms_automation_send_worker,
+            start_bulk_sms_worker,
+            start_email_validation_queue_worker,
+            start_emailoctopus_sync_queue_worker,
+            start_email_poll_worker,
+            start_clever_leads_worker,
+            start_untitled_leads_worker,
+            start_website_leads_hold_worker,
+            start_ads_dashboard_worker,
+            start_prospect_table_cache_worker,
+            start_database_maintenance_worker,
+            start_reisift_new_records_worker,
+            start_reisift_phone_status_delta_worker,
+            start_call_recording_worker,
+            start_sms_analysis_worker,
+            start_agent_refresh_worker,
+        ]
+        if REFERRAL_MARKET_AUTO_REFRESH_ENABLED:
+            worker_starters.append(start_referral_on_market_worker)
+        if SMS_ATTEMPT_SYNC_IN_APP_WORKER_ENABLED:
+            worker_starters.append(start_reisift_sms_attempt_sync_worker)
+        for start_worker in worker_starters:
+            try:
+                start_worker()
+            except Exception:
+                # Worker startup should never be part of a user's page-load latency.
+                continue
 
     timer = threading.Timer(30.0, bootstrap)
     timer.daemon = True

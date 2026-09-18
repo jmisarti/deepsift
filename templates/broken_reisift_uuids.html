@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+    <h2>Broken ReiSIFT UUIDs</h2>
+    <p>
+        These local properties could not be read from ReiSIFT while the SMS-attempt worker was establishing a baseline.
+        Repairing the UUID requeues the baseline read and any pending SMS-attempt counter update.
+    </p>
+
+    {% if notice %}
+    <p class="notice">{{ notice }}</p>
+    {% endif %}
+    {% if error %}
+    <p class="error">{{ error }}</p>
+    {% endif %}
+
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Property</th>
+                    <th>Local Status</th>
+                    <th>Stored UUID</th>
+                    <th>Failure</th>
+                    <th>Last Retry</th>
+                    <th>Repair</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr>
+                    <td>
+                        <a href="{{ url_for('property_detail', property_id=row.property_id) }}">
+                            {{ [row.street, row.city, row.state, row.postal_code]|select|join(', ') }}
+                        </a>
+                    </td>
+                    <td>{{ row.local_status or '-' }}</td>
+                    <td><code>{{ row.stored_uuid or '-' }}</code></td>
+                    <td>{{ row.baseline_error or 'Missing ReiSIFT property UUID' }}</td>
+                    <td>{{ row.updated_at|fmt_est_datetime }}</td>
+                    <td>
+                        <form method="post" action="{{ url_for('repair_broken_reisift_uuid', property_id=row.property_id) }}" class="inline-form">
+                            <input
+                                type="text"
+                                name="reisift_property_uuid"
+                                placeholder="Correct ReiSIFT UUID"
+                                aria-label="Correct ReiSIFT UUID for {{ row.street }}"
+                                required
+                            >
+                            <button type="submit">Repair &amp; Retry</button>
+                        </form>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="6">No broken ReiSIFT UUIDs are currently queued.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}

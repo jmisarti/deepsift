@@ -11354,6 +11354,47 @@ def sync_sms_delivery_phone_status_to_reisift(db, property_id, phone_number, sta
     return {"ok": bool(result.get("ok")), "result": result, "request_phone": payload_phone}
 
 
+def replay_sms_delivery_phone_status_sync_for_property(db, property_id):
+    """Replay final recipient failures after a stale property UUID is repaired."""
+    rows = db.execute(
+        """
+        SELECT e.to_number, e.failure_bucket, e.failure_reason
+        FROM sms_delivery_events e
+        LEFT JOIN communications c ON c.id = e.communication_id
+        LEFT JOIN sms_automation_queue q ON q.id = e.queue_id
+        WHERE COALESCE(c.property_id, q.property_id) = ?
+          AND COALESCE(e.is_recipient_issue, 0) = 1
+        ORDER BY e.id DESC
+        """,
+        (int(property_id or 0),),
+    ).fetchall()
+    replayed_numbers = set()
+    synced = 0
+    errors = 0
+    for row in rows:
+        phone_number = normalize_phone(row["to_number"] or "")
+        if not phone_number or phone_number in replayed_numbers:
+            continue
+        replayed_numbers.add(phone_number)
+        status = _reisift_status_for_sms_delivery_failure(row["failure_bucket"], row["failure_reason"])
+        if not status:
+            continue
+        touchpoint_update = apply_touchpoint_status_inference(db, phone_number, row["failure_reason"])
+        result = sync_sms_delivery_phone_status_to_reisift(
+            db,
+            property_id,
+            phone_number,
+            status,
+            channel_label=touchpoint_update.get("channel_label") or "",
+            failure_reason=row["failure_reason"],
+        )
+        if result.get("ok"):
+            synced += 1
+        elif not result.get("skipped"):
+            errors += 1
+    return {"reviewed": len(replayed_numbers), "synced": synced, "errors": errors}
+
+
 def record_sms_delivery_status(db, payload, sms_id="", status="", from_number="", to_number="", communication_id=None, received_at=None):
     status_text = normalize_whitespace(status or payload.get("status") or "")
     failure_reason = normalize_whitespace(
@@ -48849,6 +48890,116 @@ def new_records_page():
             "local_update_count": local_update_count,
             "county_counts": county_counts,
         },
+    )
+
+
+@app.route("/broken-reisift-uuids")
+def broken_reisift_uuids_page():
+    """Show SMS-attempt records whose stored ReiSIFT link cannot be read."""
+    ensure_db()
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT s.property_id,
+               COALESCE(NULLIF(s.property_uuid, ''), NULLIF(p.reisift_property_uuid, '')) AS stored_uuid,
+               s.baseline_error,
+               s.updated_at,
+               p.status AS local_status,
+               a.street,
+               a.city,
+               a.state,
+               a.postal_code
+        FROM sms_property_attempt_state s
+        JOIN properties p ON p.id = s.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        WHERE s.baseline_status = 'Retry'
+          AND (
+              lower(COALESCE(s.baseline_error, '')) LIKE '%404%'
+              OR lower(COALESCE(s.baseline_error, '')) LIKE '%missing_reisift_property_uuid%'
+              OR COALESCE(NULLIF(s.property_uuid, ''), NULLIF(p.reisift_property_uuid, '')) IS NULL
+          )
+        ORDER BY s.updated_at DESC, s.property_id DESC
+        """
+    ).fetchall()
+    return render_template(
+        "broken_reisift_uuids.html",
+        rows=rows,
+        notice=(request.args.get("notice") or "").strip(),
+        error=(request.args.get("error") or "").strip(),
+    )
+
+
+@app.route("/broken-reisift-uuids/<int:property_id>/repair", methods=["POST"])
+def repair_broken_reisift_uuid(property_id):
+    """Replace a stale UUID and let the isolated worker retry its pending work."""
+    ensure_db()
+    db = get_db()
+    replacement_uuid = normalize_uuid(request.form.get("reisift_property_uuid") or "")
+    if not replacement_uuid:
+        return redirect(
+            url_for(
+                "broken_reisift_uuids_page",
+                error="Enter a valid ReiSIFT property UUID before retrying.",
+            )
+        )
+    state = db.execute(
+        "SELECT property_id FROM sms_property_attempt_state WHERE property_id = ? LIMIT 1",
+        (property_id,),
+    ).fetchone()
+    if not state:
+        return redirect(url_for("broken_reisift_uuids_page", error="This property is not in the UUID repair queue."))
+
+    db.execute(
+        "UPDATE properties SET reisift_property_uuid = ? WHERE id = ?",
+        (replacement_uuid, property_id),
+    )
+    db.execute(
+        """
+        UPDATE sms_property_attempt_state
+        SET property_uuid = ?, baseline_attempts = 0, baseline_status = 'Pending',
+            baseline_error = '', baseline_loaded_at = NULL, reisift_last_synced_attempts = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE property_id = ?
+        """,
+        (replacement_uuid, property_id),
+    )
+    db.execute(
+        """
+        UPDATE reisift_sms_attempt_sync_queue
+        SET property_uuid = ?, desired_attempts = NULL, queue_status = 'Pending',
+            run_after = CURRENT_TIMESTAMP, last_error = '', updated_at = CURRENT_TIMESTAMP
+        WHERE property_id = ?
+        """,
+        (replacement_uuid, property_id),
+    )
+    db.execute(
+        """
+        INSERT INTO activity_log (property_id, activity_type, outcome, note)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            property_id,
+            "ReiSIFT UUID Repair",
+            "Queued",
+            f"Replaced stale ReiSIFT UUID and queued a fresh SMS-attempt baseline read: {replacement_uuid}",
+        ),
+    )
+    db.commit()
+    replay = replay_sms_delivery_phone_status_sync_for_property(db, property_id)
+    db.commit()
+    replay_note = ""
+    if replay["synced"]:
+        replay_note = f" Replayed {replay['synced']} prior SMS phone-status update(s)."
+    elif replay["errors"]:
+        replay_note = " Prior SMS phone-status replay needs another retry."
+    return redirect(
+        url_for(
+            "broken_reisift_uuids_page",
+            notice=(
+                "UUID replaced. The SMS-attempt worker will re-read ReiSIFT and retry pending work shortly."
+                f"{replay_note}"
+            ),
+        )
     )
 
 

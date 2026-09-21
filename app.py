@@ -302,6 +302,9 @@ REISIFT_NEW_RECORDS_EXCLUDED_STATUSES = tuple(
     if item.strip()
 )
 REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED = env_flag("REISIFT_NEW_RECORDS_AUTO_REFRESH_ENABLED", False)
+REISIFT_DEEP_PROSPECTING_AUTO_REFRESH_ENABLED = env_flag(
+    "REISIFT_DEEP_PROSPECTING_AUTO_REFRESH_ENABLED", True
+)
 REISIFT_NEW_RECORDS_MAX_ROWS = max(
     1,
     int((os.getenv("REISIFT_NEW_RECORDS_MAX_ROWS") or "50000").strip() or "50000"),
@@ -28790,7 +28793,11 @@ def start_reisift_new_records_worker():
             try:
                 now_et = datetime.now(EST_TZ)
                 if now_et.hour == REISIFT_NEW_RECORDS_REFRESH_HOUR_ET and now_et.minute < 10:
-                    run_reisift_new_records_refresh_once(triggered_by="automation")
+                    new_records_result = run_reisift_new_records_refresh_once(triggered_by="automation")
+                    # Run the second segment only after the New Records safety reconciliation
+                    # has completed or was already completed for the day.
+                    if REISIFT_DEEP_PROSPECTING_AUTO_REFRESH_ENABLED and new_records_result.get("ok"):
+                        run_reisift_deep_prospecting_refresh_once(triggered_by="automation")
                     # Prevent duplicate refreshes during the configured morning window.
                     time.sleep(600)
                     continue
@@ -39984,6 +39991,78 @@ def get_reisift_deep_prospecting_refresh_state(db=None):
     if remembered:
         return _normalize_reisift_refresh_state(remembered, REISIFT_DEEP_PROSPECTING_REFRESH_LOCK)
     return _normalize_reisift_refresh_state({}, REISIFT_DEEP_PROSPECTING_REFRESH_LOCK)
+
+
+def run_reisift_deep_prospecting_refresh_once(triggered_by="automation"):
+    """Run the daily Deep Prospecting reconciliation without creating a web request thread."""
+    ensure_db()
+    if not REISIFT_DEEP_PROSPECTING_REFRESH_LOCK.acquire(blocking=False):
+        return {"ok": True, "skipped": "refresh_already_running"}
+
+    db = open_sqlite_connection()
+    try:
+        today_et = datetime.now(EST_TZ).strftime("%Y-%m-%d")
+        last_run_date = (
+            get_setting(db, "reisift_deep_prospecting_last_auto_run_date", "") or ""
+        ).strip()
+        if triggered_by == "automation" and last_run_date == today_et:
+            return {"ok": True, "skipped": "already_ran_today", "date": today_et}
+
+        set_reisift_deep_prospecting_refresh_state(
+            db,
+            "running",
+            f"Scheduled Deep Prospecting reconciliation started ({triggered_by}).",
+            stage="starting",
+            reset_started_at=True,
+        )
+        commit_with_retry(db)
+        result = refresh_reisift_deep_prospecting_cache(
+            db,
+            progress_callback=_reisift_refresh_progress_writer(
+                db, set_reisift_deep_prospecting_refresh_state
+            ),
+        )
+        message = (
+            f"Scheduled reconciliation complete in {result.get('duration_seconds', 0)} seconds: "
+            f"{result.get('scanned', 0)} scanned, {result.get('unchanged', 0)} unchanged, "
+            f"{result.get('synced', 0)} imported/updated, {result.get('status_exit_checks', 0)} removed; "
+            f"SMS drafts created {((result.get('sms_queue') or {}).get('created', 0))}, "
+            f"removed {((result.get('sms_queue') or {}).get('suppressed', 0))}; "
+            f"EmailOctopus removals queued {result.get('status_exit_unsubscribe_queued', 0)}."
+        )
+        if result.get("search_failed"):
+            message = "ReiSIFT search is temporarily unavailable; existing cache was preserved. " + message
+        elif result.get("errors"):
+            message += f" Warnings: {len(result.get('errors') or [])}."
+        set_reisift_deep_prospecting_refresh_state(
+            db, "complete", message, result=result, stage="complete"
+        )
+        if triggered_by == "automation":
+            set_setting(db, "reisift_deep_prospecting_last_auto_run_date", today_et)
+        commit_with_retry(db)
+        return {"ok": True, "result": result, "date": today_et}
+    except Exception as exc:
+        db.rollback()
+        log_app_error(
+            db,
+            source="reisift_deep_prospecting_worker",
+            error_message=str(exc),
+            details=traceback.format_exc(),
+            route="run_reisift_deep_prospecting_refresh_once",
+            status_code=500,
+        )
+        set_reisift_deep_prospecting_refresh_state(
+            db,
+            "error",
+            str(exc),
+            result={"error": str(exc)},
+            stage="error",
+        )
+        commit_with_retry(db)
+        return {"ok": False, "error": str(exc)}
+    finally:
+        db.close()
+        REISIFT_DEEP_PROSPECTING_REFRESH_LOCK.release()
 
 
 def start_reisift_deep_prospecting_refresh_job(triggered_by="manual"):

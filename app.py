@@ -11267,14 +11267,7 @@ def suppress_sms_automation_followups_for_delivery_failure(db, property_id, phon
     if int(person_id or 0) > 0:
         clauses.append("(person_id = ? OR COALESCE(person_id, 0) = 0)")
         params.append(int(person_id or 0))
-    cur = db.execute(
-        f"""
-        DELETE FROM sms_automation_queue
-        WHERE {' AND '.join(clauses)}
-        """,
-        tuple(params),
-    )
-    return int(cur.rowcount or 0)
+    return _delete_sms_automation_queue_where(db, " AND ".join(clauses), params)
 
 
 def _reisift_status_for_sms_delivery_failure(failure_bucket, failure_reason):
@@ -37470,6 +37463,55 @@ def stale_reisift_new_record_touchpoint_reason(db, property_id, touchpoint_id, a
     return ""
 
 
+def _delete_sms_automation_queue_rows(db, queue_ids):
+    """Remove queue rows without discarding their SMS-attempt or delivery history."""
+    ids = set()
+    for queue_id in queue_ids or []:
+        try:
+            clean_id = int(queue_id or 0)
+        except (TypeError, ValueError):
+            continue
+        if clean_id > 0:
+            ids.add(clean_id)
+    ids = sorted(ids)
+    if not ids:
+        return 0
+    placeholders = ",".join(["?"] * len(ids))
+
+    # A queue item can become part of an attempt wave before later validation
+    # suppresses it. Keep the immutable member/event history, but detach it
+    # from the now-removed draft so Postgres foreign keys do not block cleanup.
+    db.execute(
+        f"""
+        UPDATE sms_property_attempt_members
+        SET queue_id = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE queue_id IN ({placeholders})
+        """,
+        tuple(ids),
+    )
+    db.execute(
+        f"""
+        UPDATE sms_delivery_events
+        SET queue_id = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE queue_id IN ({placeholders})
+        """,
+        tuple(ids),
+    )
+    cur = db.execute(
+        f"DELETE FROM sms_automation_queue WHERE id IN ({placeholders})",
+        tuple(ids),
+    )
+    return int(cur.rowcount or 0)
+
+
+def _delete_sms_automation_queue_where(db, where_sql, params=()):
+    rows = db.execute(
+        f"SELECT id FROM sms_automation_queue WHERE {where_sql}",
+        tuple(params or ()),
+    ).fetchall()
+    return _delete_sms_automation_queue_rows(db, [row["id"] for row in rows])
+
+
 def revalidate_sms_automation_queue(db, property_ids=None):
     clauses = ["status IN ('Draft', 'Queued', 'Approved', 'Scheduled')"]
     params = []
@@ -37500,8 +37542,7 @@ def revalidate_sms_automation_queue(db, property_ids=None):
         if not reason:
             reason = sms_automation_inbound_reply_suppression_reason(db, row)
         if reason:
-            db.execute("DELETE FROM sms_automation_queue WHERE id = ?", (row["id"],))
-            suppressed += 1
+            suppressed += _delete_sms_automation_queue_rows(db, [row["id"]])
     return suppressed
 
 
@@ -37860,9 +37901,10 @@ def approve_sms_automation_queue_items(db, queue_ids):
         if not reason:
             reason = sms_automation_inbound_reply_suppression_reason(db, row)
         if reason:
-            db.execute("DELETE FROM sms_automation_queue WHERE id = ?", (queue_id,))
-            result["suppressed"] += 1
-            result["suppressed_ids"].append(queue_id)
+            removed = _delete_sms_automation_queue_rows(db, [queue_id])
+            result["suppressed"] += removed
+            if removed:
+                result["suppressed_ids"].append(queue_id)
             continue
         message_body = sms_automation_initial_message_for_approval(db, row)
         db.execute(
@@ -37940,11 +37982,7 @@ def purge_suppressed_sms_automation_queue(db, property_ids=None):
         if ids:
             clauses.append("property_id IN (" + ",".join(["?"] * len(ids)) + ")")
             params.extend(ids)
-    cur = db.execute(
-        f"DELETE FROM sms_automation_queue WHERE {' AND '.join(clauses)}",
-        tuple(params),
-    )
-    return int(cur.rowcount or 0)
+    return _delete_sms_automation_queue_where(db, " AND ".join(clauses), params)
 
 
 def _is_correct_phone_status_text(status):
@@ -38028,15 +38066,11 @@ def suppress_sms_automation_queue_for_property(db, property_id, reason):
         clean_property_id = 0
     if clean_property_id <= 0:
         return 0
-    cur = db.execute(
-        """
-        DELETE FROM sms_automation_queue
-        WHERE property_id = ?
-          AND status IN ('Draft', 'Queued', 'Approved', 'Scheduled')
-        """,
+    removed = _delete_sms_automation_queue_where(
+        db,
+        "property_id = ? AND status IN ('Draft', 'Queued', 'Approved', 'Scheduled')",
         (clean_property_id,),
     )
-    removed = int(cur.rowcount or 0)
     if removed:
         try:
             db.execute(
@@ -38205,15 +38239,11 @@ def suppress_duplicate_sms_automation_queue_items(db, property_ids=None):
                 continue
             if int(item["id"]) == int(keep["id"]):
                 continue
-            cur = db.execute(
-                """
-                DELETE FROM sms_automation_queue
-                WHERE id = ?
-                  AND status NOT IN ('Sent', 'Sending', 'Approved')
-                """,
+            suppressed += _delete_sms_automation_queue_where(
+                db,
+                "id = ? AND status NOT IN ('Sent', 'Sending', 'Approved')",
                 (item["id"],),
             )
-            suppressed += int(cur.rowcount or 0)
     return suppressed
 
 
@@ -38432,14 +38462,7 @@ def suppress_sms_automation_followups_for_reply(db, property_id, phone_number, p
     reason = "Inbound SMS received from this phone; SMS automation stopped for this number."
     if communication_id:
         reason += f" Communication #{communication_id}."
-    cur = db.execute(
-        f"""
-        DELETE FROM sms_automation_queue
-        WHERE {' AND '.join(clauses)}
-        """,
-        tuple(params),
-    )
-    return int(cur.rowcount or 0)
+    return _delete_sms_automation_queue_where(db, " AND ".join(clauses), params)
 
 
 def ensure_sms_automation_followups_for_sent_row(db, sent_row, communication_id=None, sent_at=None):
@@ -42852,17 +42875,17 @@ def repair_reisift_placeholder_owner_contacts(db, limit=10000):
                     set_default=True,
                 )
             seen_properties.add(property_id)
-        removed = db.execute(
+        removed = _delete_sms_automation_queue_where(
+            db,
             """
-            DELETE FROM sms_automation_queue
-            WHERE touchpoint_id = ?
+            touchpoint_id = ?
               AND property_id <> ?
               AND status IN ('Draft', 'Queued', 'Suppressed')
               AND lower(COALESCE(suppression_reason, '')) LIKE 'stale reisift new record phone%'
             """,
             (row["touchpoint_id"], property_id),
-        ).rowcount
-        queue_rows_removed += max(0, int(removed or 0))
+        )
+        queue_rows_removed += removed
         db.execute(
             """
             UPDATE sms_automation_queue
@@ -42914,10 +42937,10 @@ def repair_reisift_placeholder_owner_contacts(db, limit=10000):
             db.execute("UPDATE properties SET owner_person_id = ? WHERE id = ?", (target_person_id, property_id))
             properties_reassigned += 1
             touched_properties.add(property_id)
-    removed_non_placeholder_stale = db.execute(
+    removed_non_placeholder_stale = _delete_sms_automation_queue_where(
+        db,
         """
-        DELETE FROM sms_automation_queue
-        WHERE status = 'Suppressed'
+        status = 'Suppressed'
           AND lower(COALESCE(suppression_reason, '')) LIKE 'stale reisift new record phone%'
           AND touchpoint_id IN (
                 SELECT t.id
@@ -42925,9 +42948,9 @@ def repair_reisift_placeholder_owner_contacts(db, limit=10000):
                 JOIN people pe ON pe.id = t.person_id
                 WHERE NOT (lower(pe.last_name) = 'owner' AND lower(pe.first_name) IN ('reisift', 'company', 'unknown'))
           )
-        """
-    ).rowcount
-    queue_rows_removed += max(0, int(removed_non_placeholder_stale or 0))
+        """,
+    )
+    queue_rows_removed += removed_non_placeholder_stale
     if touched_properties:
         suppress_duplicate_sms_automation_queue_items(db, property_ids=list(touched_properties))
         revalidate_sms_automation_queue(db, property_ids=list(touched_properties))
@@ -50097,7 +50120,11 @@ def _sms_automation_send_queue_item(db, queue_id):
     if not reason:
         reason = sms_automation_touchpoint_suppression_reason(db, row["touchpoint_id"])
     if reason:
-        db.execute("DELETE FROM sms_automation_queue WHERE id = ? AND status NOT IN ('Sent', 'Sending')", (row["id"],))
+        _delete_sms_automation_queue_where(
+            db,
+            "id = ? AND status NOT IN ('Sent', 'Sending')",
+            (row["id"],),
+        )
         try:
             refresh_prospect_table_cache_for_property_id(db, row["property_id"])
         except Exception:

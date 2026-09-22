@@ -137,6 +137,22 @@
                     {% endfor %}
                 </div>
             </div>
+            <div class="span2 sms-variation-settings">
+                <h3>Day 14 Re-Engagement Variations</h3>
+                <p class="muted-text">
+                    A Day 14 draft is created only after an unanswered initial sequence is complete. Approving that draft starts three automatic follow-ups every three business days. One variation per line.
+                    Available variables: <code>{first_name}</code> and <code>{property_address}</code>.
+                </p>
+                <div class="sms-variation-grid">
+                    {% for item in sms_reengagement_variation_settings %}
+                    <label>
+                        <span>{{ item.label }}</span>
+                        <textarea name="sms_reengagement_variants__{{ item.key }}" rows="4">{{ item.value }}</textarea>
+                        <small>{{ item.help }}</small>
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
         </form>
         <h3>Sender Health</h3>
         <p class="muted-text">Carrier/content filtering cools a sender down. Recipient-side failures suppress that recipient phone from future follow-ups.</p>

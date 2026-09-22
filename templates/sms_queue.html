@@ -180,6 +180,9 @@
         <form method="post" action="{{ url_for('sms_queue_generate') }}">
             <button type="submit">Generate From Prospect Segments</button>
         </form>
+        <form method="post" action="{{ url_for('sms_queue_generate_reengagement') }}">
+            <button type="submit">Create Day 14 Re-Engagement Drafts</button>
+        </form>
         <form method="post" action="{{ url_for('sms_queue_revalidate') }}">
             <button type="submit">Revalidate + Find New Numbers</button>
         </form>

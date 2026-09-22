@@ -138,7 +138,11 @@
                     <td>{{ row.projected_send_at|fmt_est_datetime }}</td>
                     <td><span class="pill sms-status-{{ row.status|lower|replace(' ', '-') }}">{{ row.status }}</span></td>
                     <td>
-                        {% if row.step_order and row.step_order > 1 %}
+                        {% if ':re14:fu:' in (row.queue_key or '') %}
+                            Re-Engagement Follow-Up {{ row.step_order - 10 }}
+                        {% elif ':re14' in (row.queue_key or '') %}
+                            Day 14 Re-Engagement
+                        {% elif row.step_order and row.step_order > 1 %}
                             Follow-up {{ row.step_order - 1 }}
                         {% else %}
                             Initial

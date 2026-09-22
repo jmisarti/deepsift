@@ -384,6 +384,19 @@ SMS_AUTOMATION_AUTO_SEND_BATCH_LIMIT = max(
     1,
 )
 SMS_AUTOMATION_FOLLOWUP_COUNT = max(int((os.getenv("SMS_AUTOMATION_FOLLOWUP_COUNT") or "3").strip() or "3"), 0)
+SMS_AUTOMATION_REENGAGEMENT_WAIT_DAYS = max(
+    int((os.getenv("SMS_AUTOMATION_REENGAGEMENT_WAIT_DAYS") or "14").strip() or "14"),
+    1,
+)
+SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_COUNT = max(
+    int((os.getenv("SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_COUNT") or "3").strip() or "3"),
+    0,
+)
+SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_BUSINESS_DAYS = max(
+    int((os.getenv("SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_BUSINESS_DAYS") or "3").strip() or "3"),
+    1,
+)
+SMS_AUTOMATION_REENGAGEMENT_INITIAL_STEP_ORDER = 10
 PROSPECT_CONVERSATION_STALLED_BUSINESS_DAYS = max(
     int((os.getenv("PROSPECT_CONVERSATION_STALLED_BUSINESS_DAYS") or "2").strip() or "2"),
     1,
@@ -36848,6 +36861,7 @@ SMS_AUTOMATION_LOCKED_QUEUE_STATUSES = {"Approved", "Sending", "Sent", "Held"}
 REISIFT_NEW_RECORD_TOUCHPOINT_SOURCE = "ReiSift New Records refresh"
 SMS_AUTOMATION_INITIAL_VARIATIONS_SETTING = "sms_automation_initial_message_variants_json"
 SMS_AUTOMATION_FOLLOWUP_VARIATIONS_SETTING = "sms_automation_followup_message_variants_json"
+SMS_AUTOMATION_REENGAGEMENT_VARIATIONS_SETTING = "sms_automation_reengagement_message_variants_json"
 
 SMS_AUTOMATION_ELIGIBLE_PROPERTY_STATUSES = {"new record", "new records", "deep prospecting"}
 
@@ -37826,7 +37840,13 @@ def _deterministic_sms_variation_index(seed, count):
 
 
 def sms_automation_initial_message_for_approval(db, row):
-    if not row or int(row["step_order"] or 1) != 1:
+    if not row:
+        return ""
+    if _sms_automation_is_reengagement_row(row):
+        if int(row["step_order"] or 0) != SMS_AUTOMATION_REENGAGEMENT_INITIAL_STEP_ORDER:
+            return normalize_whitespace(row["message_body"] or "")
+        return _sms_automation_reengagement_message(db, row, step_index=0)
+    if int(row["step_order"] or 1) != 1:
         return normalize_whitespace(row["message_body"] if row else "")
     variables = parse_json_object(row["rendered_variables_json"] or "{}", default={})
     if not isinstance(variables, dict):
@@ -38258,7 +38278,10 @@ def _sms_automation_is_followup_row(row):
     if not row:
         return False
     try:
-        if int(row["step_order"] or 1) > 1:
+        step_order = int(row["step_order"] or 1)
+        if _sms_automation_is_reengagement_row(row):
+            return step_order > SMS_AUTOMATION_REENGAGEMENT_INITIAL_STEP_ORDER
+        if step_order > 1:
             return True
     except Exception:
         pass
@@ -38424,6 +38447,155 @@ def _sms_automation_followup_message(db, parent_row, step_order):
     return normalize_whitespace(message)
 
 
+def _builtin_sms_reengagement_templates_for_role(contact_role):
+    role = _sms_route_role(contact_role)
+    if role == "relative":
+        return [
+            [
+                "Hi {first_name}, this is Laura checking back about {property_address}. Do you know who is handling the property?",
+                "Hi {first_name}, Laura here. I wanted to follow up about {property_address}. Are you connected to the person handling it?",
+                "Hi {first_name}, I am circling back about {property_address}. If you know the right person to speak with, would you point me their way?",
+            ],
+            [
+                "Hi {first_name}, just checking if you saw my note about {property_address}. Is there someone better for me to contact?",
+                "Hi {first_name}, quick follow-up on {property_address}. Do you know who handles the property?",
+                "Hi {first_name}, I wanted to make sure I reach the right person for {property_address}. Can you help point me in the right direction?",
+            ],
+            [
+                "Hi {first_name}, checking back once more about {property_address}. If you know who I should speak with, I would appreciate it.",
+                "Hi {first_name}, one more quick note about {property_address}. Is there a better contact for me?",
+                "Hi {first_name}, I am still trying to reach the right person for {property_address}. Please let me know if that is someone you know.",
+            ],
+            [
+                "Hi {first_name}, I will close the loop after this. If there is a better contact for {property_address}, please let me know.",
+                "Hi {first_name}, last follow-up from me about {property_address}. If you can point me to the right person, I would appreciate it.",
+                "Hi {first_name}, I do not want to keep bothering you. If you know who handles {property_address}, just let me know.",
+            ],
+        ]
+    return [
+        [
+            "Hi {first_name}, this is Laura checking back about {property_address}. If selling is still something you are considering, I am happy to talk through options.",
+            "Hi {first_name}, Laura here. I wanted to see whether selling {property_address} is still something you are considering. Happy to help if it is.",
+            "Hi {first_name}, I am circling back about {property_address}. If your plans have changed, no problem. If you would like options, I am here.",
+        ],
+        [
+            "Hi {first_name}, just checking if you saw my last note about {property_address}. I am here if a quick conversation would be helpful.",
+            "Hi {first_name}, following up on {property_address}. If selling is on your radar, I can make time for a brief call.",
+            "Hi {first_name}, wanted to check back about {property_address}. No pressure at all, just let me know if you would like to talk.",
+        ],
+        [
+            "Hi {first_name}, I wanted to check once more about {property_address}. Even if the timing is not right, I am happy to be a resource.",
+            "Hi {first_name}, checking in again about {property_address}. If there is anything you would like to discuss, just reply here.",
+            "Hi {first_name}, quick note about {property_address}. If you are considering options, I would be glad to help.",
+        ],
+        [
+            "Hi {first_name}, I will close the loop after this, but if you want to discuss {property_address}, just reply anytime.",
+            "Hi {first_name}, last note from me about {property_address}. If selling becomes a priority, I am only a text away.",
+            "Hi {first_name}, I do not want to keep nudging you. If you ever want to talk about {property_address}, please let me know.",
+        ],
+    ]
+
+
+def _sms_reengagement_variation_labels():
+    entries = []
+    for role in ["owner", "relative"]:
+        groups = _builtin_sms_reengagement_templates_for_role(role)
+        labels = ["Day 14 Message"] + [
+            f"Re-Engagement Follow-Up {index} ({SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_BUSINESS_DAYS * index} business days later)"
+            for index in range(1, SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_COUNT + 1)
+        ]
+        for index, label in enumerate(labels):
+            entries.append(
+                {
+                    "key": f"{role}_{index}",
+                    "label": f"{role.title()} - {label}",
+                    "contact_role": role,
+                    "step_index": index,
+                    "help": "One variation per line. Uses {first_name} and {property_address}.",
+                    "builtin": groups[min(index, len(groups) - 1)] if groups else [],
+                }
+            )
+    return entries
+
+
+def get_sms_automation_reengagement_variation_config(db):
+    saved = parse_json_object(
+        get_setting(db, SMS_AUTOMATION_REENGAGEMENT_VARIATIONS_SETTING, "{}"), default={}
+    )
+    saved = saved if isinstance(saved, dict) else {}
+    config = {}
+    for entry in _sms_reengagement_variation_labels():
+        values = saved.get(entry["key"])
+        if isinstance(values, str):
+            values = _parse_sms_variation_text(values)
+        elif isinstance(values, list):
+            values = [normalize_whitespace(item) for item in values if normalize_whitespace(item)]
+        else:
+            values = []
+        if not values:
+            values = [normalize_whitespace(item) for item in entry["builtin"] if normalize_whitespace(item)]
+        config[entry["key"]] = list(dict.fromkeys(values))
+    return config
+
+
+def sms_automation_reengagement_variation_settings_for_form(db):
+    config = get_sms_automation_reengagement_variation_config(db)
+    entries = []
+    for entry in _sms_reengagement_variation_labels():
+        item = dict(entry)
+        item.pop("builtin", None)
+        item["value"] = "\n".join(config.get(entry["key"]) or [])
+        entries.append(item)
+    return entries
+
+
+def save_sms_automation_reengagement_variation_settings(db, form):
+    if not _form_has_key_prefix(form, "sms_reengagement_variants__"):
+        return {}
+    config = {}
+    for entry in _sms_reengagement_variation_labels():
+        field_name = f"sms_reengagement_variants__{entry['key']}"
+        values = _parse_sms_variation_text(form.get(field_name) or "")
+        if not values:
+            values = [normalize_whitespace(item) for item in entry["builtin"] if normalize_whitespace(item)]
+        config[entry["key"]] = values
+    set_setting(
+        db,
+        SMS_AUTOMATION_REENGAGEMENT_VARIATIONS_SETTING,
+        json.dumps(config, ensure_ascii=True, sort_keys=True),
+    )
+    return config
+
+
+def _sms_automation_is_reengagement_row(row):
+    if not row:
+        return False
+    if ":re14" in str(row["queue_key"] or "").lower():
+        return True
+    source = parse_json_object(row["source_info_json"] or "", default={})
+    return bool(source.get("reengagement")) if isinstance(source, dict) else False
+
+
+def _sms_automation_reengagement_message(db, parent_row, step_index=0):
+    role = _sms_route_role(parent_row["contact_role"] if parent_row else "")
+    config = get_sms_automation_reengagement_variation_config(db) if db is not None else {}
+    variants = [
+        normalize_whitespace(item)
+        for item in (config.get(f"{role}_{max(0, int(step_index or 0))}") or [])
+        if normalize_whitespace(item)
+    ]
+    if not variants:
+        builtin = _builtin_sms_reengagement_templates_for_role(role)
+        variants = builtin[min(max(0, int(step_index or 0)), len(builtin) - 1)] if builtin else []
+    seed = f"{parent_row['queue_key'] if parent_row else ''}|reengagement|{step_index}"
+    template = variants[_deterministic_sms_variation_index(seed, len(variants))] if variants else ""
+    variables = parse_json_object(parent_row["rendered_variables_json"] if parent_row else "", default={})
+    variables = variables if isinstance(variables, dict) else {}
+    variables.setdefault("first_name", "there")
+    variables.setdefault("property_address", "")
+    return normalize_whitespace(render_sms_automation_template(template, variables))
+
+
 def sms_automation_followup_contact_role_allowed(contact_role):
     """Allow follow-ups for every classified or unclassified property contact."""
     return normalize_whitespace(contact_role).lower() in {
@@ -38473,7 +38645,18 @@ def suppress_sms_automation_followups_for_reply(db, property_id, phone_number, p
 
 
 def ensure_sms_automation_followups_for_sent_row(db, sent_row, communication_id=None, sent_at=None):
-    if SMS_AUTOMATION_FOLLOWUP_COUNT <= 0 or not sent_row:
+    if not sent_row:
+        return {"created": 0, "skipped": "missing_parent"}
+    if _sms_automation_is_reengagement_row(sent_row):
+        if _sms_automation_is_followup_row(sent_row):
+            return {"created": 0, "skipped": "followup_row"}
+        return ensure_sms_automation_reengagement_followups_for_sent_row(
+            db,
+            sent_row,
+            communication_id=communication_id,
+            sent_at=sent_at,
+        )
+    if SMS_AUTOMATION_FOLLOWUP_COUNT <= 0:
         return {"created": 0, "skipped": "disabled"}
     if _sms_automation_is_followup_row(sent_row):
         return {"created": 0, "skipped": "followup_row"}
@@ -38540,6 +38723,88 @@ def ensure_sms_automation_followups_for_sent_row(db, sent_row, communication_id=
                 sent_row["bucket"],
                 sent_row["rule_key"],
                 sent_row["sequence_name"] or _sms_sequence_name(sent_row["bucket"], sent_row["contact_role"]),
+                step_order,
+                message,
+                sent_row["rendered_variables_json"] or "",
+                json.dumps(source_info, ensure_ascii=True, sort_keys=True),
+                format_db_time(scheduled_for),
+            ),
+        )
+        created += 1
+    return {"created": created}
+
+
+def ensure_sms_automation_reengagement_followups_for_sent_row(db, sent_row, communication_id=None, sent_at=None):
+    """Schedule the three-business-day re-engagement sequence after an approved Day 14 SMS."""
+    if SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_COUNT <= 0:
+        return {"created": 0, "skipped": "disabled"}
+    try:
+        parent_id = int(sent_row["id"] or 0)
+        property_id = int(sent_row["property_id"] or 0)
+    except Exception:
+        return {"created": 0, "skipped": "invalid_parent"}
+    phone_norm = normalize_phone(sent_row["phone_number"])
+    if not parent_id or not property_id or not phone_norm:
+        return {"created": 0, "skipped": "missing_parent_data"}
+    reason = sms_automation_property_suppression_reason(db, property_id)
+    if not reason:
+        reason = sms_automation_touchpoint_suppression_reason(db, sent_row["touchpoint_id"])
+    if not reason:
+        reason = sms_automation_inbound_reply_suppression_reason(db, sent_row)
+    if reason:
+        return {"created": 0, "skipped": reason}
+
+    settings = get_sms_automation_settings(db)
+    sent_dt = parse_db_time(sent_at or sent_row["sent_at"] or "") or datetime.utcnow()
+    created = 0
+    for followup_index in range(1, SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_COUNT + 1):
+        step_order = SMS_AUTOMATION_REENGAGEMENT_INITIAL_STEP_ORDER + followup_index
+        queue_key = f"{sent_row['queue_key']}:fu:{step_order}"
+        if db.execute("SELECT id FROM sms_automation_queue WHERE queue_key = ? LIMIT 1", (queue_key,)).fetchone():
+            continue
+        scheduled_for = _sms_automation_followup_scheduled_at_utc(
+            sent_dt,
+            followup_index * SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_BUSINESS_DAYS,
+            settings,
+        )
+        source_info = parse_json_object(sent_row["source_info_json"] or "", default={})
+        source_info = source_info if isinstance(source_info, dict) else {}
+        source_info["reengagement_followup"] = {
+            "parent_queue_id": parent_id,
+            "parent_communication_id": communication_id or sent_row["communication_id"] or None,
+            "business_days_after_day14": (
+                followup_index * SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_BUSINESS_DAYS
+            ),
+        }
+        message = _sms_automation_reengagement_message(db, sent_row, step_index=followup_index)
+        parent_from_number = normalize_phone(sent_row["from_number"])
+        if not sms_automation_sender_is_configured(settings, parent_from_number):
+            parent_from_number = ""
+        from_number = parent_from_number or select_sms_automation_from_number(
+            db,
+            bucket=sent_row["bucket"],
+            contact_role=sent_row["contact_role"],
+            seed=queue_key,
+        )
+        db.execute(
+            """
+            INSERT INTO sms_automation_queue
+                (queue_key, property_id, person_id, touchpoint_id, phone_number, from_number, contact_role,
+                 bucket, rule_key, sequence_name, step_order, message_body, rendered_variables_json,
+                 source_info_json, status, scheduled_for)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Scheduled', ?)
+            """,
+            (
+                queue_key,
+                property_id,
+                sent_row["person_id"],
+                sent_row["touchpoint_id"],
+                phone_norm,
+                from_number,
+                sent_row["contact_role"],
+                sent_row["bucket"],
+                sent_row["rule_key"],
+                sent_row["sequence_name"] or "Day 14 Re-Engagement",
                 step_order,
                 message,
                 sent_row["rendered_variables_json"] or "",
@@ -38750,6 +39015,170 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
         "skipped": skipped,
         "suppressed": suppressed,
         "duplicates_suppressed": duplicates_suppressed,
+    }
+
+
+def generate_sms_automation_reengagement_drafts(db, now_utc=None):
+    """Create one manual-review Day 14 draft per completed, unanswered original SMS sequence."""
+    if SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_COUNT < 0:
+        return {"created": 0, "skipped": 0, "candidates": 0, "reason": "disabled"}
+    now_utc = now_utc or datetime.utcnow()
+    if now_utc.tzinfo is not None:
+        now_utc = now_utc.astimezone(timezone.utc).replace(tzinfo=None)
+    cutoff = now_utc - timedelta(days=SMS_AUTOMATION_REENGAGEMENT_WAIT_DAYS)
+    original_final_step = 1 + SMS_AUTOMATION_FOLLOWUP_COUNT
+    candidates = db.execute(
+        """
+        SELECT q.*
+        FROM sms_automation_queue q
+        WHERE q.status = 'Sent'
+          AND COALESCE(q.step_order, 1) = 1
+          AND lower(COALESCE(q.queue_key, '')) NOT LIKE '%:re14%'
+        ORDER BY datetime(COALESCE(NULLIF(q.sent_at, ''), NULLIF(q.created_at, ''))) ASC, q.id ASC
+        """
+    ).fetchall()
+    created = skipped = 0
+    skip_reasons = {}
+    settings = get_sms_automation_settings(db)
+    for row in candidates:
+        parent_key = str(row["queue_key"] or "").strip()
+        property_id = int(row["property_id"] or 0)
+        phone_norm = normalize_phone(row["phone_number"] or "")
+        sent_at = parse_db_time(row["sent_at"] or row["created_at"] or "")
+        if not parent_key or not property_id or not phone_norm or not sent_at:
+            skipped += 1
+            skip_reasons["invalid_parent"] = skip_reasons.get("invalid_parent", 0) + 1
+            continue
+        if SMS_AUTOMATION_FOLLOWUP_COUNT > 0:
+            final_row = db.execute(
+                """
+                SELECT sent_at
+                FROM sms_automation_queue
+                WHERE queue_key = ?
+                  AND status = 'Sent'
+                  AND COALESCE(step_order, 1) = ?
+                LIMIT 1
+                """,
+                (f"{parent_key}:fu:{original_final_step}", original_final_step),
+            ).fetchone()
+            if not final_row:
+                skipped += 1
+                skip_reasons["original_sequence_incomplete"] = (
+                    skip_reasons.get("original_sequence_incomplete", 0) + 1
+                )
+                continue
+        last_sent_row = db.execute(
+            """
+            SELECT MAX(COALESCE(NULLIF(sent_at, ''), NULLIF(created_at, ''))) AS last_sent_at
+            FROM sms_automation_queue
+            WHERE status = 'Sent'
+              AND (queue_key = ? OR queue_key LIKE ?)
+            """,
+            (parent_key, f"{parent_key}:fu:%"),
+        ).fetchone()
+        last_sent_at = parse_db_time(last_sent_row["last_sent_at"] if last_sent_row else "") or sent_at
+        if last_sent_at > cutoff:
+            skipped += 1
+            skip_reasons["waiting_for_day_14"] = skip_reasons.get("waiting_for_day_14", 0) + 1
+            continue
+        existing = db.execute(
+            """
+            SELECT id
+            FROM sms_automation_queue
+            WHERE queue_key = ? OR queue_key LIKE ?
+            LIMIT 1
+            """,
+            (f"{parent_key}:re14", f"{parent_key}:re14:fu:%"),
+        ).fetchone()
+        if existing:
+            skipped += 1
+            skip_reasons["already_created"] = skip_reasons.get("already_created", 0) + 1
+            continue
+        reason = sms_automation_property_suppression_reason(db, property_id)
+        if not reason:
+            reason = stale_reisift_new_record_touchpoint_reason(
+                db, property_id, row["touchpoint_id"]
+            )
+        if not reason:
+            reason = sms_automation_touchpoint_suppression_reason(db, row["touchpoint_id"])
+        if reason:
+            skipped += 1
+            skip_reasons["suppressed"] = skip_reasons.get("suppressed", 0) + 1
+            continue
+        inbound = db.execute(
+            """
+            SELECT id
+            FROM communications
+            WHERE property_id = ?
+              AND upper(COALESCE(channel, '')) = 'SMS'
+              AND lower(COALESCE(direction, '')) = 'inbound'
+              AND datetime(COALESCE(NULLIF(sent_at, ''), NULLIF(created_at, ''))) >= datetime(?)
+            LIMIT 1
+            """,
+            (property_id, format_db_time(sent_at)),
+        ).fetchone()
+        if inbound:
+            skipped += 1
+            skip_reasons["inbound_reply"] = skip_reasons.get("inbound_reply", 0) + 1
+            continue
+        queue_key = f"{parent_key}:re14"
+        source_info = parse_json_object(row["source_info_json"] or "", default={})
+        source_info = source_info if isinstance(source_info, dict) else {}
+        source_info["reengagement"] = {
+            "parent_queue_id": int(row["id"] or 0),
+            "parent_queue_key": parent_key,
+            "initial_sent_at": format_db_time(sent_at),
+            "last_original_sequence_sent_at": format_db_time(last_sent_at),
+            "wait_days": SMS_AUTOMATION_REENGAGEMENT_WAIT_DAYS,
+        }
+        parent_from_number = normalize_phone(row["from_number"])
+        if not sms_automation_sender_is_configured(settings, parent_from_number):
+            parent_from_number = ""
+        from_number = parent_from_number or select_sms_automation_from_number(
+            db,
+            bucket=row["bucket"],
+            contact_role=row["contact_role"],
+            seed=queue_key,
+        )
+        draft_row = dict(row)
+        draft_row.update(
+            {
+                "queue_key": queue_key,
+                "source_info_json": json.dumps(source_info, ensure_ascii=True, sort_keys=True),
+            }
+        )
+        message = _sms_automation_reengagement_message(db, draft_row, step_index=0)
+        db.execute(
+            """
+            INSERT INTO sms_automation_queue
+                (queue_key, property_id, person_id, touchpoint_id, phone_number, from_number, contact_role,
+                 bucket, rule_key, sequence_name, step_order, message_body, rendered_variables_json,
+                 source_info_json, status, scheduled_for)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft', NULL)
+            """,
+            (
+                queue_key,
+                property_id,
+                row["person_id"],
+                row["touchpoint_id"],
+                phone_norm,
+                from_number,
+                row["contact_role"],
+                row["bucket"],
+                row["rule_key"],
+                f"{row['sequence_name'] or 'AutoSMS'} - Day 14 Re-Engagement",
+                SMS_AUTOMATION_REENGAGEMENT_INITIAL_STEP_ORDER,
+                message,
+                row["rendered_variables_json"] or "",
+                json.dumps(source_info, ensure_ascii=True, sort_keys=True),
+            ),
+        )
+        created += 1
+    return {
+        "created": created,
+        "skipped": skipped,
+        "candidates": len(candidates),
+        "skip_reasons": skip_reasons,
     }
 
 
@@ -51216,6 +51645,24 @@ def sms_queue_revalidate():
         return redirect(url_for("sms_queue_page", error=f"Revalidate failed: {exc}"))
 
 
+@app.route("/sms-queue/generate-reengagement", methods=["POST"])
+def sms_queue_generate_reengagement():
+    ensure_db()
+    db = get_db()
+    try:
+        result = generate_sms_automation_reengagement_drafts(db)
+        db.commit()
+        notice = (
+            f"Day {SMS_AUTOMATION_REENGAGEMENT_WAIT_DAYS} re-engagement review complete: "
+            f"created {result['created']} draft(s) from {result['candidates']} completed original sequence(s); "
+            f"skipped {result['skipped']}."
+        )
+        return redirect(url_for("sms_queue_page", notice=notice))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("sms_queue_page", error=f"Day 14 re-engagement generation failed: {exc}"))
+
+
 @app.route("/sms-queue/<int:queue_id>/update", methods=["POST"])
 def sms_queue_update_item(queue_id):
     ensure_db()
@@ -53468,6 +53915,7 @@ def settings_page():
                 set_setting(db, key, value)
             save_sms_automation_initial_variation_settings(db, request.form)
             save_sms_automation_followup_variation_settings(db, request.form)
+            save_sms_automation_reengagement_variation_settings(db, request.form)
             notice = "SMS automation settings saved."
         elif active_tab == "email":
             fields = {
@@ -53857,6 +54305,7 @@ def settings_page():
         sms_automation_rules=sms_automation_rules,
         sms_initial_variation_settings=sms_automation_initial_variation_settings_for_form(db),
         sms_followup_variation_settings=sms_automation_followup_variation_settings_for_form(db),
+        sms_reengagement_variation_settings=sms_automation_reengagement_variation_settings_for_form(db),
         sms_sender_health=get_sms_sender_health_rows(db),
         active_tab=active_tab,
         deep_dive_smrtphone_from=deep_dive_smrtphone_from,

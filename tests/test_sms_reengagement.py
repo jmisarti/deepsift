@@ -58,6 +58,13 @@ class SmsReengagementTests(unittest.TestCase):
     def tearDown(self):
         self.db.close()
 
+    def test_verified_phone_status_only_accepts_explicit_confirmation(self):
+        self.assertTrue(app.is_verified_phone_status_text("Correct"))
+        self.assertTrue(app.is_verified_phone_status_text(" verified "))
+        self.assertFalse(app.is_verified_phone_status_text("Unknown"))
+        self.assertFalse(app.is_verified_phone_status_text("Dead"))
+        self.assertFalse(app.is_verified_phone_status_text(""))
+
     def _insert_original_sequence(self):
         values = []
         for step in range(1, 5):

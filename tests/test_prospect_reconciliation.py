@@ -145,6 +145,35 @@ class ProspectReconciliationTests(unittest.TestCase):
         self.assertEqual(app.classify_email_domain_type("owner@examplecompany.com"), "work_organization")
         self.assertEqual(app.classify_email_domain_type(""), "missing")
 
+    def test_local_contact_flags_count_only_verified_sms_eligible_numbers(self):
+        self.db.executescript(
+            """
+            ALTER TABLE touchpoints ADD COLUMN channel_label TEXT;
+            ALTER TABLE touchpoints ADD COLUMN status TEXT;
+            CREATE TABLE skiptrace_runs (id INTEGER PRIMARY KEY, property_id INTEGER);
+            CREATE TABLE activity_log (id INTEGER PRIMARY KEY, property_id INTEGER, activity_type TEXT);
+            CREATE TABLE person_notes (id INTEGER PRIMARY KEY, person_id INTEGER, source TEXT, note_body TEXT);
+            """
+        )
+        self.db.execute("INSERT INTO properties (id, owner_person_id, status) VALUES (1, 11, 'New Record')")
+        self.db.executemany(
+            """
+            INSERT INTO touchpoints (id, person_id, channel_type, value, channel_label, status)
+            VALUES (?, 11, 'Phone', ?, ?, ?)
+            """,
+            [
+                (1, "2015550100", "Mobile", "Correct"),
+                (2, "2015550100", "Unknown", "Verified"),
+                (3, "2015550101", "Landline", "Correct"),
+                (4, "2015550102", "Mobile", "Unknown"),
+            ],
+        )
+
+        flags = app.bulk_new_record_local_contact_flags(self.db, [1])
+
+        self.assertEqual(flags[1]["verified_phone_count"], 1)
+        self.assertEqual(flags[1]["no_good_numbers"], 0)
+
     def test_bulk_eligibility_preserves_gmail_identity_on_another_active_property(self):
         self.db.executemany(
             "INSERT INTO properties (id, owner_person_id, status) VALUES (?, ?, ?)",

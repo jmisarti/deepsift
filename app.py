@@ -1694,6 +1694,7 @@ def migrate_db(db):
             rei_skipped INTEGER NOT NULL DEFAULT 0,
             deep_skipped INTEGER NOT NULL DEFAULT 0,
             no_good_numbers INTEGER NOT NULL DEFAULT 0,
+            verified_phone_count INTEGER NOT NULL DEFAULT 0,
             property_lists TEXT,
             property_lists_json TEXT,
             source_first_seen_at TEXT,
@@ -1723,11 +1724,15 @@ def migrate_db(db):
     ensure_column(db, "prospect_table_cache", "conversation_stalled", "conversation_stalled INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "prospect_table_cache", "no_sms_response", "no_sms_response INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "prospect_table_cache", "email_engaged", "email_engaged INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "prospect_table_cache", "verified_phone_count", "verified_phone_count INTEGER NOT NULL DEFAULT 0")
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_priority ON prospect_table_cache(segment, priority_preset, is_llc_owner)"
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_local_property ON prospect_table_cache(local_property_id)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_verified_phones ON prospect_table_cache(segment, verified_phone_count)"
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_prospect_table_cache_audiences ON prospect_table_cache(segment, conversation_stalled, no_sms_response, email_engaged)"
@@ -33208,6 +33213,11 @@ def is_bad_phone_status_text(status):
     return key in BLOCKED_CONTACT_STATUSES or key in {value.lower() for value in SMS_AUTOMATION_SUPPRESSED_PHONE_STATUSES}
 
 
+def is_verified_phone_status_text(status):
+    """Whether a locally stored phone status is affirmatively serviceable."""
+    return normalize_whitespace(status).lower() in {"correct", "verified"}
+
+
 def should_apply_reisift_phone_status(current_status, reisift_status):
     desired = normalize_whitespace(reisift_status)
     if not desired:
@@ -38923,7 +38933,7 @@ def upsert_sms_automation_draft(db, property_id, target, route, source_info, pay
     return "created"
 
 
-def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=None, segment=None):
+def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=None, segment=None, verified_only=False):
     token = token or ""
     clauses = ["COALESCE(n.is_active, 1) = 1", "COALESCE(n.local_property_id, 0) > 0"]
     params = []
@@ -38990,6 +39000,12 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
                     "cached": True,
                 }
         targets = collect_sms_automation_targets_for_property(db, property_id, active_property_uuid=row["property_uuid"])
+        if verified_only:
+            targets = [
+                target
+                for target in targets
+                if is_verified_phone_status_text(target["row"]["status"] or "")
+            ]
         if not targets:
             skipped += 1
             continue
@@ -39015,6 +39031,7 @@ def generate_sms_automation_queue_for_new_records(db, token=None, property_ids=N
         "skipped": skipped,
         "suppressed": suppressed,
         "duplicates_suppressed": duplicates_suppressed,
+        "verified_only": bool(verified_only),
     }
 
 
@@ -41035,6 +41052,8 @@ def prospect_table_source_signature(db, segment):
     ).fetchone()
     return json.dumps(
         {
+            # Bump this when derived cache columns change so existing rows are reprojected once.
+            "projection_version": 2,
             "segment": segment,
             "row_count": int((row["row_count"] if row else 0) or 0),
             "max_synced_at": str((row["max_synced_at"] if row else "") or ""),
@@ -41307,6 +41326,10 @@ def rebuild_prospect_table_cache(
     list_names_by_uuid = reisift_new_record_list_names_for_properties(db, [row["property_uuid"] for row in rows])
     activity_counts = bulk_property_activity_counts_for_new_records(db, rows)
     audience_flags = bulk_prospect_audience_flags(db, rows)
+    local_contact_flags = bulk_new_record_local_contact_flags(
+        db,
+        [item.get("local_property_id") for item in rows],
+    )
     now_text = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     inserted = 0
     for item in rows:
@@ -41325,8 +41348,8 @@ def rebuild_prospect_table_cache(
                  added_at, reisift_updated_at, local_property_id, local_status_after, deep_dive_property_id, deep_dive_status,
                  mail_out, call_out, call_in, sms_out, sms_in, email_out, email_in, emails_opened, inbound_responses,
                  conversation_stalled, no_sms_response, email_engaged,
-                 rei_skipped, deep_skipped, no_good_numbers, property_lists, property_lists_json, source_first_seen_at, source_last_synced_at, projection_updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 rei_skipped, deep_skipped, no_good_numbers, verified_phone_count, property_lists, property_lists_json, source_first_seen_at, source_last_synced_at, projection_updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(segment, property_uuid) DO UPDATE SET
                 status = excluded.status,
                 full_address = excluded.full_address,
@@ -41361,6 +41384,7 @@ def rebuild_prospect_table_cache(
                  rei_skipped = excluded.rei_skipped,
                 deep_skipped = excluded.deep_skipped,
                 no_good_numbers = excluded.no_good_numbers,
+                verified_phone_count = excluded.verified_phone_count,
                 property_lists = excluded.property_lists,
                 property_lists_json = excluded.property_lists_json,
                 source_first_seen_at = excluded.source_first_seen_at,
@@ -41403,6 +41427,7 @@ def rebuild_prospect_table_cache(
                 int(item.get("rei_skipped") or 0),
                 int(item.get("deep_skipped") or 0),
                 int(item.get("no_good_numbers") or 0),
+                int((local_contact_flags.get(int(item.get("local_property_id") or 0)) or {}).get("verified_phone_count") or 0),
                 property_lists,
                 json.dumps(list_names, ensure_ascii=True),
                 _clean_optional_db_text(item.get("first_seen_at")),
@@ -42172,7 +42197,10 @@ def bulk_new_record_local_contact_flags(db, property_ids):
         if clean_pid > 0:
             clean_property_ids.add(clean_pid)
     property_ids = sorted(clean_property_ids)
-    defaults = {property_id: {"deep_skipped": 0, "no_good_numbers": 0} for property_id in property_ids}
+    defaults = {
+        property_id: {"deep_skipped": 0, "no_good_numbers": 0, "verified_phone_count": 0}
+        for property_id in property_ids
+    }
     if not property_ids:
         return defaults
 
@@ -42238,7 +42266,7 @@ def bulk_new_record_local_contact_flags(db, property_ids):
 
     all_network_ids = sorted({pid for ids in network_by_property.values() for pid in ids})
     skipped_person_ids = set()
-    phone_statuses_by_person = {}
+    phone_rows_by_person = {}
     if all_network_ids:
         for chunk in iter_query_chunks(all_network_ids):
             network_placeholders = ",".join(["?"] * len(chunk))
@@ -42257,23 +42285,35 @@ def bulk_new_record_local_contact_flags(db, property_ids):
                 skipped_person_ids.add(int(row["person_id"]))
             for row in db.execute(
                 f"""
-                SELECT person_id, status
+                SELECT person_id, status, channel_label, value
                 FROM touchpoints
                 WHERE person_id IN ({network_placeholders})
                   AND lower(channel_type) = 'phone'
                 """,
                 tuple(chunk),
             ).fetchall():
-                phone_statuses_by_person.setdefault(int(row["person_id"]), []).append(row["status"] or "")
+                phone_rows_by_person.setdefault(int(row["person_id"]), []).append(dict(row))
 
     for property_id in property_ids:
         network_ids = network_by_property.get(property_id, set())
         deep_skipped = property_id in deep_skipped_properties or bool(network_ids.intersection(skipped_person_ids))
-        statuses = []
+        phone_rows = []
         for person_id in network_ids:
-            statuses.extend(phone_statuses_by_person.get(person_id, []))
+            phone_rows.extend(phone_rows_by_person.get(person_id, []))
+        statuses = [row.get("status") or "" for row in phone_rows]
         no_good_numbers = bool(statuses) and all(_new_record_is_bad_phone_status(status) for status in statuses)
-        defaults[property_id] = {"deep_skipped": 1 if deep_skipped else 0, "no_good_numbers": 1 if no_good_numbers else 0}
+        verified_numbers = {
+            normalize_phone(row.get("value") or "")
+            for row in phone_rows
+            if is_verified_phone_status_text(row.get("status") or "")
+            and normalize_whitespace(row.get("channel_label") or "").lower() in {"", "mobile", "unknown"}
+            and normalize_phone(row.get("value") or "")
+        }
+        defaults[property_id] = {
+            "deep_skipped": 1 if deep_skipped else 0,
+            "no_good_numbers": 1 if no_good_numbers else 0,
+            "verified_phone_count": len(verified_numbers),
+        }
     return defaults
 
 
@@ -42357,6 +42397,13 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
             continue
         clauses.append(f"COALESCE(c.{column}, 0) = ?")
         params.append(1 if expected else 0)
+    verified_number_filter = _new_record_yes_no_filter_value(filters.get("verified_number") or "")
+    if verified_number_filter is not None:
+        clauses.append(
+            "COALESCE(c.verified_phone_count, 0) > 0"
+            if verified_number_filter
+            else "COALESCE(c.verified_phone_count, 0) = 0"
+        )
     selected_lists = filters.get("lists") if isinstance(filters.get("lists"), list) else parse_csv_list(filters.get("lists") or "")
     for selected_list in selected_lists:
         list_name = normalize_whitespace(selected_list)
@@ -42446,6 +42493,7 @@ def get_cached_new_records(db, sort_dir="desc", filters=None, offset=0, limit=No
             item[count_key] = int(item.get(count_key) or 0)
         for flag_key in ["rei_skipped", "deep_skipped", "no_good_numbers"]:
             item[flag_key] = 1 if int(item.get(flag_key) or 0) else 0
+        item["verified_phone_count"] = int(item.get("verified_phone_count") or 0)
         for audience_key in ["conversation_stalled", "no_sms_response", "email_engaged"]:
             item[audience_key] = 1 if int(item.get(audience_key) or 0) else 0
         item["is_vacant"] = None if item.get("is_vacant") is None else (1 if int(item.get("is_vacant") or 0) else 0)
@@ -49337,6 +49385,7 @@ def new_records_page():
         "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),
+        "verified_number": (request.args.get("verified_number") or "").strip(),
     }
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()
@@ -49775,6 +49824,7 @@ def deep_prospecting_page():
         "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),
+        "verified_number": (request.args.get("verified_number") or "").strip(),
     }
     notice = (request.args.get("notice") or "").strip()
     error = (request.args.get("error") or "").strip()
@@ -49903,6 +49953,7 @@ def new_records_refresh():
         "rei_skipped": (request.form.get("rei_skipped") or request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.form.get("deep_skipped") or request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.form.get("no_good_numbers") or request.args.get("no_good_numbers") or "").strip(),
+        "verified_number": (request.form.get("verified_number") or request.args.get("verified_number") or "").strip(),
         "page": (request.form.get("page") or request.args.get("page") or "1").strip(),
         "per_page": (request.form.get("per_page") or request.args.get("per_page") or "200").strip(),
     }
@@ -49938,6 +49989,7 @@ def deep_prospecting_refresh():
         "rei_skipped": (request.form.get("rei_skipped") or request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.form.get("deep_skipped") or request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.form.get("no_good_numbers") or request.args.get("no_good_numbers") or "").strip(),
+        "verified_number": (request.form.get("verified_number") or request.args.get("verified_number") or "").strip(),
         "page": (request.form.get("page") or request.args.get("page") or "1").strip(),
         "per_page": (request.form.get("per_page") or request.args.get("per_page") or "200").strip(),
     }
@@ -51000,6 +51052,12 @@ def get_sms_automation_queue_rows(db, filters=None):
             continue
         clauses.append(f"COALESCE(n.{column}, 0) = ?")
         params.append(1 if expected else 0)
+    verified_number_filter = _new_record_yes_no_filter_value(filters.get("verified_number") or "")
+    if verified_number_filter is not None:
+        if verified_number_filter:
+            clauses.append("lower(trim(COALESCE(t.status, ''))) IN ('correct', 'verified')")
+        else:
+            clauses.append("lower(trim(COALESCE(t.status, ''))) NOT IN ('correct', 'verified')")
     email_clicked_filter = (filters.get("email_clicked") or "").strip().lower()
     email_click_count_sql = """
         SELECT COUNT(*)
@@ -51180,6 +51238,10 @@ def _sms_queue_matches_new_record_filters(row, filters):
             continue
         actual = bool(int(row.get(row_key) or 0))
         if actual != expected:
+            return False
+    verified_number_filter = _new_record_yes_no_filter_value(filters.get("verified_number") or "")
+    if verified_number_filter is not None:
+        if is_verified_phone_status_text(row.get("phone_status") or "") != verified_number_filter:
             return False
     return True
 
@@ -51560,6 +51622,7 @@ def sms_queue_page():
         "rei_skipped": (request.args.get("rei_skipped") or "").strip(),
         "deep_skipped": (request.args.get("deep_skipped") or "").strip(),
         "no_good_numbers": (request.args.get("no_good_numbers") or "").strip(),
+        "verified_number": (request.args.get("verified_number") or "").strip(),
         "status": (request.args.get("status") or "").strip(),
         "bucket": (request.args.get("bucket") or "").strip(),
         "contact_role": (request.args.get("contact_role") or "").strip(),
@@ -51624,6 +51687,24 @@ def sms_queue_generate():
     except Exception as exc:
         db.rollback()
         return redirect(url_for("sms_queue_page", error=f"Generate failed: {exc}"))
+
+
+@app.route("/sms-queue/generate-verified", methods=["POST"])
+def sms_queue_generate_verified():
+    """Build review drafts only for locally confirmed mobile/unknown phones."""
+    ensure_db()
+    db = get_db()
+    try:
+        result = generate_sms_automation_queue_for_new_records(db, token="", verified_only=True)
+        db.commit()
+        notice = (
+            f"Verified-number draft review complete: created {result['created']}, updated {result['updated']}, "
+            f"suppressed {result['suppressed']}, duplicate candidates suppressed {result.get('duplicates_suppressed', 0)}."
+        )
+        return redirect(url_for("sms_queue_page", notice=notice, verified_number="yes"))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("sms_queue_page", error=f"Verified-number generation failed: {exc}"))
 
 
 @app.route("/sms-queue/revalidate", methods=["POST"])

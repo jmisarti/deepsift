@@ -51,7 +51,7 @@
                 </select>
             </label>
             <button type="submit">Apply</button>
-            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.is_vacant or filters.priority_preset or filters.engagement_audience or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers %}open{% endif %}>
+            <details class="filter-dropdown" {% if filters.date_from or filters.date_to or filters.status or filters.county or filters.city or filters.lists or filters.completeness or filters.owner_type or filters.owner_out_of_state or filters.is_vacant or filters.priority_preset or filters.engagement_audience or filters.rei_skipped or filters.deep_skipped or filters.no_good_numbers or filters.verified_number %}open{% endif %}>
                 <summary>Filters</summary>
                 <div class="filter-dropdown-panel">
                     <label>From
@@ -161,6 +161,13 @@
                             <option value="no" {% if filters.no_good_numbers == 'no' %}selected{% endif %}>No</option>
                         </select>
                     </label>
+                    <label>Verified Number?
+                        <select name="verified_number">
+                            <option value="">All</option>
+                            <option value="yes" {% if filters.verified_number == 'yes' %}selected{% endif %}>Correct / Verified</option>
+                            <option value="no" {% if filters.verified_number == 'no' %}selected{% endif %}>No Correct / Verified</option>
+                        </select>
+                    </label>
                     <div class="filter-dropdown-actions">
                         <button type="submit">Apply Filters</button>
                         <a class="button-link secondary" href="{{ url_for(page_endpoint or 'new_records_page') }}">Clear</a>
@@ -187,6 +194,7 @@
             <input type="hidden" name="rei_skipped" value="{{ filters.rei_skipped }}">
             <input type="hidden" name="deep_skipped" value="{{ filters.deep_skipped }}">
             <input type="hidden" name="no_good_numbers" value="{{ filters.no_good_numbers }}">
+            <input type="hidden" name="verified_number" value="{{ filters.verified_number }}">
             <input type="hidden" name="page" value="{{ pagination.page }}">
             <input type="hidden" name="per_page" value="{{ pagination.per_page }}">
             <button type="submit">{{ refresh_button_label or "Refresh New Records" }}</button>

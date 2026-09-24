@@ -145,6 +145,18 @@ class ProspectReconciliationTests(unittest.TestCase):
         self.assertEqual(app.classify_email_domain_type("owner@examplecompany.com"), "work_organization")
         self.assertEqual(app.classify_email_domain_type(""), "missing")
 
+    def test_date_added_rejects_future_source_dates(self):
+        today = datetime.date(2026, 9, 23)
+        self.assertTrue(app.reisift_added_date_is_current_or_past(datetime.datetime(2026, 9, 23), today))
+        self.assertFalse(app.reisift_added_date_is_current_or_past(datetime.datetime(2026, 9, 24), today))
+        self.assertEqual(
+            app.latest_current_or_past_reisift_date(
+                [datetime.datetime(2026, 9, 22), datetime.datetime(2026, 10, 1)],
+                today_et=today,
+            ),
+            datetime.datetime(2026, 9, 22),
+        )
+
     def test_local_contact_flags_count_only_verified_sms_eligible_numbers(self):
         self.db.executescript(
             """

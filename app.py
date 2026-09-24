@@ -3331,6 +3331,32 @@ def ensure_prospect_priority_backfill(db):
     return {"backfilled": True, "fields": field_result, "cache": cache_result}
 
 
+def ensure_reisift_future_added_date_backfill(db):
+    """Clear cached Date Added values that came from invalid future source dates."""
+    setting_key = "reisift_date_added_future_values_v1_repaired"
+    if get_setting(db, setting_key, "") == "1":
+        return {"backfilled": False, "reason": "already_done"}
+    result = backfill_reisift_new_record_cached_fields(db, only_future=True)
+    today = datetime.now(EST_TZ).date().isoformat()
+    remaining_records = execute_with_retry(
+        db,
+        "UPDATE reisift_new_records SET added_at = NULL WHERE COALESCE(added_at, '') > ?",
+        (today,),
+    )
+    remaining_cache_rows = execute_with_retry(
+        db,
+        "UPDATE prospect_table_cache SET added_at = NULL, projection_updated_at = CURRENT_TIMESTAMP WHERE COALESCE(added_at, '') > ?",
+        (today,),
+    )
+    set_setting(db, setting_key, "1")
+    return {
+        "backfilled": True,
+        **result,
+        "cleared_records": max(int(remaining_records.rowcount or 0), 0),
+        "cleared_cache_rows": max(int(remaining_cache_rows.rowcount or 0), 0),
+    }
+
+
 def ensure_sms_delivery_classification_backfill(db):
     if get_setting(db, "sms_delivery_classification_v2_backfilled", "") == "1":
         return {"backfilled": False, "reason": "already_done"}
@@ -3401,6 +3427,10 @@ def ensure_db(force=False):
                 ensure_prospect_priority_backfill(db)
             except Exception as exc:
                 log_app_error(db, "prospect_priority_backfill", str(exc), status_code=500)
+            try:
+                ensure_reisift_future_added_date_backfill(db)
+            except Exception as exc:
+                log_app_error(db, "reisift_future_added_date_backfill", str(exc), status_code=500)
             try:
                 ensure_sms_delivery_classification_backfill(db)
             except Exception as exc:
@@ -36115,6 +36145,24 @@ def parse_iso_datetime(value):
         return None
 
 
+def reisift_added_date_is_current_or_past(value, today_et=None):
+    """Date Added is an acquisition date, so future source values are invalid."""
+    if not isinstance(value, datetime):
+        return False
+    if value.tzinfo is not None:
+        candidate_date = value.astimezone(EST_TZ).date()
+    else:
+        candidate_date = value.date()
+    return candidate_date <= (today_et or datetime.now(EST_TZ).date())
+
+
+def latest_current_or_past_reisift_date(dates, today_et=None):
+    valid_dates = [
+        value for value in dates if reisift_added_date_is_current_or_past(value, today_et=today_et)
+    ]
+    return max(valid_dates) if valid_dates else None
+
+
 def reisift_added_at_dt(search_row, detail_payload):
     lp_dt = latest_lp_tag_datetime(search_row, detail_payload)
     if lp_dt is not None:
@@ -36132,7 +36180,7 @@ def reisift_added_at_dt(search_row, detail_payload):
         candidates.extend([detail_payload.get("created"), detail_payload.get("created_at")])
     for item in candidates:
         parsed = parse_iso_datetime(item)
-        if parsed is not None:
+        if parsed is not None and reisift_added_date_is_current_or_past(parsed):
             return parsed
     return None
 
@@ -36220,7 +36268,7 @@ def latest_reisift_upload_date_datetime(*payloads):
             parsed = parse_reisift_date_value(value)
             if parsed is not None:
                 dates.append(parsed)
-    return max(dates) if dates else None
+    return latest_current_or_past_reisift_date(dates)
 
 
 def iter_reisift_source_date_candidate_values(value, depth=0):
@@ -36264,7 +36312,7 @@ def latest_reisift_source_date_datetime(*payloads):
             parsed = parse_reisift_date_value(value)
             if parsed is not None:
                 dates.append(parsed)
-    return max(dates) if dates else None
+    return latest_current_or_past_reisift_date(dates)
 
 
 def latest_lp_tag_datetime(*payloads):
@@ -36310,7 +36358,7 @@ def latest_lp_tag_datetime(*payloads):
                     dates.append(datetime(int(numeric_month_year.group(2)), int(numeric_month_year.group(1)), 1))
                 except ValueError:
                     pass
-    return max(dates) if dates else None
+    return latest_current_or_past_reisift_date(dates)
 
 
 def find_local_property_id_for_reisift_payload(db, payload):
@@ -40930,8 +40978,9 @@ def backfill_reisift_new_record_lists(db, only_missing=False):
     return {"properties": properties, "list_rows": list_rows}
 
 
-def backfill_reisift_new_record_cached_fields(db, only_missing=False):
+def backfill_reisift_new_record_cached_fields(db, only_missing=False, only_future=False):
     where_sql = "WHERE COALESCE(payload_json, '') <> ''"
+    params = []
     if only_missing:
         where_sql += """
           AND (
@@ -40944,12 +40993,16 @@ def backfill_reisift_new_record_cached_fields(db, only_missing=False):
              OR COALESCE(priority_preset, '') = ''
           )
         """
+    if only_future:
+        where_sql += " AND COALESCE(added_at, '') > ?"
+        params.append(datetime.now(EST_TZ).date().isoformat())
     rows = db.execute(
         f"""
         SELECT property_uuid, payload_json, full_address, county, local_property_id, owner_names
         FROM reisift_new_records
         {where_sql}
-        """
+        """,
+        tuple(params),
     ).fetchall()
     updated = 0
     for row in rows:
@@ -40985,7 +41038,11 @@ def backfill_reisift_new_record_cached_fields(db, only_missing=False):
                 is_llc_owner = ?,
                 priority_preset = ?,
                 priority_match = ?,
-                added_at = COALESCE(NULLIF(?, ''), added_at)
+                added_at = CASE
+                    WHEN NULLIF(?, '') IS NOT NULL THEN ?
+                    WHEN COALESCE(added_at, '') > ? THEN NULL
+                    ELSE added_at
+                END
             WHERE property_uuid = ?
             """,
             (
@@ -40999,9 +41056,21 @@ def backfill_reisift_new_record_cached_fields(db, only_missing=False):
                 priority["priority_preset"],
                 priority["priority_match"],
                 fields["added_at"] or "",
+                fields["added_at"] or "",
+                datetime.now(EST_TZ).date().isoformat(),
                 row["property_uuid"],
             ),
         )
+        if only_future:
+            execute_with_retry(
+                db,
+                """
+                UPDATE prospect_table_cache
+                SET added_at = ?, projection_updated_at = CURRENT_TIMESTAMP
+                WHERE property_uuid = ?
+                """,
+                (fields["added_at"], row["property_uuid"]),
+            )
         updated += 1
     return {"properties": updated}
 

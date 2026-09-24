@@ -37591,6 +37591,15 @@ def _delete_sms_automation_queue_where(db, where_sql, params=()):
     return _delete_sms_automation_queue_rows(db, [row["id"] for row in rows])
 
 
+def remove_sms_automation_reengagement_drafts(db):
+    """Remove manual-review Day 14 drafts without touching any sent or scheduled SMS."""
+    return _delete_sms_automation_queue_where(
+        db,
+        "status = 'Draft' AND lower(COALESCE(queue_key, '')) LIKE ?",
+        ("%:re14%",),
+    )
+
+
 def revalidate_sms_automation_queue(db, property_ids=None):
     clauses = ["status IN ('Draft', 'Queued', 'Approved', 'Scheduled')"]
     params = []
@@ -37648,6 +37657,85 @@ def _sms_automation_template_variables(person, prop, bucket, contact_role, sourc
         "county": "",
         "contact_role": contact_role or "",
     }
+
+
+def _sms_automation_queue_value(row, key, default=""):
+    """Read a queue-row field from either a sqlite row or a plain dictionary."""
+    if not row:
+        return default
+    try:
+        value = row[key]
+    except (IndexError, KeyError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def sms_automation_template_variables_for_queue_row(db, row):
+    """Rebuild SMS tokens from the active person/property instead of stale queue JSON."""
+    variables = parse_json_object(
+        _sms_automation_queue_value(row, "rendered_variables_json", "{}"), default={}
+    )
+    variables = dict(variables) if isinstance(variables, dict) else {}
+    source_json = parse_json_object(
+        _sms_automation_queue_value(row, "source_info_json", "{}"), default={}
+    )
+    source_json = source_json if isinstance(source_json, dict) else {}
+    source_info = source_json.get("source_info")
+    if not isinstance(source_info, dict):
+        source_info = source_json if "sheriff_sale_date" in source_json else {}
+
+    person = None
+    touchpoint_id = _sms_automation_queue_value(row, "touchpoint_id", 0)
+    if touchpoint_id:
+        person = db.execute(
+            """
+            SELECT pe.id AS person_id, pe.first_name, pe.last_name
+            FROM touchpoints t
+            JOIN people pe ON pe.id = t.person_id
+            WHERE t.id = ?
+            LIMIT 1
+            """,
+            (int(touchpoint_id),),
+        ).fetchone()
+    if not person and _sms_automation_queue_value(row, "person_id", 0):
+        person = db.execute(
+            "SELECT id AS person_id, first_name, last_name FROM people WHERE id = ? LIMIT 1",
+            (int(_sms_automation_queue_value(row, "person_id", 0)),),
+        ).fetchone()
+
+    prop = _sms_automation_property_row(
+        db, _sms_automation_queue_value(row, "property_id", 0)
+    )
+    bucket = _sms_automation_queue_value(row, "bucket", "")
+    contact_role = _sms_automation_queue_value(row, "contact_role", "")
+    lists_text = (
+        source_json.get("payload_lists")
+        or variables.get("list_name")
+        or bucket
+    )
+    if person and prop:
+        live_variables = _sms_automation_template_variables(
+            person, prop, bucket, contact_role, source_info, lists_text
+        )
+        # Keep saved source-only values when local data cannot supply them, but
+        # always favor current names and addresses from the linked records.
+        for key, value in live_variables.items():
+            if value not in (None, ""):
+                variables[key] = value
+        if prop["owner_person_id"]:
+            owner = db.execute(
+                "SELECT first_name, last_name FROM people WHERE id = ? LIMIT 1",
+                (int(prop["owner_person_id"]),),
+            ).fetchone()
+            if owner:
+                variables["owner_name"] = normalize_whitespace(
+                    f"{proper_case_name(owner['first_name'] or '')} "
+                    f"{proper_case_name(owner['last_name'] or '')}"
+                )
+
+    variables.setdefault("first_name", "there")
+    variables.setdefault("property_address", "")
+    return variables
 
 
 def render_sms_automation_template(template, variables):
@@ -37906,9 +37994,7 @@ def sms_automation_initial_message_for_approval(db, row):
         return _sms_automation_reengagement_message(db, row, step_index=0)
     if int(row["step_order"] or 1) != 1:
         return normalize_whitespace(row["message_body"] if row else "")
-    variables = parse_json_object(row["rendered_variables_json"] or "{}", default={})
-    if not isinstance(variables, dict):
-        variables = {}
+    variables = sms_automation_template_variables_for_queue_row(db, row)
     source_json = parse_json_object(row["source_info_json"] or "{}", default={})
     source_info = source_json.get("source_info") if isinstance(source_json, dict) else {}
     if not isinstance(source_info, dict):
@@ -37991,6 +38077,7 @@ def approve_sms_automation_queue_items(db, queue_ids):
             if removed:
                 result["suppressed_ids"].append(queue_id)
             continue
+        variables = sms_automation_template_variables_for_queue_row(db, row)
         message_body = sms_automation_initial_message_for_approval(db, row)
         db.execute(
             """
@@ -38000,10 +38087,11 @@ def approve_sms_automation_queue_items(db, queue_ids):
                 scheduled_for = NULL,
                 suppression_reason = '',
                 message_body = ?,
+                rendered_variables_json = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (now_text, message_body, queue_id),
+            (now_text, message_body, json.dumps(variables, ensure_ascii=True, sort_keys=True), queue_id),
         )
         result["approved"] += 1
         result["approved_ids"].append(queue_id)
@@ -38496,11 +38584,7 @@ def _sms_automation_followup_message(db, parent_row, step_order):
     seed = f"{parent_row['queue_key'] if parent_row else ''}|fu|{step_order}"
     idx = int(hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:8], 16) % max(len(variants), 1)
     template = variants[idx] if variants else ""
-    variables = parse_json_object(parent_row["rendered_variables_json"] if parent_row else "", default={})
-    if not variables:
-        variables = {}
-    variables.setdefault("first_name", "there")
-    variables.setdefault("property_address", "")
+    variables = sms_automation_template_variables_for_queue_row(db, parent_row)
     message = render_sms_automation_template(template, variables)
     return normalize_whitespace(message)
 
@@ -38647,10 +38731,7 @@ def _sms_automation_reengagement_message(db, parent_row, step_index=0):
         variants = builtin[min(max(0, int(step_index or 0)), len(builtin) - 1)] if builtin else []
     seed = f"{parent_row['queue_key'] if parent_row else ''}|reengagement|{step_index}"
     template = variants[_deterministic_sms_variation_index(seed, len(variants))] if variants else ""
-    variables = parse_json_object(parent_row["rendered_variables_json"] if parent_row else "", default={})
-    variables = variables if isinstance(variables, dict) else {}
-    variables.setdefault("first_name", "there")
-    variables.setdefault("property_address", "")
+    variables = sms_automation_template_variables_for_queue_row(db, parent_row)
     return normalize_whitespace(render_sms_automation_template(template, variables))
 
 
@@ -38739,6 +38820,11 @@ def ensure_sms_automation_followups_for_sent_row(db, sent_row, communication_id=
 
     settings = get_sms_automation_settings(db)
     sent_dt = parse_db_time(sent_at or sent_row["sent_at"] or "") or datetime.utcnow()
+    rendered_variables_json = json.dumps(
+        sms_automation_template_variables_for_queue_row(db, sent_row),
+        ensure_ascii=True,
+        sort_keys=True,
+    )
     created = 0
     for followup_index in range(1, SMS_AUTOMATION_FOLLOWUP_COUNT + 1):
         step_order = followup_index + 1
@@ -38783,7 +38869,7 @@ def ensure_sms_automation_followups_for_sent_row(db, sent_row, communication_id=
                 sent_row["sequence_name"] or _sms_sequence_name(sent_row["bucket"], sent_row["contact_role"]),
                 step_order,
                 message,
-                sent_row["rendered_variables_json"] or "",
+                rendered_variables_json,
                 json.dumps(source_info, ensure_ascii=True, sort_keys=True),
                 format_db_time(scheduled_for),
             ),
@@ -38814,6 +38900,11 @@ def ensure_sms_automation_reengagement_followups_for_sent_row(db, sent_row, comm
 
     settings = get_sms_automation_settings(db)
     sent_dt = parse_db_time(sent_at or sent_row["sent_at"] or "") or datetime.utcnow()
+    rendered_variables_json = json.dumps(
+        sms_automation_template_variables_for_queue_row(db, sent_row),
+        ensure_ascii=True,
+        sort_keys=True,
+    )
     created = 0
     for followup_index in range(1, SMS_AUTOMATION_REENGAGEMENT_FOLLOWUP_COUNT + 1):
         step_order = SMS_AUTOMATION_REENGAGEMENT_INITIAL_STEP_ORDER + followup_index
@@ -38865,7 +38956,7 @@ def ensure_sms_automation_reengagement_followups_for_sent_row(db, sent_row, comm
                 sent_row["sequence_name"] or "Day 14 Re-Engagement",
                 step_order,
                 message,
-                sent_row["rendered_variables_json"] or "",
+                rendered_variables_json,
                 json.dumps(source_info, ensure_ascii=True, sort_keys=True),
                 format_db_time(scheduled_for),
             ),
@@ -39212,6 +39303,11 @@ def generate_sms_automation_reengagement_drafts(db, now_utc=None):
                 "source_info_json": json.dumps(source_info, ensure_ascii=True, sort_keys=True),
             }
         )
+        draft_row["rendered_variables_json"] = json.dumps(
+            sms_automation_template_variables_for_queue_row(db, draft_row),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
         message = _sms_automation_reengagement_message(db, draft_row, step_index=0)
         db.execute(
             """
@@ -39234,7 +39330,7 @@ def generate_sms_automation_reengagement_drafts(db, now_utc=None):
                 f"{row['sequence_name'] or 'AutoSMS'} - Day 14 Re-Engagement",
                 SMS_AUTOMATION_REENGAGEMENT_INITIAL_STEP_ORDER,
                 message,
-                row["rendered_variables_json"] or "",
+                draft_row["rendered_variables_json"],
                 json.dumps(source_info, ensure_ascii=True, sort_keys=True),
             ),
         )
@@ -50766,7 +50862,17 @@ def _sms_automation_send_queue_item(db, queue_id):
             "error": f"Outside send window ({start.strftime('%I:%M %p')} - {end.strftime('%I:%M %p')} ET).",
         }
     to_number = row["phone_number"]
-    body = row["message_body"]
+    rendered_variables = sms_automation_template_variables_for_queue_row(db, row)
+    body = render_sms_automation_template(row["message_body"] or "", rendered_variables)
+    if body != normalize_whitespace(row["message_body"] or ""):
+        db.execute(
+            """
+            UPDATE sms_automation_queue
+            SET message_body = ?, rendered_variables_json = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (body, json.dumps(rendered_variables, ensure_ascii=True, sort_keys=True), row["id"]),
+        )
     from_number, rate_reason = select_sms_automation_send_from_number(
         db,
         preferred_from_number=row["from_number"],

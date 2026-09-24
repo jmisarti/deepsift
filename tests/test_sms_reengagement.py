@@ -22,6 +22,30 @@ class SmsReengagementTests(unittest.TestCase):
         self.db.executescript(
             """
             CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+            CREATE TABLE addresses (
+                id INTEGER PRIMARY KEY,
+                street TEXT,
+                city TEXT,
+                state TEXT,
+                postal_code TEXT
+            );
+            CREATE TABLE people (
+                id INTEGER PRIMARY KEY,
+                first_name TEXT,
+                last_name TEXT
+            );
+            CREATE TABLE properties (
+                id INTEGER PRIMARY KEY,
+                status TEXT,
+                owner_person_id INTEGER,
+                resident_person_id INTEGER,
+                reisift_property_uuid TEXT,
+                property_address_id INTEGER
+            );
+            CREATE TABLE touchpoints (
+                id INTEGER PRIMARY KEY,
+                person_id INTEGER
+            );
             CREATE TABLE sms_automation_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 queue_key TEXT UNIQUE,
@@ -65,7 +89,8 @@ class SmsReengagementTests(unittest.TestCase):
         self.assertFalse(app.is_verified_phone_status_text("Dead"))
         self.assertFalse(app.is_verified_phone_status_text(""))
 
-    def _insert_original_sequence(self):
+    def _insert_original_sequence(self, rendered_variables_json=None):
+        rendered_variables_json = rendered_variables_json or '{"first_name":"Jane","property_address":"1 Main St"}'
         values = []
         for step in range(1, 5):
             suffix = "" if step == 1 else f":fu:{step}"
@@ -83,7 +108,7 @@ class SmsReengagementTests(unittest.TestCase):
                     "General New Record - Owner",
                     step,
                     "Initial message",
-                    '{"first_name":"Jane","property_address":"1 Main St"}',
+                    rendered_variables_json,
                     "{}",
                     "Sent",
                     f"2026-09-0{step} 14:00:00",
@@ -121,6 +146,37 @@ class SmsReengagementTests(unittest.TestCase):
             )
             self.assertEqual(duplicate["created"], 0)
             self.assertEqual(duplicate["skip_reasons"].get("already_created"), 1)
+
+    def test_reengagement_rebuilds_tokens_when_historical_queue_json_is_empty(self):
+        self.db.execute(
+            "INSERT INTO addresses (id, street, city, state, postal_code) VALUES (1, '1 Main St', 'Newark', 'NJ', '07102')"
+        )
+        self.db.execute(
+            "INSERT INTO people (id, first_name, last_name) VALUES (10, 'jane', 'doe')"
+        )
+        self.db.execute(
+            "INSERT INTO properties (id, status, owner_person_id, property_address_id) VALUES (1, 'New Record', 10, 1)"
+        )
+        self.db.execute("INSERT INTO touchpoints (id, person_id) VALUES (20, 10)")
+        self._insert_original_sequence(rendered_variables_json="{}")
+        original = self.db.execute(
+            "SELECT * FROM sms_automation_queue WHERE step_order = 1 LIMIT 1"
+        ).fetchone()
+        self.assertIn("Hi Jane,", app.sms_automation_initial_message_for_approval(self.db, original))
+        self.assertIn("1 Main St", app._sms_automation_followup_message(self.db, original, 2))
+        with mock.patch.object(app, "sms_automation_property_suppression_reason", return_value=""), mock.patch.object(
+            app, "sms_automation_touchpoint_suppression_reason", return_value=""
+        ), mock.patch.object(app, "stale_reisift_new_record_touchpoint_reason", return_value=""):
+            result = app.generate_sms_automation_reengagement_drafts(
+                self.db, now_utc=datetime.datetime(2026, 9, 22, 14, 0, 0)
+            )
+        self.assertEqual(result["created"], 1)
+        row = self.db.execute(
+            "SELECT message_body, rendered_variables_json FROM sms_automation_queue WHERE queue_key LIKE '%:re14'"
+        ).fetchone()
+        self.assertIn("Hi Jane,", row["message_body"])
+        self.assertIn("1 Main St", row["message_body"])
+        self.assertIn('"first_name": "Jane"', row["rendered_variables_json"])
 
     def test_reengagement_followups_use_three_business_day_cadence(self):
         self._insert_original_sequence()

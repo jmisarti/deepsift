@@ -43042,6 +43042,207 @@ def prospect_signal_set(list_names=None, owner_out_of_state=False, is_vacant=Non
     return signals
 
 
+# This is intentionally a small, explicit audience. It is not the broader
+# priority preset, so a new priority rule cannot unexpectedly add mail targets.
+MAIL_CAMPAIGN_AUDIENCE_KEY = "essex_union_priority_mail"
+MAIL_CAMPAIGN_AUDIENCE_LABEL = "Essex / Union Priority Mail"
+MAIL_CAMPAIGN_RULES = (
+    {"key": "essex_judgment_lien", "county": "Essex", "signals": ("judgment_lien",), "label": "Judgment Lien"},
+    {"key": "union_lis_pendens_senior", "county": "Union", "signals": ("lis_pendens", "senior"), "label": "Lis Pendens + Senior"},
+    {"key": "union_high_equity_lis_pendens_senior", "county": "Union", "signals": ("high_equity", "lis_pendens", "senior"), "label": "High Equity + Lis Pendens + Senior"},
+    {"key": "essex_free_clear_lis_pendens", "county": "Essex", "signals": ("free_clear", "lis_pendens"), "label": "Free & Clear + Lis Pendens"},
+    {"key": "essex_lis_pendens_out_of_state", "county": "Essex", "signals": ("lis_pendens", "out_of_state"), "label": "Lis Pendens + Out-of-State"},
+    {"key": "essex_free_clear_vacant", "county": "Essex", "signals": ("free_clear", "vacant"), "label": "Free & Clear + Vacant"},
+    {"key": "essex_lis_pendens_senior", "county": "Essex", "signals": ("lis_pendens", "senior"), "label": "Lis Pendens + Senior"},
+)
+
+
+def mail_campaign_matched_rules(row):
+    """Return exact approved mail rules matched by one cached prospect row."""
+    if not row or int(row["is_llc_owner"] or 0) == 1:
+        return []
+    county_key = normalize_county_name(row["county"] or "")
+    list_names = parse_json_list(row["property_lists_json"] or "[]")
+    signals = prospect_signal_set(
+        list_names=list_names,
+        owner_out_of_state=bool(int(row["owner_out_of_state"] or 0)),
+        is_vacant=row["is_vacant"],
+    )
+    return [
+        rule
+        for rule in MAIL_CAMPAIGN_RULES
+        if county_key == normalize_county_name(rule["county"])
+        and all(signal in signals for signal in rule["signals"])
+    ]
+
+
+def get_mail_campaign_runs(db):
+    return db.execute(
+        """
+        SELECT r.*, s.name AS sequence_name, s.status AS sequence_status
+        FROM mail_campaign_runs r
+        JOIN sequence_campaigns s ON s.id = r.sequence_campaign_id
+        ORDER BY r.updated_at DESC, r.id DESC
+        """
+    ).fetchall()
+
+
+def get_mail_campaign_target_counts(db, run_id):
+    rows = db.execute(
+        """
+        SELECT status, COUNT(*) AS count
+        FROM mail_campaign_targets
+        WHERE mail_campaign_run_id = ?
+        GROUP BY status
+        """,
+        (run_id,),
+    ).fetchall()
+    return {str(row["status"] or "Draft"): int(row["count"] or 0) for row in rows}
+
+
+def _mail_campaign_property_context(db, property_id):
+    return db.execute(
+        """
+        SELECT p.id, p.owner_person_id, p.property_address_id, p.status,
+               a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+
+
+def refresh_mail_campaign_targets(db, run_id):
+    """Rebuild one campaign's review set from cached prospects without sending mail."""
+    run = db.execute(
+        "SELECT * FROM mail_campaign_runs WHERE id = ? AND audience_key = ?",
+        (run_id, MAIL_CAMPAIGN_AUDIENCE_KEY),
+    ).fetchone()
+    if not run:
+        raise ValueError("Mail campaign was not found.")
+
+    source_rows = db.execute(
+        """
+        SELECT *
+        FROM prospect_table_cache
+        WHERE segment IN (?, ?)
+          AND COALESCE(local_property_id, 0) > 0
+          AND lower(trim(COALESCE(status, ''))) IN (?, ?, ?)
+        ORDER BY added_at DESC, property_uuid ASC
+        """,
+        (
+            REISIFT_NEW_RECORDS_SEGMENT,
+            REISIFT_DEEP_PROSPECTING_SEGMENT,
+            "new record",
+            "new records",
+            "deep prospecting",
+        ),
+    ).fetchall()
+    existing_rows = db.execute(
+        "SELECT * FROM mail_campaign_targets WHERE mail_campaign_run_id = ?",
+        (run_id,),
+    ).fetchall()
+    existing_by_pair = {
+        (int(row["property_id"] or 0), int(row["person_id"] or 0)): row
+        for row in existing_rows
+    }
+    active_pairs = set()
+    created = 0
+    updated = 0
+    suppressed = 0
+    now_text = format_db_time(datetime.utcnow())
+
+    for source in source_rows:
+        rules = mail_campaign_matched_rules(source)
+        if not rules:
+            continue
+        property_id = int(source["local_property_id"] or 0)
+        prop = _mail_campaign_property_context(db, property_id)
+        person_id = int(prop["owner_person_id"] or 0) if prop else 0
+        if not prop or not person_id:
+            continue
+        person = db.execute("SELECT * FROM people WHERE id = ?", (person_id,)).fetchone()
+        if not person:
+            continue
+        active_pairs.add((property_id, person_id))
+        reason = get_mail_sequence_suppression_reason(db, prop, person)
+        mail_target, _ = get_sequence_mail_target(db, prop, person_id)
+        if not reason and not mail_target:
+            reason = "No mailing address is available."
+        next_status = "Suppressed" if reason else "Draft"
+        matched_rules = "; ".join(rule["label"] for rule in rules)
+        mailing_address = format_sequence_mail_target(mail_target) if mail_target else ""
+        existing = existing_by_pair.get((property_id, person_id))
+        if existing:
+            current_status = str(existing["status"] or "Draft")
+            if current_status not in {"Enrolled", "Sent"} and not reason and current_status == "Approved":
+                next_status = "Approved"
+            db.execute(
+                """
+                UPDATE mail_campaign_targets
+                SET property_uuid = ?, source_segment = ?, matched_rules = ?, mailing_address = ?,
+                    status = ?, suppression_reason = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    source["property_uuid"] or "",
+                    source["segment"] or "",
+                    matched_rules,
+                    mailing_address,
+                    current_status if current_status in {"Enrolled", "Sent"} else next_status,
+                    reason,
+                    now_text,
+                    existing["id"],
+                ),
+            )
+            updated += 1
+        else:
+            db.execute(
+                """
+                INSERT INTO mail_campaign_targets
+                    (mail_campaign_run_id, property_id, person_id, property_uuid, source_segment,
+                     matched_rules, mailing_address, status, suppression_reason, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    property_id,
+                    person_id,
+                    source["property_uuid"] or "",
+                    source["segment"] or "",
+                    matched_rules,
+                    mailing_address,
+                    next_status,
+                    reason,
+                    now_text,
+                    now_text,
+                ),
+            )
+            created += 1
+        if reason:
+            suppressed += 1
+
+    for row in existing_rows:
+        pair = (int(row["property_id"] or 0), int(row["person_id"] or 0))
+        if pair in active_pairs or str(row["status"] or "") in {"Enrolled", "Sent"}:
+            continue
+        if str(row["status"] or "") in {"Draft", "Approved"}:
+            db.execute(
+                """
+                UPDATE mail_campaign_targets
+                SET status = 'Suppressed', suppression_reason = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("No longer matches this campaign's active ReiSIFT audience.", now_text, row["id"]),
+            )
+            suppressed += 1
+
+    db.execute("UPDATE mail_campaign_runs SET updated_at = ? WHERE id = ?", (now_text, run_id))
+    return {"created": created, "updated": updated, "suppressed": suppressed}
+
+
 def _priority_stack_label(stack):
     return " + ".join(PROSPECT_PRIORITY_SIGNAL_LABELS.get(signal, signal.replace("_", " ").title()) for signal in stack)
 
@@ -49641,6 +49842,212 @@ def new_records_page():
             "county_counts": county_counts,
         },
     )
+
+
+@app.route("/mail-campaigns")
+def mail_campaigns_page():
+    ensure_db()
+    db = get_db()
+    runs = get_mail_campaign_runs(db)
+    requested_run_id = _safe_int(request.args.get("run"), 0)
+    selected_run = next((row for row in runs if int(row["id"] or 0) == requested_run_id), None)
+    if not selected_run and runs:
+        selected_run = runs[0]
+
+    targets = []
+    counts = {}
+    target_page = max(1, _safe_int(request.args.get("page"), 1))
+    target_per_page = 200
+    target_total = 0
+    if selected_run:
+        target_total = int(
+            (
+                db.execute(
+                    "SELECT COUNT(*) AS count FROM mail_campaign_targets WHERE mail_campaign_run_id = ?",
+                    (selected_run["id"],),
+                ).fetchone()
+                or {"count": 0}
+            )["count"]
+            or 0
+        )
+        target_pages = max(1, math.ceil(target_total / target_per_page)) if target_total else 1
+        target_page = min(target_page, target_pages)
+        targets = db.execute(
+            """
+            SELECT t.*, p.status AS property_status, a.street, a.city, a.state, a.postal_code,
+                   person.first_name, person.last_name
+            FROM mail_campaign_targets t
+            LEFT JOIN properties p ON p.id = t.property_id
+            LEFT JOIN addresses a ON a.id = p.property_address_id
+            LEFT JOIN people person ON person.id = t.person_id
+            WHERE t.mail_campaign_run_id = ?
+            ORDER BY CASE t.status WHEN 'Approved' THEN 0 WHEN 'Draft' THEN 1 WHEN 'Suppressed' THEN 2 ELSE 3 END,
+                     t.updated_at DESC, t.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (selected_run["id"], target_per_page, (target_page - 1) * target_per_page),
+        ).fetchall()
+        counts = get_mail_campaign_target_counts(db, selected_run["id"])
+    else:
+        target_pages = 1
+
+    return render_template(
+        "mail_campaigns.html",
+        audience_label=MAIL_CAMPAIGN_AUDIENCE_LABEL,
+        audience_rules=MAIL_CAMPAIGN_RULES,
+        mail_sequences=get_mail_only_sequence_campaigns(db, only_active=True),
+        runs=runs,
+        selected_run=selected_run,
+        targets=targets,
+        counts=counts,
+        target_pagination={
+            "page": target_page,
+            "per_page": target_per_page,
+            "total_count": target_total,
+            "total_pages": target_pages,
+            "has_prev": target_page > 1,
+            "has_next": target_page < target_pages,
+        },
+        notice=(request.args.get("notice") or "").strip(),
+        error=(request.args.get("error") or "").strip(),
+    )
+
+
+@app.route("/mail-campaigns/create", methods=["POST"])
+def create_mail_campaign():
+    ensure_db()
+    db = get_db()
+    try:
+        sequence_campaign_id = _safe_int(request.form.get("sequence_campaign_id"), 0)
+        if not sequence_campaign_id or not is_mail_only_sequence_campaign(db, sequence_campaign_id):
+            raise ValueError("Choose an active Mail-only sequence before creating a campaign.")
+        sequence = db.execute(
+            "SELECT id, name, status FROM sequence_campaigns WHERE id = ?",
+            (sequence_campaign_id,),
+        ).fetchone()
+        if not sequence or str(sequence["status"] or "").lower() != "active":
+            raise ValueError("The selected Mail sequence must be active.")
+        name = normalize_whitespace(request.form.get("name") or "")
+        if not name:
+            name = f"{MAIL_CAMPAIGN_AUDIENCE_LABEL} {datetime.now(EST_TZ).strftime('%m/%d/%Y')}"
+        cur = db.execute(
+            """
+            INSERT INTO mail_campaign_runs (name, sequence_campaign_id, audience_key, status)
+            VALUES (?, ?, ?, 'Draft')
+            """,
+            (name, sequence_campaign_id, MAIL_CAMPAIGN_AUDIENCE_KEY),
+        )
+        db.commit()
+        return redirect(url_for("mail_campaigns_page", run=cur.lastrowid, notice="Campaign created. Refresh candidates to build its review list."))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("mail_campaigns_page", error=str(exc)))
+
+
+@app.route("/mail-campaigns/<int:run_id>/refresh", methods=["POST"])
+def refresh_mail_campaign(run_id):
+    ensure_db()
+    db = get_db()
+    try:
+        result = refresh_mail_campaign_targets(db, run_id)
+        db.commit()
+        notice = "Candidate review list refreshed: {created} created, {updated} updated, {suppressed} suppressed.".format(**result)
+        return redirect(url_for("mail_campaigns_page", run=run_id, notice=notice))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("mail_campaigns_page", run=run_id, error=f"Candidate refresh failed: {exc}"))
+
+
+@app.route("/mail-campaigns/<int:run_id>/approve", methods=["POST"])
+def approve_mail_campaign_targets(run_id):
+    ensure_db()
+    db = get_db()
+    target_ids = [
+        _safe_int(value, 0)
+        for value in request.form.getlist("target_ids")
+        if _safe_int(value, 0) > 0
+    ]
+    target_ids = list(dict.fromkeys(target_ids))
+    if not target_ids:
+        return redirect(url_for("mail_campaigns_page", run=run_id, error="Select at least one Draft target to approve."))
+    try:
+        placeholders = ",".join("?" for _ in target_ids)
+        cur = db.execute(
+            f"""
+            UPDATE mail_campaign_targets
+            SET status = 'Approved', approved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE mail_campaign_run_id = ? AND status = 'Draft' AND id IN ({placeholders})
+            """,
+            tuple([run_id] + target_ids),
+        )
+        db.commit()
+        return redirect(url_for("mail_campaigns_page", run=run_id, notice=f"Approved {int(cur.rowcount or 0)} mail target(s)."))
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("mail_campaigns_page", run=run_id, error=f"Approval failed: {exc}"))
+
+
+@app.route("/mail-campaigns/<int:run_id>/enroll", methods=["POST"])
+def enroll_mail_campaign_targets(run_id):
+    ensure_db()
+    db = get_db()
+    try:
+        run = db.execute("SELECT * FROM mail_campaign_runs WHERE id = ?", (run_id,)).fetchone()
+        if not run:
+            raise ValueError("Mail campaign was not found.")
+        if not is_mail_only_sequence_campaign(db, run["sequence_campaign_id"]):
+            raise ValueError("This campaign's sequence is no longer Mail-only.")
+        refresh_mail_campaign_targets(db, run_id)
+        approved_rows = db.execute(
+            """
+            SELECT * FROM mail_campaign_targets
+            WHERE mail_campaign_run_id = ? AND status = 'Approved'
+            ORDER BY id ASC
+            """,
+            (run_id,),
+        ).fetchall()
+        enrolled = 0
+        suppressed = 0
+        for target in approved_rows:
+            try:
+                enrollment_id, _ = enroll_person_in_sequence(
+                    db,
+                    run["sequence_campaign_id"],
+                    target["property_id"],
+                    target["person_id"],
+                )
+                db.execute(
+                    """
+                    UPDATE mail_campaign_targets
+                    SET status = 'Enrolled', sequence_enrollment_id = ?, enrolled_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP, suppression_reason = ''
+                    WHERE id = ?
+                    """,
+                    (enrollment_id, target["id"]),
+                )
+                enrolled += 1
+            except Exception as exc:
+                db.execute(
+                    """
+                    UPDATE mail_campaign_targets
+                    SET status = 'Suppressed', suppression_reason = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (str(exc), target["id"]),
+                )
+                suppressed += 1
+        db.execute("UPDATE mail_campaign_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (run_id,))
+        db.commit()
+        return redirect(
+            url_for(
+                "mail_campaigns_page",
+                run=run_id,
+                notice=f"Enrolled {enrolled} approved target(s); {suppressed} were stopped by the final eligibility check.",
+            )
+        )
+    except Exception as exc:
+        db.rollback()
+        return redirect(url_for("mail_campaigns_page", run=run_id, error=f"Enrollment failed: {exc}"))
 
 
 @app.route("/broken-reisift-uuids")

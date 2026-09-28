@@ -689,5 +689,42 @@ CREATE TABLE IF NOT EXISTS sms_automation_queue (
     FOREIGN KEY(communication_id) REFERENCES communications(id)
 );
 
+CREATE TABLE IF NOT EXISTS mail_campaign_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    sequence_campaign_id INTEGER NOT NULL,
+    audience_key TEXT NOT NULL DEFAULT 'essex_union_priority_mail',
+    status TEXT NOT NULL DEFAULT 'Draft',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(sequence_campaign_id) REFERENCES sequence_campaigns(id)
+);
+
+CREATE TABLE IF NOT EXISTS mail_campaign_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mail_campaign_run_id INTEGER NOT NULL,
+    property_id INTEGER,
+    person_id INTEGER,
+    property_uuid TEXT,
+    source_segment TEXT,
+    matched_rules TEXT,
+    mailing_address TEXT,
+    status TEXT NOT NULL DEFAULT 'Draft',
+    suppression_reason TEXT,
+    sequence_enrollment_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    approved_at TEXT,
+    enrolled_at TEXT,
+    FOREIGN KEY(mail_campaign_run_id) REFERENCES mail_campaign_runs(id),
+    FOREIGN KEY(property_id) REFERENCES properties(id),
+    FOREIGN KEY(person_id) REFERENCES people(id),
+    FOREIGN KEY(sequence_enrollment_id) REFERENCES sequence_enrollments(id),
+    UNIQUE(mail_campaign_run_id, property_id, person_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mail_campaign_targets_run_status
+    ON mail_campaign_targets(mail_campaign_run_id, status, id);
+
 CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_status ON sms_automation_queue(status, scheduled_for);
 CREATE INDEX IF NOT EXISTS idx_sms_automation_queue_property ON sms_automation_queue(property_id);

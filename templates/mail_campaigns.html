@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="cards page-summary-cards">
+    <article><h3>Draft</h3><p>{{ counts.get('Draft', 0) }}</p></article>
+    <article><h3>Approved</h3><p>{{ counts.get('Approved', 0) }}</p></article>
+    <article><h3>Enrolled</h3><p>{{ counts.get('Enrolled', 0) }}</p></article>
+    <article><h3>Suppressed</h3><p>{{ counts.get('Suppressed', 0) }}</p></article>
+</section>
+
+{% if notice %}<div class="notice-banner">{{ notice }}</div>{% endif %}
+{% if error %}<div class="error-banner">{{ error }}</div>{% endif %}
+
+<section class="panel">
+    <h2>{{ audience_label }}</h2>
+    <p>Only the seven approved Essex and Union rules below are eligible. LLC owners are excluded. Each qualifying property creates one owner target, addressed to that owner's default mailing address, including the SkipSherpa golden tax mailing address when available.</p>
+    <ul class="compact-list">
+        {% for rule in audience_rules %}
+        <li><strong>{{ rule.county }}:</strong> {{ rule.label }}</li>
+        {% endfor %}
+    </ul>
+    <p class="help-text">A candidate refresh reads the local prospect cache only. It does not call ReiSIFT or OpenLetterConnect, and it does not place mail. Approved targets are rechecked immediately before enrollment.</p>
+</section>
+
+<section class="panel">
+    <h3>Create Mail Campaign</h3>
+    {% if mail_sequences %}
+    <form method="post" action="{{ url_for('create_mail_campaign') }}" class="grid-form compact">
+        <label>Campaign name
+            <input name="name" placeholder="Essex / Union Priority Mail">
+        </label>
+        <label>Mail-only sequence
+            <select name="sequence_campaign_id" required>
+                <option value="">Choose active sequence</option>
+                {% for sequence in mail_sequences %}
+                <option value="{{ sequence.id }}">{{ sequence.name }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label><button type="submit">Create Review Campaign</button></label>
+    </form>
+    {% else %}
+    <p>No active Mail-only sequence is available. Create one under Settings, with only MAIL steps and its OpenLetterConnect template selected, before creating a campaign.</p>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <h3>Campaign Review</h3>
+    {% if runs %}
+    <form method="get" action="{{ url_for('mail_campaigns_page') }}" class="panel-actions inline-form">
+        <label>Campaign
+            <select name="run" onchange="this.form.submit()">
+                {% for run in runs %}
+                <option value="{{ run.id }}" {% if selected_run and run.id == selected_run.id %}selected{% endif %}>{{ run.name }} · {{ run.sequence_name }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <button type="submit">Open</button>
+    </form>
+
+    {% if selected_run %}
+    <div class="panel-actions" style="margin-top: 0.8rem;">
+        <form method="post" action="{{ url_for('refresh_mail_campaign', run_id=selected_run.id) }}">
+            <button type="submit">Refresh Candidates</button>
+        </form>
+        <form method="post" action="{{ url_for('enroll_mail_campaign_targets', run_id=selected_run.id) }}" onsubmit="return confirm('Enroll every approved target into {{ selected_run.sequence_name }}? This makes each target eligible for the existing mail sequence; it does not bypass its sending window or final suppression checks.');">
+            <button type="submit" {% if not counts.get('Approved') %}disabled{% endif %}>Enroll Approved ({{ counts.get('Approved', 0) }})</button>
+        </form>
+    </div>
+
+    <form method="post" action="{{ url_for('approve_mail_campaign_targets', run_id=selected_run.id) }}">
+        <div class="panel-actions" style="margin-top: 0.8rem;">
+            <button type="submit" {% if not counts.get('Draft') %}disabled{% endif %}>Approve Selected Drafts</button>
+            <span class="help-text">Showing {{ target_pagination.page }} of {{ target_pagination.total_pages }}. Enrolled targets are locked to prevent this campaign from creating a second enrollment.</span>
+        </div>
+        <div class="sms-queue-table-wrap">
+            <table class="crm-table sms-queue-table mail-campaign-table">
+                <thead>
+                    <tr>
+                        <th class="sms-select-col"><input type="checkbox" id="mailSelectAll" aria-label="Select all draft mail targets"></th>
+                        <th>Status</th>
+                        <th>Property</th>
+                        <th>Owner</th>
+                        <th>Mailing Address</th>
+                        <th>Matched Rule</th>
+                        <th>Source</th>
+                        <th>Reason</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for target in targets %}
+                    <tr>
+                        <td class="sms-select-col"><input type="checkbox" name="target_ids" value="{{ target.id }}" {% if target.status != 'Draft' %}disabled{% endif %}></td>
+                        <td><span class="status-pill {{ target.status|lower }}">{{ target.status }}</span></td>
+                        <td>
+                            {% if target.property_id %}<a href="{{ url_for('property_detail', property_id=target.property_id) }}">{{ target.street }}, {{ target.city }}, {{ target.state }} {{ target.postal_code }}</a>{% else %}{{ target.property_uuid }}{% endif %}
+                        </td>
+                        <td>{% if target.person_id %}<a href="{{ url_for('person_detail', person_id=target.person_id, property_id=target.property_id) }}">{{ target.first_name }} {{ target.last_name }}</a>{% endif %}</td>
+                        <td>{{ target.mailing_address or 'Unavailable' }}</td>
+                        <td>{{ target.matched_rules }}</td>
+                        <td>{{ 'New Records' if target.source_segment == 'new_records' else 'Deep Prospecting' }}</td>
+                        <td class="sms-queue-reason">{{ target.suppression_reason or '' }}</td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="8">No targets yet. Refresh candidates to build this campaign's review list.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </form>
+    {% if target_pagination.total_pages > 1 %}
+    <div class="panel-actions" style="margin-top: 0.8rem;">
+        {% if target_pagination.has_prev %}<a class="button-link" href="{{ url_for('mail_campaigns_page', run=selected_run.id, page=target_pagination.page - 1) }}">Previous 200</a>{% endif %}
+        <span>{{ target_pagination.total_count }} total targets</span>
+        {% if target_pagination.has_next %}<a class="button-link" href="{{ url_for('mail_campaigns_page', run=selected_run.id, page=target_pagination.page + 1) }}">Next 200</a>{% endif %}
+    </div>
+    {% endif %}
+    {% endif %}
+    {% else %}
+    <p>Create a review campaign, then refresh candidates. Nothing is mailed until reviewed targets are approved and enrolled.</p>
+    {% endif %}
+</section>
+
+<script>
+document.getElementById('mailSelectAll')?.addEventListener('change', (event) => {
+  document.querySelectorAll('input[name="target_ids"]:not(:disabled)').forEach((input) => {
+    input.checked = event.target.checked;
+  });
+});
+</script>
+{% endblock %}

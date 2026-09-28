@@ -88,6 +88,17 @@ body {
     min-width: 1180px;
 }
 
+.mail-campaign-table {
+    min-width: 1280px;
+}
+
+.compact-list {
+    display: grid;
+    gap: 0.3rem;
+    margin: 0.75rem 0;
+    padding-left: 1.25rem;
+}
+
 .sms-queue-table th,
 .sms-queue-table td {
     vertical-align: top;

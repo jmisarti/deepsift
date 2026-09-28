@@ -55089,32 +55089,35 @@ def settings_page():
         """,
         (PROPERTYLEADS_PPL_EVENT_SOURCE,),
     ).fetchall()
-    untitled_snapshot_runs = db.execute(
-        """
-        SELECT id, worksheet_name, row_count, new_rows, updated_rows, removed_rows, reappeared_rows,
-               lead_event_rows, contact_change_rows, hot_alert_rows, created_at
-        FROM untitled_sheet_snapshots
-        ORDER BY id DESC
-        LIMIT 20
-        """
-    ).fetchall()
+    untitled_snapshot_runs = []
+    untitled_email_sync_rows = []
+    if automation_settings.get("untitled_leads_enabled"):
+        untitled_snapshot_runs = db.execute(
+            """
+            SELECT id, worksheet_name, row_count, new_rows, updated_rows, removed_rows, reappeared_rows,
+                   lead_event_rows, contact_change_rows, hot_alert_rows, created_at
+            FROM untitled_sheet_snapshots
+            ORDER BY id DESC
+            LIMIT 20
+            """
+        ).fetchall()
+        untitled_email_sync_rows = db.execute(
+            """
+            SELECT display_label, campaign_email, email_validation_status, emailoctopus_sync_status,
+                   emailoctopus_contact_id, email_validation_checked_at, emailoctopus_synced_at, emailoctopus_last_error
+            FROM untitled_sheet_current
+            WHERE COALESCE(campaign_email, '') <> ''
+               OR COALESCE(email_validation_status, '') <> ''
+               OR COALESCE(emailoctopus_sync_status, '') <> ''
+            ORDER BY COALESCE(emailoctopus_synced_at, email_validation_checked_at, last_changed_at) DESC, id DESC
+            LIMIT 50
+            """
+        ).fetchall()
     untitled_change_log = db.execute(
         """
         SELECT id, display_label, change_type, summary_text, created_at
         FROM untitled_sheet_changes
         ORDER BY id DESC
-        LIMIT 50
-        """
-    ).fetchall()
-    untitled_email_sync_rows = db.execute(
-        """
-        SELECT display_label, campaign_email, email_validation_status, emailoctopus_sync_status,
-               emailoctopus_contact_id, email_validation_checked_at, emailoctopus_synced_at, emailoctopus_last_error
-        FROM untitled_sheet_current
-        WHERE COALESCE(campaign_email, '') <> ''
-           OR COALESCE(email_validation_status, '') <> ''
-           OR COALESCE(emailoctopus_sync_status, '') <> ''
-        ORDER BY COALESCE(emailoctopus_synced_at, email_validation_checked_at, last_changed_at) DESC, id DESC
         LIMIT 50
         """
     ).fetchall()

@@ -829,6 +829,7 @@
         {% endif %}
     </details>
 
+    {% if automation_settings.untitled_leads_enabled %}
     <details class="collapsed-section" style="margin-top: 1rem;" open>
         <summary>Anonymous Lead Snapshot Runs</summary>
         {% if untitled_snapshot_runs and untitled_snapshot_runs|length > 0 %}
@@ -868,6 +869,7 @@
         <p style="margin-top:0.75rem;">No anonymous lead snapshots yet.</p>
         {% endif %}
     </details>
+    {% endif %}
 
     <details class="collapsed-section" style="margin-top: 1rem;" open>
         <summary>Anonymous Lead Change Log</summary>
@@ -899,6 +901,7 @@
         {% endif %}
     </details>
 
+    {% if automation_settings.untitled_leads_enabled %}
     <details class="collapsed-section" style="margin-top: 1rem;" open>
         <summary>Anonymous Lead Email Sync Status</summary>
         {% if untitled_email_sync_rows and untitled_email_sync_rows|length > 0 %}
@@ -934,5 +937,6 @@
         <p style="margin-top:0.75rem;">No anonymous lead email sync activity yet.</p>
         {% endif %}
     </details>
+    {% endif %}
 </section>
 {% endblock %}

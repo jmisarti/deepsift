@@ -10053,6 +10053,20 @@ def get_mail_sequence_suppression_reason(db, property_row, person_row):
     if property_status_key in ON_MARKET_STATUSES or property_status_key == "sold":
         return f"Mail is blocked because the property status is '{property_status or property_status_key}'."
 
+    mailing_target, _ = get_sequence_mail_target(db, property_row, person_row["id"])
+    mailing_address_id = (
+        int(((mailing_target or {}).get("meta_data") or {}).get("address_id") or 0)
+        if isinstance(mailing_target, dict)
+        else 0
+    )
+    if mailing_address_id:
+        mailing_address = db.execute(
+            "SELECT is_verified_deliverable FROM addresses WHERE id = ?",
+            (mailing_address_id,),
+        ).fetchone()
+        if mailing_address and mailing_address["is_verified_deliverable"] is not None and int(mailing_address["is_verified_deliverable"] or 0) == 0:
+            return "Mail is blocked because the selected mailing address is marked not deliverable."
+
     latest_mail_status = get_latest_mail_order_status_label(db, property_row["id"], person_row["id"])
     if latest_mail_status == "Bad Address":
         return "Mail is blocked because the latest OpenLetterConnect result was Bad Address."
@@ -50050,6 +50064,173 @@ def enroll_mail_campaign_targets(run_id):
         return redirect(url_for("mail_campaigns_page", run=run_id, error=f"Enrollment failed: {exc}"))
 
 
+def _mail_issue_address_text(row, prefix="mailing_"):
+    return format_property_address_line(
+        row[f"{prefix}street"] or "",
+        row[f"{prefix}city"] or "",
+        row[f"{prefix}state"] or "",
+        row[f"{prefix}postal_code"] or "",
+    )
+
+
+def get_mail_issue_rows(db, issue_filter="all"):
+    """Build a property-level view of provider returns and known bad mail targets."""
+    issues_by_property = {}
+
+    def get_or_create(row):
+        property_id = int(row["property_id"] or 0)
+        issue = issues_by_property.get(property_id)
+        if issue:
+            return issue
+        owner_name = " ".join(
+            part for part in [str(row["owner_first_name"] or "").strip(), str(row["owner_last_name"] or "").strip()] if part
+        ).strip()
+        issue = {
+            "property_id": property_id,
+            "street": row["street"] or "",
+            "city": row["city"] or "",
+            "state": row["state"] or "",
+            "postal_code": row["postal_code"] or "",
+            "property_status": row["property_status"] or "",
+            "person_id": int(row["owner_person_id"] or 0) or None,
+            "owner_name": owner_name,
+            "issue_types": [],
+            "mailing_address": "",
+            "mailing_label": "",
+            "latest_provider_status": "",
+            "latest_order_id": "",
+            "latest_event_at": "",
+            "details": [],
+        }
+        issues_by_property[property_id] = issue
+        return issue
+
+    provider_rows = db.execute(
+        """
+        SELECT m.*, p.status AS property_status, p.owner_person_id,
+               a.street, a.city, a.state, a.postal_code,
+               owner.first_name AS owner_first_name, owner.last_name AS owner_last_name
+        FROM mail_orders m
+        JOIN properties p ON p.id = m.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        LEFT JOIN people owner ON owner.id = p.owner_person_id
+        WHERE lower(COALESCE(m.status, '')) LIKE '%return%'
+           OR lower(COALESCE(m.status, '')) LIKE '%nixie%'
+           OR lower(COALESCE(m.status, '')) LIKE '%rts%'
+           OR lower(COALESCE(m.status, '')) LIKE '%failed%'
+           OR lower(COALESCE(m.status, '')) LIKE '%bad address%'
+           OR lower(COALESCE(m.status, '')) LIKE '%undeliverable%'
+           OR lower(COALESCE(m.status, '')) LIKE '%canceled%'
+        ORDER BY COALESCE(m.status_updated_at, m.bad_address_at, m.created_at) DESC, m.id DESC
+        """
+    ).fetchall()
+    for row in provider_rows:
+        normalized = _normalize_openletterconnect_status(row["status"] or "")
+        if normalized != "Bad Address":
+            continue
+        issue = get_or_create(row)
+        if "Provider return" not in issue["issue_types"]:
+            issue["issue_types"].append("Provider return")
+        status_at = row["bad_address_at"] or row["status_updated_at"] or row["created_at"] or ""
+        if not issue["latest_event_at"] or str(status_at) > str(issue["latest_event_at"]):
+            issue["latest_provider_status"] = row["status"] or "Bad Address"
+            issue["latest_order_id"] = row["external_order_id"] or ""
+            issue["latest_event_at"] = status_at
+        detail = f"OpenLetterConnect reported: {row['status'] or 'Bad Address'}"
+        if detail not in issue["details"]:
+            issue["details"].append(detail)
+
+    mailability_rows = db.execute(
+        """
+        WITH ranked_owner_mailing AS (
+            SELECT p.id AS property_id, p.status AS property_status, p.owner_person_id,
+                   property_address.street, property_address.city, property_address.state, property_address.postal_code,
+                   owner.first_name AS owner_first_name, owner.last_name AS owner_last_name,
+                   pa.label AS mailing_label,
+                   mailing_address.street AS mailing_street, mailing_address.city AS mailing_city,
+                   mailing_address.state AS mailing_state, mailing_address.postal_code AS mailing_postal_code,
+                   mailing_address.is_verified_deliverable AS mailing_verified_deliverable,
+                   property_address.is_verified_deliverable AS property_verified_deliverable,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY p.id
+                       ORDER BY COALESCE(pa.is_default_mailing, 0) DESC, pa.id DESC
+                   ) AS address_rank
+            FROM properties p
+            LEFT JOIN addresses property_address ON property_address.id = p.property_address_id
+            LEFT JOIN people owner ON owner.id = p.owner_person_id
+            LEFT JOIN person_addresses pa ON pa.person_id = p.owner_person_id
+            LEFT JOIN addresses mailing_address ON mailing_address.id = pa.address_id
+        )
+        SELECT *
+        FROM ranked_owner_mailing
+        WHERE address_rank = 1
+          AND COALESCE(mailing_verified_deliverable, property_verified_deliverable) = 0
+        """
+    ).fetchall()
+    for row in mailability_rows:
+        issue = get_or_create(row)
+        if "Marked not mailable" not in issue["issue_types"]:
+            issue["issue_types"].append("Marked not mailable")
+        mailing_address = _mail_issue_address_text(row)
+        if not mailing_address:
+            mailing_address = format_property_address_line(
+                row["street"] or "", row["city"] or "", row["state"] or "", row["postal_code"] or ""
+            )
+        issue["mailing_address"] = mailing_address
+        issue["mailing_label"] = row["mailing_label"] or "Property Address"
+        detail = "The selected mailing address is marked not deliverable in DeepSift."
+        if detail not in issue["details"]:
+            issue["details"].append(detail)
+
+    issue_filter = str(issue_filter or "all").strip().lower()
+    rows = list(issues_by_property.values())
+    if issue_filter == "provider_return":
+        rows = [row for row in rows if "Provider return" in row["issue_types"]]
+    elif issue_filter == "not_mailable":
+        rows = [row for row in rows if "Marked not mailable" in row["issue_types"]]
+    for row in rows:
+        row["issue_label"] = " + ".join(row["issue_types"])
+        row["detail_text"] = " ".join(row["details"])
+    rows.sort(key=lambda row: (str(row["latest_event_at"] or ""), row["property_id"]), reverse=True)
+    return rows
+
+
+@app.route("/mail-issues")
+def mail_issues_page():
+    ensure_db()
+    db = get_db()
+    issue_filter = (request.args.get("type") or "all").strip().lower()
+    if issue_filter not in {"all", "provider_return", "not_mailable"}:
+        issue_filter = "all"
+    rows = get_mail_issue_rows(db, issue_filter=issue_filter)
+    page = max(1, _safe_int(request.args.get("page"), 1))
+    per_page = 200
+    total_count = len(rows)
+    total_pages = max(1, math.ceil(total_count / per_page)) if total_count else 1
+    page = min(page, total_pages)
+    offset = (page - 1) * per_page
+    page_rows = rows[offset : offset + per_page]
+    provider_return_count = sum(1 for row in rows if "Provider return" in row["issue_types"])
+    not_mailable_count = sum(1 for row in rows if "Marked not mailable" in row["issue_types"])
+    return render_template(
+        "mail_issues.html",
+        rows=page_rows,
+        issue_filter=issue_filter,
+        summary={
+            "total_count": total_count,
+            "provider_return_count": provider_return_count,
+            "not_mailable_count": not_mailable_count,
+        },
+        pagination={
+            "page": page,
+            "total_pages": total_pages,
+            "total_count": total_count,
+            "has_prev": page > 1,
+            "has_next": page < total_pages,
+        },
+    )
+
+
 @app.route("/broken-reisift-uuids")
 def broken_reisift_uuids_page():
     """Show SMS-attempt records whose stored ReiSIFT link cannot be read."""
@@ -60290,7 +60471,16 @@ def _normalize_openletterconnect_status(raw_status, event_type=""):
         return "Delivered"
     if "in transit" in lower or "re-routed" in lower or "rerouted" in lower:
         return "In Transit"
-    if "returned" in lower or "failed" in lower or "bad address" in lower or "undeliverable" in lower or "canceled" in lower:
+    if (
+        "returned" in lower
+        or "return to sender" in lower
+        or "nixie" in lower
+        or lower == "rts"
+        or "failed" in lower
+        or "bad address" in lower
+        or "undeliverable" in lower
+        or "canceled" in lower
+    ):
         return "Bad Address"
     if "processing" in lower or "not mailed" in lower or "pending" in lower or "created" in lower or "submitted" in lower or "queued" in lower:
         return "Pending"

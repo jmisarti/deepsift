@@ -92,6 +92,10 @@ body {
     min-width: 1280px;
 }
 
+.mail-issues-table {
+    min-width: 1320px;
+}
+
 .compact-list {
     display: grid;
     gap: 0.3rem;

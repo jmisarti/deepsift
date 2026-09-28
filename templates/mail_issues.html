@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="cards page-summary-cards">
+    <article><h3>Properties With Issues</h3><p>{{ summary.total_count }}</p></article>
+    <article><h3>Provider Returns</h3><p>{{ summary.provider_return_count }}</p></article>
+    <article><h3>Marked Not Mailable</h3><p>{{ summary.not_mailable_count }}</p></article>
+</section>
+
+<section class="panel">
+    <h2>Mail Issues</h2>
+    <p>Provider returns include bad address, undeliverable, returned, canceled, RTS, and Nixie results from OpenLetterConnect. “Marked not mailable” means the owner’s selected default mailing address is locally marked not deliverable.</p>
+    <div class="panel-actions">
+        <a class="button-link {% if issue_filter == 'all' %}secondary{% endif %}" href="{{ url_for('mail_issues_page') }}">All</a>
+        <a class="button-link {% if issue_filter == 'provider_return' %}secondary{% endif %}" href="{{ url_for('mail_issues_page', type='provider_return') }}">Provider Returns</a>
+        <a class="button-link {% if issue_filter == 'not_mailable' %}secondary{% endif %}" href="{{ url_for('mail_issues_page', type='not_mailable') }}">Marked Not Mailable</a>
+    </div>
+    <p class="help-text">These records are blocked from Mail Campaigns and other mail-only sequence sends. The view is read-only; it does not change ReiSIFT or the address record.</p>
+
+    <div class="sms-queue-table-wrap" style="margin-top:0.85rem;">
+        <table class="crm-table sms-queue-table mail-issues-table">
+            <thead>
+                <tr>
+                    <th>Property</th>
+                    <th>Owner</th>
+                    <th>Issue</th>
+                    <th>Mailing Address</th>
+                    <th>Provider Status</th>
+                    <th>Order</th>
+                    <th>Last Event</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr>
+                    <td><a href="{{ url_for('property_detail', property_id=row.property_id) }}">{{ row.street }}, {{ row.city }}, {{ row.state }} {{ row.postal_code }}</a><div class="sms-queue-reason">{{ row.property_status or 'Unknown status' }}</div></td>
+                    <td>{% if row.person_id %}<a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">{{ row.owner_name or 'Owner' }}</a>{% else %}{{ row.owner_name or '-' }}{% endif %}</td>
+                    <td>{{ row.issue_label }}</td>
+                    <td>{{ row.mailing_address or '-' }}{% if row.mailing_label %}<div class="sms-queue-reason">{{ row.mailing_label }}</div>{% endif %}</td>
+                    <td>{{ row.latest_provider_status or '-' }}</td>
+                    <td>{{ row.latest_order_id or '-' }}</td>
+                    <td>{{ row.latest_event_at|fmt_est_datetime if row.latest_event_at else '-' }}</td>
+                    <td class="sms-queue-reason">{{ row.detail_text }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="8">No mail issues match this view.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% if pagination.total_pages > 1 %}
+    <div class="panel-actions" style="margin-top:0.85rem;">
+        {% if pagination.has_prev %}<a class="button-link secondary" href="{{ url_for('mail_issues_page', type=issue_filter, page=pagination.page - 1) }}">Previous 200</a>{% endif %}
+        <span>Page {{ pagination.page }} of {{ pagination.total_pages }} · {{ pagination.total_count }} properties</span>
+        {% if pagination.has_next %}<a class="button-link secondary" href="{{ url_for('mail_issues_page', type=issue_filter, page=pagination.page + 1) }}">Next 200</a>{% endif %}
+    </div>
+    {% endif %}
+</section>
+{% endblock %}

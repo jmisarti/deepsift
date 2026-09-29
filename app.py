@@ -21024,6 +21024,130 @@ def ensure_emailoctopus_engagement_history_backfilled(db):
     return result
 
 
+def _emailoctopus_export_address_key(row):
+    return normalize_address_match_text(
+        " ".join(
+            part
+            for part in (
+                str((row or {}).get("address") or (row or {}).get("street") or "").strip(),
+                str((row or {}).get("city") or "").strip(),
+                str((row or {}).get("state") or "").strip(),
+            )
+            if part
+        )
+    )
+
+
+def _emailoctopus_export_property_index(db):
+    index = {}
+    rows = db.execute(
+        """
+        SELECT p.id, p.reisift_property_uuid, a.street, a.city, a.state
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        """
+    ).fetchall()
+    for row in rows:
+        key = _emailoctopus_export_address_key(dict(row))
+        if key:
+            index.setdefault(key, []).append(dict(row))
+    return index
+
+
+def import_emailoctopus_clicked_export(db, csv_path):
+    """Import EmailOctopus's contact-level EmailClicked export without inflating live counts."""
+    property_index = _emailoctopus_export_property_index(db)
+    result = {
+        "rows": 0,
+        "clicked_rows": 0,
+        "imported": 0,
+        "already_present": 0,
+        "unmatched": 0,
+        "conflicted": 0,
+        "samples": [],
+    }
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as source:
+        for raw_row in csv.DictReader(source):
+            result["rows"] += 1
+            tags = {
+                normalize_whitespace(tag).lower()
+                for tag in str(raw_row.get("Tags") or "").split(",")
+                if normalize_whitespace(tag)
+            }
+            if "emailclicked" not in tags:
+                continue
+            result["clicked_rows"] += 1
+            contact_id = str(raw_row.get("Identifier") or "").strip()
+            contact_email = normalize_email_identity(raw_row.get("Email address") or "")
+            fields = {
+                "event_key": f"emailoctopus_export_clicked:{contact_id or contact_email}",
+                "event_action": "clicked",
+                "contact_id": contact_id,
+                "contact_email": contact_email,
+                # The export has no click timestamp. Last changed is the closest
+                # available historical marker for when EmailClicked was present.
+                "occurred_at": str(raw_row.get("Last changed") or raw_row.get("Created") or "").strip(),
+            }
+            email_resolution = _resolve_emailoctopus_event_record(db, fields)
+            email_property_id = _safe_int(email_resolution.get("property_id"), 0)
+            address_candidates = property_index.get(_emailoctopus_export_address_key(raw_row), [])
+            candidate_ids = {int(item["id"] or 0) for item in address_candidates if int(item["id"] or 0) > 0}
+
+            selected = None
+            match_source = ""
+            if email_property_id and email_property_id in candidate_ids:
+                selected = next(item for item in address_candidates if int(item["id"] or 0) == email_property_id)
+                match_source = "email_and_address"
+            elif len(address_candidates) == 1 and not email_property_id:
+                selected = address_candidates[0]
+                match_source = "address"
+            elif email_property_id and not address_candidates:
+                selected = {
+                    "id": email_property_id,
+                    "reisift_property_uuid": email_resolution.get("reisift_property_uuid") or "",
+                }
+                match_source = "email"
+            elif email_property_id or address_candidates:
+                result["conflicted"] += 1
+                if len(result["samples"]) < 10:
+                    result["samples"].append({"email": contact_email, "status": "conflicted"})
+                continue
+            else:
+                result["unmatched"] += 1
+                if len(result["samples"]) < 10:
+                    result["samples"].append({"email": contact_email, "status": "unmatched"})
+                continue
+
+            property_id = int(selected["id"] or 0)
+            resolution = {
+                "property_id": property_id,
+                "person_id": _safe_int(email_resolution.get("person_id"), 0),
+                "reisift_property_uuid": str(
+                    selected.get("reisift_property_uuid") or email_resolution.get("reisift_property_uuid") or ""
+                ).strip(),
+                "match_source": f"emailoctopus_export_{match_source}",
+            }
+            contact_key = _emailoctopus_engagement_contact_key(fields)
+            already_present = db.execute(
+                """
+                SELECT 1
+                FROM emailoctopus_engagement_daily
+                WHERE property_id = ? AND contact_key = ? AND event_action = 'clicked'
+                LIMIT 1
+                """,
+                (property_id, contact_key),
+            ).fetchone()
+            if already_present:
+                result["already_present"] += 1
+                continue
+            imported = record_emailoctopus_engagement(db, fields, resolution)
+            if imported.get("engagement_id"):
+                result["imported"] += 1
+            else:
+                result["already_present"] += 1
+    return result
+
+
 def _emailoctopus_reisift_note(action, emails, event_fields):
     label = str(action or "").strip().title()
     email_text = ", ".join([email for email in emails if email]) or "-"

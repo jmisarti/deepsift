@@ -611,12 +611,12 @@ class ProspectReconciliationTests(unittest.TestCase):
                 status TEXT,
                 sent_at TEXT
             );
-            CREATE TABLE emailoctopus_webhook_events (
+            CREATE TABLE emailoctopus_engagement_daily (
                 id INTEGER PRIMARY KEY,
                 property_id INTEGER,
                 event_action TEXT,
-                event_type TEXT,
-                processing_status TEXT
+                contact_key TEXT,
+                event_count INTEGER DEFAULT 1
             );
             CREATE TABLE clever_lead_submissions (id INTEGER PRIMARY KEY, local_property_id INTEGER);
             CREATE TABLE propertyleads_lead_submissions (id INTEGER PRIMARY KEY, local_property_id INTEGER);
@@ -653,12 +653,12 @@ class ProspectReconciliationTests(unittest.TestCase):
         )
         self.db.executemany(
             """
-            INSERT INTO emailoctopus_webhook_events (id, property_id, event_action, event_type, processing_status)
-            VALUES (?, ?, ?, ?, 'processed')
+            INSERT INTO emailoctopus_engagement_daily (id, property_id, event_action, contact_key, event_count)
+            VALUES (?, ?, ?, ?, 1)
             """,
             [
-                (1, 3, "opened", "contact.opened"),
-                (2, 4, "clicked", "contact.clicked"),
+                (1, 3, "opened", "contact:3"),
+                (2, 4, "clicked", "contact:4"),
             ],
         )
         self.db.execute(

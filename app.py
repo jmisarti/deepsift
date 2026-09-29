@@ -2825,6 +2825,44 @@ def migrate_db(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_action ON emailoctopus_webhook_events(event_action, processing_status, received_at DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_contact ON emailoctopus_webhook_events(contact_email, contact_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_webhook_events_property ON emailoctopus_webhook_events(property_id, event_action)")
+    # Keep durable engagement facts separate from the short-lived raw webhook payload.
+    # The report and prospect filters must survive webhook-payload retention cleanup.
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS emailoctopus_engagement_daily (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            property_id INTEGER NOT NULL,
+            person_id INTEGER,
+            contact_key TEXT NOT NULL,
+            contact_email TEXT,
+            contact_id TEXT,
+            event_action TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            event_count INTEGER NOT NULL DEFAULT 0,
+            first_occurred_at TEXT NOT NULL,
+            last_occurred_at TEXT NOT NULL,
+            campaign_ids_json TEXT NOT NULL DEFAULT '[]',
+            last_event_key TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(property_id, contact_key, event_action, event_date),
+            FOREIGN KEY(property_id) REFERENCES properties(id) ON DELETE CASCADE,
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_engagement_daily_report ON emailoctopus_engagement_daily(event_action, property_id, event_date)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_emailoctopus_engagement_daily_contact ON emailoctopus_engagement_daily(contact_key, event_action, event_date)")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS emailoctopus_engagement_event_keys (
+            event_key TEXT PRIMARY KEY,
+            engagement_id INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(engagement_id) REFERENCES emailoctopus_engagement_daily(id) ON DELETE SET NULL
+        )
+        """
+    )
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS emailoctopus_contact_tag_syncs (
@@ -20810,6 +20848,168 @@ def _json_list_append_unique(raw_json, values):
     return json.dumps(current, ensure_ascii=True)
 
 
+EMAILOCTOPUS_DURABLE_ENGAGEMENT_ACTIONS = {"opened", "clicked"}
+
+
+def _emailoctopus_engagement_timestamp(value):
+    parsed = parse_flexible_datetime(value)
+    if parsed:
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    return format_db_time(datetime.utcnow())
+
+
+def _emailoctopus_engagement_contact_key(fields):
+    contact_id = str((fields or {}).get("contact_id") or "").strip()
+    if contact_id:
+        return f"contact:{contact_id}"
+    email = normalize_email_identity((fields or {}).get("contact_email") or "")
+    if email:
+        return f"email:{email}"
+    return f"event:{str((fields or {}).get('event_key') or '').strip()}"
+
+
+def record_emailoctopus_engagement(db, fields, resolution):
+    """Persist a compact, idempotent engagement fact before raw webhook cleanup."""
+    action = str((fields or {}).get("event_action") or "").strip().lower()
+    property_id = _safe_int((resolution or {}).get("property_id"), 0)
+    event_key = str((fields or {}).get("event_key") or "").strip()
+    if action not in EMAILOCTOPUS_DURABLE_ENGAGEMENT_ACTIONS or property_id <= 0 or not event_key:
+        return {"ok": True, "skipped": "not_durable_engagement"}
+
+    # Claim the provider event first. This protects the rollup from webhook retries
+    # and lets a one-time backfill safely overlap ordinary live processing.
+    claim = db.execute(
+        """
+        INSERT INTO emailoctopus_engagement_event_keys (event_key)
+        VALUES (?)
+        ON CONFLICT(event_key) DO NOTHING
+        """,
+        (event_key,),
+    )
+    if int(claim.rowcount or 0) != 1:
+        return {"ok": True, "skipped": "already_recorded"}
+
+    occurred_at = _emailoctopus_engagement_timestamp(
+        (fields or {}).get("occurred_at") or (fields or {}).get("received_at")
+    )
+    event_date = occurred_at[:10]
+    contact_email = normalize_email_identity((fields or {}).get("contact_email") or "")
+    contact_id = str((fields or {}).get("contact_id") or "").strip()
+    contact_key = _emailoctopus_engagement_contact_key(fields)
+    person_id = _safe_int((resolution or {}).get("person_id"), 0)
+    campaign_id = str((fields or {}).get("campaign_id") or "").strip()
+    existing = db.execute(
+        """
+        SELECT *
+        FROM emailoctopus_engagement_daily
+        WHERE property_id = ? AND contact_key = ? AND event_action = ? AND event_date = ?
+        LIMIT 1
+        """,
+        (property_id, contact_key, action, event_date),
+    ).fetchone()
+    if existing:
+        first_at = min(str(existing["first_occurred_at"] or occurred_at), occurred_at)
+        last_at = max(str(existing["last_occurred_at"] or occurred_at), occurred_at)
+        db.execute(
+            """
+            UPDATE emailoctopus_engagement_daily
+            SET person_id = COALESCE(NULLIF(?, 0), person_id),
+                contact_email = COALESCE(NULLIF(?, ''), contact_email),
+                contact_id = COALESCE(NULLIF(?, ''), contact_id),
+                event_count = event_count + 1,
+                first_occurred_at = ?,
+                last_occurred_at = ?,
+                campaign_ids_json = ?,
+                last_event_key = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                person_id,
+                contact_email,
+                contact_id,
+                first_at,
+                last_at,
+                _json_list_append_unique(existing["campaign_ids_json"], [campaign_id]),
+                event_key,
+                int(existing["id"]),
+            ),
+        )
+        engagement_id = int(existing["id"])
+    else:
+        cur = db.execute(
+            """
+            INSERT INTO emailoctopus_engagement_daily (
+                property_id, person_id, contact_key, contact_email, contact_id, event_action,
+                event_date, event_count, first_occurred_at, last_occurred_at,
+                campaign_ids_json, last_event_key
+            )
+            VALUES (?, NULLIF(?, 0), ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+            """,
+            (
+                property_id,
+                person_id,
+                contact_key,
+                contact_email,
+                contact_id,
+                action,
+                event_date,
+                occurred_at,
+                occurred_at,
+                _json_list_append_unique("[]", [campaign_id]),
+                event_key,
+            ),
+        )
+        engagement_id = int(cur.lastrowid or 0)
+    db.execute(
+        "UPDATE emailoctopus_engagement_event_keys SET engagement_id = ? WHERE event_key = ?",
+        (engagement_id or None, event_key),
+    )
+    return {"ok": True, "engagement_id": engagement_id, "event_action": action}
+
+
+def backfill_emailoctopus_engagement_history(db, batch_size=500, max_batches=100):
+    """Backfill retained, matched webhook history without duplicating live events."""
+    limit = max(1, min(_safe_int(batch_size, 500), 5000))
+    recorded = 0
+    skipped = 0
+    scanned = 0
+    last_id = 0
+    complete = False
+    for _ in range(max(1, _safe_int(max_batches, 100))):
+        rows = db.execute(
+            """
+            SELECT id, event_key, event_action, contact_id, contact_email, campaign_id, occurred_at,
+                   property_id, person_id
+            FROM emailoctopus_webhook_events
+            WHERE id > ?
+              AND COALESCE(property_id, 0) > 0
+              AND lower(COALESCE(event_action, '')) IN ('opened', 'clicked')
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (last_id, limit),
+        ).fetchall()
+        if not rows:
+            complete = True
+            break
+        for row in rows:
+            data = dict(row)
+            result = record_emailoctopus_engagement(db, data, data)
+            if result.get("engagement_id"):
+                recorded += 1
+            else:
+                skipped += 1
+        scanned += len(rows)
+        last_id = int(rows[-1]["id"] or 0)
+        if len(rows) < limit:
+            complete = True
+            break
+    return {"scanned": scanned, "recorded": recorded, "skipped": skipped, "complete": complete}
+
+
 def _emailoctopus_reisift_note(action, emails, event_fields):
     label = str(action or "").strip().title()
     email_text = ", ".join([email for email in emails if email]) or "-"
@@ -21173,6 +21373,9 @@ def process_emailoctopus_event(db, event, safe_headers=None):
         """,
         (property_id, person_id, property_uuid, event_db_id),
     )
+    # Persist open/click history locally before the raw webhook payload is eligible
+    # for the short retention window and before any external ReiSIFT call can fail.
+    record_emailoctopus_engagement(db, fields, resolution)
     sync_result = {"ok": True, "skipped": "not_attempted"}
     click_tag_result = {"ok": True, "skipped": "not_click_event"}
     sync_error = ""
@@ -41370,14 +41573,9 @@ def bulk_prospect_audience_flags(db, rows):
         for row in db.execute(
             f"""
             SELECT DISTINCT property_id
-            FROM emailoctopus_webhook_events
+            FROM emailoctopus_engagement_daily
             WHERE property_id IN ({placeholders})
-              AND (
-                  lower(COALESCE(event_action, '')) IN ('opened', 'clicked')
-                  OR lower(COALESCE(event_type, '')) LIKE '%open%'
-                  OR lower(COALESCE(event_type, '')) LIKE '%click%'
-              )
-              AND lower(COALESCE(processing_status, '')) NOT IN ('unauthorized', 'ignored', 'unmatched', 'error')
+              AND lower(COALESCE(event_action, '')) IN ('opened', 'clicked')
             """,
             tuple(chunk),
         ).fetchall():
@@ -42173,11 +42371,10 @@ def local_emailoctopus_open_count_for_property(db, property_id):
         return 0
     row = db.execute(
         """
-        SELECT COUNT(DISTINCT COALESCE(NULLIF(contact_email, ''), event_key)) AS opened_count
-        FROM emailoctopus_webhook_events
+        SELECT COUNT(DISTINCT contact_key) AS opened_count
+        FROM emailoctopus_engagement_daily
         WHERE property_id = ?
           AND lower(COALESCE(event_action, '')) = 'opened'
-          AND lower(COALESCE(processing_status, '')) NOT IN ('unauthorized', 'ignored', 'unmatched', 'error')
         """,
         (clean_property_id,),
     ).fetchone()
@@ -42308,11 +42505,10 @@ def bulk_property_activity_counts_for_new_records(db, rows):
         for row in db.execute(
             f"""
             SELECT property_id,
-                   COUNT(DISTINCT COALESCE(NULLIF(contact_email, ''), event_key)) AS opened_count
-            FROM emailoctopus_webhook_events
+                   COUNT(DISTINCT contact_key) AS opened_count
+            FROM emailoctopus_engagement_daily
             WHERE property_id IN ({placeholders})
               AND lower(COALESCE(event_action, '')) = 'opened'
-              AND lower(COALESCE(processing_status, '')) NOT IN ('unauthorized', 'ignored', 'unmatched', 'error')
             GROUP BY property_id
             """,
             tuple(chunk),
@@ -50378,22 +50574,22 @@ def get_email_click_engagement_rows(db, filters=None):
     date_from = _email_clicks_date_bound(filters.get("date_from"), end_of_day=False)
     date_to = _email_clicks_date_bound(filters.get("date_to"), end_of_day=True)
     where = [
-        "(lower(COALESCE(e.event_action, '')) = 'clicked' OR lower(COALESCE(e.event_type, '')) LIKE '%click%')",
-        "COALESCE(e.property_id, 0) > 0",
+        "lower(COALESCE(d.event_action, '')) = 'clicked'",
+        "COALESCE(d.property_id, 0) > 0",
     ]
     params = []
     if date_from:
-        where.append("datetime(COALESCE(NULLIF(e.occurred_at, ''), e.received_at)) >= datetime(?)")
+        where.append("datetime(d.event_date || ' 00:00:00') >= datetime(?)")
         params.append(date_from)
     if date_to:
-        where.append("datetime(COALESCE(NULLIF(e.occurred_at, ''), e.received_at)) <= datetime(?)")
+        where.append("datetime(d.event_date || ' 23:59:59') <= datetime(?)")
         params.append(date_to)
     if search:
         like = f"%{search.lower()}%"
         where.append(
             """
             (
-                lower(COALESCE(e.contact_email, '')) LIKE ?
+                lower(COALESCE(d.contact_email, '')) LIKE ?
              OR lower(COALESCE(pe.first_name, '') || ' ' || COALESCE(pe.last_name, '')) LIKE ?
              OR lower(COALESCE(a.street, '') || ' ' || COALESCE(a.city, '') || ' ' || COALESCE(a.postal_code, '')) LIKE ?
             )
@@ -50402,12 +50598,12 @@ def get_email_click_engagement_rows(db, filters=None):
         params.extend([like, like, like])
     query = f"""
         SELECT
-            COALESCE(NULLIF(e.contact_id, ''), NULLIF(e.contact_email, ''), 'event:' || e.id) AS contact_key,
-            e.contact_email,
-            e.contact_id,
-            e.property_id,
-            e.person_id,
-            COALESCE(NULLIF(e.reisift_property_uuid, ''), NULLIF(p.reisift_property_uuid, '')) AS reisift_property_uuid,
+            d.contact_key,
+            d.contact_email,
+            d.contact_id,
+            d.property_id,
+            d.person_id,
+            NULLIF(p.reisift_property_uuid, '') AS reisift_property_uuid,
             pe.first_name,
             pe.middle_name,
             pe.last_name,
@@ -50417,15 +50613,15 @@ def get_email_click_engagement_rows(db, filters=None):
             a.city,
             a.state,
             a.postal_code,
-            COUNT(*) AS click_count,
-            MIN(datetime(COALESCE(NULLIF(e.occurred_at, ''), e.received_at))) AS first_click_at,
-            MAX(datetime(COALESCE(NULLIF(e.occurred_at, ''), e.received_at))) AS last_click_at,
+            SUM(d.event_count) AS click_count,
+            MIN(d.first_occurred_at) AS first_click_at,
+            MAX(d.last_occurred_at) AS last_click_at,
             (
                 SELECT GROUP_CONCAT(value, ', ')
                 FROM (
                     SELECT t.value
                     FROM touchpoints t
-                    WHERE t.person_id = e.person_id
+                    WHERE t.person_id = d.person_id
                       AND lower(COALESCE(t.channel_type, '')) = 'phone'
                       AND COALESCE(t.value, '') <> ''
                     GROUP BY t.value
@@ -50438,7 +50634,7 @@ def get_email_click_engagement_rows(db, filters=None):
                 FROM (
                     SELECT t.value
                     FROM touchpoints t
-                    WHERE t.person_id = e.person_id
+                    WHERE t.person_id = d.person_id
                       AND lower(COALESCE(t.channel_type, '')) = 'email'
                       AND COALESCE(t.value, '') <> ''
                     GROUP BY t.value
@@ -50446,17 +50642,17 @@ def get_email_click_engagement_rows(db, filters=None):
                     LIMIT 5
                 )
             ) AS emails
-        FROM emailoctopus_webhook_events e
-        LEFT JOIN people pe ON pe.id = e.person_id
-        LEFT JOIN properties p ON p.id = e.property_id
+        FROM emailoctopus_engagement_daily d
+        LEFT JOIN people pe ON pe.id = d.person_id
+        LEFT JOIN properties p ON p.id = d.property_id
         LEFT JOIN addresses a ON a.id = p.property_address_id
         WHERE {" AND ".join(where)}
-        GROUP BY contact_key,
-                 e.contact_email,
-                 e.contact_id,
-                 e.property_id,
-                 e.person_id,
-                 COALESCE(NULLIF(e.reisift_property_uuid, ''), NULLIF(p.reisift_property_uuid, '')),
+        GROUP BY d.contact_key,
+                 d.contact_email,
+                 d.contact_id,
+                 d.property_id,
+                 d.person_id,
+                 NULLIF(p.reisift_property_uuid, ''),
                  pe.first_name,
                  pe.middle_name,
                  pe.last_name,
@@ -50466,8 +50662,8 @@ def get_email_click_engagement_rows(db, filters=None):
                  a.city,
                  a.state,
                  a.postal_code
-        HAVING COUNT(*) >= ?
-        ORDER BY click_count DESC, last_click_at DESC, e.property_id DESC
+        HAVING SUM(d.event_count) >= ?
+        ORDER BY click_count DESC, last_click_at DESC, d.property_id DESC
     """
     rows = db.execute(query, (*params, min_clicks)).fetchall()
     output = []
@@ -51823,13 +52019,10 @@ def get_sms_automation_queue_rows(db, filters=None):
             clauses.append("lower(trim(COALESCE(t.status, ''))) NOT IN ('correct', 'verified')")
     email_clicked_filter = (filters.get("email_clicked") or "").strip().lower()
     email_click_count_sql = """
-        SELECT COUNT(*)
-        FROM emailoctopus_webhook_events e
+        SELECT COALESCE(SUM(e.event_count), 0)
+        FROM emailoctopus_engagement_daily e
         WHERE e.property_id = q.property_id
-          AND (
-              lower(COALESCE(e.event_action, '')) = 'clicked'
-              OR lower(COALESCE(e.event_type, '')) LIKE '%click%'
-          )
+          AND lower(COALESCE(e.event_action, '')) = 'clicked'
     """
     if email_clicked_filter == "yes":
         clauses.append(f"({email_click_count_sql}) > 0")

@@ -59,6 +59,22 @@ class EmailOctopusEngagementTests(unittest.TestCase):
                 engagement_id INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE emailoctopus_webhook_events (
+                id INTEGER PRIMARY KEY,
+                event_key TEXT,
+                event_action TEXT,
+                contact_id TEXT,
+                contact_email TEXT,
+                campaign_id TEXT,
+                occurred_at TEXT,
+                property_id INTEGER,
+                person_id INTEGER
+            );
+            CREATE TABLE app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT
+            );
             """
         )
         self.db.execute(
@@ -104,6 +120,22 @@ class EmailOctopusEngagementTests(unittest.TestCase):
         self.assertEqual(len(report), 1)
         self.assertEqual(report[0]["clicks"], 3)
         self.assertEqual(report[0]["email"], "jane@example.com")
+
+    def test_one_time_backfill_marks_completion_after_retained_events(self):
+        self.db.execute(
+            """
+            INSERT INTO emailoctopus_webhook_events (
+                id, event_key, event_action, contact_id, contact_email, campaign_id,
+                occurred_at, property_id, person_id
+            ) VALUES (1, 'historic-click', 'clicked', 'contact-1', 'jane@example.com', 'campaign-a',
+                      '2026-09-15T13:00:00Z', 1, 1)
+            """
+        )
+
+        result = app.ensure_emailoctopus_engagement_history_backfilled(self.db)
+        self.assertEqual(result["recorded"], 1)
+        self.assertEqual(app.get_setting(self.db, "emailoctopus_engagement_history_backfill_v1"), "complete")
+        self.assertEqual(app.ensure_emailoctopus_engagement_history_backfilled(self.db)["skipped"], "already_complete")
 
 
 if __name__ == "__main__":

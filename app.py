@@ -3474,6 +3474,10 @@ def ensure_db(force=False):
             except Exception as exc:
                 log_app_error(db, "sms_delivery_classification_backfill", str(exc), status_code=500)
             try:
+                ensure_emailoctopus_engagement_history_backfilled(db)
+            except Exception as exc:
+                log_app_error(db, "emailoctopus_engagement_history_backfill", str(exc), status_code=500)
+            try:
                 ensure_prospect_table_cache_seeded(db)
             except Exception:
                 pass
@@ -21008,6 +21012,16 @@ def backfill_emailoctopus_engagement_history(db, batch_size=500, max_batches=100
             complete = True
             break
     return {"scanned": scanned, "recorded": recorded, "skipped": skipped, "complete": complete}
+
+
+def ensure_emailoctopus_engagement_history_backfilled(db):
+    """Run the raw-event migration once; future webhook events roll up live."""
+    if get_setting(db, "emailoctopus_engagement_history_backfill_v1", "") == "complete":
+        return {"skipped": "already_complete"}
+    result = backfill_emailoctopus_engagement_history(db)
+    if result.get("complete"):
+        set_setting(db, "emailoctopus_engagement_history_backfill_v1", "complete")
+    return result
 
 
 def _emailoctopus_reisift_note(action, emails, event_fields):

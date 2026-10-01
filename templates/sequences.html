@@ -356,10 +356,13 @@ document.getElementById('previewProofsBtn')?.addEventListener('click', async () 
       return `
         <section class="panel" style="margin-top:0.8rem;">
           <h4>Mail Step ${esc(String(step.step_order))}: ${esc(step.template_label || `Template ${step.template_id || ''}`)}</h4>
-          <p class="muted-text">Scheduled ${esc(String(step.delay_hours))} hours after enrollment.</p>
+          <p class="muted-text">Wait ${esc(String(step.delay_hours))} hours after the prior step succeeds.</p>
           ${step.error ? `<div class="error-banner">${esc(step.error)}</div>` : ''}
           ${successful.map(proofMediaHtml).join('')}
-          ${failures.map((proof) => `<div class="error-banner">${esc(proof.error || 'OLC proof generation failed')}</div>`).join('')}
+          ${failures.map((proof) => `
+            <div class="error-banner">${esc(proof.error || 'OLC proof generation failed')}</div>
+            <details><summary>View OLC proof response</summary><pre class="json-block">${esc(JSON.stringify(proof.response || {}, null, 2))}</pre></details>
+          `).join('')}
         </section>
       `;
     }).join('');

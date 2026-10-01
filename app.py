@@ -7070,6 +7070,20 @@ def view_openletterconnect_proofs(order_payload, db=None):
         letter_urls = list(dict.fromkeys(letter_urls))
         pdf_urls = list(dict.fromkeys(pdf_urls))
 
+        if not image_urls and not pdf_urls:
+            proofs.append(
+                {
+                    "index": idx,
+                    "contact": contact,
+                    "ok": False,
+                    "error": "OLC returned no displayable proof image or PDF",
+                    "response": pblob,
+                    "debug_entries": debug_entries[:25],
+                    "request_payload": proof_payload,
+                }
+            )
+            continue
+
         proofs.append(
             {
                 "index": idx,

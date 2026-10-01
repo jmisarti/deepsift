@@ -22,7 +22,7 @@
         <label class="inline-check"><input type="checkbox" name="stop_on_reply" value="1" checked><span>Stop on reply</span></label>
         <div class="span2">
             <table class="crm-table" id="newCampaignSteps">
-                <thead><tr><th>Order</th><th>Delay Hours</th><th>Channel</th><th>Subject (Email Only)</th><th>Mail Template (Mail Only)</th><th>Body / Recording / Note</th><th></th></tr></thead>
+                <thead><tr><th>Order</th><th>Wait After Prior Step (Hours)</th><th>Channel</th><th>Subject (Email Only)</th><th>Mail Template (Mail Only)</th><th>Body / Recording / Note</th><th></th></tr></thead>
                 <tbody>
                     <tr>
                         <td><input name="new_step_order[]" type="number" min="1" value="1"></td>
@@ -95,7 +95,7 @@
                 <label class="inline-check"><input type="checkbox" name="stop_on_reply" value="1" {% if row.campaign.stop_on_reply %}checked{% endif %}><span>Stop on reply</span></label>
                 <div class="span2">
                     <table class="crm-table campaign-steps-table" id="campaignSteps{{ row.campaign.id }}">
-                        <thead><tr><th>Order</th><th>Delay Hours</th><th>Channel</th><th>Subject (Email Only)</th><th>Mail Template (Mail Only)</th><th>Body / Recording / Note</th><th></th></tr></thead>
+                        <thead><tr><th>Order</th><th>Wait After Prior Step (Hours)</th><th>Channel</th><th>Subject (Email Only)</th><th>Mail Template (Mail Only)</th><th>Body / Recording / Note</th><th></th></tr></thead>
                         <tbody>
                             {% for s in row.steps %}
                             <tr>
@@ -135,7 +135,7 @@
 
 <section class="panel">
     <h3>Preview Render And OLC Proofs</h3>
-    <p class="muted-text">Select a saved sequence, property, and recipient. <strong>Generate OLC Proofs</strong> renders the actual mail pieces only; it never places an order or creates a charge.</p>
+    <p class="muted-text">Each step's wait starts when the prior step succeeds; the first step starts at enrollment. Select a saved sequence, property, and recipient. <strong>Generate OLC Proofs</strong> renders the actual mail pieces only; it never places an order or creates a charge.</p>
     <div class="grid-form compact">
         <label>Campaign
             <select id="previewCampaignId">
@@ -319,7 +319,8 @@ document.getElementById('previewRenderBtn')?.addEventListener('click', async () 
 });
 
 function proofMediaHtml(proof){
-  const images = [...(proof.envelope_urls || []), ...(proof.letter_urls || proof.image_urls || [])];
+  // OLC may mix specifically labeled and generic image URLs in the same proof response.
+  const images = [...new Set([...(proof.image_urls || []), ...(proof.letter_urls || []), ...(proof.envelope_urls || [])])];
   const pdfs = proof.pdf_urls || [];
   if (!images.length && !pdfs.length) return '<p class="muted-text">OLC did not return a displayable image or PDF for this recipient.</p>';
   return `
@@ -366,6 +367,7 @@ document.getElementById('previewProofsBtn')?.addEventListener('click', async () 
       <p><strong>Sample recipient:</strong> ${esc(data.person?.name || '')} at ${esc(data.mail_target || '')}<br>
       <strong>Property:</strong> ${esc(data.property?.address || '')}</p>
       <p class="muted-text">These are OLC proofs only. No mail has been ordered.</p>
+      <details><summary>View values sent to OLC</summary><pre class="json-block">${esc(JSON.stringify(data.mail_merge_data || {}, null, 2))}</pre></details>
       ${stepsHtml || '<div class="error-banner">This sequence has no MAIL steps to proof.</div>'}
     `;
   } catch (_e) {

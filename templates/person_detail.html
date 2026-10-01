@@ -558,8 +558,10 @@ function personProofImagesHtml(proofs) {
       ${ok.map((p, idx) => {
         const c = p.contact || {};
         const label = `${c.firstName || ''} ${c.lastName || ''}`.trim() || `Recipient ${idx + 1}`;
-        const envelope = (p.envelope_urls || []).map((u) => `<img src="${esc(u)}" alt="Envelope proof ${esc(label)}">`).join('');
-        const letter = (p.letter_urls || p.image_urls || []).map((u) => `<img src="${esc(u)}" alt="Letter proof ${esc(label)}">`).join('');
+        const envelopeUrls = [...new Set(p.envelope_urls || [])];
+        const allImageUrls = [...new Set([...(p.image_urls || []), ...(p.letter_urls || []), ...envelopeUrls])];
+        const envelope = envelopeUrls.map((u) => `<img src="${esc(u)}" alt="Envelope proof ${esc(label)}">`).join('');
+        const letter = allImageUrls.filter((u) => !envelopeUrls.includes(u)).map((u) => `<img src="${esc(u)}" alt="Letter proof ${esc(label)}">`).join('');
         const pdfs = (p.pdf_urls || []).map((u) => `<a href="${esc(u)}" target="_blank">PDF Proof</a>`).join(' ');
         const pdfPreviews = (p.pdf_urls || []).map((u) => `<iframe class="proof-pdf-frame" src="${esc(u)}"></iframe>`).join('');
         const debug = (p.debug_entries || []).map((d) => `<tr><td>${esc(d.path || '')}</td><td>${esc(d.url || '')}</td></tr>`).join('');

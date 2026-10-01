@@ -55852,6 +55852,11 @@ def preview_sequence_mail_proofs(campaign_id):
                 "address": f"{prop['street']}, {prop['city']}, {prop['state']} {prop['postal_code']}".strip(),
             },
             "mail_target": format_sequence_mail_target(contact),
+            "mail_merge_data": {
+                key: value
+                for key, value in contact.items()
+                if key != "meta_data"
+            },
             "steps": rendered_steps,
         }
     )

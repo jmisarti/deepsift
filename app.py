@@ -6842,6 +6842,9 @@ def build_openletterconnect_order_payload(db, contacts, property_row, template_i
     sender_website = dm["sender_website"] or os.getenv("DM_SENDER_WEBSITE", "").strip()
     postage_type = dm["postage_type"] or os.getenv("DM_POSTAGE_TYPE", "").strip()
     envelope_type = dm["envelope_type"] or os.getenv("DM_ENVELOPE_TYPE", "").strip()
+    ros_offer_percentage = normalize_ros_offer_percentage(
+        dm.get("ros_offer_percentage") or os.getenv("DM_ROS_OFFER_PERCENTAGE", "60")
+    )
     product_id = resolve_openletterconnect_product_id(
         template_data,
         preferred_postage_type=postage_type,
@@ -6893,6 +6896,9 @@ def build_openletterconnect_order_payload(db, contacts, property_row, template_i
         "productId": product_id,
         "contacts": contacts_for_payload,
     }
+    # OLC only requires this input for templates containing ROS merge fields.
+    if template_uses_ros_offer(template_data):
+        payload["rosOfferPercentage"] = ros_offer_percentage
 
     if any([sender_first, sender_last, sender_company, sender_address1, sender_address2, sender_city, sender_state, sender_zip, sender_phone, sender_email, sender_website]):
         account_name = " ".join([x for x in [sender_first, sender_last] if (x or "").strip()]).strip()
@@ -12276,7 +12282,28 @@ def get_direct_mail_settings(db):
         "sender_website": get_setting(db, "dm_sender_website", ""),
         "postage_type": get_setting(db, "dm_postage_type", ""),
         "envelope_type": get_setting(db, "dm_envelope_type", ""),
+        "ros_offer_percentage": normalize_ros_offer_percentage(
+            get_setting(db, "dm_ros_offer_percentage", "60")
+        ),
     }
+
+
+def normalize_ros_offer_percentage(value):
+    """Return OLC's required 0-100 ROS offer percentage as an integer."""
+    try:
+        percentage = int(str(value).strip())
+    except (TypeError, ValueError):
+        return 60
+    return percentage if 0 <= percentage <= 100 else 60
+
+
+def template_uses_ros_offer(template_data):
+    """Only send ROS settings to templates that include OLC ROS merge fields."""
+    try:
+        template_text = json.dumps(template_data or {}, ensure_ascii=True).upper()
+    except (TypeError, ValueError):
+        return False
+    return "ROS.WRITTEN_OFFER" in template_text or "ROS.PROPERTY_OFFER" in template_text
 
 
 def get_direct_mail_template_id(db):
@@ -55117,6 +55144,9 @@ def settings_page():
                 "dm_sender_website": request.form.get("dm_sender_website", ""),
                 "dm_postage_type": postage_value,
                 "dm_envelope_type": envelope_value,
+                "dm_ros_offer_percentage": str(
+                    normalize_ros_offer_percentage(request.form.get("dm_ros_offer_percentage", "60"))
+                ),
             }
             for key, value in fields.items():
                 set_setting(db, key, value)

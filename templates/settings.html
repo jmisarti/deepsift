@@ -36,6 +36,9 @@
             <label>Phone <input name="dm_sender_phone" value="{{ dm.sender_phone }}"></label>
             <label>Email <input name="dm_sender_email" value="{{ dm.sender_email }}"></label>
             <label>Website <input name="dm_sender_website" value="{{ dm.sender_website }}"></label>
+            <label>ROS Offer Percentage
+                <input type="number" name="dm_ros_offer_percentage" value="{{ dm.ros_offer_percentage }}" min="0" max="100" step="1" required>
+            </label>
             <label>Postage Type
                 <select name="dm_postage_type">
                     <option value="">Use Template Default</option>

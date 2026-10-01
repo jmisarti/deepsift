@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="cards page-summary-cards">
+    <article><h3>Matching Activity</h3><p>{{ summary.total_count }}</p></article>
+    <article><h3>Queued Steps</h3><p>{{ summary.queued_count }}</p></article>
+</section>
+
+<section class="panel">
+    <h2>Mail Activity</h2>
+    <p class="help-text">OLC orders show their latest provider status. Sequence Queue rows are future mail-only steps that have not yet run. Canceled is a review state, not a bad-address finding.</p>
+    <form method="get" class="panel-actions inline-form">
+        <label>Status
+            <select name="status" onchange="this.form.submit()">
+                {% for option in status_filters %}
+                <option value="{{ option }}" {% if status_filter == option %}selected{% endif %}>{{ option.replace('_', ' ')|title }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <button type="submit">Filter</button>
+        {% if status_filter != 'all' %}<a class="button-link" href="{{ url_for('mail_activity_page') }}">Clear</a>{% endif %}
+    </form>
+</section>
+
+<section class="panel">
+    <div class="sms-queue-table-wrap">
+        <table class="crm-table sms-queue-table">
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>Type</th>
+                    <th>Property</th>
+                    <th>Person</th>
+                    <th>Property Status</th>
+                    <th>Campaign / Mode</th>
+                    <th>OLC Order</th>
+                    <th>Scheduled / Updated</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr>
+                    <td><span class="status-pill {{ row.status|lower|replace(' ', '-') }}">{{ row.status }}</span></td>
+                    <td>{{ row.kind }}</td>
+                    <td>{% if row.property_id %}<a href="{{ url_for('property_detail', property_id=row.property_id) }}">{{ row.property_address or ('Property #' ~ row.property_id) }}</a>{% else %}{{ row.property_address or 'Unavailable' }}{% endif %}</td>
+                    <td>{% if row.person_id %}<a href="{{ url_for('person_detail', person_id=row.person_id, property_id=row.property_id) }}">{{ row.person_name or ('Person #' ~ row.person_id) }}</a>{% else %}{{ row.person_name or '' }}{% endif %}</td>
+                    <td>{{ row.property_status }}</td>
+                    <td>{{ row.campaign_name }}</td>
+                    <td>{% if row.external_order_id %}{{ row.external_order_id }}{% if row.external_order_item_id %} / {{ row.external_order_item_id }}{% endif %}{% endif %}</td>
+                    <td>{{ row.scheduled_for or row.occurred_at }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="8">No mail activity matches this filter.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% if pagination.total_pages > 1 %}
+    <div class="panel-actions" style="margin-top: 0.8rem;">
+        {% if pagination.has_prev %}<a class="button-link" href="{{ url_for('mail_activity_page', status=status_filter, page=pagination.page - 1) }}">Previous 200</a>{% endif %}
+        <span>{{ pagination.total_count }} total rows</span>
+        {% if pagination.has_next %}<a class="button-link" href="{{ url_for('mail_activity_page', status=status_filter, page=pagination.page + 1) }}">Next 200</a>{% endif %}
+    </div>
+    {% endif %}
+</section>
+{% endblock %}

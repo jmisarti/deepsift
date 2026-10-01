@@ -50243,6 +50243,133 @@ def new_records_page():
     )
 
 
+MAIL_ACTIVITY_STATUS_FILTERS = (
+    "all",
+    "queued",
+    "pending",
+    "mailed",
+    "in transit",
+    "delivered",
+    "canceled",
+    "bad address",
+)
+
+
+def get_mail_activity_rows(db, status_filter="all"):
+    """Return property-level OLC orders plus future mail-only sequence work."""
+    rows = []
+    order_rows = db.execute(
+        """
+        SELECT m.id, m.property_id, m.person_id, m.external_order_id, m.external_order_item_id,
+               m.status, m.status_updated_at, m.created_at, m.mode,
+               p.status AS property_status, a.street, a.city, a.state, a.postal_code,
+               person.first_name, person.last_name
+        FROM mail_orders m
+        LEFT JOIN properties p ON p.id = m.property_id
+        LEFT JOIN addresses a ON a.id = p.property_address_id
+        LEFT JOIN people person ON person.id = m.person_id
+        ORDER BY COALESCE(m.status_updated_at, m.created_at) DESC, m.id DESC
+        """
+    ).fetchall()
+    for row in order_rows:
+        status = _normalize_openletterconnect_status(row["status"] or "Pending")
+        rows.append(
+            {
+                "kind": "OLC Order",
+                "status": status,
+                "property_id": row["property_id"],
+                "person_id": row["person_id"],
+                "property_address": format_property_address_line(
+                    row["street"] or "", row["city"] or "", row["state"] or "", row["postal_code"] or ""
+                ),
+                "person_name": " ".join(
+                    part for part in [str(row["first_name"] or "").strip(), str(row["last_name"] or "").strip()] if part
+                ),
+                "property_status": row["property_status"] or "",
+                "external_order_id": row["external_order_id"] or "",
+                "external_order_item_id": row["external_order_item_id"] or "",
+                "campaign_name": row["mode"] or "",
+                "scheduled_for": "",
+                "occurred_at": row["status_updated_at"] or row["created_at"] or "",
+            }
+        )
+
+    mail_campaign_ids = [int(row["id"]) for row in get_mail_only_sequence_campaigns(db, only_active=True)]
+    if mail_campaign_ids:
+        placeholders = ",".join("?" for _ in mail_campaign_ids)
+        queued_rows = db.execute(
+            f"""
+            SELECT e.id, e.property_id, e.person_id, e.next_run_at, e.started_at,
+                   c.name AS campaign_name, p.status AS property_status,
+                   a.street, a.city, a.state, a.postal_code, person.first_name, person.last_name
+            FROM sequence_enrollments e
+            JOIN sequence_campaigns c ON c.id = e.campaign_id
+            LEFT JOIN properties p ON p.id = e.property_id
+            LEFT JOIN addresses a ON a.id = p.property_address_id
+            LEFT JOIN people person ON person.id = e.person_id
+            WHERE e.status = 'Active' AND e.campaign_id IN ({placeholders})
+            ORDER BY e.next_run_at ASC, e.id ASC
+            """,
+            tuple(mail_campaign_ids),
+        ).fetchall()
+        for row in queued_rows:
+            rows.append(
+                {
+                    "kind": "Sequence Queue",
+                    "status": "Queued",
+                    "property_id": row["property_id"],
+                    "person_id": row["person_id"],
+                    "property_address": format_property_address_line(
+                        row["street"] or "", row["city"] or "", row["state"] or "", row["postal_code"] or ""
+                    ),
+                    "person_name": " ".join(
+                        part for part in [str(row["first_name"] or "").strip(), str(row["last_name"] or "").strip()] if part
+                    ),
+                    "property_status": row["property_status"] or "",
+                    "external_order_id": "",
+                    "external_order_item_id": "",
+                    "campaign_name": row["campaign_name"] or "",
+                    "scheduled_for": row["next_run_at"] or "",
+                    "occurred_at": row["next_run_at"] or row["started_at"] or "",
+                }
+            )
+
+    selected = str(status_filter or "all").strip().lower()
+    if selected != "all":
+        rows = [row for row in rows if row["status"].lower() == selected]
+    rows.sort(key=lambda row: (str(row["occurred_at"] or ""), str(row["external_order_id"] or "")), reverse=True)
+    return rows
+
+
+@app.route("/mail-activity")
+def mail_activity_page():
+    ensure_db()
+    db = get_db()
+    status_filter = (request.args.get("status") or "all").strip().lower()
+    if status_filter not in MAIL_ACTIVITY_STATUS_FILTERS:
+        status_filter = "all"
+    all_rows = get_mail_activity_rows(db, status_filter=status_filter)
+    page = max(1, _safe_int(request.args.get("page"), 1))
+    per_page = 200
+    total_count = len(all_rows)
+    total_pages = max(1, math.ceil(total_count / per_page)) if total_count else 1
+    page = min(page, total_pages)
+    return render_template(
+        "mail_activity.html",
+        rows=all_rows[(page - 1) * per_page : page * per_page],
+        status_filter=status_filter,
+        status_filters=MAIL_ACTIVITY_STATUS_FILTERS,
+        summary={"total_count": total_count, "queued_count": sum(1 for row in all_rows if row["status"] == "Queued")},
+        pagination={
+            "page": page,
+            "total_pages": total_pages,
+            "total_count": total_count,
+            "has_prev": page > 1,
+            "has_next": page < total_pages,
+        },
+    )
+
+
 @app.route("/mail-campaigns")
 def mail_campaigns_page():
     ensure_db()
@@ -60977,6 +61104,12 @@ def _normalize_openletterconnect_status(raw_status, event_type=""):
         return "Delivered"
     if "in transit" in lower or "re-routed" in lower or "rerouted" in lower:
         return "In Transit"
+    # A cancellation does not establish that the mailing address is invalid.
+    # Keep it reviewable without suppressing the address from future mail.
+    if "canceled" in lower or "cancelled" in lower:
+        if any(token in lower for token in ("bad address", "undeliverable", "return to sender", "nixie", "rts")):
+            return "Bad Address"
+        return "Canceled"
     if (
         "returned" in lower
         or "return to sender" in lower
@@ -60985,7 +61118,6 @@ def _normalize_openletterconnect_status(raw_status, event_type=""):
         or "failed" in lower
         or "bad address" in lower
         or "undeliverable" in lower
-        or "canceled" in lower
     ):
         return "Bad Address"
     if "processing" in lower or "not mailed" in lower or "pending" in lower or "created" in lower or "submitted" in lower or "queued" in lower:

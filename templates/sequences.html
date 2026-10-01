@@ -373,7 +373,7 @@ document.getElementById('previewProofsBtn')?.addEventListener('click', async () 
       <p><strong>Sample recipient:</strong> ${esc(data.person?.name || '')} at ${esc(data.mail_target || '')}<br>
       <strong>Property:</strong> ${esc(data.property?.address || '')}</p>
       <p class="muted-text">These are OLC proofs only. No mail has been ordered.</p>
-      <details><summary>View values sent to OLC</summary><pre class="json-block">${esc(JSON.stringify(data.mail_merge_data || {}, null, 2))}</pre></details>
+      <details><summary>View exact contact payload sent to OLC</summary><pre class="json-block">${esc(JSON.stringify(data.olc_contact_payload || {}, null, 2))}</pre></details>
       ${stepsHtml || '<div class="error-banner">This sequence has no MAIL steps to proof.</div>'}
     `;
   } catch (_e) {

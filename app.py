@@ -55835,6 +55835,7 @@ def preview_sequence_mail_proofs(campaign_id):
         return jsonify({"error": "This sequence has no MAIL steps to proof"}), 400
 
     rendered_steps = []
+    olc_contact_payload = {}
     for step in mail_steps:
         template_id = resolve_direct_mail_template_id(db, step["mail_template_id"])
         try:
@@ -55845,6 +55846,9 @@ def preview_sequence_mail_proofs(campaign_id):
                 template_id=template_id,
                 mode="sequence-proof-preview",
             )
+            contacts = built["payload"].get("contacts") if isinstance(built.get("payload"), dict) else []
+            if not olc_contact_payload and isinstance(contacts, list) and isinstance(contacts[0] if contacts else None, dict):
+                olc_contact_payload = contacts[0]
             rendered_steps.append(
                 {
                     "step_order": step["step_order"],
@@ -55876,11 +55880,7 @@ def preview_sequence_mail_proofs(campaign_id):
                 "address": f"{prop['street']}, {prop['city']}, {prop['state']} {prop['postal_code']}".strip(),
             },
             "mail_target": format_sequence_mail_target(contact),
-            "mail_merge_data": {
-                key: value
-                for key, value in contact.items()
-                if key != "meta_data"
-            },
+            "olc_contact_payload": olc_contact_payload,
             "steps": rendered_steps,
         }
     )

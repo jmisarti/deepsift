@@ -328,7 +328,10 @@ function proofMediaHtml(proof){
       ${images.map((url) => `<img src="${esc(url)}" alt="OpenLetterConnect proof">`).join('')}
       ${pdfs.map((url) => `<iframe class="proof-pdf-frame" src="${esc(url)}" title="OpenLetterConnect PDF proof"></iframe>`).join('')}
     </div>
-    ${pdfs.map((url) => `<a href="${esc(url)}" target="_blank" rel="noopener">Open PDF proof</a>`).join(' ')}
+    ${pdfs.map((url) => String(url).startsWith('data:application/pdf')
+      ? '<span class="muted-text">Embedded PDF shown above. Use the PDF viewer controls to save it.</span>'
+      : `<a href="${esc(url)}" target="_blank" rel="noopener">Open PDF proof</a>`
+    ).join(' ')}
   `;
 }
 

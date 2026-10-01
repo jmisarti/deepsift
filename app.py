@@ -135,6 +135,16 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = env_flag("SESSION_COOKIE_SECURE", False)
 
+
+@app.after_request
+def prevent_stale_html_cache(response):
+    """Dynamic screens include inline workflow controls and must not be browser-cached."""
+    if request.method == "GET" and response.mimetype == "text/html":
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 SMRTPHONE_SEND_URL = os.getenv("SMRTPHONE_SEND_URL", "https://phone.smrt.studio/sms/send").strip()
 SMRTPHONE_API_KEY = os.getenv("SMRTPHONE_API_KEY", "").strip()
 SMRTPHONE_FROM_NUMBER = os.getenv("SMRTPHONE_FROM_NUMBER", "19088679098").strip() or "19088679098"

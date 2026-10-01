@@ -723,8 +723,9 @@ function previewImagesHtml(meta, proofs, compact=false) {
           const allImageUrls = [...new Set([...(p.image_urls || []), ...(p.letter_urls || []), ...envelopeUrls])];
           const envelope = envelopeUrls.map((u) => `<img src="${esc(u)}" alt="Envelope proof ${esc(label)}">`).join('');
           const letter = allImageUrls.filter((u) => !envelopeUrls.includes(u)).map((u) => `<img src="${esc(u)}" alt="Letter proof ${esc(label)}">`).join('');
-          const pdfs = (p.pdf_urls || []).map((u) => `<a href="${esc(u)}" target="_blank">PDF Proof</a>`).join(' ');
-          const pdfPreviews = (p.pdf_urls || []).map((u) => `<iframe class="proof-pdf-frame" src="${esc(u)}"></iframe>`).join('');
+          const pdfUrls = p.pdf_urls || [];
+          const pdfs = pdfUrls.map((u) => String(u).startsWith('data:application/pdf') ? '<span class="muted-text">Embedded PDF shown below</span>' : `<a href="${esc(u)}" target="_blank" rel="noopener">PDF Proof</a>`).join(' ');
+          const pdfPreviews = pdfUrls.map((u) => `<iframe class="proof-pdf-frame" src="${esc(u)}" title="OpenLetterConnect PDF proof"></iframe>`).join('');
           const debug = (p.debug_entries || []).map((d) => `<tr><td>${esc(d.path || '')}</td><td>${esc(d.url || '')}</td></tr>`).join('');
           return `<div class="proof-item">
             <div class="proof-title">${esc(label)}</div>

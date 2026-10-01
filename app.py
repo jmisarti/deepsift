@@ -50573,9 +50573,9 @@ def broken_reisift_uuids_page():
     rows = db.execute(
         """
         SELECT s.property_id,
-               COALESCE(NULLIF(s.property_uuid, ''), NULLIF(p.reisift_property_uuid, '')) AS stored_uuid,
-               s.baseline_error,
-               s.updated_at,
+               COALESCE(NULLIF(q.property_uuid, ''), NULLIF(s.property_uuid, ''), NULLIF(p.reisift_property_uuid, '')) AS stored_uuid,
+               COALESCE(NULLIF(s.baseline_error, ''), NULLIF(q.last_error, '')) AS baseline_error,
+               COALESCE(q.updated_at, s.updated_at) AS updated_at,
                p.status AS local_status,
                a.street,
                a.city,
@@ -50584,13 +50584,23 @@ def broken_reisift_uuids_page():
         FROM sms_property_attempt_state s
         JOIN properties p ON p.id = s.property_id
         LEFT JOIN addresses a ON a.id = p.property_address_id
-        WHERE s.baseline_status = 'Retry'
-          AND (
-              lower(COALESCE(s.baseline_error, '')) LIKE '%404%'
-              OR lower(COALESCE(s.baseline_error, '')) LIKE '%missing_reisift_property_uuid%'
-              OR COALESCE(NULLIF(s.property_uuid, ''), NULLIF(p.reisift_property_uuid, '')) IS NULL
-          )
-        ORDER BY s.updated_at DESC, s.property_id DESC
+        LEFT JOIN reisift_sms_attempt_sync_queue q ON q.property_id = s.property_id
+        WHERE (
+                s.baseline_status = 'Retry'
+            AND (
+                    lower(COALESCE(s.baseline_error, '')) LIKE '%404%'
+                 OR lower(COALESCE(s.baseline_error, '')) LIKE '%missing_reisift_property_uuid%'
+                 OR COALESCE(NULLIF(s.property_uuid, ''), NULLIF(p.reisift_property_uuid, '')) IS NULL
+            )
+        ) OR (
+                q.queue_status IN ('Retry', 'BrokenUUID')
+            AND (
+                    lower(COALESCE(q.last_error, '')) LIKE '%404%'
+                 OR lower(COALESCE(q.last_error, '')) LIKE '%missing_reisift_property_uuid%'
+                 OR COALESCE(NULLIF(q.property_uuid, ''), NULLIF(s.property_uuid, ''), NULLIF(p.reisift_property_uuid, '')) IS NULL
+            )
+        )
+        ORDER BY COALESCE(q.updated_at, s.updated_at) DESC, s.property_id DESC
         """
     ).fetchall()
     return render_template(
@@ -51270,6 +51280,13 @@ def sms_attempt_sync_window_is_open(now=None):
     )
 
 
+def reisift_sms_attempt_error_is_broken_uuid(error):
+    text = str(error or "").strip().lower()
+    if "missing_reisift_property_uuid" in text:
+        return True
+    return "404" in text and "/api/internal/property/" in text
+
+
 def _sms_attempt_property_uuid(db, property_id):
     return normalize_uuid(_get_local_property_uuid(db, property_id) or "")
 
@@ -51671,8 +51688,8 @@ def run_reisift_sms_attempt_sync_once(limit=25, now=None):
             desired = int(job["baseline_attempts"] or 0) + int(job["completed_wave_count"] or 0)
             if not property_uuid:
                 db.execute(
-                    "UPDATE reisift_sms_attempt_sync_queue SET queue_status = 'Retry', attempts = attempts + 1, last_error = ?, run_after = ?, updated_at = CURRENT_TIMESTAMP WHERE property_id = ?",
-                    ("missing_reisift_property_uuid", format_db_time(datetime.utcnow() + timedelta(minutes=10)), property_id),
+                    "UPDATE reisift_sms_attempt_sync_queue SET queue_status = 'BrokenUUID', attempts = attempts + 1, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE property_id = ?",
+                    ("missing_reisift_property_uuid", property_id),
                 )
                 errors += 1
                 continue
@@ -51710,14 +51727,23 @@ def run_reisift_sms_attempt_sync_once(limit=25, now=None):
                 )
                 synced += 1
             except Exception as exc:
+                error_text = str(exc)[:1000]
+                queue_status = "BrokenUUID" if reisift_sms_attempt_error_is_broken_uuid(error_text) else "Retry"
                 db.execute(
                     """
                     UPDATE reisift_sms_attempt_sync_queue
-                    SET queue_status = 'Retry', attempts = attempts + 1, last_error = ?,
-                        run_after = ?, updated_at = CURRENT_TIMESTAMP
+                    SET queue_status = ?, attempts = attempts + 1, last_error = ?,
+                        run_after = CASE WHEN ? = 'Retry' THEN ? ELSE run_after END,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE property_id = ?
                     """,
-                    (str(exc)[:1000], format_db_time(datetime.utcnow() + timedelta(minutes=10)), property_id),
+                    (
+                        queue_status,
+                        error_text,
+                        queue_status,
+                        format_db_time(datetime.utcnow() + timedelta(minutes=10)),
+                        property_id,
+                    ),
                 )
                 errors += 1
             db.commit()

@@ -3,8 +3,8 @@
 <section class="panel">
     <h2>Broken ReiSIFT UUIDs</h2>
     <p>
-        These local properties could not be read from ReiSIFT while the SMS-attempt worker was establishing a baseline.
-        Repairing the UUID requeues the baseline read and any pending SMS-attempt counter update.
+        These local properties could not be read from ReiSIFT while the SMS-attempt worker was establishing a baseline
+        or writing a completed counter update. Repairing the UUID requeues the baseline read and any pending SMS-attempt counter update.
     </p>
 
     {% if notice %}

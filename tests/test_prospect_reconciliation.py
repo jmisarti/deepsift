@@ -758,6 +758,15 @@ class ProspectReconciliationTests(unittest.TestCase):
         self.assertTrue(app.sms_attempt_sync_window_is_open(after))
         self.assertFalse(app.sms_attempt_sync_window_is_open(weekend))
 
+    def test_sms_attempt_404_is_classified_as_a_broken_uuid(self):
+        self.assertTrue(
+            app.reisift_sms_attempt_error_is_broken_uuid(
+                "404 Client Error: Not Found for url: https://apiv2.reisift.io/api/internal/property/example/"
+            )
+        )
+        self.assertTrue(app.reisift_sms_attempt_error_is_broken_uuid("missing_reisift_property_uuid"))
+        self.assertFalse(app.reisift_sms_attempt_error_is_broken_uuid("429 Too Many Requests"))
+
     def test_sms_attempt_baseline_bootstrap_only_seeds_active_prospects(self):
         self.db.executescript(
             """

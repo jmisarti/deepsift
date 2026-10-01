@@ -15,6 +15,7 @@
         <a class="settings-tab {% if active_tab == 'referral' %}active{% endif %}" href="{{ url_for('settings_page', tab='referral') }}">Referral Settings</a>
         <a class="settings-tab {% if active_tab == 'sms_automation' %}active{% endif %}" href="{{ url_for('settings_page', tab='sms_automation') }}">SMS Automation</a>
         <a class="settings-tab {% if active_tab == 'email' %}active{% endif %}" href="{{ url_for('settings_page', tab='email') }}">Email Settings</a>
+        <a class="settings-tab {% if request.path.startswith('/sequences') %}active{% endif %}" href="{{ url_for('sequences_page') }}">Sequence Automation</a>
         <a class="settings-tab {% if active_tab == 'ads' %}active{% endif %}" href="{{ url_for('settings_page', tab='ads') }}">Ad Platforms</a>
         <a class="settings-tab {% if active_tab == 'integrations' %}active{% endif %}" href="{{ url_for('settings_page', tab='integrations') }}">Integration Settings</a>
         <a class="settings-tab {% if active_tab == 'automations' %}active{% endif %}" href="{{ url_for('settings_page', tab='automations') }}">Automations</a>

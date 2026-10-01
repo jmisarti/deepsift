@@ -134,7 +134,8 @@
 </section>
 
 <section class="panel">
-    <h3>Preview Render</h3>
+    <h3>Preview Render And OLC Proofs</h3>
+    <p class="muted-text">Select a saved sequence, property, and recipient. <strong>Generate OLC Proofs</strong> renders the actual mail pieces only; it never places an order or creates a charge.</p>
     <div class="grid-form compact">
         <label>Campaign
             <select id="previewCampaignId">
@@ -157,7 +158,10 @@
                 {% endfor %}
             </select>
         </label>
-        <label><button type="button" id="previewRenderBtn">Preview</button></label>
+        <div class="inline-actions">
+            <button type="button" id="previewRenderBtn">Preview Details</button>
+            <button type="button" id="previewProofsBtn">Generate OLC Proofs</button>
+        </div>
     </div>
     <div id="previewRenderOut" style="margin-top:0.8rem;"></div>
 </section>
@@ -311,6 +315,61 @@ document.getElementById('previewRenderBtn')?.addEventListener('click', async () 
     `;
   } catch (_e) {
     out.innerHTML = '<div class="error-banner">Preview failed</div>';
+  }
+});
+
+function proofMediaHtml(proof){
+  const images = [...(proof.envelope_urls || []), ...(proof.letter_urls || proof.image_urls || [])];
+  const pdfs = proof.pdf_urls || [];
+  if (!images.length && !pdfs.length) return '<p class="muted-text">OLC did not return a displayable image or PDF for this recipient.</p>';
+  return `
+    <div class="mail-preview-images proof-grid">
+      ${images.map((url) => `<img src="${esc(url)}" alt="OpenLetterConnect proof">`).join('')}
+      ${pdfs.map((url) => `<iframe class="proof-pdf-frame" src="${esc(url)}" title="OpenLetterConnect PDF proof"></iframe>`).join('')}
+    </div>
+    ${pdfs.map((url) => `<a href="${esc(url)}" target="_blank" rel="noopener">Open PDF proof</a>`).join(' ')}
+  `;
+}
+
+document.getElementById('previewProofsBtn')?.addEventListener('click', async () => {
+  const out = document.getElementById('previewRenderOut');
+  const campaignId = document.getElementById('previewCampaignId').value;
+  const propertyId = document.getElementById('previewPropertyId').value;
+  const personId = document.getElementById('previewPersonId').value;
+  if (!campaignId || !propertyId || !personId) return;
+  out.innerHTML = '<p>Generating OpenLetterConnect proof previews. No order will be placed...</p>';
+  try {
+    const res = await fetch(`/api/sequences/${campaignId}/proofs`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({property_id: propertyId, person_id: personId})
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      out.innerHTML = `<div class="error-banner">${esc(data.error || 'Proof generation failed')}</div>`;
+      return;
+    }
+    const stepsHtml = (data.steps || []).map((step) => {
+      const failures = (step.proofs || []).filter((proof) => !proof.ok);
+      const successful = (step.proofs || []).filter((proof) => proof.ok);
+      return `
+        <section class="panel" style="margin-top:0.8rem;">
+          <h4>Mail Step ${esc(String(step.step_order))}: ${esc(step.template_label || `Template ${step.template_id || ''}`)}</h4>
+          <p class="muted-text">Scheduled ${esc(String(step.delay_hours))} hours after enrollment.</p>
+          ${step.error ? `<div class="error-banner">${esc(step.error)}</div>` : ''}
+          ${successful.map(proofMediaHtml).join('')}
+          ${failures.map((proof) => `<div class="error-banner">${esc(proof.error || 'OLC proof generation failed')}</div>`).join('')}
+        </section>
+      `;
+    }).join('');
+    out.innerHTML = `
+      <p><strong>Sample recipient:</strong> ${esc(data.person?.name || '')} at ${esc(data.mail_target || '')}<br>
+      <strong>Property:</strong> ${esc(data.property?.address || '')}</p>
+      <p class="muted-text">These are OLC proofs only. No mail has been ordered.</p>
+      ${stepsHtml || '<div class="error-banner">This sequence has no MAIL steps to proof.</div>'}
+    `;
+  } catch (_e) {
+    out.innerHTML = '<div class="error-banner">Proof generation failed.</div>';
   }
 });
 </script>

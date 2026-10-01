@@ -55770,6 +55770,93 @@ def preview_sequence_campaign(campaign_id):
     )
 
 
+@app.route("/api/sequences/<int:campaign_id>/proofs", methods=["POST"])
+def preview_sequence_mail_proofs(campaign_id):
+    """Render OLC proofs for a saved sequence without creating an order."""
+    ensure_db()
+    db = get_db()
+    payload = request.get_json(silent=True) or {}
+    property_id = payload.get("property_id")
+    person_id = payload.get("person_id")
+    if not str(property_id).isdigit() or not str(person_id).isdigit():
+        return jsonify({"error": "property_id and person_id are required"}), 400
+
+    property_id = int(property_id)
+    person_id = int(person_id)
+    campaign = db.execute("SELECT id, name FROM sequence_campaigns WHERE id = ?", (campaign_id,)).fetchone()
+    if not campaign:
+        return jsonify({"error": "Campaign not found"}), 404
+    person = db.execute("SELECT id, first_name, last_name, deceased FROM people WHERE id = ?", (person_id,)).fetchone()
+    prop = db.execute(
+        """
+        SELECT p.id, p.owner_person_id, a.street, a.city, a.state, a.postal_code
+        FROM properties p
+        JOIN addresses a ON a.id = p.property_address_id
+        WHERE p.id = ?
+        """,
+        (property_id,),
+    ).fetchone()
+    if not person or not prop:
+        return jsonify({"error": "Person or property not found"}), 404
+    if int(person["deceased"] or 0) == 1:
+        return jsonify({"error": "Proofs are not available for deceased individuals"}), 400
+
+    contact, skipped = get_sequence_mail_target(db, prop, person_id)
+    if not contact:
+        reason = (skipped[0].get("reason") if skipped else "no mailing address available")
+        return jsonify({"error": f"No proof can be generated: {reason}"}), 400
+
+    mail_steps = [step for step in get_sequence_steps(db, campaign_id) if (step["channel"] or "").upper() == "MAIL"]
+    if not mail_steps:
+        return jsonify({"error": "This sequence has no MAIL steps to proof"}), 400
+
+    rendered_steps = []
+    for step in mail_steps:
+        template_id = resolve_direct_mail_template_id(db, step["mail_template_id"])
+        try:
+            built = build_openletterconnect_order_payload(
+                db,
+                [contact],
+                prop,
+                template_id=template_id,
+                mode="sequence-proof-preview",
+            )
+            rendered_steps.append(
+                {
+                    "step_order": step["step_order"],
+                    "delay_hours": round((int(step["delay_minutes"] or 0)) / 60.0, 4),
+                    "template_id": template_id,
+                    "template_label": describe_sequence_mail_template(db, template_id),
+                    "proofs": view_openletterconnect_proofs(built["payload"], db=db),
+                }
+            )
+        except Exception as exc:
+            rendered_steps.append(
+                {
+                    "step_order": step["step_order"],
+                    "delay_hours": round((int(step["delay_minutes"] or 0)) / 60.0, 4),
+                    "template_id": template_id,
+                    "template_label": describe_sequence_mail_template(db, template_id),
+                    "error": str(exc),
+                    "proofs": [],
+                }
+            )
+
+    return jsonify(
+        {
+            "ok": True,
+            "campaign": {"id": campaign["id"], "name": campaign["name"]},
+            "person": {"id": person["id"], "name": f"{person['first_name']} {person['last_name']}".strip()},
+            "property": {
+                "id": prop["id"],
+                "address": f"{prop['street']}, {prop['city']}, {prop['state']} {prop['postal_code']}".strip(),
+            },
+            "mail_target": format_sequence_mail_target(contact),
+            "steps": rendered_steps,
+        }
+    )
+
+
 def _property_sequence_targets(db, property_id):
     prop = db.execute("SELECT owner_person_id FROM properties WHERE id = ?", (property_id,)).fetchone()
     if not prop:
